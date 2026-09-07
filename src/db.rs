@@ -1,0 +1,159 @@
+//! Local SQLite persistence for projects, sessions, and chat messages.
+//!
+//! Accessed synchronously on the UI (main) thread. Schema is created on open.
+
+use rusqlite::{params, Connection, Result};
+
+/// A project: a workspace the user groups sessions under.
+#[derive(Clone, Debug)]
+pub struct Project {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+}
+
+/// A session (conversation) belonging to a project and bound to an agent.
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub id: i64,
+    pub project_id: i64,
+    pub agent: String,
+    pub title: String,
+    pub cwd: String,
+}
+
+/// A chat message stored in a session.
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub role: String, // "user" | "agent"
+    pub content: String,
+}
+
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let conn = Connection::open(path)?;
+        let store = Self { conn };
+        store.init()?;
+        Ok(store)
+    }
+
+    fn init(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+    }
+
+    pub fn projects(&self) -> Vec<Project> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, path FROM projects ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    pub fn insert_project(&self, name: &str, path: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
+            params![name, path],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn sessions(&self) -> Vec<Session> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, project_id, agent, title, cwd FROM sessions ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(Session {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                agent: row.get(2)?,
+                title: row.get(3)?,
+                cwd: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    pub fn insert_session(
+        &self,
+        project_id: i64,
+        agent: &str,
+        title: &str,
+        cwd: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO sessions (project_id, agent, title, cwd) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, agent, title, cwd],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn messages(&self, session_id: i64) -> Vec<Message> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![session_id], |row| {
+            Ok(Message {
+                role: row.get(0)?,
+                content: row.get(1)?,
+            })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    pub fn insert_message(&self, session_id: i64, role: &str, content: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES (?1, ?2, ?3)",
+            params![session_id, role, content],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+}

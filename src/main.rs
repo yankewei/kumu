@@ -1,137 +1,388 @@
-//! kumu: settings page (Providers) — lists the model service providers a local
-//! ACP agent can use, derived from the agent's session `configOptions`
-//! (category: model). Rendered with gpui-component's themed Sidebar + tokens;
-//! no hard-coded colors.
+//! kumu — local multi-agent desktop shell.
 //!
-//! Scope: single agent (default omp, `KUMU_AGENT=opencode` to switch), one
-//! session, read-only (no credential editing).
+//! Two screens (same window, view switch):
+//!   Home     : left tree (projects → sessions), settings entry in the header;
+//!              right panel shows the selected session's conversation.
+//!   Settings : left nav ("服务商"), right shows the supported agents.
+//!
+//! Sessions/messages persist to a local SQLite DB (~/.kumu/kumu.db). Light
+//! theme (default). Real-time ACP prompt/response is the next step; the input
+//! currently records user messages locally (agent reply wiring pending).
 
-mod acp;
+mod db;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::time::Duration;
 
-use gpui_kit::component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-};
+use db::{Message, Project, Session, Store};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use tokio::sync::mpsc::UnboundedSender;
+
+/// Agents kumu can drive (static registry; ACP wiring is the next step).
+struct AgentDef {
+    id: &'static str,
+    name: &'static str,
+    desc: &'static str,
+}
+
+const AGENTS: [AgentDef; 2] = [
+    AgentDef {
+        id: "opencode",
+        name: "Opencode",
+        desc: "SST Opencode · ACP v1",
+    },
+    AgentDef {
+        id: "omp",
+        name: "Oh My Pi",
+        desc: "omp · ACP v1",
+    },
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Home,
+    Settings,
+}
 
 struct KumuApp {
-    status: SharedString,
-    providers: Vec<(String, usize)>,
-    total_models: usize,
-    /// Kept alive so the ACP connection loop never sees its channel close.
-    _cmd_tx: UnboundedSender<String>,
-    _poll: Task<()>,
+    store: Store,
+    view: View,
+    projects: Vec<Project>,
+    sessions: Vec<Session>,
+    selected: Option<i64>,
+    messages: Vec<Message>,
+    input_state: Entity<InputState>,
 }
 
 impl KumuApp {
-    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (ev_tx, ev_rx) = mpsc::channel::<acp::Event>();
-        let cfg = acp::Config::agent();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-        let cmd_tx = acp::spawn(cfg, cwd, ev_tx);
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let db_path = db_path();
+        let store = Store::open(&db_path).expect("failed to open sqlite db");
+        let mut app = Self {
+            store,
+            view: View::Home,
+            projects: Vec::new(),
+            sessions: Vec::new(),
+            selected: None,
+            messages: Vec::new(),
+            input_state: cx.new(|cx| InputState::new(window, cx).placeholder("输入消息…")),
+        };
+        app.bootstrap();
+        app
+    }
 
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                for ev in ev_rx.try_iter() {
-                    this.update(cx, |this, cx| this.on_event(ev, cx)).ok();
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+    /// Make sure there is at least one project + one session so the shell is usable.
+    fn bootstrap(&mut self) {
+        if self.store.projects().is_empty() {
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/"))
+                .to_string_lossy()
+                .into_owned();
+            self.store.insert_project("kumu", &cwd).ok();
+        }
+        self.refresh();
+        if self.sessions.is_empty() {
+            if let Some(p) = self.projects.first().cloned() {
+                let cwd = p.path.clone();
+                self.store.insert_session(p.id, "omp", "会话 1", &cwd).ok();
+                self.refresh();
             }
-        });
-
-        Self {
-            status: "connecting…".into(),
-            providers: Vec::new(),
-            total_models: 0,
-            _cmd_tx: cmd_tx,
-            _poll: poll,
+        }
+        if self.selected.is_none() {
+            if let Some(s) = self.sessions.first().cloned() {
+                self.select_session(s.id);
+            }
         }
     }
 
-    fn on_event(&mut self, ev: acp::Event, cx: &mut Context<Self>) {
-        match ev {
-            acp::Event::Log(s) => self.status = s.into(),
-            acp::Event::Error(s) => self.status = format!("error: {s}").into(),
-            acp::Event::Providers {
-                total_models,
-                providers,
-            } => {
-                self.providers = providers.into_iter().map(|p| (p.id, p.count)).collect();
-                self.total_models = total_models;
-                self.status = "connected".into();
-            }
-            acp::Event::Agent(_) | acp::Event::Done(_) | acp::Event::Permission(_) => {}
+    fn refresh(&mut self) {
+        self.projects = self.store.projects();
+        self.sessions = self.store.sessions();
+    }
+
+    fn select_session(&mut self, id: i64) {
+        self.selected = Some(id);
+        self.messages = self.store.messages(id);
+    }
+
+    fn new_session(&mut self) {
+        let project_id = self
+            .projects
+            .first()
+            .map(|p| p.id)
+            .unwrap_or_else(|| self.store.insert_project("kumu", "cwd-not-set").unwrap_or(1));
+        let cwd = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let n = self.sessions.len() + 1;
+        if let Ok(id) = self.store.insert_session(project_id, "omp", &format!("会话 {n}"), &cwd) {
+            self.refresh();
+            self.select_session(id);
         }
+    }
+
+    fn send(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected else { return };
+        let text = self.input_state.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.store.insert_message(session_id, "user", text.trim()).ok();
+        self.messages = self.store.messages(session_id);
+        // TODO(next step): route the prompt to the session's agent over ACP and
+        // persist + stream the reply here.
         cx.notify();
+    }
+
+    fn selected_session(&self) -> Option<&Session> {
+        let id = self.selected?;
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
+    fn agent_name(&self, agent_id: &str) -> String {
+        AGENTS
+            .iter()
+            .find(|a| a.id == agent_id)
+            .map(|a| a.name.to_string())
+            .unwrap_or_else(|| agent_id.to_string())
     }
 }
 
-impl Render for KumuApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl KumuApp {
+    fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let status = self.status.clone();
-        let providers = self.providers.clone();
-        let provider_count = providers.len();
-        let providers_empty = providers.is_empty();
-        let total_models = self.total_models;
-        let agent = std::env::var("KUMU_AGENT").unwrap_or_else(|_| "omp".into());
+        let selected = self.selected;
 
-        let sidebar = Sidebar::new("kumu-sidebar")
-            .w(px(236.))
-            .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
+        // Left column: projects -> sessions tree.
+        let mut tree: Vec<Stateful<Div>> = Vec::new();
+        for project in &self.projects {
+            let project_name = project.name.clone();
+            tree.push(
+                div()
+                    .id(format!("project-head-{}", project.id))
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_bold()
+                    .text_color(theme.muted_foreground)
+                    .child(project_name),
+            );
+            let project_sessions = self
+                .sessions
+                .iter()
+                .filter(|s| s.project_id == project.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for s in project_sessions {
+                let active = selected == Some(s.id);
+                let (bg, fg, tag) = if active {
+                    (theme.primary, theme.primary_foreground, theme.primary_foreground)
+                } else {
+                    (theme.transparent, theme.foreground, theme.muted_foreground)
+                };
+                let sid = s.id;
+                let title = s.title.clone();
+                let agent = self.agent_name(&s.agent);
+                tree.push(
+                    div()
+                        .id(format!("session-{sid}"))
+                        .mx_2()
+                        .px_3()
+                        .py(px(6.))
+                        .rounded(theme.radius)
+                        .bg(bg)
+                        .text_color(fg)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_session(sid);
+                            cx.notify();
+                        }))
                         .child(
-                            div()
-                                .size_6()
-                                .rounded(theme.radius)
-                                .bg(theme.primary)
-                                .text_color(theme.primary_foreground)
-                                .flex()
+                            h_flex()
                                 .items_center()
-                                .justify_center()
-                                .text_xs()
-                                .font_bold()
-                                .child("k"),
-                        )
-                        .child(div().font_bold().child("kumu")),
-                ),
+                                .gap_2()
+                                .child(div().flex_1().text_sm().child(title))
+                                .child(div().text_size(px(10.)).text_color(tag).child(agent)),
+                        ),
+                );
+            }
+        }
+
+        let left = v_flex()
+            .w(px(264.))
+            .h_full()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_3()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_bold().child("kumu"))
+                    .child(
+                        div()
+                            .id("open-settings")
+                            .rounded(theme.radius)
+                            .p_1()
+                            .text_color(theme.muted_foreground)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = View::Settings;
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::Settings)),
+                    ),
+            )
+            .child(div().h_px().w_full().bg(theme.border))
+            .child(
+                div()
+                    .flex_1()
+                    .id("session-tree")
+                    .overflow_y_scroll()
+                    .children(tree),
             )
             .child(
-                SidebarGroup::new("设置").child(
-                    SidebarMenu::new().children([
-                        SidebarMenuItem::new("服务商").active(true),
-                        SidebarMenuItem::new("会话"),
-                        SidebarMenuItem::new("外观"),
-                    ]),
-                ),
-            )
-            .footer(
-                SidebarFooter::new().child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(theme.muted_foreground)
-                        .text_xs()
-                        .child(div().size_2().rounded_full().bg(theme.primary))
-                        .child(format!("{agent} · {status}")),
-                ),
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("new-session")
+                            .ghost()
+                            .small()
+                            .label("+ 新建会话")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.new_session();
+                                cx.notify();
+                            })),
+                    ),
             );
 
-        // Provider rows as bordered surface cards.
+        // Right: selected session's agent header + conversation.
+        let right = match self.selected_session() {
+            Some(session) => {
+                let agent = self.agent_name(&session.agent);
+                let title = session.title.clone();
+                let cwd = session.cwd.clone();
+                let messages = self.messages.clone();
+                let agent_for_rows = agent.clone();
+                // Owned copies so the row closure is 'static (no theme borrow).
+                let (primary, muted, foreground, radius) =
+                    (theme.primary, theme.muted, theme.foreground, theme.radius);
+                let rows = v_flex()
+                    .gap_2()
+                    .children(messages.into_iter().map(move |m| {
+                        let user = m.role == "user";
+                        let (bg, who) = if user {
+                            (primary.opacity(0.08), "你".to_string())
+                        } else {
+                            (muted, agent_for_rows.clone())
+                        };
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .rounded(radius)
+                            .bg(bg)
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_bold()
+                                            .text_color(if user { primary } else { foreground })
+                                            .child(who),
+                                    )
+                                    .child(div().text_sm().child(m.content)),
+                            )
+                    }));
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(div().text_sm().font_bold().child(title))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded(px(999.))
+                                    .bg(theme.muted)
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(agent),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(cwd),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .id("conversation")
+                            .overflow_y_scroll()
+                            .px_4()
+                            .py_3()
+                            .child(rows),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(Input::new(&self.input_state).flex_1())
+                            .child(
+                                Button::new("send")
+                                    .primary()
+                                    .label("发送")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send(window, cx);
+                                    })),
+                            ),
+                    )
+            }
+            None => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .child("选择左侧会话，或新建一个"),
+        };
+
+        h_flex()
+            .size_full()
+            .bg(theme.background)
+            .child(left)
+            .child(div().w_px().h_full().bg(theme.border))
+            .child(right)
+    }
+
+    fn render_settings(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+
         let rows = v_flex()
             .gap_2()
-            .children(providers.into_iter().map(|(id, count)| {
+            .children(AGENTS.iter().map(|a| {
                 h_flex()
                     .items_center()
                     .justify_between()
@@ -140,87 +391,119 @@ impl Render for KumuApp {
                     .rounded(theme.radius)
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.muted)
+                    .bg(theme.background)
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().font_medium().text_sm().child(id)),
+                        v_flex()
+                            .gap(px(2.))
+                            .child(div().font_medium().text_sm().child(a.name))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(a.desc),
+                            ),
                     )
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py(px(2.))
-                                    .rounded(px(999.))
-                                    .bg(theme.primary)
-                                    .text_color(theme.primary_foreground)
-                                    .text_size(px(11.))
-                                    .child(count.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("个模型"),
-                            ),
+                        div()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded(px(999.))
+                            .bg(theme.muted)
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child("本地"),
                     )
             }));
 
-        let content = v_flex()
+        let left = v_flex()
+            .w(px(220.))
+            .h_full()
+            .bg(theme.background)
+            .child(div().px_4().py_3().font_bold().text_sm().child("设置"))
+            .child(div().h_px().w_full().bg(theme.border))
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_3()
+                    .child(
+                        div()
+                            .px_3()
+                            .py(px(6.))
+                            .rounded(theme.radius)
+                            .bg(theme.primary)
+                            .text_color(theme.primary_foreground)
+                            .text_sm()
+                            .child("服务商"),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py(px(6.))
+                            .rounded(theme.radius)
+                            .text_color(theme.muted_foreground)
+                            .text_sm()
+                            .child("通用"),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .child(
+                        Button::new("back-home")
+                            .ghost()
+                            .label("← 返回首页")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = View::Home;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        let right = v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
+            .px_5()
+            .py_5()
+            .gap_3()
             .child(
                 h_flex()
                     .items_center()
                     .gap_3()
-                    .px_5()
-                    .pt_5()
                     .child(div().text_lg().font_bold().child("服务商"))
                     .child(
                         div()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child(format!("{agent} 会话可用的模型服务商")),
+                            .child("本机可用的 agent"),
                     ),
             )
-            .child(
-                div()
-                    .px_5()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("共 {provider_count} 家 · {total_models} 个模型")),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .id("provider-list")
-                    .overflow_y_scroll()
-                    .px_5()
-                    .py_3()
-                    .child(
-                        rows.when(providers_empty, |this| {
-                            this.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("等待 agent 返回模型列表…"),
-                            )
-                        }),
-                    ),
-            );
+            .child(rows);
 
         h_flex()
             .size_full()
             .bg(theme.background)
-            .child(sidebar)
+            .child(left)
             .child(div().w_px().h_full().bg(theme.border))
-            .child(content)
+            .child(right)
     }
+}
+
+impl Render for KumuApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.view {
+            View::Home => self.render_home(window, cx),
+            View::Settings => self.render_settings(window, cx),
+        }
+    }
+}
+
+fn db_path() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".kumu").join("kumu.db")
 }
 
 fn main() {
@@ -228,37 +511,18 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        let window_options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(1040.), px(680.)), cx)),
+            ..Default::default()
+        };
 
-        // Load themes/ (zed-dark.json sets itself as the dark default) and open
-        // the window only once the theme is applied, so it appears in Zed Dark.
-        let themes_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("themes");
-        let _ = ThemeRegistry::watch_dir(themes_dir, cx, move |cx| {
-            if std::env::var_os("KUMU_DEBUG").is_some() {
-                let reg = ThemeRegistry::global(cx);
-                eprintln!("[theme] registered: {:?}", reg.themes().keys().collect::<Vec<_>>());
-                eprintln!("[theme] default_dark: {}", reg.default_dark_theme().name);
-            }
-            // Rebuild the cached Theme global so it picks up the newly
-            // registered Zed Dark (it cloned the default at init time).
-            if cx.has_global::<Theme>() {
-                cx.remove_global::<Theme>();
-            }
-            Theme::change(ThemeMode::Dark, None, cx);
-            if std::env::var_os("KUMU_DEBUG").is_some() {
-                eprintln!("[theme] active: {}", Theme::global(cx).theme_name());
-            }
-            let window_options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(980.), px(640.)), cx)),
-                ..Default::default()
-            };
-            let _ = cx.spawn(async move |cx| {
-                cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| KumuApp::new(window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .expect("failed to open window");
+        cx.spawn(async move |cx| {
+            cx.open_window(window_options, |window, cx| {
+                let view = cx.new(|cx| KumuApp::new(window, cx));
+                cx.new(|cx| Root::new(view, window, cx))
             })
-            .detach();
-        });
+            .expect("failed to open window");
+        })
+        .detach();
     });
 }
