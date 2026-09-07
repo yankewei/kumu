@@ -257,7 +257,8 @@ fn main() {
                     cx.new(|cx| Root::new(view, window, cx))
                 })
                 .expect("failed to open window");
-            });
+            })
+            .detach();
         });
     });
 }
