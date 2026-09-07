@@ -1,0 +1,11 @@
+[package]
+name = "kumu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agent-client-protocol = "2.1"
+gpui-kit = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time"] }
