@@ -40,7 +40,7 @@ const AGENTS: [AgentDef; 2] = [
     },
 ];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
     Home,
     Settings,
@@ -70,6 +70,7 @@ impl KumuApp {
             input_state: cx.new(|cx| InputState::new(window, cx).placeholder("输入消息…")),
         };
         app.bootstrap();
+        eprintln!("[ui] KumuApp initialized, view={:?}", app.view);
         app
     }
 
@@ -380,22 +381,66 @@ impl KumuApp {
     fn render_settings(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
 
+        // Left: settings category list (Zed style: sentence-case rows, muted hints).
+        let nav_item = |label: &str, active: bool| {
+            div()
+                .id(format!("settings-nav-{label}"))
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(if active { theme.muted } else { theme.transparent })
+                .text_sm()
+                .text_color(if active { theme.foreground } else { theme.muted_foreground })
+                .child(label.to_string())
+        };
+
+        let left = v_flex()
+            .w(px(236.))
+            .h_full()
+            .flex_shrink_0()
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .px_3()
+                    .py_4()
+                    .child(nav_item("服务商", true))
+                    .child(nav_item("通用", false))
+                    .child(nav_item("快捷键", false)),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .id("back-home")
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = View::Home;
+                                cx.notify();
+                            }))
+                            .child("← 返回首页"),
+                    ),
+            );
+
+        // Right: title + agent entries as settings rows (label/desc + control).
         let rows = v_flex()
-            .gap_2()
+            .gap(px(2.))
             .children(AGENTS.iter().map(|a| {
                 h_flex()
                     .items_center()
-                    .justify_between()
-                    .px_4()
-                    .py_3()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
+                    .gap_4()
+                    .py_2()
                     .child(
                         v_flex()
+                            .flex_1()
                             .gap(px(2.))
-                            .child(div().font_medium().text_sm().child(a.name))
+                            .child(div().text_sm().font_bold().child(a.name))
                             .child(
                                 div()
                                     .text_size(px(12.))
@@ -404,84 +449,39 @@ impl KumuApp {
                             ),
                     )
                     .child(
-                        div()
+                        h_flex()
+                            .items_center()
+                            .gap_1()
                             .px_2()
-                            .py(px(2.))
-                            .rounded(px(999.))
-                            .bg(theme.muted)
-                            .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
-                            .child("本地"),
+                            .py_1()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.background)
+                            .text_size(px(12.))
+                            .text_color(theme.foreground)
+                            .child("本地")
+                            .child(Icon::new(IconName::ChevronDown)),
                     )
             }));
-
-        let left = v_flex()
-            .w(px(220.))
-            .h_full()
-            .bg(theme.background)
-            .child(div().px_4().py_3().font_bold().text_sm().child("设置"))
-            .child(div().h_px().w_full().bg(theme.border))
-            .child(
-                v_flex()
-                    .gap(px(2.))
-                    .px_3()
-                    .py_3()
-                    .child(
-                        div()
-                            .px_3()
-                            .py(px(6.))
-                            .rounded(theme.radius)
-                            .bg(theme.primary)
-                            .text_color(theme.primary_foreground)
-                            .text_sm()
-                            .child("服务商"),
-                    )
-                    .child(
-                        div()
-                            .px_3()
-                            .py(px(6.))
-                            .rounded(theme.radius)
-                            .text_color(theme.muted_foreground)
-                            .text_sm()
-                            .child("通用"),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .px_3()
-                    .py_3()
-                    .child(
-                        Button::new("back-home")
-                            .ghost()
-                            .label("← 返回首页")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.view = View::Home;
-                                cx.notify();
-                            })),
-                    ),
-            );
 
         let right = v_flex()
             .flex_1()
             .h_full()
-            .min_w_0()
-            .px_5()
-            .py_5()
-            .gap_3()
+            .px(px(48.))
+            .py(px(32.))
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_3()
-                    .child(div().text_lg().font_bold().child("服务商"))
+                div()
+                    .w_full()
+                    .max_w(px(600.))
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("本机可用的 agent"),
+                        v_flex()
+                            .gap(px(4.))
+                            .child(div().text_size(px(17.)).font_bold().child("服务商"))
+                            .child(div().h_px().w_full().bg(theme.border))
+                            .child(rows),
                     ),
-            )
-            .child(rows);
+            );
 
         h_flex()
             .size_full()
@@ -517,11 +517,13 @@ fn main() {
         };
 
         cx.spawn(async move |cx| {
-            cx.open_window(window_options, |window, cx| {
+            match cx.open_window(window_options, |window, cx| {
                 let view = cx.new(|cx| KumuApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("failed to open window");
+            }) {
+                Ok(_) => eprintln!("[ui] window opened"),
+                Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),
+            }
         })
         .detach();
     });
