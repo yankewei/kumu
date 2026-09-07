@@ -1,5 +1,5 @@
-//! Settings window: category nav on the left, setting rows on the right.
-//! Opened from Home's gear icon; resizable with a minimum size it opens at.
+//! Settings window, Waku-style: sidebar (back row + search + icon nav) on the
+//! left; a centered content column with card-grouped rows on the right.
 
 use super::widgets::pill;
 use crate::agents::AGENTS;
@@ -42,28 +42,44 @@ impl SettingsWindow {
 
         let query = self.search_state.read(cx).value().to_lowercase();
 
-        // ---- Left: search + category nav (Zed-style chevron rows). ----
-        let nav_defs: [(&'static str, SettingsPage); 2] = [
-            ("服务商", SettingsPage::Providers),
-            ("通用", SettingsPage::General),
+        // ---- Left: back row + search + icon nav (Waku-style sidebar). ----
+        let back = div()
+            .id("settings-back")
+            .h_9()
+            .px_2p5()
+            .rounded_lg()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .cursor_pointer()
+            .text_sm()
+            .text_color(sidebar_fg)
+            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+            .on_click(|_, window, _| window.remove_window())
+            .child(Icon::new(IconName::ArrowLeft).small().text_color(muted_fg))
+            .child("返回");
+
+        let nav_defs: [(IconName, &'static str, SettingsPage); 2] = [
+            (IconName::Bot, "服务商", SettingsPage::Providers),
+            (IconName::Settings, "通用", SettingsPage::General),
         ];
         let nav = nav_defs
             .into_iter()
-            .filter(|(label, _)| query.is_empty() || label.to_lowercase().contains(&query))
-            .map(|(label, page)| {
+            .filter(|(_, label, _)| query.is_empty() || label.to_lowercase().contains(&query))
+            .map(|(icon, label, page)| {
                 let active = self.settings_page == page;
                 div()
                     .id(SharedString::from(format!("settings-nav-{label}")))
-                    .w_full()
-                    .h_flex()
+                    .h_9()
+                    .px_2p5()
+                    .rounded_lg()
+                    .flex()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1p5()
-                    .rounded(radius)
+                    .gap_2p5()
                     .cursor_pointer()
-                    .bg(if active { sidebar_accent } else { theme.transparent })
+                    .text_sm()
                     .text_color(if active { sidebar_accent_fg } else { sidebar_fg })
+                    .bg(if active { sidebar_accent } else { theme.transparent })
                     .when(!active, |this| {
                         this.hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                     })
@@ -72,11 +88,11 @@ impl SettingsWindow {
                         cx.notify();
                     }))
                     .child(
-                        Icon::new(IconName::ChevronRight)
-                            .small()
+                        Icon::new(icon)
+                            .with_size(px(15.))
                             .text_color(if active { sidebar_accent_fg } else { muted_fg }),
                     )
-                    .child(div().text_sm().child(label))
+                    .child(label)
             })
             .collect::<Vec<_>>();
 
@@ -86,120 +102,55 @@ impl SettingsWindow {
             .flex_shrink_0()
             .bg(sidebar)
             .text_color(sidebar_fg)
+            .child(div().px_2().pt_3().child(back))
             .child(
-                div().px_3().py_3().child(
+                div().px_2().pt_3().child(
                     Input::new(&self.search_state)
                         .small()
                         .prefix(Icon::new(IconName::Search).small().text_color(muted_fg)),
                 ),
             )
-            .child(v_flex().px_2().gap_0p5().children(nav))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(sidebar_border)
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child("本地数据 · ~/.kumu/kumu.db"),
-            );
+            .child(div().h_2())
+            .child(v_flex().px_2().gap_0p5().children(nav));
 
-        // ---- Right: page header + hairline-separated setting rows. ----
-        let (title, desc) = match self.settings_page {
-            SettingsPage::Providers => ("服务商", "通过 ACP 发现的本机 agent"),
-            SettingsPage::General => ("通用", "界面外观与本地数据"),
+        // ---- Right: centered column with the page title + grouped cards. ----
+        let title = match self.settings_page {
+            SettingsPage::Providers => "服务商",
+            SettingsPage::General => "通用",
         };
 
-        let mut rows: Vec<AnyElement> = Vec::new();
-        let push_row = |rows: &mut Vec<AnyElement>, control: AnyElement, title: &'static str, desc: &'static str| {
-            rows.push(
-                h_flex()
-                    .items_start()
-                    .justify_between()
-                    .gap_6()
-                    .py_3p5()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().font_medium().child(title))
-                            .child(div().text_xs().text_color(muted_fg).child(desc)),
-                    )
-                    .child(control)
-                    .into_any_element(),
-            );
+        let cards: Vec<AnyElement> = match self.settings_page {
+            SettingsPage::Providers => vec![self.render_providers_card(
+                theme.background, radius, primary, link, muted, muted_fg, border,
+            )],
+            SettingsPage::General => vec![self.render_general_card(
+                dark, radius, primary, link, muted, muted_fg, border,
+            )],
         };
-        let divider = |rows: &mut Vec<AnyElement>| {
-            rows.push(div().h_px().w_full().bg(border).into_any_element());
-        };
-
-        match self.settings_page {
-            SettingsPage::Providers => {
-                for (i, a) in AGENTS.iter().enumerate() {
-                    push_row(
-                        &mut rows,
-                        pill(true, "本地", radius, primary, link, muted, muted_fg).into_any_element(),
-                        a.name,
-                        a.desc,
-                    );
-                    if i + 1 < AGENTS.len() {
-                        divider(&mut rows);
-                    }
-                }
-            }
-            SettingsPage::General => {
-                push_row(
-                    &mut rows,
-                    Switch::new("dark-mode")
-                        .checked(dark)
-                        .on_click(|checked, window, cx| {
-                            Theme::change(
-                                if *checked { ThemeMode::Dark } else { ThemeMode::Light },
-                                Some(window),
-                                cx,
-                            );
-                        })
-                        .into_any_element(),
-                    "深色外观",
-                    "在亮色与暗色主题之间切换。",
-                );
-                divider(&mut rows);
-                push_row(
-                    &mut rows,
-                    pill(false, "SQLite", radius, primary, link, muted, muted_fg).into_any_element(),
-                    "本地数据",
-                    "会话与消息保存在 ~/.kumu/kumu.db。",
-                );
-            }
-        }
 
         let right = v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
             .child(
-                v_flex()
-                    .gap_1()
-                    .px_8()
-                    .pt_5()
-                    .child(div().text_base().font_bold().child(title))
-                    .child(div().text_sm().text_color(muted_fg).child(desc)),
-            )
-            .child(div().mt_4().h_px().w_full().bg(border))
-            .child(
                 div()
                     .flex_1()
                     .id("settings-content")
                     .overflow_y_scroll()
                     .px_8()
-                    .pt_2()
-                    .child(v_flex().max_w_128().children(rows)),
+                    .pt_4()
+                    .pb_8()
+                    .child(
+                        v_flex().max_w(rems(40.)).mx_auto().child(
+                            v_flex()
+                                .gap_5()
+                                .child(div().text_lg().font_medium().child(title))
+                                .children(cards),
+                        ),
+                    ),
             );
 
-        let title_bar = TitleBar::new()
-            .child(div().text_sm().font_bold().child("kumu"))
-            .child(div().text_sm().text_color(muted_fg).child("设置"));
+        let title_bar = TitleBar::new().child(div().text_sm().font_bold().child("kumu"));
 
         v_flex()
             .size_full()
@@ -212,9 +163,150 @@ impl SettingsWindow {
                     .flex_1()
                     .min_h_0()
                     .child(left)
-                    .child(div().w_px().h_full().bg(border))
+                    .child(div().w_px().h_full().bg(sidebar_border))
                     .child(right),
             )
+    }
+
+    /// One card: elevated surface (muted bg) with hairline-separated rows.
+    fn card(&self, bg: Hsla) -> Div {
+        div().w_full().px_5().py_4().rounded_lg().bg(bg)
+    }
+
+    fn render_providers_card(
+        &self,
+        base_bg: Hsla,
+        radius: Pixels,
+        primary: Hsla,
+        link: Hsla,
+        muted: Hsla,
+        muted_fg: Hsla,
+        border: Hsla,
+    ) -> AnyElement {
+        let rows = AGENTS
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .py_3()
+                    .when(i + 1 < AGENTS.len(), |row| {
+                        row.border_b_1().border_color(border)
+                    })
+                    // 30px icon tile on the card's lighter base.
+                    .child(
+                        div()
+                            .size(px(30.))
+                            .flex_none()
+                            .rounded(radius)
+                            .bg(base_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::Bot)
+                                    .with_size(px(16.))
+                                    .text_color(muted_fg),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().font_medium().child(a.name))
+                            .child(
+                                div()
+                                    .mt_0p5()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .text_ellipsis()
+                                    .child(a.desc),
+                            ),
+                    )
+                    .child(pill(true, "本地", radius, primary, link, muted, muted_fg))
+            })
+            .collect::<Vec<_>>();
+
+        self.card(muted)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_sm().font_medium().child("编码 Agent"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("通过 ACP 发现的本机 agent"),
+                    ),
+            )
+            .child(v_flex().mt_1().children(rows))
+            .into_any_element()
+    }
+
+    fn render_general_card(
+        &self,
+        dark: bool,
+        radius: Pixels,
+        primary: Hsla,
+        link: Hsla,
+        muted: Hsla,
+        muted_fg: Hsla,
+        border: Hsla,
+    ) -> AnyElement {
+        let row = |title: &'static str,
+                   desc: &'static str,
+                   control: AnyElement,
+                   border: Hsla,
+                   last: bool| {
+            h_flex()
+                .items_center()
+                .gap_6()
+                .py_3()
+                .when(!last, |r| r.border_b_1().border_color(border))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_medium().child(title))
+                        .child(
+                            div()
+                                .mt_0p5()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(desc),
+                        ),
+                )
+                .child(control)
+        };
+        let switch = Switch::new("dark-mode")
+            .checked(dark)
+            .on_click(|checked, window, cx| {
+                Theme::change(
+                    if *checked { ThemeMode::Dark } else { ThemeMode::Light },
+                    Some(window),
+                    cx,
+                );
+            })
+            .into_any_element();
+
+        self.card(muted)
+            .child(row(
+                "深色外观",
+                "在亮色与暗色主题之间切换。",
+                switch,
+                border,
+                false,
+            ))
+            .child(row(
+                "本地数据",
+                "会话与消息保存在 ~/.kumu/kumu.db。",
+                pill(false, "SQLite", radius, primary, link, muted, muted_fg)
+                    .into_any_element(),
+                border,
+                true,
+            ))
+            .into_any_element()
     }
 }
 

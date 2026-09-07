@@ -1,22 +1,22 @@
 # kumu
 
-## 是什么
+## What it is
 
-macOS 本地 coding agent 桌面壳：一个窗口管理多个本地 agent 的会话（项目 → 会话树 → 对话）。基于 GPUI（gpui-kit）+ Agent Client Protocol，会话与消息存在本地 SQLite（`~/.kumu/kumu.db`）。
+A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → conversation). Built on GPUI (gpui-kit) + Agent Client Protocol, with sessions and messages stored in local SQLite (`~/.kumu/kumu.db`).
 
-目前是能力演示：Home（会话树 + 对话）和设置（服务商/通用、深色外观）两个窗口；ACP 客户端层已实现，尚未接入 UI。
+Currently a capability demo: two windows — Home (session tree + conversation) and Settings (providers/general, dark mode). The ACP client layer is implemented but not wired into the UI yet.
 
-## 怎么安装
+## Installation
 
-需要 Rust（`cargo`）和一个本地 agent 二进制（默认 `omp`，可选 `opencode`）。
+Requires Rust (`cargo`) and a local agent binary (default `omp`, or `opencode`).
 
 ```bash
 git clone git@github.com:yankewei/kumu.git
 cd kumu
-cargo run                        # 默认使用 omp
-KUMU_AGENT=opencode cargo run    # 或使用 opencode
+cargo run                        # uses omp by default
+KUMU_AGENT=opencode cargo run    # or opencode
 ```
 
-- `OMP_BIN` / `OPENCODE_BIN`：agent 不在 PATH 时指定二进制路径。
-- opencode 需要 `OPENCODE_API_KEY`（env 优先，否则自动读取 `~/.local/share/opencode/auth.json`）；omp 无需配置。
-- `KUMU_DEBUG=1 cargo run`：把 ACP 事件打到 stderr，用于无界面验证。
+- `OMP_BIN` / `OPENCODE_BIN`: path to the agent binary if it is not on PATH.
+- opencode needs `OPENCODE_API_KEY` (env first, otherwise read automatically from `~/.local/share/opencode/auth.json`); omp needs no setup.
+- `KUMU_DEBUG=1 cargo run`: print ACP events to stderr for headless verification.
