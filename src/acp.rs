@@ -10,7 +10,8 @@ use std::sync::mpsc::Sender;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, TextContent,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::{
@@ -30,6 +31,19 @@ pub enum Event {
     Permission(String),
     /// A fatal error occurred.
     Error(String),
+    /// Model-service providers exposed by the agent via the session's model
+    /// config option, grouped by provider with model counts.
+    Providers {
+        total_models: usize,
+        providers: Vec<ProviderStat>,
+    },
+}
+
+/// One model provider (service provider) and how many models it exposes.
+#[derive(Clone, Debug)]
+pub struct ProviderStat {
+    pub id: String,
+    pub count: usize,
 }
 
 /// How to launch the local agent subprocess.
@@ -43,11 +57,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build the config for the agent named by `KUMU_AGENT` (default "opencode").
+    /// Build the config for the agent named by `KUMU_AGENT`
+    /// (default `omp` for the settings demo; `opencode` opt-in).
     pub fn agent() -> Self {
         match std::env::var("KUMU_AGENT").as_deref() {
-            Ok("omp") => Self::omp(),
-            _ => Self::opencode(),
+            Ok("opencode") => Self::opencode(),
+            _ => Self::omp(),
         }
     }
 
@@ -124,6 +139,13 @@ fn emit(tx: &Sender<Event>, ev: Event) {
             Event::Error(s) => eprintln!("[acp] error: {s}"),
             Event::Log(s) => eprintln!("[acp] log: {s}"),
             Event::Permission(s) => eprintln!("[acp] perm: {s}"),
+            Event::Providers {
+                total_models,
+                providers,
+            } => eprintln!(
+                "[acp] providers: {total_models} models across {} providers: {providers:?}",
+                providers.len()
+            ),
         }
     }
     let _ = tx.send(ev);
@@ -267,6 +289,57 @@ async fn run(
                 emit(
                     &log_tx,
                     Event::Log(format!("session ready: {session_id}")),
+                );
+
+                // Read the model config option and group its selectable models
+                // by provider (value prefix). This is the ACP-standard way to
+                // learn which model providers a session can use.
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                if let Some(options) = &new_session.config_options {
+                    for option in options {
+                        let is_model = matches!(
+                            &option.category,
+                            Some(SessionConfigOptionCategory::Model)
+                        ) || option.id.0.as_ref() == "model";
+                        if !is_model {
+                            continue;
+                        }
+                        if let SessionConfigKind::Select(select) = &option.kind {
+                            let mut add = |raw: &str| {
+                                let provider = raw.split('/').next().unwrap_or(raw);
+                                *counts.entry(provider.to_string()).or_default() += 1;
+                            };
+                            match &select.options {
+                                SessionConfigSelectOptions::Ungrouped(values) => {
+                                    for value in values {
+                                        add(value.value.0.as_ref());
+                                    }
+                                }
+                                SessionConfigSelectOptions::Grouped(groups) => {
+                                    for group in groups {
+                                        for value in &group.options {
+                                            add(value.value.0.as_ref());
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let mut providers: Vec<ProviderStat> = counts
+                    .into_iter()
+                    .map(|(id, count)| ProviderStat { id, count })
+                    .collect();
+                providers.sort_by(|a, b| b.count.cmp(&a.count));
+                let total_models = providers.iter().map(|p| p.count).sum();
+                emit(
+                    &ev_tx,
+                    Event::Providers {
+                        total_models,
+                        providers,
+                    },
                 );
 
                 // Headless convenience: send one prompt before the UI loop.
