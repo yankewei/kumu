@@ -1,13 +1,16 @@
 //! kumu — local multi-agent desktop shell.
 //!
-//! Two screens (same window, view switch):
-//!   Home     : left tree (projects → sessions), settings entry in the header;
-//!              right panel shows the selected session's conversation.
-//!   Settings : left nav ("服务商"), right shows the supported agents.
+//! Follows GPUI Kit's design guides:
+//!   - layout uses rem helpers (w_64/p_4/gap_3/text_sm…), px only for physical
+//!     boundaries (hairlines via h_px/w_px, window chrome);
+//!   - colors/surfaces read from cx.theme() by semantic role (sidebar uses
+//!     sidebar_* tokens; no raw hex/hsla in app code);
+//!   - density/spacing/typography stay on the semantic scale;
+//!   - primary reserved for the decision commit, internal nav = ghost/default.
 //!
-//! Sessions/messages persist to a local SQLite DB (~/.kumu/kumu.db). Light
-//! theme (default). Real-time ACP prompt/response is the next step; the input
-//! currently records user messages locally (agent reply wiring pending).
+//! Two screens in one window: Home (projects → sessions tree + conversation)
+//! and Settings (category nav + supported-agents list). Persistence is local
+//! SQLite (~/.kumu/kumu.db). Real-time ACP wiring is the next step.
 
 mod db;
 
@@ -70,11 +73,9 @@ impl KumuApp {
             input_state: cx.new(|cx| InputState::new(window, cx).placeholder("输入消息…")),
         };
         app.bootstrap();
-        eprintln!("[ui] KumuApp initialized, view={:?}", app.view);
         app
     }
 
-    /// Make sure there is at least one project + one session so the shell is usable.
     fn bootstrap(&mut self) {
         if self.store.projects().is_empty() {
             let cwd = std::env::current_dir()
@@ -159,7 +160,7 @@ impl KumuApp {
         let theme = cx.theme();
         let selected = self.selected;
 
-        // Left column: projects -> sessions tree.
+        // ---- Left: sidebar surface with the project/session tree. ----
         let mut tree: Vec<Stateful<Div>> = Vec::new();
         for project in &self.projects {
             let project_name = project.name.clone();
@@ -167,9 +168,9 @@ impl KumuApp {
                 div()
                     .id(format!("project-head-{}", project.id))
                     .px_3()
-                    .pt_3()
+                    .pt_4()
                     .pb_1()
-                    .text_size(px(11.))
+                    .text_xs()
                     .font_bold()
                     .text_color(theme.muted_foreground)
                     .child(project_name),
@@ -183,9 +184,13 @@ impl KumuApp {
             for s in project_sessions {
                 let active = selected == Some(s.id);
                 let (bg, fg, tag) = if active {
-                    (theme.primary, theme.primary_foreground, theme.primary_foreground)
+                    (
+                        theme.sidebar_accent,
+                        theme.sidebar_accent_foreground,
+                        theme.sidebar_accent_foreground,
+                    )
                 } else {
-                    (theme.transparent, theme.foreground, theme.muted_foreground)
+                    (theme.transparent, theme.sidebar_foreground, theme.muted_foreground)
                 };
                 let sid = s.id;
                 let title = s.title.clone();
@@ -195,7 +200,7 @@ impl KumuApp {
                         .id(format!("session-{sid}"))
                         .mx_2()
                         .px_3()
-                        .py(px(6.))
+                        .py_1()
                         .rounded(theme.radius)
                         .bg(bg)
                         .text_color(fg)
@@ -208,23 +213,25 @@ impl KumuApp {
                                 .items_center()
                                 .gap_2()
                                 .child(div().flex_1().text_sm().child(title))
-                                .child(div().text_size(px(10.)).text_color(tag).child(agent)),
+                                .child(div().text_xs().text_color(tag).child(agent)),
                         ),
                 );
             }
         }
 
         let left = v_flex()
-            .w(px(264.))
+            .w_64()
             .h_full()
-            .bg(theme.background)
+            .flex_shrink_0()
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
             .child(
                 h_flex()
                     .px_4()
-                    .py_3()
+                    .h_10()
                     .items_center()
                     .justify_between()
-                    .child(div().font_bold().child("kumu"))
+                    .child(div().text_sm().font_bold().child("kumu"))
                     .child(
                         div()
                             .id("open-settings")
@@ -238,7 +245,7 @@ impl KumuApp {
                             .child(Icon::new(IconName::Settings)),
                     ),
             )
-            .child(div().h_px().w_full().bg(theme.border))
+            .child(div().h_px().w_full().bg(theme.sidebar_border))
             .child(
                 div()
                     .flex_1()
@@ -248,15 +255,13 @@ impl KumuApp {
             )
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .p_3()
                     .border_t_1()
-                    .border_color(theme.border)
+                    .border_color(theme.sidebar_border)
                     .child(
                         Button::new("new-session")
-                            .ghost()
-                            .small()
                             .label("+ 新建会话")
+                            .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.new_session();
                                 cx.notify();
@@ -264,7 +269,7 @@ impl KumuApp {
                     ),
             );
 
-        // Right: selected session's agent header + conversation.
+        // ---- Right: selected session's header + conversation. ----
         let right = match self.selected_session() {
             Some(session) => {
                 let agent = self.agent_name(&session.agent);
@@ -276,7 +281,7 @@ impl KumuApp {
                 let (primary, muted, foreground, radius) =
                     (theme.primary, theme.muted, theme.foreground, theme.radius);
                 let rows = v_flex()
-                    .gap_2()
+                    .gap_3()
                     .children(messages.into_iter().map(move |m| {
                         let user = m.role == "user";
                         let (bg, who) = if user {
@@ -295,7 +300,7 @@ impl KumuApp {
                                     .gap_1()
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_xs()
                                             .font_bold()
                                             .text_color(if user { primary } else { foreground })
                                             .child(who),
@@ -310,30 +315,28 @@ impl KumuApp {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_2()
+                            .gap_3()
                             .px_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(theme.border)
+                            .h_12()
                             .child(div().text_sm().font_bold().child(title))
                             .child(
                                 div()
                                     .px_2()
-                                    .py(px(2.))
-                                    .rounded(px(999.))
+                                    .rounded_full()
                                     .bg(theme.muted)
-                                    .text_size(px(11.))
+                                    .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(agent),
                             )
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(cwd),
                             ),
                     )
+                    .child(div().h_px().w_full().bg(theme.border))
                     .child(
                         div()
                             .flex_1()
@@ -343,14 +346,13 @@ impl KumuApp {
                             .py_3()
                             .child(rows),
                     )
+                    .child(div().h_px().w_full().bg(theme.border))
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_2()
+                            .gap_3()
                             .px_4()
                             .py_3()
-                            .border_t_1()
-                            .border_color(theme.border)
                             .child(Input::new(&self.input_state).flex_1())
                             .child(
                                 Button::new("send")
@@ -366,13 +368,23 @@ impl KumuApp {
                 .flex_1()
                 .items_center()
                 .justify_center()
+                .gap_3()
                 .text_color(theme.muted_foreground)
-                .child("选择左侧会话，或新建一个"),
+                .child(div().text_sm().child("还没有会话"))
+                .child(
+                    Button::new("empty-new")
+                        .label("新建会话")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.new_session();
+                            cx.notify();
+                        })),
+                ),
         };
 
         h_flex()
             .size_full()
             .bg(theme.background)
+            .text_color(theme.foreground)
             .child(left)
             .child(div().w_px().h_full().bg(theme.border))
             .child(right)
@@ -381,27 +393,27 @@ impl KumuApp {
     fn render_settings(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
 
-        // Left: settings category list (Zed style: sentence-case rows, muted hints).
         let nav_item = |label: &str, active: bool| {
             div()
                 .id(format!("settings-nav-{label}"))
                 .w_full()
-                .px_2()
+                .px_3()
                 .py_1()
                 .rounded(theme.radius)
-                .bg(if active { theme.muted } else { theme.transparent })
+                .bg(if active { theme.sidebar_accent } else { theme.transparent })
+                .text_color(if active { theme.sidebar_accent_foreground } else { theme.muted_foreground })
                 .text_sm()
-                .text_color(if active { theme.foreground } else { theme.muted_foreground })
                 .child(label.to_string())
         };
 
         let left = v_flex()
-            .w(px(236.))
+            .w_56()
             .h_full()
             .flex_shrink_0()
+            .bg(theme.sidebar)
             .child(
                 v_flex()
-                    .gap(px(2.))
+                    .gap_1()
                     .px_3()
                     .py_4()
                     .child(nav_item("服务商", true))
@@ -411,74 +423,63 @@ impl KumuApp {
             .child(div().flex_1())
             .child(
                 div()
-                    .px_4()
-                    .py_3()
+                    .p_3()
                     .border_t_1()
-                    .border_color(theme.border)
+                    .border_color(theme.sidebar_border)
                     .child(
-                        div()
-                            .id("back-home")
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
+                        Button::new("back-home")
+                            .ghost()
+                            .label("返回首页")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.view = View::Home;
                                 cx.notify();
-                            }))
-                            .child("← 返回首页"),
+                            })),
                     ),
             );
 
-        // Right: title + agent entries as settings rows (label/desc + control).
+        // Agent entries: label + description, with a trailing neutral status.
         let rows = v_flex()
-            .gap(px(2.))
+            .gap_2()
             .children(AGENTS.iter().map(|a| {
                 h_flex()
                     .items_center()
                     .gap_4()
-                    .py_2()
+                    .py_1()
                     .child(
                         v_flex()
                             .flex_1()
-                            .gap(px(2.))
+                            .gap_1()
                             .child(div().text_sm().font_bold().child(a.name))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(a.desc),
                             ),
                     )
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.background)
-                            .text_size(px(12.))
-                            .text_color(theme.foreground)
-                            .child("本地")
-                            .child(Icon::new(IconName::ChevronDown)),
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("本地"),
                     )
             }));
 
         let right = v_flex()
             .flex_1()
             .h_full()
-            .px(px(48.))
-            .py(px(32.))
+            .px_6()
+            .py_8()
             .child(
                 div()
                     .w_full()
-                    .max_w(px(600.))
+                    .max_w_80()
                     .child(
                         v_flex()
-                            .gap(px(4.))
-                            .child(div().text_size(px(17.)).font_bold().child("服务商"))
-                            .child(div().h_px().w_full().bg(theme.border))
+                            .gap_2()
+                            .child(div().text_lg().font_bold().child("服务商"))
+                            .child(div().text_sm().text_color(theme.muted_foreground).child("本机可用的 agent"))
+                            .child(div().h_px().w_full().bg(theme.border).mt_4())
                             .child(rows),
                     ),
             );
@@ -486,6 +487,7 @@ impl KumuApp {
         h_flex()
             .size_full()
             .bg(theme.background)
+            .text_color(theme.foreground)
             .child(left)
             .child(div().w_px().h_full().bg(theme.border))
             .child(right)
