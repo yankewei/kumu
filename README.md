@@ -10,16 +10,25 @@ Built with [GPUI](https://gpui-kit.com) (gpui-kit 0.6) + the official
 
 ## Current screen: Settings → Providers
 
-Two-column settings layout (left: settings nav incl. an active **服务商** item;
-right: the provider list with per-provider model counts):
+Zed-settings look: system UI font, light surfaces, hairline dividers, periwinkle
+accent, custom transparent title bar. Two-column settings layout (left: search +
+settings nav; right: page rows with title/description + control):
 
 ```text
 ┌──────────────┬──────────────────────────────────┐
-│ 设置          │  服务商                           │
-│ ▸ 服务商(选中) │  opencode-go        36 个模型    │
-│   会话 / 外观… │  rc                  4 个模型    │
+│ [搜索设置…]   │  服务商                           │
+│ ▸ 服务商(选中) │  Opencode   SST Opencode · ACP v1 │
+│   通用        │  ────────────────────────────────  │
+│              │  Oh My Pi    omp · ACP v1    本地  │
 └──────────────┴──────────────────────────────────┘
 ```
+
+- **Look & feel** lives in `themes/*.json` ("Kumu Light" / "Zed Dark"), loaded
+  into the `ThemeRegistry` at startup. App code only reads semantic tokens
+  from `cx.theme()`; the UI font (`.SystemUIFont`) and radius are theme config too.
+- **通用** page has a working 深色外观 switch that flips `Theme::change`
+  (light ↔ dark) live.
+`
 
 - **Data source is ACP itself, not private config files.** The agent returns a
   `configOptions` array on `session/new`; the option with `category: "model"`
@@ -32,15 +41,24 @@ right: the provider list with per-provider model counts):
 
 ## Architecture
 
+Module layout:
+
 ```
-┌─ UI (gpui/gpui-kit, main thread)      src/main.rs
-│    settings layout: sidebar nav + provider list (status bar on top)
-├─ poll task: drain ACP→UI mpsc, update entity on main thread
-├─ ACP thread (dedicated tokio runtime) src/acp.rs
-│    agent-client-protocol Client role → `<agent> acp` subprocess (stdio)
-│    on session/new: parse model config option → group models by provider
-└─ config                          agent command/args/env + cwd
+src/
+  main.rs        entry: init gpui + themes, open the Home window
+  ui/            GPUI views, one module per window
+    home.rs      KumuApp: projects → sessions tree + conversation
+    settings.rs  SettingsWindow: category nav + provider/general pages
+    widgets.rs   theme-token helpers shared across windows (pill…)
+  theme.rs       themes/*.json → ThemeRegistry (Kumu Light / Zed Dark)
+  agents.rs      static registry of agents kumu can drive
+  db.rs          local SQLite persistence (~/.kumu/kumu.db)
+  acp.rs         ACP client layer (not wired into the UI yet)
 ```
+
+ACP thread (when wired), on a dedicated tokio runtime inside src/acp.rs:
+agent-client-protocol Client role → `<agent> acp` subprocess (stdio); on
+session/new it parses the model config option and groups models by provider.
 
 UI / ACP decoupling: ACP → UI via `std::sync::mpsc` (drained by a gpui poll
 task); UI → ACP via a `tokio::sync::mpsc::UnboundedSender` (non-blocking send,

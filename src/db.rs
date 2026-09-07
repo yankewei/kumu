@@ -157,3 +157,9 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 }
+
+/// Default database location: ~/.kumu/kumu.db.
+pub fn db_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".kumu").join("kumu.db")
+}
