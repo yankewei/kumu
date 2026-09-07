@@ -1,30 +1,23 @@
-//! kumu: settings page demo — lists the model providers a local ACP agent can
-//! use, derived from the agent's session `configOptions` (category: model).
+//! kumu: settings page (Providers) — lists the model service providers a local
+//! ACP agent can use, derived from the agent's session `configOptions`
+//! (category: model). Rendered with gpui-component's themed Sidebar + tokens;
+//! no hard-coded colors.
 //!
-//! Current scope (single agent, read-only): connects to `omp acp` (override
-//! with KUMU_AGENT=opencode), creates one session, reads its model config
-//! option, groups the models by provider, and renders the settings page:
-//!
-//! ```text
-//! ┌────────────────────┬───────────────────────────────┐
-//! │ 设置                │  服务商                       │
-//! │  ▸ 服务商  (选中)    │  opencode-go    36 个模型     │
-//! │   会话 / 外观 / …    │  rc              4 个模型     │
-//! └────────────────────┴───────────────────────────────┘
-//! ```
+//! Scope: single agent (default omp, `KUMU_AGENT=opencode` to switch), one
+//! session, read-only (no credential editing).
 
 mod acp;
 
 use std::sync::mpsc;
 use std::time::Duration;
 
-use gpui_kit::component::Root;
+use gpui_kit::component::sidebar::{
+    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+};
+use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use tokio::sync::mpsc::UnboundedSender;
-
-const SIDEBAR_W: f32 = 220.0;
-const NEUTRAL: Hsla = hsla(0., 0., 0.6, 1.0);
 
 struct KumuApp {
     status: SharedString,
@@ -42,7 +35,6 @@ impl KumuApp {
         let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
         let cmd_tx = acp::spawn(cfg, cwd, ev_tx);
 
-        // Drain the ACP -> UI channel on the main thread.
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 for ev in ev_rx.try_iter() {
@@ -75,7 +67,6 @@ impl KumuApp {
                 self.total_models = total_models;
                 self.status = "connected".into();
             }
-            // Chat-only events are not rendered in the settings page.
             acp::Event::Agent(_) | acp::Event::Done(_) | acp::Event::Permission(_) => {}
         }
         cx.notify();
@@ -83,99 +74,124 @@ impl KumuApp {
 }
 
 impl Render for KumuApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         let status = self.status.clone();
         let providers = self.providers.clone();
         let provider_count = providers.len();
+        let providers_empty = providers.is_empty();
         let total_models = self.total_models;
         let agent = std::env::var("KUMU_AGENT").unwrap_or_else(|_| "omp".into());
 
-        let sidebar_items = [
-            ("服务商", true),
-            ("会话", false),
-            ("外观", false),
-            ("快捷键", false),
-        ];
-        let sidebar = div()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .px(px(12.))
-            .py(px(16.))
-            .bg(hsla(0., 0., 0.14, 1.0))
-            .child(
-                div()
-                    .px(px(8.))
-                    .pb(px(12.))
-                    .text_size(px(12.))
-                    .text_color(NEUTRAL)
-                    .child("设置"),
+        let sidebar = Sidebar::new("kumu-sidebar")
+            .w(px(236.))
+            .header(
+                SidebarHeader::new().child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size_6()
+                                .rounded(theme.radius)
+                                .bg(theme.primary)
+                                .text_color(theme.primary_foreground)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .font_bold()
+                                .child("k"),
+                        )
+                        .child(div().font_bold().child("kumu")),
+                ),
             )
-            .children(sidebar_items.into_iter().map(|(label, active)| {
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .w_full()
-                    .text_size(px(14.))
-                    .bg(if active { hsla(0.55, 0.6, 0.45, 0.35) } else { hsla(0., 0., 0., 0.) })
-                    .text_color(if active { hsla(0.55, 0.6, 0.85, 1.0) } else { NEUTRAL })
-                    .child(label.to_string())
-            }));
+            .child(
+                SidebarGroup::new("设置").child(
+                    SidebarMenu::new().children([
+                        SidebarMenuItem::new("服务商").active(true),
+                        SidebarMenuItem::new("会话"),
+                        SidebarMenuItem::new("外观"),
+                    ]),
+                ),
+            )
+            .footer(
+                SidebarFooter::new().child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(theme.muted_foreground)
+                        .text_xs()
+                        .child(div().size_2().rounded_full().bg(theme.primary))
+                        .child(format!("{agent} · {status}")),
+                ),
+            );
 
-        let rows = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
+        // Provider rows as bordered surface cards.
+        let rows = v_flex()
+            .gap_2()
             .children(providers.into_iter().map(|(id, count)| {
-                div()
-                    .flex()
+                h_flex()
                     .items_center()
                     .justify_between()
-                    .px(px(14.))
-                    .py(px(12.))
-                    .rounded(px(8.))
-                    .bg(hsla(0., 0., 0.16, 1.0))
-                    .child(div().text_size(px(14.)).text_color(hsla(0., 0., 0.85, 1.)).child(id))
+                    .px_4()
+                    .py_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
                     .child(
-                        div()
-                            .px(px(10.))
-                            .py(px(3.))
-                            .rounded(px(999.))
-                            .bg(hsla(0.55, 0.5, 0.5, 0.25))
-                            .text_size(px(12.))
-                            .text_color(hsla(0.55, 0.5, 0.8, 1.0))
-                            .child(format!("{count} 个模型")),
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().font_medium().text_sm().child(id)),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded(px(999.))
+                                    .bg(theme.primary)
+                                    .text_color(theme.primary_foreground)
+                                    .text_size(px(11.))
+                                    .child(count.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("个模型"),
+                            ),
                     )
             }));
 
-        let content = div()
+        let content = v_flex()
             .flex_1()
             .h_full()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .px(px(24.))
-            .py(px(20.))
+            .min_w_0()
             .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap(px(10.))
-                    .child(div().text_xl().child("服务商"))
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .pt_5()
+                    .child(div().text_lg().font_bold().child("服务商"))
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .text_color(NEUTRAL)
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
                             .child(format!("{agent} 会话可用的模型服务商")),
                     ),
             )
             .child(
                 div()
-                    .text_size(px(13.))
-                    .text_color(NEUTRAL)
+                    .px_5()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
                     .child(format!("共 {provider_count} 家 · {total_models} 个模型")),
             )
             .child(
@@ -183,33 +199,26 @@ impl Render for KumuApp {
                     .flex_1()
                     .id("provider-list")
                     .overflow_y_scroll()
-                    .child(div().flex().flex_col().gap(px(6.)).child(rows)),
+                    .px_5()
+                    .py_3()
+                    .child(
+                        rows.when(providers_empty, |this| {
+                            this.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("等待 agent 返回模型列表…"),
+                            )
+                        }),
+                    ),
             );
 
-        div()
+        h_flex()
             .size_full()
-            .flex()
-            .flex_col()
-            .text_color(hsla(0., 0., 0.85, 1.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .px(px(16.))
-                    .py(px(10.))
-                    .gap(px(10.))
-                    .child(div().text_size(px(13.)).text_color(hsla(0., 0., 0.9, 1.)).child("kumu"))
-                    .child(div().flex_1().text_size(px(12.)).text_color(NEUTRAL).child(status)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .child(sidebar)
-                    .child(div().w_px().h_full().bg(hsla(0., 0., 0.22, 1.0)))
-                    .child(content),
-            )
+            .bg(theme.background)
+            .child(sidebar)
+            .child(div().w_px().h_full().bg(theme.border))
+            .child(content)
     }
 }
 
@@ -219,7 +228,7 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(980.), px(680.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(980.), px(640.)), cx)),
             ..Default::default()
         };
 
