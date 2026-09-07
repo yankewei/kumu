@@ -32,8 +32,6 @@ pub enum Event {
     Error(String),
 }
 
-/// Commands flowing from the UI to the ACP thread: a prompt to send.
-
 /// How to launch the local agent subprocess.
 pub struct Config {
     pub command: String,
@@ -45,22 +43,44 @@ pub struct Config {
 }
 
 impl Config {
-    /// The demo agent: `opencode acp`, with the RC gateway key injected so the
-    /// subprocess can actually reach a model even when launched from a GUI app.
-    pub fn opencode() -> Self {
+    /// Build the config for the agent named by `KUMU_AGENT` (default "opencode").
+    pub fn agent() -> Self {
+        match std::env::var("KUMU_AGENT").as_deref() {
+            Ok("omp") => Self::omp(),
+            _ => Self::opencode(),
+        }
+    }
+
+    /// `opencode acp`, with the RC gateway key injected so the subprocess can
+    /// reach a model even when launched from a GUI app.
+    fn opencode() -> Self {
         let mut env = Vec::new();
         if let Some(key) = opencode_api_key() {
             env.push(("OPENCODE_API_KEY".to_string(), key));
         }
         Self {
-            command: opencode_bin().to_string(),
+            command: opencode_bin(),
             args: vec!["acp".to_string()],
             env,
-            auto_prompt: std::env::var("KUMU_AUTO_PROMPT")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            auto_prompt: auto_prompt_env(),
         }
     }
+
+    /// `omp acp` (Oh My Pi); uses its own stored model config.
+    fn omp() -> Self {
+        Self {
+            command: std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_string()),
+            args: vec!["acp".to_string()],
+            env: Vec::new(),
+            auto_prompt: auto_prompt_env(),
+        }
+    }
+}
+
+fn auto_prompt_env() -> Option<String> {
+    std::env::var("KUMU_AUTO_PROMPT")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn opencode_bin() -> String {

@@ -69,7 +69,7 @@ impl KumuApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("Ask the agent… (Send button)"));
 
         let (ev_tx, ev_rx) = mpsc::channel::<acp::Event>();
-        let cfg = acp::Config::opencode();
+        let cfg = acp::Config::agent();
         let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
         let cmd_tx = acp::spawn(cfg, cwd, ev_tx);
 

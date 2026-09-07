@@ -4,14 +4,17 @@ A macOS desktop app idea: manage multiple local coding agents (ACP) in one UI.
 Built with [GPUI](https://gpui-kit.com) (gpui-kit 0.6) + the official
 [Agent Client Protocol Rust SDK](https://agentclientprotocol.com/libraries/rust).
 
-> Status: **capability demo (M0–M3 proof)**, protocol v1 only, single agent
-> (Opencode), single session, auto-approve permissions.
+> Status: **capability demo (M0–M3 proof)**, protocol v1 only, one agent per app
+> launch (switchable: Opencode / Oh My Pi), single session, auto-approve
+> permissions.
 
 ## What the demo proves
 
-- A GPUI window talks to `opencode acp` over stdio (ACP v1).
+- A GPUI window drives a local agent over stdio (ACP v1).
 - Full prompt round-trip works: initialize → session/new → prompt → streamed
   `agent_message_chunk` → idle stop reason.
+- Two real agents verified end-to-end through the official Rust SDK:
+  **Opencode 1.18** and **Oh My Pi (omp) 18.1.13**.
 - gpui (main thread) and the ACP connection (dedicated tokio thread) stay
   decoupled through two channels:
   - ACP → UI: `std::sync::mpsc`, drained by a gpui poll task.
@@ -36,10 +39,19 @@ Built with [GPUI](https://gpui-kit.com) (gpui-kit 0.6) + the official
 cargo run
 ```
 
-Requires `opencode` on PATH (or `OPENCODE_BIN`). The agent needs a reachable
-model; kumu injects `OPENCODE_API_KEY` (env first, else the RC-AI-Gateway key
-opencode already stored in `~/.local/share/opencode/auth.json`) so it works when
-launched from a GUI.
+Requires an agent on PATH:
+
+```bash
+cargo run                                  # opencode (default)
+KUMU_AGENT=omp cargo run                   # Oh My Pi (omp)
+```
+
+- `opencode` (default): `OPENCODE_BIN` overrides the binary. Needs a reachable
+  model; kumu injects `OPENCODE_API_KEY` (env first, else the RC-AI-Gateway key
+  opencode already stored in `~/.local/share/opencode/auth.json`) so it works
+  when launched from a GUI.
+- `omp` (Oh My Pi): `OMP_BIN` overrides the binary. Uses its own stored model
+  config; no extra env needed.
 
 Headless verification:
 
@@ -59,10 +71,11 @@ Expected on stderr:
 
 ## Verified findings
 
-- Opencode 1.18 supports ACP v1 (`initialize`/`session/new`/`session/prompt`).
-- Its default model routing hit the built-in AI Gateway and failed
+- **Opencode 1.18** and **Oh My Pi (omp) 18.1.13** both speak ACP v1
+  (`initialize`/`session/new`/`session/prompt`) over stdio.
+- Opencode's default model routing hit the built-in AI Gateway and failed
   (`AI Gateway Error`) until `OPENCODE_API_KEY` was injected — provider config
-  uses `{env:OPENCODE_API_KEY}`.
+  uses `{env:OPENCODE_API_KEY}`. omp needs no injection.
 - v1 `RequestPermissionRequest` has **no** `title`/`subject` (that's v2); it
   carries `tool_call` + `options`.
 
@@ -74,4 +87,6 @@ Expected on stderr:
 - Multiple sessions on one opencode connection (one `session/new` per project
   `cwd`) — the stated core use case; verify opencode's single-process
   multi-session concurrency first.
-- Multiple agents; protocol v2 behind a feature flag.
+- Multiple agents per app process (one connection per agent) — currently one
+  agent per launch via `KUMU_AGENT`;
+- Protocol v2 behind a feature flag.
