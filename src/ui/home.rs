@@ -8,7 +8,7 @@ use crate::agents::AGENTS;
 use crate::db::{db_path, Message, Project, Session, Store};
 use crate::ui::widgets::pill;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -20,7 +20,7 @@ pub struct KumuApp {
     sessions: Vec<Session>,
     selected: Option<i64>,
     messages: Vec<Message>,
-    input_state: Entity<InputState>,
+    input_state: Entity<TextareaState>,
 }
 
 impl KumuApp {
@@ -33,7 +33,11 @@ impl KumuApp {
             sessions: Vec::new(),
             selected: None,
             messages: Vec::new(),
-            input_state: cx.new(|cx| InputState::new(window, cx).placeholder("输入消息…")),
+            input_state: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(1, 6)
+                    .placeholder("输入消息…")
+            }),
         };
         app.bootstrap();
         app
@@ -78,6 +82,10 @@ impl KumuApp {
             .first()
             .map(|p| p.id)
             .unwrap_or_else(|| self.store.insert_project("kumu", "cwd-not-set").unwrap_or(1));
+        self.new_session_in(project_id);
+    }
+
+    fn new_session_in(&mut self, project_id: i64) {
         let cwd = self
             .projects
             .iter()
@@ -91,7 +99,7 @@ impl KumuApp {
         }
     }
 
-    fn send(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session_id) = self.selected else { return };
         let text = self.input_state.read(cx).value().to_string();
         if text.trim().is_empty() {
@@ -99,6 +107,8 @@ impl KumuApp {
         }
         self.store.insert_message(session_id, "user", text.trim()).ok();
         self.messages = self.store.messages(session_id);
+        self.input_state
+            .update(cx, |state, cx| state.set_value("", window, cx));
         // TODO(next step): route the prompt to the session's agent over ACP and
         // persist + stream the reply here.
         cx.notify();
@@ -129,8 +139,8 @@ impl KumuApp {
             }
         }
         let mut options = TitleBar::window_options();
-        options.window_bounds = Some(WindowBounds::centered(size(px(1024.), px(640.)), cx));
-        options.window_min_size = Some(size(px(1024.), px(640.)));
+        options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
+        options.window_min_size = Some(size(px(680.), px(640.)));
         if let Ok(handle) = cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| SettingsWindow::new(window, cx));
             cx.new(|cx| Root::new(view, window, cx))
@@ -152,23 +162,44 @@ impl KumuApp {
             (theme.sidebar, theme.sidebar_foreground, theme.sidebar_border);
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
-        let (primary, link, muted) = (theme.primary, theme.link, theme.muted);
+        let (primary, link) = (theme.primary, theme.link);
         let selected = self.selected;
 
         // ---- Left: sidebar surface with the project/session tree. ----
         let mut tree: Vec<Stateful<Div>> = Vec::new();
         for project in &self.projects {
             let project_name = project.name.clone();
+            let project_id = project.id;
             tree.push(
-                div()
-                    .id(format!("project-head-{}", project.id))
+                h_flex()
+                    .id(format!("project-head-{project_id}"))
                     .px_3()
                     .pt_4()
                     .pb_1()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(muted_fg)
-                    .child(project_name),
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(muted_fg)
+                            .child(project_name),
+                    )
+                    .child(
+                        div()
+                            .id(format!("project-new-session-{project_id}"))
+                            .rounded(radius)
+                            .p_0p5()
+                            .cursor_pointer()
+                            .text_color(muted_fg)
+                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.new_session_in(project_id);
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::Plus).small()),
+                    ),
             );
             let project_sessions = self
                 .sessions
@@ -229,19 +260,21 @@ impl KumuApp {
             )
             .child(
                 div()
-                    .p_3()
+                    .px_3()
+                    .py_1p5()
+                    .flex()
                     .border_t_1()
                     .border_color(sidebar_border)
                     .child(
-                        Button::new("new-session")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label("新建会话")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.new_session();
-                                cx.notify();
-                            })),
+                        div()
+                            .id("open-settings")
+                            .rounded(radius)
+                            .p_1()
+                            .cursor_pointer()
+                            .text_color(muted_fg)
+                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)))
+                            .child(Icon::new(IconName::Settings).small()),
                     ),
             );
 
@@ -253,6 +286,9 @@ impl KumuApp {
                 let cwd = session.cwd.clone();
                 let messages = self.messages.clone();
                 let agent_for_rows = agent.clone();
+                // One centered column shared by messages and composer: capped
+                // width for readability, floored so it never gets too skinny.
+                let (col_max, col_min) = (rems(44.), rems(24.));
                 let rows = v_flex()
                     .gap_3()
                     .children(messages.into_iter().map(move |m| {
@@ -309,23 +345,66 @@ impl KumuApp {
                             .overflow_y_scroll()
                             .px_5()
                             .py_4()
-                            .child(rows),
+                            .child(
+                                div()
+                                    .max_w(col_max)
+                                    .min_w(col_min)
+                                    .mx_auto()
+                                    .child(rows),
+                            ),
                     )
                     .child(div().h_px().w_full().bg(border))
                     .child(
+                        // Composer: the lower half of the conversation area —
+                        // a multi-line textarea with the send button inside,
+                        // on the same centered column as the messages.
                         h_flex()
-                            .items_center()
-                            .gap_3()
-                            .px_4()
+                            .flex_none()
+                            .px_5()
                             .py_3()
-                            .child(Input::new(&self.input_state).flex_1())
+                            .bg(theme.muted.opacity(0.5))
                             .child(
-                                Button::new("send")
-                                    .primary()
-                                    .label("发送")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send(window, cx);
-                                    })),
+                                v_flex()
+                                    .w_full()
+                                    .max_w(col_max)
+                                    .min_w(col_min)
+                                    .mx_auto()
+                                    .rounded(radius)
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(theme.background)
+                                    .overflow_hidden()
+                                    .child(
+                                        div().p_2().child(
+                                            Textarea::new(&self.input_state)
+                                                .appearance(false)
+                                                .bordered(false)
+                                                .w_full(),
+                                        ),
+                                    )
+                                    .child(
+                                        // Toolbar: spans the full width of the
+                                        // box; future tool icons on the left,
+                                        // send pinned to the far right.
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .bg(theme.muted.opacity(0.5))
+                                            .px_2()
+                                            .py_1p5()
+                                            .child(div().flex_1())
+                                            .child(
+                                                Button::new("send")
+                                                    .primary()
+                                                    .small()
+                                                    .icon(IconName::ArrowUp)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.send(window, cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
                             ),
                     )
             }
@@ -348,20 +427,8 @@ impl KumuApp {
         };
 
         // Full-width title bar strip: brand on the left (traffic lights float
-        // to its left), the settings gear on the right.
-        let title_bar = TitleBar::new()
-            .child(div().text_sm().font_bold().child("kumu"))
-            .child(
-                div()
-                    .id("open-settings")
-                    .rounded(radius)
-                    .p_1()
-                    .cursor_pointer()
-                    .text_color(muted_fg)
-                    .hover(move |style| style.bg(muted))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)))
-                    .child(Icon::new(IconName::Settings).small()),
-            );
+        // to its left); the settings entry lives in the sidebar's bottom-left.
+        let title_bar = TitleBar::new().child(div().text_sm().font_bold().child("kumu"));
 
         v_flex()
             .size_full()

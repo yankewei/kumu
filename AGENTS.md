@@ -13,4 +13,4 @@ A client that communicates with multiple local agents over the ACP protocol.
 2. Communication with local agents must go through the ACP protocol (Agent Client Protocol, stdio subprocess)
 
 ## Product reference
-- Use waku[https://github.com/egoist/waku] source code on github as a reference when you need to design a UI
+- Use [zed](https://github.com/zed-industries/zed) source code on github as a reference when you need to design a UI

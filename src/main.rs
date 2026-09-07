@@ -14,12 +14,13 @@
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
 //!   - `agents.rs` static registry of agents kumu can drive;
 //!   - `db.rs`    local SQLite persistence (projects/sessions/messages);
-//!   - `acp.rs`   ACP client layer on a dedicated thread (not wired into the
-//!     UI yet — kept compiling so it stays type-checked).
+//!   - `acp.rs`   ACP client layer on a dedicated thread (settings probes
+//!     agents over it to discover their models; full sessions still TODO).
 
-#[allow(dead_code)] // not wired into the UI yet
+#[allow(dead_code)] // run() not wired into the UI yet
 mod acp;
 mod agents;
+mod assets;
 mod db;
 mod theme;
 mod ui;
@@ -29,13 +30,14 @@ use gpui_kit::*;
 use ui::KumuApp;
 
 fn main() {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
 
     app.run(move |cx| {
         gpui_kit::init(cx);
         theme::load_kumu_themes(cx);
         let mut window_options = TitleBar::window_options();
-        window_options.window_bounds = Some(WindowBounds::centered(size(px(1040.), px(680.)), cx));
+        window_options.window_bounds = Some(WindowBounds::centered(size(px(1360.), px(900.)), cx));
+        window_options.window_min_size = Some(size(px(960.), px(640.)));
 
         cx.spawn(async move |cx| {
             match cx.open_window(window_options, |window, cx| {

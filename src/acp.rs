@@ -10,8 +10,8 @@ use std::sync::mpsc::Sender;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionNotification, TextContent,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionNotification, TextContent,
 };
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::{
@@ -37,6 +37,15 @@ pub enum Event {
         total_models: usize,
         providers: Vec<ProviderStat>,
     },
+    /// Model counts discovered by probing an agent (settings sidebar):
+    /// total models across N providers.
+    Models {
+        agent: &'static str,
+        total_models: usize,
+        providers: usize,
+    },
+    /// A probe connection failed (agent missing / handshake error).
+    ProbeFailed { agent: &'static str },
 }
 
 /// One model provider (service provider) and how many models it exposes.
@@ -63,6 +72,15 @@ impl Config {
         match std::env::var("KUMU_AGENT").as_deref() {
             Ok("opencode") => Self::opencode(),
             _ => Self::omp(),
+        }
+    }
+
+    /// Build the config for a known agent id from the static registry.
+    pub fn for_agent(id: &str) -> Option<Self> {
+        match id {
+            "opencode" => Some(Self::opencode()),
+            "omp" => Some(Self::omp()),
+            _ => None,
         }
     }
 
@@ -146,6 +164,14 @@ fn emit(tx: &Sender<Event>, ev: Event) {
                 "[acp] providers: {total_models} models across {} providers: {providers:?}",
                 providers.len()
             ),
+            Event::Models {
+                agent,
+                total_models,
+                providers,
+            } => eprintln!(
+                "[acp] probe {agent}: {total_models} models across {providers} providers"
+            ),
+            Event::ProbeFailed { agent } => eprintln!("[acp] probe {agent} failed"),
         }
     }
     let _ = tx.send(ev);
@@ -171,6 +197,122 @@ pub fn spawn(
         })
         .expect("failed to spawn acp thread");
     cmd_tx
+}
+
+/// Probe an agent over ACP just to discover its models: initialize, create
+/// one throwaway session, read the model config option, then return — the
+/// connection teardown kills the agent subprocess. Fails after `TIMEOUT`.
+pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
+    std::thread::Builder::new()
+        .name(format!("kumu-probe-{agent}"))
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            let result = rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                    let mut launch = AcpAgentConfig::new(&cfg.command);
+                    for a in &cfg.args {
+                        launch = launch.arg(a.clone());
+                    }
+                    for (k, v) in &cfg.env {
+                        launch = launch.env(k.clone(), v.clone());
+                    }
+                    let ev_tx = ev_tx.clone();
+                    Client
+                        .builder()
+                        .name("kumu-probe")
+                        .connect_with(
+                            AcpAgent::new(launch),
+                            move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                                connection
+                                    .send_request(InitializeRequest::new(
+                                        agent_client_protocol::schema::ProtocolVersion::V1,
+                                    ))
+                                    .block_task()
+                                    .await?;
+                                let new_session = connection
+                                    .send_request(NewSessionRequest::new(cwd))
+                                    .block_task()
+                                    .await?;
+                                let (total_models, providers) =
+                                    model_stats(&new_session.config_options);
+                                emit(
+                                    &ev_tx,
+                                    Event::Models {
+                                        agent,
+                                        total_models,
+                                        providers: providers.len(),
+                                    },
+                                );
+                                Ok(())
+                            },
+                        )
+                        .await
+                })
+                .await
+            });
+            let fail = |msg: String| {
+                if std::env::var("KUMU_DEBUG").is_ok() {
+                    eprintln!("[acp] probe {agent} failed: {msg}");
+                }
+                emit(&ev_tx, Event::ProbeFailed { agent });
+            };
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => fail(err.to_string()),
+                Err(err) => fail(format!("timed out: {err}")),
+            }
+        })
+        .expect("failed to spawn probe thread");
+}
+
+/// Group the session's model config options by provider (value prefix) —
+/// the ACP-standard way to learn which models an agent exposes.
+fn model_stats(config_options: &Option<Vec<SessionConfigOption>>) -> (usize, Vec<ProviderStat>) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    if let Some(options) = config_options {
+        for option in options {
+            let is_model = matches!(
+                &option.category,
+                Some(SessionConfigOptionCategory::Model)
+            ) || option.id.0.as_ref() == "model";
+            if !is_model {
+                continue;
+            }
+            if let SessionConfigKind::Select(select) = &option.kind {
+                let mut add = |raw: &str| {
+                    let provider = raw.split('/').next().unwrap_or(raw);
+                    *counts.entry(provider.to_string()).or_default() += 1;
+                };
+                match &select.options {
+                    SessionConfigSelectOptions::Ungrouped(values) => {
+                        for value in values {
+                            add(value.value.0.as_ref());
+                        }
+                    }
+                    SessionConfigSelectOptions::Grouped(groups) => {
+                        for group in groups {
+                            for value in &group.options {
+                                add(value.value.0.as_ref());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut providers: Vec<ProviderStat> = counts
+        .into_iter()
+        .map(|(id, count)| ProviderStat { id, count })
+        .collect();
+    providers.sort_by(|a, b| b.count.cmp(&a.count));
+    let total_models = providers.iter().map(|p| p.count).sum();
+    (total_models, providers)
 }
 
 async fn run(
@@ -294,46 +436,7 @@ async fn run(
                 // Read the model config option and group its selectable models
                 // by provider (value prefix). This is the ACP-standard way to
                 // learn which model providers a session can use.
-                let mut counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                if let Some(options) = &new_session.config_options {
-                    for option in options {
-                        let is_model = matches!(
-                            &option.category,
-                            Some(SessionConfigOptionCategory::Model)
-                        ) || option.id.0.as_ref() == "model";
-                        if !is_model {
-                            continue;
-                        }
-                        if let SessionConfigKind::Select(select) = &option.kind {
-                            let mut add = |raw: &str| {
-                                let provider = raw.split('/').next().unwrap_or(raw);
-                                *counts.entry(provider.to_string()).or_default() += 1;
-                            };
-                            match &select.options {
-                                SessionConfigSelectOptions::Ungrouped(values) => {
-                                    for value in values {
-                                        add(value.value.0.as_ref());
-                                    }
-                                }
-                                SessionConfigSelectOptions::Grouped(groups) => {
-                                    for group in groups {
-                                        for value in &group.options {
-                                            add(value.value.0.as_ref());
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                let mut providers: Vec<ProviderStat> = counts
-                    .into_iter()
-                    .map(|(id, count)| ProviderStat { id, count })
-                    .collect();
-                providers.sort_by(|a, b| b.count.cmp(&a.count));
-                let total_models = providers.iter().map(|p| p.count).sum();
+                let (total_models, providers) = model_stats(&new_session.config_options);
                 emit(
                     &ev_tx,
                     Event::Providers {
@@ -391,5 +494,92 @@ fn variant_name(u: &SessionUpdate) -> &'static str {
         SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
         SessionUpdate::UsageUpdate(_) => "usage_update",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether `command` resolves to an existing executable (a path, or on
+    /// PATH).
+    fn command_exists(command: &str) -> bool {
+        if command.contains('/') {
+            return std::path::Path::new(command).is_file();
+        }
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(command))
+                    .any(|candidate| candidate.is_file())
+            })
+            .unwrap_or(false)
+    }
+
+    /// End-to-end: probe a real local agent (KUMU_AGENT, default omp) and
+    /// expect a Models event. Skipped when the agent binary is missing so the
+    /// suite still passes on machines without local agents.
+    #[test]
+    fn probe_discovers_models() {
+        let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {
+            Ok("opencode") => "opencode",
+            _ => "omp",
+        };
+        let cfg = Config::for_agent(agent).expect("known agent");
+        if !command_exists(&cfg.command) {
+            println!("skipping probe_discovers_models: {} not found", cfg.command);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        probe(agent, cfg, tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining).expect("probe timed out") {
+                Event::Models {
+                    agent,
+                    total_models,
+                    providers,
+                } => {
+                    println!("{agent}: {total_models} models across {providers} providers");
+                    assert!(total_models > 0);
+                    break;
+                }
+                Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A probe against a missing binary must surface `ProbeFailed` instead of
+    /// failing silently (spawn/handshake errors were previously swallowed).
+    #[test]
+    fn probe_missing_agent_reports_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        probe(
+            "missing",
+            Config {
+                command: "/nonexistent/kumu-agent-test".into(),
+                args: vec![],
+                env: vec![],
+                auto_prompt: None,
+            },
+            tx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("probe ended without ProbeFailed")
+            {
+                Event::Models { .. } => panic!("unexpected probe success"),
+                Event::ProbeFailed { agent } => {
+                    assert_eq!(agent, "missing");
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 }

@@ -1,13 +1,25 @@
 //! Settings window, Waku-style: sidebar (back row + search + icon nav) on the
 //! left; a centered content column with card-grouped rows on the right.
 
+use std::collections::{HashMap, HashSet};
+
+use futures::StreamExt;
+
 use super::widgets::pill;
+use crate::acp;
 use crate::agents::AGENTS;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+
+/// App-wide cache of model counts probed over ACP, keyed by agent id:
+/// (total models, provider count). Survives settings window reopens.
+#[derive(Default)]
+struct ModelCounts(HashMap<&'static str, (usize, usize)>);
+
+impl Global for ModelCounts {}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsPage {
@@ -18,13 +30,75 @@ enum SettingsPage {
 pub struct SettingsWindow {
     settings_page: SettingsPage,
     search_state: Entity<InputState>,
+    /// Probed model counts per agent id.
+    models: HashMap<&'static str, (usize, usize)>,
+    /// Agents whose probe is still running.
+    probing: HashSet<&'static str>,
 }
 
 impl SettingsWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let models = if cx.has_global::<ModelCounts>() {
+            cx.global::<ModelCounts>().0.clone()
+        } else {
+            // Must exist up front: the probe handler below calls global_mut.
+            cx.set_global(ModelCounts::default());
+            HashMap::new()
+        };
+
+        // Probe every not-yet-cached agent over ACP for its model list.
+        let mut probing = HashSet::new();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
+        for a in AGENTS.iter() {
+            if models.contains_key(a.id) {
+                continue;
+            }
+            if let Some(cfg) = acp::Config::for_agent(a.id) {
+                acp::probe(a.id, cfg, ev_tx.clone());
+                probing.insert(a.id);
+            }
+        }
+        drop(ev_tx);
+
+        // Bridge the ACP threads' std channel into the UI: a plain forwarder
+        // thread feeds an async channel the main thread can await.
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<acp::Event>();
+        std::thread::spawn(move || {
+            for ev in ev_rx {
+                if bridge_tx.unbounded_send(ev).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = bridge_rx.next().await {
+                let outcome = match &ev {
+                    acp::Event::Models {
+                        agent,
+                        total_models,
+                        providers,
+                    } => Some((*agent, Some((*total_models, *providers)))),
+                    acp::Event::ProbeFailed { agent } => Some((*agent, None)),
+                    _ => None,
+                };
+                let Some((agent, stats)) = outcome else { continue };
+                let _ = this.update(cx, |settings, cx| {
+                    settings.probing.remove(&agent);
+                    if let Some(stats) = stats {
+                        settings.models.insert(agent, stats);
+                        cx.global_mut::<ModelCounts>().0.insert(agent, stats);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
         Self {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
+            models,
+            probing,
         }
     }
 
@@ -52,7 +126,7 @@ impl SettingsWindow {
             .items_center()
             .gap_2p5()
             .cursor_pointer()
-            .text_sm()
+            .text_xs()
             .text_color(sidebar_fg)
             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
             .on_click(|_, window, _| window.remove_window())
@@ -77,7 +151,7 @@ impl SettingsWindow {
                     .items_center()
                     .gap_2p5()
                     .cursor_pointer()
-                    .text_sm()
+                    .text_xs()
                     .text_color(if active { sidebar_accent_fg } else { sidebar_fg })
                     .bg(if active { sidebar_accent } else { theme.transparent })
                     .when(!active, |this| {
@@ -97,7 +171,7 @@ impl SettingsWindow {
             .collect::<Vec<_>>();
 
         let left = v_flex()
-            .w_64()
+            .w_56()
             .h_full()
             .flex_shrink_0()
             .bg(sidebar)
@@ -121,7 +195,7 @@ impl SettingsWindow {
 
         let cards: Vec<AnyElement> = match self.settings_page {
             SettingsPage::Providers => vec![self.render_providers_card(
-                theme.background, radius, primary, link, muted, muted_fg, border,
+                dark, theme.background, radius, primary, link, muted, muted_fg, border,
             )],
             SettingsPage::General => vec![self.render_general_card(
                 dark, radius, primary, link, muted, muted_fg, border,
@@ -132,6 +206,7 @@ impl SettingsWindow {
             .flex_1()
             .h_full()
             .min_w_0()
+            .bg(if dark { theme.background } else { gpui_kit::gpui::white() })
             .child(
                 div()
                     .flex_1()
@@ -144,7 +219,7 @@ impl SettingsWindow {
                         v_flex().max_w(rems(40.)).mx_auto().child(
                             v_flex()
                                 .gap_5()
-                                .child(div().text_lg().font_medium().child(title))
+                                .child(div().text_base().font_medium().child(title))
                                 .children(cards),
                         ),
                     ),
@@ -175,6 +250,7 @@ impl SettingsWindow {
 
     fn render_providers_card(
         &self,
+        dark: bool,
         base_bg: Hsla,
         radius: Pixels,
         primary: Hsla,
@@ -183,10 +259,32 @@ impl SettingsWindow {
         muted_fg: Hsla,
         border: Hsla,
     ) -> AnyElement {
+        // White card on the light panel; keep the muted surface in dark mode.
+        let card_bg = if dark { muted } else { gpui_kit::gpui::white() };
+        // Icon tiles flip to muted so they still contrast against the white card.
+        let tile_bg = if dark { base_bg } else { muted };
         let rows = AGENTS
             .iter()
             .enumerate()
             .map(|(i, a)| {
+                let status_pill = if let Some((total, provs)) = self.models.get(a.id) {
+                    pill(
+                        false,
+                        format!("{total} 模型 · {provs} 服务商"),
+                        radius,
+                        primary,
+                        link,
+                        muted,
+                        muted_fg,
+                    )
+                    .into_any_element()
+                } else if self.probing.contains(&a.id) {
+                    pill(false, "检测模型…", radius, primary, link, muted, muted_fg)
+                        .into_any_element()
+                } else {
+                    pill(false, "模型未知", radius, primary, link, muted, muted_fg)
+                        .into_any_element()
+                };
                 h_flex()
                     .items_center()
                     .gap_3()
@@ -200,42 +298,54 @@ impl SettingsWindow {
                             .size(px(30.))
                             .flex_none()
                             .rounded(radius)
-                            .bg(base_bg)
+                            .bg(tile_bg)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
-                                Icon::new(IconName::Bot)
+                            .child(match a.logo {
+                                // Svg logos are alpha masks; tint them with
+                                // the theme. Other formats (png) keep their
+                                // own brand colors.
+                                Some(logo) if logo.ends_with(".svg") => {
+                                    Icon::empty()
+                                        .path(logo)
+                                        .with_size(px(16.))
+                                        .text_color(muted_fg)
+                                        .into_any_element()
+                                }
+                                Some(logo) => img(logo).size(px(16.)).into_any_element(),
+                                None => Icon::new(IconName::Bot)
                                     .with_size(px(16.))
-                                    .text_color(muted_fg),
-                            ),
+                                    .text_color(muted_fg)
+                                    .into_any_element(),
+                            }),
                     )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().font_medium().child(a.name))
+                            .child(div().text_xs().font_medium().child(a.name))
                             .child(
                                 div()
                                     .mt_0p5()
-                                    .text_xs()
+                                    .text_size(rems(0.6875))
                                     .text_color(muted_fg)
                                     .text_ellipsis()
                                     .child(a.desc),
                             ),
                     )
-                    .child(pill(true, "本地", radius, primary, link, muted, muted_fg))
+                    .child(status_pill)
             })
             .collect::<Vec<_>>();
 
-        self.card(muted)
+        self.card(card_bg)
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_sm().font_medium().child("编码 Agent"))
+                    .child(div().text_xs().font_medium().child("编码 Agent"))
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(rems(0.6875))
                             .text_color(muted_fg)
                             .child("通过 ACP 发现的本机 agent"),
                     ),
@@ -268,11 +378,11 @@ impl SettingsWindow {
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_sm().font_medium().child(title))
+                        .child(div().text_xs().font_medium().child(title))
                         .child(
                             div()
                                 .mt_0p5()
-                                .text_xs()
+                                .text_size(rems(0.6875))
                                 .text_color(muted_fg)
                                 .child(desc),
                         ),
@@ -290,7 +400,7 @@ impl SettingsWindow {
             })
             .into_any_element();
 
-        self.card(muted)
+        self.card(if dark { muted } else { gpui_kit::gpui::white() })
             .child(row(
                 "深色外观",
                 "在亮色与暗色主题之间切换。",
