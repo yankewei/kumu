@@ -8,6 +8,7 @@
 
 mod acp;
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -227,18 +228,36 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(980.), px(640.)), cx)),
-            ..Default::default()
-        };
 
-        cx.spawn(async move |cx| {
-            cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| KumuApp::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("failed to open window");
-        })
-        .detach();
+        // Load themes/ (zed-dark.json sets itself as the dark default) and open
+        // the window only once the theme is applied, so it appears in Zed Dark.
+        let themes_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("themes");
+        let _ = ThemeRegistry::watch_dir(themes_dir, cx, move |cx| {
+            if std::env::var_os("KUMU_DEBUG").is_some() {
+                let reg = ThemeRegistry::global(cx);
+                eprintln!("[theme] registered: {:?}", reg.themes().keys().collect::<Vec<_>>());
+                eprintln!("[theme] default_dark: {}", reg.default_dark_theme().name);
+            }
+            // Rebuild the cached Theme global so it picks up the newly
+            // registered Zed Dark (it cloned the default at init time).
+            if cx.has_global::<Theme>() {
+                cx.remove_global::<Theme>();
+            }
+            Theme::change(ThemeMode::Dark, None, cx);
+            if std::env::var_os("KUMU_DEBUG").is_some() {
+                eprintln!("[theme] active: {}", Theme::global(cx).theme_name());
+            }
+            let window_options = WindowOptions {
+                window_bounds: Some(WindowBounds::centered(size(px(980.), px(640.)), cx)),
+                ..Default::default()
+            };
+            let _ = cx.spawn(async move |cx| {
+                cx.open_window(window_options, |window, cx| {
+                    let view = cx.new(|cx| KumuApp::new(window, cx));
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
+                .expect("failed to open window");
+            });
+        });
     });
 }
