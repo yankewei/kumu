@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
 
-use super::widgets::pill;
+use super::widgets::{agent_logo, pill};
+use super::{AgentModels, ModelCatalog};
 use crate::acp;
 use crate::agents::AGENTS;
 use gpui_kit::component::input::{Input, InputState};
@@ -13,13 +14,6 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-
-/// App-wide cache of model counts probed over ACP, keyed by agent id:
-/// (total models, provider count). Survives settings window reopens.
-#[derive(Default)]
-struct ModelCounts(HashMap<&'static str, (usize, usize)>);
-
-impl Global for ModelCounts {}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsPage {
@@ -30,19 +24,19 @@ enum SettingsPage {
 pub struct SettingsWindow {
     settings_page: SettingsPage,
     search_state: Entity<InputState>,
-    /// Probed model counts per agent id.
-    models: HashMap<&'static str, (usize, usize)>,
+    /// Probed model catalogs per agent id.
+    models: HashMap<&'static str, ModelCatalog>,
     /// Agents whose probe is still running.
     probing: HashSet<&'static str>,
 }
 
 impl SettingsWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let models = if cx.has_global::<ModelCounts>() {
-            cx.global::<ModelCounts>().0.clone()
+        let models = if cx.has_global::<AgentModels>() {
+            cx.global::<AgentModels>().0.clone()
         } else {
             // Must exist up front: the probe handler below calls global_mut.
-            cx.set_global(ModelCounts::default());
+            cx.set_global(AgentModels::default());
             HashMap::new()
         };
 
@@ -75,18 +69,26 @@ impl SettingsWindow {
                 let outcome = match &ev {
                     acp::Event::Models {
                         agent,
-                        total_models,
-                        providers,
-                    } => Some((*agent, Some((*total_models, *providers)))),
+                        models,
+                        current,
+                    } => Some((
+                        *agent,
+                        Some(ModelCatalog {
+                            models: models.clone(),
+                            current: current.clone(),
+                        }),
+                    )),
                     acp::Event::ProbeFailed { agent } => Some((*agent, None)),
                     _ => None,
                 };
-                let Some((agent, stats)) = outcome else { continue };
+                let Some((agent, catalog)) = outcome else {
+                    continue;
+                };
                 let _ = this.update(cx, |settings, cx| {
                     settings.probing.remove(&agent);
-                    if let Some(stats) = stats {
-                        settings.models.insert(agent, stats);
-                        cx.global_mut::<ModelCounts>().0.insert(agent, stats);
+                    if let Some(catalog) = catalog {
+                        settings.models.insert(agent, catalog.clone());
+                        cx.global_mut::<AgentModels>().0.insert(agent, catalog);
                     }
                     cx.notify();
                 });
@@ -105,10 +107,17 @@ impl SettingsWindow {
     fn render_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
-        let (foreground, muted_fg, border, radius) =
-            (theme.foreground, theme.muted_foreground, theme.border, theme.radius);
-        let (sidebar, sidebar_fg, sidebar_border) =
-            (theme.sidebar, theme.sidebar_foreground, theme.sidebar_border);
+        let (foreground, muted_fg, border, radius) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+            theme.radius,
+        );
+        let (sidebar, sidebar_fg, sidebar_border) = (
+            theme.sidebar,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+        );
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
         let (primary, link, muted) = (theme.primary, theme.link, theme.muted);
@@ -152,8 +161,16 @@ impl SettingsWindow {
                     .gap_2p5()
                     .cursor_pointer()
                     .text_xs()
-                    .text_color(if active { sidebar_accent_fg } else { sidebar_fg })
-                    .bg(if active { sidebar_accent } else { theme.transparent })
+                    .text_color(if active {
+                        sidebar_accent_fg
+                    } else {
+                        sidebar_fg
+                    })
+                    .bg(if active {
+                        sidebar_accent
+                    } else {
+                        theme.transparent
+                    })
                     .when(!active, |this| {
                         this.hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                     })
@@ -161,11 +178,11 @@ impl SettingsWindow {
                         this.settings_page = page;
                         cx.notify();
                     }))
-                    .child(
-                        Icon::new(icon)
-                            .with_size(px(15.))
-                            .text_color(if active { sidebar_accent_fg } else { muted_fg }),
-                    )
+                    .child(Icon::new(icon).with_size(px(15.)).text_color(if active {
+                        sidebar_accent_fg
+                    } else {
+                        muted_fg
+                    }))
                     .child(label)
             })
             .collect::<Vec<_>>();
@@ -195,18 +212,29 @@ impl SettingsWindow {
 
         let cards: Vec<AnyElement> = match self.settings_page {
             SettingsPage::Providers => vec![self.render_providers_card(
-                dark, theme.background, radius, primary, link, muted, muted_fg, border,
+                dark,
+                theme.background,
+                radius,
+                primary,
+                link,
+                muted,
+                muted_fg,
+                border,
             )],
-            SettingsPage::General => vec![self.render_general_card(
-                dark, radius, primary, link, muted, muted_fg, border,
-            )],
+            SettingsPage::General => {
+                vec![self.render_general_card(dark, radius, primary, link, muted, muted_fg, border)]
+            }
         };
 
         let right = v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
-            .bg(if dark { theme.background } else { gpui_kit::gpui::white() })
+            .bg(if dark {
+                theme.background
+            } else {
+                gpui_kit::gpui::white()
+            })
             .child(
                 div()
                     .flex_1()
@@ -219,7 +247,7 @@ impl SettingsWindow {
                         v_flex().max_w(rems(40.)).mx_auto().child(
                             v_flex()
                                 .gap_5()
-                                .child(div().text_base().font_medium().child(title))
+                                .child(div().text_sm().font_medium().child(title))
                                 .children(cards),
                         ),
                     ),
@@ -267,10 +295,16 @@ impl SettingsWindow {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let status_pill = if let Some((total, provs)) = self.models.get(a.id) {
+                let status_pill = if let Some(catalog) = self.models.get(a.id) {
+                    let providers = catalog
+                        .models
+                        .iter()
+                        .map(|m| m.provider.as_str())
+                        .collect::<HashSet<_>>()
+                        .len();
                     pill(
                         false,
-                        format!("{total} 模型 · {provs} 服务商"),
+                        format!("{} 模型 · {} 服务商", catalog.models.len(), providers),
                         radius,
                         primary,
                         link,
@@ -302,23 +336,7 @@ impl SettingsWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(match a.logo {
-                                // Svg logos are alpha masks; tint them with
-                                // the theme. Other formats (png) keep their
-                                // own brand colors.
-                                Some(logo) if logo.ends_with(".svg") => {
-                                    Icon::empty()
-                                        .path(logo)
-                                        .with_size(px(16.))
-                                        .text_color(muted_fg)
-                                        .into_any_element()
-                                }
-                                Some(logo) => img(logo).size(px(16.)).into_any_element(),
-                                None => Icon::new(IconName::Bot)
-                                    .with_size(px(16.))
-                                    .text_color(muted_fg)
-                                    .into_any_element(),
-                            }),
+                            .child(agent_logo(a.logo, px(16.), muted_fg)),
                     )
                     .child(
                         v_flex()
@@ -328,7 +346,7 @@ impl SettingsWindow {
                             .child(
                                 div()
                                     .mt_0p5()
-                                    .text_size(rems(0.6875))
+                                    .text_xs()
                                     .text_color(muted_fg)
                                     .text_ellipsis()
                                     .child(a.desc),
@@ -345,7 +363,7 @@ impl SettingsWindow {
                     .child(div().text_xs().font_medium().child("编码 Agent"))
                     .child(
                         div()
-                            .text_size(rems(0.6875))
+                            .text_xs()
                             .text_color(muted_fg)
                             .child("通过 ACP 发现的本机 agent"),
                     ),
@@ -382,7 +400,7 @@ impl SettingsWindow {
                         .child(
                             div()
                                 .mt_0p5()
-                                .text_size(rems(0.6875))
+                                .text_xs()
                                 .text_color(muted_fg)
                                 .child(desc),
                         ),
@@ -393,7 +411,11 @@ impl SettingsWindow {
             .checked(dark)
             .on_click(|checked, window, cx| {
                 Theme::change(
-                    if *checked { ThemeMode::Dark } else { ThemeMode::Light },
+                    if *checked {
+                        ThemeMode::Dark
+                    } else {
+                        ThemeMode::Light
+                    },
                     Some(window),
                     cx,
                 );
@@ -411,8 +433,7 @@ impl SettingsWindow {
             .child(row(
                 "本地数据",
                 "会话与消息保存在 ~/.kumu/kumu.db。",
-                pill(false, "SQLite", radius, primary, link, muted, muted_fg)
-                    .into_any_element(),
+                pill(false, "SQLite", radius, primary, link, muted, muted_fg).into_any_element(),
                 border,
                 true,
             ))

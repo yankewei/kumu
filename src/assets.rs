@@ -44,7 +44,12 @@ mod tests {
         assert!(KumuAssetSource.load("omp.png").unwrap().is_some());
         assert!(KumuAssetSource.load("opencode.svg").unwrap().is_some());
         // gpui-kit's bundled icons resolve through the fallback.
-        assert!(KumuAssetSource.load("icons/settings.svg").unwrap().is_some());
+        assert!(
+            KumuAssetSource
+                .load("icons/settings.svg")
+                .unwrap()
+                .is_some()
+        );
         assert!(KumuAssetSource.load("missing.svg").unwrap().is_none());
     }
 }

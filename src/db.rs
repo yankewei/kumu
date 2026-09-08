@@ -2,7 +2,7 @@
 //!
 //! Accessed synchronously on the UI (main) thread. Schema is created on open.
 
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 
 /// A project: a workspace the user groups sessions under.
 #[derive(Clone, Debug)]
@@ -20,12 +20,14 @@ pub struct Session {
     pub agent: String,
     pub title: String,
     pub cwd: String,
+    /// Selected model (config-option value); None = agent default.
+    pub model: Option<String>,
 }
 
 /// A chat message stored in a session.
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub role: String, // "user" | "agent"
+    pub role: String, // "user" | "agent" | "system"
     pub content: String,
 }
 
@@ -58,6 +60,7 @@ impl Store {
                 agent TEXT NOT NULL,
                 title TEXT NOT NULL,
                 cwd TEXT NOT NULL,
+                model TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -68,7 +71,13 @@ impl Store {
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
-        )
+        )?;
+        // Migration for dbs created before model was part of CREATE TABLE
+        // (duplicate-column errors on fresh dbs are expected and ignored).
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
+            .ok();
+        Ok(())
     }
 
     pub fn projects(&self) -> Vec<Project> {
@@ -99,7 +108,7 @@ impl Store {
     pub fn sessions(&self) -> Vec<Session> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, project_id, agent, title, cwd FROM sessions ORDER BY id")
+            .prepare("SELECT id, project_id, agent, title, cwd, model FROM sessions ORDER BY id")
             .unwrap();
         stmt.query_map([], |row| {
             Ok(Session {
@@ -108,6 +117,7 @@ impl Store {
                 agent: row.get(2)?,
                 title: row.get(3)?,
                 cwd: row.get(4)?,
+                model: row.get(5)?,
             })
         })
         .unwrap()
@@ -127,6 +137,19 @@ impl Store {
             params![project_id, agent, title, cwd],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_session_agent_model(
+        &self,
+        id: i64,
+        agent: &str,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![agent, model, id],
+        )?;
+        Ok(())
     }
 
     pub fn messages(&self, session_id: i64) -> Vec<Message> {

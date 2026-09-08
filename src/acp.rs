@@ -7,16 +7,17 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
+use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionNotification, TextContent,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionNotification, SetSessionConfigOptionRequest, TextContent,
 };
-use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::{
-    on_receive_notification, on_receive_request, AcpAgent, AcpAgentConfig, Client, ConnectionTo,
-    Result,
+    AcpAgent, AcpAgentConfig, Client, ConnectionTo, Result, on_receive_notification,
+    on_receive_request,
 };
 
 /// Events flowing from the ACP thread to the UI.
@@ -31,32 +32,40 @@ pub enum Event {
     Permission(String),
     /// A fatal error occurred.
     Error(String),
-    /// Model-service providers exposed by the agent via the session's model
-    /// config option, grouped by provider with model counts.
-    Providers {
-        total_models: usize,
-        providers: Vec<ProviderStat>,
-    },
-    /// Model counts discovered by probing an agent (settings sidebar):
-    /// total models across N providers.
+    /// The models an agent exposes, from its session's model config option
+    /// (sent by both probes and live connections).
     Models {
         agent: &'static str,
-        total_models: usize,
-        providers: usize,
+        models: Vec<ModelInfo>,
+        /// The value the agent reports as active for this session.
+        current: Option<String>,
     },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
 }
 
-/// One model provider (service provider) and how many models it exposes.
+/// One selectable model as exposed by an agent.
 #[derive(Clone, Debug)]
-pub struct ProviderStat {
-    pub id: String,
-    pub count: usize,
+pub struct ModelInfo {
+    /// Value to pass to `session/set_config_option`.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Provider inferred from the value prefix before `/`.
+    pub provider: String,
+}
+
+/// UI -> ACP commands on the channel returned by [`spawn`].
+pub enum Cmd {
+    Prompt(String),
+    /// Select the session's model by its config-option value.
+    SetModel(String),
 }
 
 /// How to launch the local agent subprocess.
 pub struct Config {
+    /// Static registry id this config was built for (used in events).
+    pub agent: &'static str,
     pub command: String,
     pub args: Vec<String>,
     /// Extra env vars applied on top of the inherited environment.
@@ -66,32 +75,24 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build the config for the agent named by `KUMU_AGENT`
-    /// (default `omp` for the settings demo; `opencode` opt-in).
-    pub fn agent() -> Self {
-        match std::env::var("KUMU_AGENT").as_deref() {
-            Ok("opencode") => Self::opencode(),
-            _ => Self::omp(),
-        }
-    }
-
     /// Build the config for a known agent id from the static registry.
-    pub fn for_agent(id: &str) -> Option<Self> {
+    pub fn for_agent(id: &'static str) -> Option<Self> {
         match id {
-            "opencode" => Some(Self::opencode()),
-            "omp" => Some(Self::omp()),
+            "opencode" => Some(Self::opencode(id)),
+            "omp" => Some(Self::omp(id)),
             _ => None,
         }
     }
 
     /// `opencode acp`, with the RC gateway key injected so the subprocess can
     /// reach a model even when launched from a GUI app.
-    fn opencode() -> Self {
+    fn opencode(agent: &'static str) -> Self {
         let mut env = Vec::new();
         if let Some(key) = opencode_api_key() {
             env.push(("OPENCODE_API_KEY".to_string(), key));
         }
         Self {
+            agent,
             command: opencode_bin(),
             args: vec!["acp".to_string()],
             env,
@@ -100,8 +101,9 @@ impl Config {
     }
 
     /// `omp acp` (Oh My Pi); uses its own stored model config.
-    fn omp() -> Self {
+    fn omp(agent: &'static str) -> Self {
         Self {
+            agent,
             command: std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_string()),
             args: vec!["acp".to_string()],
             env: Vec::new(),
@@ -157,19 +159,19 @@ fn emit(tx: &Sender<Event>, ev: Event) {
             Event::Error(s) => eprintln!("[acp] error: {s}"),
             Event::Log(s) => eprintln!("[acp] log: {s}"),
             Event::Permission(s) => eprintln!("[acp] perm: {s}"),
-            Event::Providers {
-                total_models,
-                providers,
-            } => eprintln!(
-                "[acp] providers: {total_models} models across {} providers: {providers:?}",
-                providers.len()
-            ),
             Event::Models {
                 agent,
-                total_models,
-                providers,
+                models,
+                current,
             } => eprintln!(
-                "[acp] probe {agent}: {total_models} models across {providers} providers"
+                "[acp] models: {agent} exposes {} models (active: {:?}) across {} providers",
+                models.len(),
+                current,
+                models
+                    .iter()
+                    .map(|m| m.provider.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
             ),
             Event::ProbeFailed { agent } => eprintln!("[acp] probe {agent} failed"),
         }
@@ -182,8 +184,8 @@ pub fn spawn(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
-) -> tokio::sync::mpsc::UnboundedSender<String> {
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+) -> tokio::sync::mpsc::UnboundedSender<Cmd> {
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
     std::thread::Builder::new()
         .name("kumu-acp".into())
         .spawn(move || {
@@ -238,14 +240,14 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                                     .send_request(NewSessionRequest::new(cwd))
                                     .block_task()
                                     .await?;
-                                let (total_models, providers) =
-                                    model_stats(&new_session.config_options);
+                                let (_, current, models) =
+                                    model_catalog(&new_session.config_options);
                                 emit(
                                     &ev_tx,
                                     Event::Models {
                                         agent,
-                                        total_models,
-                                        providers: providers.len(),
+                                        models,
+                                        current,
                                     },
                                 );
                                 Ok(())
@@ -270,34 +272,43 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         .expect("failed to spawn probe thread");
 }
 
-/// Group the session's model config options by provider (value prefix) —
-/// the ACP-standard way to learn which models an agent exposes.
-fn model_stats(config_options: &Option<Vec<SessionConfigOption>>) -> (usize, Vec<ProviderStat>) {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+/// Extract the session's model config option: its id (for
+/// `session/set_config_option`), the value the agent reports as active, and
+/// the selectable models, grouped flat.
+fn model_catalog(
+    config_options: &Option<Vec<SessionConfigOption>>,
+) -> (Option<SessionConfigId>, Option<String>, Vec<ModelInfo>) {
+    let mut option_id = None;
+    let mut current = None;
+    let mut models: Vec<ModelInfo> = Vec::new();
     if let Some(options) = config_options {
         for option in options {
-            let is_model = matches!(
-                &option.category,
-                Some(SessionConfigOptionCategory::Model)
-            ) || option.id.0.as_ref() == "model";
+            let is_model = matches!(&option.category, Some(SessionConfigOptionCategory::Model))
+                || option.id.0.as_ref() == "model";
             if !is_model {
                 continue;
             }
             if let SessionConfigKind::Select(select) = &option.kind {
-                let mut add = |raw: &str| {
-                    let provider = raw.split('/').next().unwrap_or(raw);
-                    *counts.entry(provider.to_string()).or_default() += 1;
+                option_id = Some(option.id.clone());
+                current = Some(select.current_value.0.as_ref().to_string());
+                let mut add = |value: &SessionConfigSelectOption| {
+                    let raw = value.value.0.as_ref();
+                    models.push(ModelInfo {
+                        value: raw.to_string(),
+                        name: value.name.clone(),
+                        provider: raw.split('/').next().unwrap_or(raw).to_string(),
+                    });
                 };
                 match &select.options {
                     SessionConfigSelectOptions::Ungrouped(values) => {
-                        for value in values {
-                            add(value.value.0.as_ref());
+                        for v in values {
+                            add(v);
                         }
                     }
                     SessionConfigSelectOptions::Grouped(groups) => {
                         for group in groups {
-                            for value in &group.options {
-                                add(value.value.0.as_ref());
+                            for v in &group.options {
+                                add(v);
                             }
                         }
                     }
@@ -306,20 +317,15 @@ fn model_stats(config_options: &Option<Vec<SessionConfigOption>>) -> (usize, Vec
             }
         }
     }
-    let mut providers: Vec<ProviderStat> = counts
-        .into_iter()
-        .map(|(id, count)| ProviderStat { id, count })
-        .collect();
-    providers.sort_by(|a, b| b.count.cmp(&a.count));
-    let total_models = providers.iter().map(|p| p.count).sum();
-    (total_models, providers)
+    models.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
+    (option_id, current, models)
 }
 
 async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
 ) -> Result<()> {
     let mut launch = AcpAgentConfig::new(&cfg.command);
     for a in &cfg.args {
@@ -337,11 +343,7 @@ async fn run(
 
     emit(
         &log_tx,
-        Event::Log(format!(
-            "spawning: {} {}",
-            cfg.command,
-            cfg.args.join(" ")
-        )),
+        Event::Log(format!("spawning: {} {}", cfg.command, cfg.args.join(" "))),
     );
 
     Client
@@ -394,10 +396,7 @@ async fn run(
                         ))
                     }
                     None => {
-                        emit(
-                            &perm_tx,
-                            Event::Permission("no options, cancelling".into()),
-                        );
+                        emit(&perm_tx, Event::Permission("no options, cancelling".into()));
                         responder.respond(RequestPermissionResponse::new(
                             RequestPermissionOutcome::Cancelled,
                         ))
@@ -428,20 +427,17 @@ async fn run(
                     .block_task()
                     .await?;
                 let session_id = new_session.session_id;
-                emit(
-                    &log_tx,
-                    Event::Log(format!("session ready: {session_id}")),
-                );
+                emit(&log_tx, Event::Log(format!("session ready: {session_id}")));
 
-                // Read the model config option and group its selectable models
-                // by provider (value prefix). This is the ACP-standard way to
-                // learn which model providers a session can use.
-                let (total_models, providers) = model_stats(&new_session.config_options);
+                // Read the model config option: its id lets the UI switch the
+                // session's model later; the catalog feeds the model picker.
+                let (model_option_id, current, models) = model_catalog(&new_session.config_options);
                 emit(
                     &ev_tx,
-                    Event::Providers {
-                        total_models,
-                        providers,
+                    Event::Models {
+                        agent: cfg.agent,
+                        models,
+                        current,
                     },
                 );
 
@@ -455,22 +451,43 @@ async fn run(
                         ))
                         .block_task()
                         .await?;
-                    emit(
-                        &ev_tx,
-                        Event::Done(format!("{:?}", response.stop_reason)),
-                    );
+                    emit(&ev_tx, Event::Done(format!("{:?}", response.stop_reason)));
                 }
 
-                while let Some(text) = cmd_rx.recv().await {
-                    emit(&log_tx, Event::Log("prompt sent".into()));
-                    let response = connection
-                        .send_request(PromptRequest::new(
-                            session_id.clone(),
-                            vec![ContentBlock::Text(TextContent::new(text))],
-                        ))
-                        .block_task()
-                        .await?;
-                    emit(&ev_tx, Event::Done(format!("{:?}", response.stop_reason)));
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        Cmd::Prompt(text) => {
+                            emit(&log_tx, Event::Log("prompt sent".into()));
+                            let response = connection
+                                .send_request(PromptRequest::new(
+                                    session_id.clone(),
+                                    vec![ContentBlock::Text(TextContent::new(text))],
+                                ))
+                                .block_task()
+                                .await?;
+                            emit(&ev_tx, Event::Done(format!("{:?}", response.stop_reason)));
+                        }
+                        Cmd::SetModel(value) => match &model_option_id {
+                            Some(option_id) => {
+                                if let Err(err) = connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        session_id.clone(),
+                                        option_id.clone(),
+                                        value.as_str(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    emit(&log_tx, Event::Log(format!("set model failed: {err}")));
+                                } else {
+                                    emit(&log_tx, Event::Log(format!("model set: {value}")));
+                                }
+                            }
+                            None => {
+                                emit(&log_tx, Event::Log("no model config option to set".into()))
+                            }
+                        },
+                    }
                 }
                 emit(&log_tx, Event::Log("connection closing".into()));
                 Ok(())
@@ -516,11 +533,17 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// The real-agent tests share one local agent binary; running its
+    /// subprocesses concurrently is slow enough to trip the timeouts, so
+    /// serialize them.
+    static AGENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// End-to-end: probe a real local agent (KUMU_AGENT, default omp) and
     /// expect a Models event. Skipped when the agent binary is missing so the
     /// suite still passes on machines without local agents.
     #[test]
     fn probe_discovers_models() {
+        let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {
             Ok("opencode") => "opencode",
             _ => "omp",
@@ -536,16 +559,74 @@ mod tests {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("probe timed out") {
-                Event::Models {
-                    agent,
-                    total_models,
-                    providers,
-                } => {
-                    println!("{agent}: {total_models} models across {providers} providers");
-                    assert!(total_models > 0);
+                Event::Models { agent, models, current } => {
+                    println!("{agent}: {} models, active: {current:?}", models.len());
+                    assert!(!models.is_empty());
                     break;
                 }
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// End-to-end: spawn a real agent (KUMU_AGENT, default omp), send one
+    /// prompt, and expect streamed Agent chunks followed by Done — the same
+    /// path the home window uses. Skipped when the binary is missing.
+    #[test]
+    fn session_prompts_agent_end_to_end() {
+        let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {
+            Ok("opencode") => "opencode",
+            _ => "omp",
+        };
+        let mut cfg = Config::for_agent(agent).expect("known agent");
+        if !command_exists(&cfg.command) {
+            println!(
+                "skipping session_prompts_agent_end_to_end: {} not found",
+                cfg.command
+            );
+            return;
+        }
+        cfg.auto_prompt = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd_tx = spawn(
+            cfg,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            tx,
+        );
+
+        // Wait for the model catalog, then pick its first model before
+        // prompting — exercises session/set_config_option on the live path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining).expect("catalog timed out") {
+                Event::Models { models, .. } => {
+                    if let Some(model) = models.first() {
+                        cmd_tx.send(Cmd::SetModel(model.value.clone())).unwrap();
+                    }
+                    break;
+                }
+                Event::Error(err) => panic!("acp error: {err}"),
+                _ => {}
+            }
+        }
+        cmd_tx
+            .send(Cmd::Prompt("Reply with exactly: ok".into()))
+            .unwrap();
+
+        let mut text = String::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining).expect("prompt timed out") {
+                Event::Agent(chunk) => text.push_str(&chunk),
+                Event::Done(_) => {
+                    println!("{agent} replied: {text:?}");
+                    assert!(text.contains("ok"));
+                    break;
+                }
+                Event::Error(err) => panic!("acp error: {err}"),
                 _ => {}
             }
         }
@@ -559,6 +640,7 @@ mod tests {
         probe(
             "missing",
             Config {
+                agent: "missing",
                 command: "/nonexistent/kumu-agent-test".into(),
                 args: vec![],
                 env: vec![],

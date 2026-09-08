@@ -15,9 +15,8 @@
 //!   - `agents.rs` static registry of agents kumu can drive;
 //!   - `db.rs`    local SQLite persistence (projects/sessions/messages);
 //!   - `acp.rs`   ACP client layer on a dedicated thread (settings probes
-//!     agents over it to discover their models; full sessions still TODO).
+//!     agents over it to discover their models; home sessions prompt them).
 
-#[allow(dead_code)] // run() not wired into the UI yet
 mod acp;
 mod agents;
 mod assets;
