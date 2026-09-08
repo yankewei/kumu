@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionNotification, SetSessionConfigOptionRequest, TextContent,
+    SessionNotification, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Client, ConnectionTo, Result, on_receive_notification,
@@ -26,6 +26,17 @@ pub enum Event {
     Log(String),
     /// A chunk of agent reply text; append to the current agent row.
     Agent(String),
+    /// A chunk of the agent's internal reasoning; transient (not persisted).
+    Thought(String),
+    /// A tool call started or changed. `title`/`status` are empty when the
+    /// update didn't touch them; `status` is one of pending/running/done/failed.
+    ToolCall {
+        id: String,
+        title: String,
+        status: &'static str,
+    },
+    /// The agent named the session (session/info update with a title).
+    SessionTitle { title: String },
     /// The prompt turn ended with this stop reason.
     Done(String),
     /// A permission request was auto-approved (which option).
@@ -155,6 +166,11 @@ fn emit(tx: &Sender<Event>, ev: Event) {
     if std::env::var("KUMU_DEBUG").is_ok() {
         match &ev {
             Event::Agent(t) => eprintln!("[acp] agent: {t}"),
+            Event::Thought(t) => eprintln!("[acp] thought: {t}"),
+            Event::ToolCall { id, title, status } => {
+                eprintln!("[acp] tool {id}: {title} ({status})")
+            }
+            Event::SessionTitle { title } => eprintln!("[acp] title: {title}"),
             Event::Done(s) => eprintln!("[acp] done: {s}"),
             Event::Error(s) => eprintln!("[acp] error: {s}"),
             Event::Log(s) => eprintln!("[acp] log: {s}"),
@@ -293,10 +309,11 @@ fn model_catalog(
                 current = Some(select.current_value.0.as_ref().to_string());
                 let mut add = |value: &SessionConfigSelectOption| {
                     let raw = value.value.0.as_ref();
+                    let provider = raw.split('/').next().unwrap_or(raw).to_string();
                     models.push(ModelInfo {
                         value: raw.to_string(),
-                        name: value.name.clone(),
-                        provider: raw.split('/').next().unwrap_or(raw).to_string(),
+                        name: strip_provider_prefix(&value.name, &provider),
+                        provider,
                     });
                 };
                 match &select.options {
@@ -319,6 +336,37 @@ fn model_catalog(
     }
     models.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
     (option_id, current, models)
+}
+
+/// Drop the provider prefix from a display name ("OpenCode Go/GLM-5.3" →
+/// "GLM-5.3"): agents like opencode concatenate provider + model in the name,
+/// which duplicates the provider column in the picker. The prefix only counts
+/// as a provider when it normalizes to the same key as the value's provider
+/// segment; otherwise the name is kept untouched.
+fn strip_provider_prefix(name: &str, provider: &str) -> String {
+    let key = |s: &str| {
+        s.to_lowercase()
+            .chars()
+            .filter(|c: &char| c.is_alphanumeric())
+            .collect::<String>()
+    };
+    match name.split_once('/') {
+        Some((prefix, rest)) if !rest.is_empty() && key(prefix) == key(provider) => {
+            rest.to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Stable lowercase names for tool call statuses (used by the UI rows).
+fn status_name(status: &ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::InProgress => "running",
+        ToolCallStatus::Completed => "done",
+        ToolCallStatus::Failed => "failed",
+        _ => "pending",
+    }
 }
 
 async fn run(
@@ -355,6 +403,44 @@ async fn run(
                     SessionUpdate::AgentMessageChunk(chunk) => {
                         if let ContentBlock::Text(t) = chunk.content {
                             emit(&notif_tx, Event::Agent(t.text));
+                        }
+                    }
+                    SessionUpdate::AgentThoughtChunk(chunk) => {
+                        if let ContentBlock::Text(t) = chunk.content {
+                            emit(&notif_tx, Event::Thought(t.text));
+                        }
+                    }
+                    SessionUpdate::ToolCall(call) => {
+                        emit(
+                            &notif_tx,
+                            Event::ToolCall {
+                                id: call.tool_call_id.0.to_string(),
+                                title: call.title,
+                                status: status_name(&call.status),
+                            },
+                        );
+                    }
+                    SessionUpdate::ToolCallUpdate(update) => {
+                        emit(
+                            &notif_tx,
+                            Event::ToolCall {
+                                id: update.tool_call_id.0.to_string(),
+                                title: update.fields.title.unwrap_or_default(),
+                                status: update
+                                    .fields
+                                    .status
+                                    .as_ref()
+                                    .map(status_name)
+                                    .unwrap_or(""),
+                            },
+                        );
+                    }
+                    SessionUpdate::SessionInfoUpdate(info) => {
+                        if let Some(title) = info.title.take() {
+                            let title = title.trim().to_string();
+                            if !title.is_empty() {
+                                emit(&notif_tx, Event::SessionTitle { title });
+                            }
                         }
                     }
                     other => {

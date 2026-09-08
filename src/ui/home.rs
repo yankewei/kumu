@@ -13,11 +13,48 @@ use crate::agents::AGENTS;
 use crate::db::{Message, Project, Session, Store, db_path};
 use crate::ui::widgets::agent_logo;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+
+/// One tool call observed during the live turn, in first-seen order.
+struct ToolRun {
+    id: String,
+    title: String,
+    /// pending / running / done / failed
+    status: &'static str,
+}
+
+/// Live view of one session's in-flight turn. The answer is an
+/// incrementally-parsed markdown view; thinking is collapsed into a status
+/// row and tool calls into status rows. All of it is transient: only the
+/// answer text is persisted on Done.
+struct TurnState {
+    started_at: std::time::Instant,
+    /// Whether thinking chunks have arrived (rendered as a collapsed status).
+    thinking: bool,
+    answer: Entity<TextViewState>,
+    answer_len: usize,
+    /// Mirror of the answer source; persisted on Done.
+    answer_text: String,
+    tools: Vec<ToolRun>,
+}
+
+impl TurnState {
+    fn new(cx: &mut App) -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            thinking: false,
+            answer: cx.new(|cx| TextViewState::markdown("", cx)),
+            answer_len: 0,
+            answer_text: String::new(),
+            tools: Vec::new(),
+        }
+    }
+}
 
 pub struct KumuApp {
     store: Store,
@@ -31,8 +68,15 @@ pub struct KumuApp {
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
     acp_txs: HashMap<i64, UnboundedSender<acp::Cmd>>,
-    /// In-flight agent replies keyed by session id.
-    streaming: HashMap<i64, String>,
+    /// Live turn state keyed by session id: streaming thinking, tool calls,
+    /// and the answer being built. Dropped when the turn ends.
+    turns: HashMap<i64, TurnState>,
+    /// Scroll position of the conversation list; pinned to the bottom every
+    /// frame while [`Self::follow_tail`] is on.
+    conversation_scroll: ScrollHandle,
+    /// Whether the conversation auto-scrolls as new content streams in.
+    /// Released when the user scrolls up, re-engaged at the bottom.
+    follow_tail: bool,
     /// Model picker state: controlled open flag, which agent's rail tab is
     /// active (None = the session's current agent), and the search field.
     model_picker_open: bool,
@@ -55,13 +99,27 @@ impl KumuApp {
                 TextareaState::new(window, cx)
                     .auto_grow(1, 6)
                     .placeholder("输入消息…")
+                    // Chat composer semantics: plain Enter sends, Shift+Enter
+                    // inserts a newline (the textarea handles the newline).
+                    .submit_on_enter(true)
             }),
             acp_txs: HashMap::new(),
-            streaming: HashMap::new(),
+            turns: HashMap::new(),
+            conversation_scroll: ScrollHandle::new(),
+            follow_tail: true,
             model_picker_open: false,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
         };
+        // Enter in the composer sends the prompt (Shift+Enter newline is
+        // handled by the textarea itself via submit_on_enter).
+        cx.subscribe_in(&app.input_state, window, |this, _, ev, window, cx| {
+            // Shift+Enter also emits PressEnter; only plain Enter sends.
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                this.send(window, cx);
+            }
+        })
+        .detach();
         app.bootstrap();
         app.probe_models(cx);
         app
@@ -142,6 +200,7 @@ impl KumuApp {
     fn select_session(&mut self, id: i64) {
         self.selected = Some(id);
         self.messages = self.store.messages(id);
+        self.follow_tail = true;
     }
 
     fn new_session(&mut self) {
@@ -175,12 +234,28 @@ impl KumuApp {
             return;
         };
         let text = self.input_state.read(cx).value().trim().to_string();
-        if text.is_empty() || self.streaming.contains_key(&session_id) {
+        if text.is_empty() || self.turns.contains_key(&session_id) {
             return;
         }
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        self.follow_tail = true;
+        // Until the agent reports a real title (session/info), fall back to
+        // the first line of the first user message.
+        if session.title.starts_with("会话 ") {
+            let line = text.lines().next().unwrap_or(&text).trim();
+            if !line.is_empty() {
+                let mut title: String = line.chars().take(24).collect();
+                if line.chars().count() > 24 {
+                    title.push('…');
+                }
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    s.title = title.clone();
+                }
+                self.store.update_session_title(session_id, &title).ok();
+            }
+        }
         self.store.insert_message(session_id, "user", &text).ok();
         self.messages = self.store.messages(session_id);
         self.input_state
@@ -188,10 +263,7 @@ impl KumuApp {
 
         self.ensure_connection(&session, cx);
         if let Some(tx) = self.acp_txs.get(&session_id) {
-            self.streaming.insert(session_id, String::new());
             let _ = tx.send(acp::Cmd::Prompt(text));
-        } else {
-            self.streaming.remove(&session_id);
         }
         cx.notify();
     }
@@ -249,13 +321,51 @@ impl KumuApp {
     fn on_acp_event(&mut self, session_id: i64, ev: acp::Event, cx: &mut Context<Self>) {
         match ev {
             acp::Event::Agent(chunk) => {
-                self.streaming
-                    .entry(session_id)
-                    .or_default()
-                    .push_str(&chunk);
+                // Feed the chunk straight into the session's markdown view:
+                // `push_str` appends incrementally instead of re-parsing the
+                // whole document on every chunk.
+                let turn = self.turn_entry(session_id, cx);
+                turn.answer.update(cx, |state, cx| state.push_str(&chunk, cx));
+                turn.answer_text.push_str(&chunk);
+                turn.answer_len += chunk.chars().count();
+            }
+            acp::Event::Thought(chunk) => {
+                let _ = chunk;
+                self.turn_entry(session_id, cx).thinking = true;
+            }
+            acp::Event::ToolCall {
+                id,
+                title,
+                status,
+            } => {
+                let turn = self.turn_entry(session_id, cx);
+                if let Some(run) = turn.tools.iter_mut().find(|t| t.id == id) {
+                    if !status.is_empty() {
+                        run.status = status;
+                    }
+                    if !title.is_empty() {
+                        run.title = title;
+                    }
+                } else {
+                    turn.tools.push(ToolRun {
+                        id,
+                        title,
+                        status: if status.is_empty() { "running" } else { status },
+                    });
+                }
+            }
+            acp::Event::SessionTitle { title } => {
+                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    session.title = title.clone();
+                }
+                self.store.update_session_title(session_id, &title).ok();
+                cx.notify();
             }
             acp::Event::Done(_) => {
-                if let Some(text) = self.streaming.remove(&session_id) {
+                if let Some(turn) = self.turns.remove(&session_id) {
+                    // Only the answer is persisted; thinking and tool rows
+                    // were transient views of the live turn.
+                    let text = turn.answer_text;
                     if !text.trim().is_empty() {
                         self.store.insert_message(session_id, "agent", &text).ok();
                     }
@@ -265,7 +375,7 @@ impl KumuApp {
                 }
             }
             acp::Event::Error(err) => {
-                self.streaming.remove(&session_id);
+                self.turns.remove(&session_id);
                 self.system_message(session_id, err);
             }
             acp::Event::Models {
@@ -285,6 +395,35 @@ impl KumuApp {
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Get (or lazily create) the live turn state for a session. Creating one
+    /// also starts a 500ms notify ticker so the working-time label keeps
+    /// counting even when no ACP chunks arrive.
+    fn turn_entry(&mut self, session_id: i64, cx: &mut Context<Self>) -> &mut TurnState {
+        if !self.turns.contains_key(&session_id) {
+            self.turns.insert(session_id, TurnState::new(cx));
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let alive = this
+                    .update(cx, |app, cx| {
+                        if app.turns.contains_key(&session_id) {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            })
+            .detach();
+        }
+        self.turns.get_mut(&session_id).unwrap()
     }
 
     /// Switch a session's agent and/or model: persists the choice, reopens the
@@ -307,7 +446,7 @@ impl KumuApp {
             // connection below re-applies the stored model on session/new.
             // The in-flight reply (if any) is abandoned with it.
             self.acp_txs.remove(&session_id);
-            self.streaming.remove(&session_id);
+            self.turns.remove(&session_id);
         }
         if let Some(session) = self.selected_session().cloned() {
             // A connection that already existed needs the model pushed
@@ -649,6 +788,7 @@ impl KumuApp {
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
         let primary = theme.primary;
+        let (success, danger) = (theme.success, theme.danger);
         let selected = self.selected;
 
         // ---- Left: sidebar surface with the project/session tree. ----
@@ -794,21 +934,15 @@ impl KumuApp {
         let right =
             match self.selected_session() {
                 Some(session) => {
-                    let agent = self.agent_name(&session.agent);
                     let title = session.title.clone();
                     let messages = self.messages.clone();
-                    let agent_for_rows = agent.clone();
-                    let streaming = self
-                        .streaming
-                        .get(&session.id)
-                        .cloned()
-                        .map(|text| (agent.clone(), text));
+                    let turn = self.turns.get(&session.id);
                     // One centered column shared by messages and composer: capped
                     // width for readability, floored so it never gets too skinny.
                     let (col_max, col_min) = (rems(44.), rems(24.));
                     let mut rows = v_flex()
                         .gap_3()
-                        .children(messages.into_iter().map(move |m| {
+                        .children(messages.into_iter().enumerate().map(move |(ix, m)| {
                             if m.role == "user" {
                                 h_flex().justify_end().child(
                                     div()
@@ -822,37 +956,85 @@ impl KumuApp {
                             } else if m.role == "system" {
                                 div().text_xs().text_color(muted_fg).child(m.content)
                             } else {
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_medium()
-                                            .text_color(muted_fg)
-                                            .child(agent_for_rows.clone()),
-                                    )
-                                    .child(div().text_sm().child(m.content))
+                                // Agent replies arrive as markdown (ACP text
+                                // blocks SHOULD render as markdown).
+                                div().text_sm().child(TextView::markdown(
+                                    SharedString::from(format!("msg-{ix}")),
+                                    m.content,
+                                ))
                             }
                         }));
-                    if let Some((agent_name, text)) = streaming {
+                    if let Some(turn) = turn {
+                        // Thinking is collapsed: a bare status row, never the
+                        // raw reasoning text.
+                        if turn.thinking {
+                            rows = rows.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::LoaderCircle)
+                                            .small()
+                                            .text_color(muted_fg),
+                                    )
+                                    .child(div().text_xs().text_color(muted_fg).child("思考中…")),
+                            );
+                        }
+                        // Tool calls: one compact status row each, in
+                        // first-seen order.
+                        for run in &turn.tools {
+                            let (icon, color) = match run.status {
+                                "done" => (IconName::Check, success),
+                                "failed" => (IconName::Close, danger),
+                                _ => (IconName::LoaderCircle, muted_fg),
+                            };
+                            rows = rows.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(Icon::new(icon).small().text_color(color))
+                                    .child(
+                                        div().text_xs().text_color(muted_fg).truncate().child(
+                                            run.title.clone(),
+                                        ),
+                                    ),
+                            );
+                        }
+                        // The answer streams incrementally; before the first
+                        // chunk lands, show a bare ellipsis.
+                        let body: AnyElement = if turn.answer_len == 0 {
+                            div().child("…").into_any_element()
+                        } else {
+                            div()
+                                .text_sm()
+                                .child(TextView::new(&turn.answer))
+                                .into_any_element()
+                        };
+                        rows = rows.child(div().text_sm().text_color(muted_fg).child(body));
+                        // Working-time label at the bottom-left of the reply.
+                        let secs = turn.started_at.elapsed().as_secs();
+                        let label = if secs >= 60 {
+                            format!("{}m{:02}s", secs / 60, secs % 60)
+                        } else {
+                            format!("{secs}s")
+                        };
                         rows = rows.child(
-                            v_flex()
-                                .gap_1()
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .font_medium()
-                                        .text_color(muted_fg)
-                                        .child(agent_name),
+                                    Icon::new(IconName::LoaderCircle)
+                                        .small()
+                                        .text_color(muted_fg),
                                 )
-                                .child(div().text_sm().text_color(muted_fg).child(
-                                    if text.is_empty() {
-                                        "…".to_string()
-                                    } else {
-                                        text
-                                    },
-                                )),
+                                .child(div().text_xs().text_color(muted_fg).child(label)),
                         );
+                    }
+                    // Pin to the bottom of this frame's content while
+                    // following: re-armed every render, consumed at paint,
+                    // so async markdown growth stays glued to the tail.
+                    if self.follow_tail {
+                        self.conversation_scroll.scroll_to_bottom();
                     }
                     v_flex()
                         .flex_1()
@@ -869,7 +1051,15 @@ impl KumuApp {
                             div()
                                 .flex_1()
                                 .id("conversation")
+                                .track_scroll(&self.conversation_scroll)
                                 .overflow_y_scroll()
+                                .on_scroll_wheel(cx.listener(|this, _, _, _| {
+                                    // Any manual scroll that leaves the bottom
+                                    // releases the tail; landing back engages it.
+                                    let handle = &this.conversation_scroll;
+                                    this.follow_tail =
+                                        handle.offset().y + handle.max_offset().y <= px(8.);
+                                }))
                                 .px_5()
                                 .py_4()
                                 .child(div().max_w(col_max).min_w(col_min).mx_auto().child(rows)),
@@ -1005,8 +1195,9 @@ fn model_row(
 ) -> Stateful<Div> {
     div()
         .id(SharedString::from(format!("model-row-{name}-{subtitle}")))
-        .h(px(52.))
         .px_2p5()
+        .py_1p5()
+        .gap_2()
         .rounded(radius)
         .flex()
         .items_center()
@@ -1015,17 +1206,18 @@ fn model_row(
         .when(selected, |el| el.bg(accent))
         .when(!selected, |el| el.hover(move |s| s.bg(muted)))
         .child(
-            v_flex().min_w_0().child(
-                div()
-                    .text_sm()
-                    .font_medium()
-                    .truncate()
-                    .text_color(if selected { accent_fg } else { muted_fg })
-                    .child(name.to_string()),
-            ),
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .font_medium()
+                .truncate()
+                .text_color(if selected { accent_fg } else { muted_fg })
+                .child(name.to_string()),
         )
         .child(
             div()
+                .min_w_0()
                 .text_xs()
                 .text_color(if selected { accent_fg } else { muted_fg })
                 .truncate()

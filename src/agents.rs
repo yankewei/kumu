@@ -16,7 +16,7 @@ pub const AGENTS: [AgentDef; 2] = [
         id: "opencode",
         name: "Opencode",
         desc: "ACP v1",
-        logo: Some("opencode.svg"),
+        logo: Some("opencode.png"),
     },
     AgentDef {
         id: "omp",

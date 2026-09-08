@@ -152,6 +152,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_session_title(&self, id: i64, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![title, id],
+        )?;
+        Ok(())
+    }
+
     pub fn messages(&self, session_id: i64) -> Vec<Message> {
         let mut stmt = self
             .conn
