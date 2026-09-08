@@ -1,0 +1,400 @@
+//! Composer model picker: agent tabs, search, and model selection.
+
+use std::collections::HashMap;
+
+use gpui_kit::component::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+use gpui_kit::component::input::Input;
+use gpui_kit::component::popover::Popover;
+
+use super::KumuApp;
+use crate::acp;
+use crate::agents::AGENTS;
+use crate::db::Session;
+use crate::ui::AgentModels;
+use crate::ui::widgets::agent_logo;
+
+impl KumuApp {
+    /// Switch a session's agent and/or model: persists the choice, reopens the
+    /// ACP connection when the agent changes, and applies the model over the
+    /// session's model config option.
+    fn pick_model(&mut self, agent_id: &'static str, model_value: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected else {
+            return;
+        };
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let agent_changed = session.agent != agent_id;
+        self.store
+            .update_session_agent_model(session_id, agent_id, Some(&model_value))
+            .ok();
+        self.refresh();
+        if agent_changed {
+            // Dropping the sender closes the old agent subprocess; the fresh
+            // connection below re-applies the stored model on session/new.
+            // The in-flight reply (if any) is abandoned with it.
+            self.acp_txs.remove(&session_id);
+            self.turns.remove(&session_id);
+        }
+        if let Some(session) = self.selected_session().cloned() {
+            // A connection that already existed needs the model pushed
+            // explicitly; a fresh one from ensure_connection re-applies the
+            // just-stored model itself.
+            let existed = self.acp_txs.contains_key(&session_id);
+            self.ensure_connection(&session, cx);
+            if existed {
+                if let Some(tx) = self.acp_txs.get(&session_id) {
+                    let _ = tx.send(acp::Cmd::SetModel(model_value));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Label for the composer's model picker chip: the selected model's name
+    /// (the chip's icon already identifies the agent). Fresh sessions fall
+    /// back to the model the agent reports as active, then the agent name.
+    fn picker_label(&self, session: &Session, cx: &App) -> String {
+        let catalog = cx
+            .try_global::<AgentModels>()
+            .and_then(|g| g.0.get(session.agent.as_str()));
+        let model_value = session
+            .model
+            .as_deref()
+            .or(catalog.and_then(|c| c.current.as_deref()));
+        match model_value {
+            Some(value) => catalog
+                .and_then(|c| c.models.iter().find(|m| m.value == value))
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| value.to_string()),
+            None => self.agent_name(&session.agent),
+        }
+    }
+
+    /// The composer's model picker, Waku-style: a chip trigger opening a
+    /// controlled panel with an agent rail on the left and a searchable model
+    /// list on the right. Picking a model switches the session's agent with it.
+    pub(super) fn model_picker(&self, session: &Session, cx: &Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let label = self.picker_label(session, cx);
+        let chip_logo = AGENTS
+            .iter()
+            .find(|a| a.id == session.agent)
+            .and_then(|a| a.logo);
+        let (radius, muted, muted_fg, border, accent, accent_fg, background) = {
+            let theme = cx.theme();
+            (
+                theme.radius,
+                theme.muted,
+                theme.muted_foreground,
+                theme.border,
+                theme.sidebar_accent,
+                theme.sidebar_accent_foreground,
+                theme.background,
+            )
+        };
+        let search = self.model_search.clone();
+        let open = self.model_picker_open;
+
+        let chip = ChipTrigger {
+            element: h_flex()
+                .id("model-picker-chip")
+                .h(px(24.))
+                .px_1p5()
+                .gap_1p5()
+                .rounded(radius)
+                .cursor_pointer()
+                .text_color(muted_fg)
+                .when(open, |el| el.bg(muted.opacity(0.6)))
+                .when(!open, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
+                .child(agent_logo(chip_logo, px(13.), muted_fg))
+                .child(div().max_w(px(220.)).text_xs().truncate().child(label)),
+        };
+
+        Popover::new("model-picker")
+            .appearance(false)
+            .anchor(Anchor::BottomLeft)
+            .open(open)
+            .on_open_change({
+                let weak = weak.clone();
+                let search = search.clone();
+                move |open, window, cx| {
+                    let open = *open;
+                    let _ = weak.update(cx, |app, cx| {
+                        app.model_picker_open = open;
+                        if open {
+                            // Waku resets onto the session's agent and clears
+                            // the filter each time the panel opens.
+                            app.model_picker_tab = None;
+                            search.update(cx, |state, cx| state.set_value("", window, cx));
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .trigger(chip)
+            .content(move |_state, _window, cx| {
+                let cache = if cx.has_global::<AgentModels>() {
+                    cx.global::<AgentModels>().0.clone()
+                } else {
+                    HashMap::new()
+                };
+                let (cur_agent, cur_model) = weak
+                    .upgrade()
+                    .and_then(|app| app.read(cx).selected_session().cloned())
+                    .map(|s| (s.agent, s.model))
+                    .unwrap_or_default();
+                let tab = weak.upgrade().and_then(|app| app.read(cx).model_picker_tab);
+                let query = search.read(cx).value().trim().to_lowercase();
+                let searching = !query.is_empty();
+                // The rail highlights the active tab; with no tab picked it
+                // follows the session's current agent.
+                let active_agent = tab.unwrap_or_else(|| cur_agent.as_str());
+
+                // ---- Left rail: one logo tab per agent (Waku-style). ----
+                let mut rail = v_flex()
+                    .w_12()
+                    .h_full()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .py_2()
+                    .bg(muted.opacity(0.4))
+                    .border_r_1()
+                    .border_color(border);
+                for a in AGENTS.iter() {
+                    let selected = active_agent == a.id;
+                    let tab_weak = weak.clone();
+                    rail = rail.child(
+                        div()
+                            .id(format!("model-tab-{}", a.id))
+                            .size(px(34.))
+                            .rounded(radius)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .when(selected, |el| el.bg(accent))
+                            .when(!selected, |el| el.hover(move |s| s.bg(muted)))
+                            .child(agent_logo(
+                                a.logo,
+                                px(18.),
+                                if selected { accent_fg } else { muted_fg },
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let _ = tab_weak.update(cx, |app, cx| {
+                                    app.model_picker_tab = Some(a.id);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+
+                // ---- Right: search field + model rows. ----
+                let mut list = v_flex().gap_0p5().p_1p5();
+                if searching {
+                    let matched: Vec<(&'static str, &acp::ModelInfo)> = AGENTS
+                        .iter()
+                        .flat_map(|a| {
+                            cache
+                                .get(a.id)
+                                .map(|c| c.models.as_slice())
+                                .into_iter()
+                                .flatten()
+                                .filter(|m| {
+                                    m.name.to_lowercase().contains(&query)
+                                        || m.value.to_lowercase().contains(&query)
+                                })
+                                .map(|m| (a.id, m))
+                        })
+                        .collect();
+                    if matched.is_empty() {
+                        list = list.child(empty_list_state("没有匹配的模型", muted_fg));
+                    }
+                    for (agent_id, model) in matched {
+                        let agent_name = AGENTS
+                            .iter()
+                            .find(|a| a.id == agent_id)
+                            .map(|a| a.name)
+                            .unwrap_or("?");
+                        list = list.child(model_row(
+                            &model.name,
+                            format!("{agent_name} · {}", model.provider),
+                            agent_id == cur_agent
+                                && cur_model.as_deref() == Some(model.value.as_str()),
+                            radius,
+                            muted,
+                            muted_fg,
+                            accent,
+                            accent_fg,
+                            {
+                                let weak = weak.clone();
+                                let value = model.value.clone();
+                                move |_, _, cx| {
+                                    let _ = weak.update(cx, |app, cx| {
+                                        app.pick_model(agent_id, value.clone(), cx);
+                                        app.model_picker_open = false;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ));
+                    }
+                } else {
+                    let list_agent =
+                        tab.or_else(|| AGENTS.iter().find(|a| a.id == cur_agent).map(|a| a.id));
+                    match list_agent.and_then(|id| cache.get(id)) {
+                        Some(catalog) if !catalog.models.is_empty() => {
+                            let agent_id = list_agent.unwrap();
+                            for model in catalog.models.iter() {
+                                list = list.child(model_row(
+                                    &model.name,
+                                    model.provider.clone(),
+                                    agent_id == cur_agent
+                                        && cur_model.as_deref() == Some(model.value.as_str()),
+                                    radius,
+                                    muted,
+                                    muted_fg,
+                                    accent,
+                                    accent_fg,
+                                    {
+                                        let weak = weak.clone();
+                                        let value = model.value.clone();
+                                        move |_, _, cx| {
+                                            let _ = weak.update(cx, |app, cx| {
+                                                app.pick_model(agent_id, value.clone(), cx);
+                                                app.model_picker_open = false;
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                ));
+                            }
+                        }
+                        Some(_) => {
+                            list = list.child(empty_list_state("无可用模型", muted_fg));
+                        }
+                        None => {
+                            list = list.child(empty_list_state("检测模型…", muted_fg));
+                        }
+                    }
+                }
+
+                h_flex()
+                    .w(px(460.))
+                    .h(px(340.))
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(border)
+                    .bg(background)
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .child(rail)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(div().p_2().border_b_1().border_color(border).child(
+                                Input::new(&search).small().prefix(
+                                    Icon::new(IconName::Search).small().text_color(muted_fg),
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .id("model-picker-list")
+                                    .overflow_y_scroll()
+                                    .child(list),
+                            ),
+                    )
+            })
+    }
+}
+
+/// A Waku-style chip trigger for the picker's popover: a plain interactive
+/// div wrapped so it can carry the popover's `selected` (open) state.
+struct ChipTrigger {
+    element: Stateful<Div>,
+}
+
+impl Selectable for ChipTrigger {
+    fn selected(self, _selected: bool) -> Self {
+        // The open-state tint is applied at build time from the controlled
+        // flag; nothing to do here.
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+
+impl IntoElement for ChipTrigger {
+    type Element = AnyElement;
+
+    fn into_element(self) -> Self::Element {
+        self.element.into_any_element()
+    }
+}
+
+/// One selectable model row in the picker's list.
+fn model_row(
+    name: &str,
+    subtitle: String,
+    selected: bool,
+    radius: Pixels,
+    muted: Hsla,
+    muted_fg: Hsla,
+    accent: Hsla,
+    accent_fg: Hsla,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(format!("model-row-{name}-{subtitle}")))
+        .px_2p5()
+        .py_1p5()
+        .gap_2()
+        .rounded(radius)
+        .flex()
+        .items_center()
+        .min_w_0()
+        .cursor_pointer()
+        .when(selected, |el| el.bg(accent))
+        .when(!selected, |el| el.hover(move |s| s.bg(muted)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .font_medium()
+                .truncate()
+                .text_color(if selected { accent_fg } else { muted_fg })
+                .child(name.to_string()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_xs()
+                .text_color(if selected { accent_fg } else { muted_fg })
+                .truncate()
+                .child(subtitle),
+        )
+        .on_click(on_click)
+}
+
+/// Centered placeholder text for an empty model list.
+fn empty_list_state(label: &'static str, muted_fg: Hsla) -> Div {
+    div()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(muted_fg)
+        .child(label)
+}
