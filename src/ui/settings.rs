@@ -465,13 +465,7 @@ impl SettingsWindow {
                         .flex_1()
                         .min_w_0()
                         .child(div().text_xs().font_medium().child(title))
-                        .child(
-                            div()
-                                .mt_0p5()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(desc),
-                        ),
+                        .child(div().mt_0p5().text_xs().text_color(muted_fg).child(desc)),
                 )
                 .child(control)
         };
@@ -492,7 +486,9 @@ impl SettingsWindow {
         let font_select = div()
             .w_48()
             .child(
-                Select::new(&self.font_select).small().placeholder("选择字体"),
+                Select::new(&self.font_select)
+                    .small()
+                    .placeholder("选择字体"),
             )
             .into_any_element();
 

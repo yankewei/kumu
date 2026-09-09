@@ -27,7 +27,7 @@ pub struct Session {
 /// A chat message stored in a session.
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub role: String, // "user" | "agent" | "system"
+    pub role: String, // "user" | "agent" | "system" | "thinking" | "tool"
     pub content: String,
 }
 
@@ -206,11 +206,9 @@ const SETTING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 pub fn get_setting(key: &str) -> Option<String> {
     let conn = Connection::open(&db_path()).ok()?;
     conn.busy_timeout(SETTING_BUSY_TIMEOUT).ok()?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = ?1",
-        [key],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
     .ok()
 }
 

@@ -69,11 +69,9 @@ pub fn apply_saved_font(cx: &mut App) {
 /// paragraph gap. Installed after every theme/base sync because gpui-component
 /// resets the global defaults whenever it re-applies the theme.
 fn install_text_view_style(cx: &mut App) {
-    let style = base::TextViewStyle::from_theme(&base::Theme::global(cx))
-        .with_paragraph_gap(rems(1.25));
-    base::TextViewDefaults::new()
-        .with_style(style)
-        .install(cx);
+    let style =
+        base::TextViewStyle::from_theme(&base::Theme::global(cx)).with_paragraph_gap(rems(1.25));
+    base::TextViewDefaults::new().with_style(style).install(cx);
 }
 
 /// The font picker's items: the system default first, then every installed,

@@ -170,8 +170,16 @@ fn emit(tx: &Sender<Event>, ev: Event) {
         match &ev {
             Event::Agent(t) => eprintln!("[acp] agent: {t}"),
             Event::Thought(t) => eprintln!("[acp] thought: {t}"),
-            Event::ToolCall { id, title, status, content } => {
-                eprintln!("[acp] tool {id}: {title} ({status}) content={} chars", content.len())
+            Event::ToolCall {
+                id,
+                title,
+                status,
+                content,
+            } => {
+                eprintln!(
+                    "[acp] tool {id}: {title} ({status}) content={} chars",
+                    content.len()
+                )
             }
             Event::SessionTitle { title } => eprintln!("[acp] title: {title}"),
             Event::Done(s) => eprintln!("[acp] done: {s}"),
@@ -374,7 +382,10 @@ fn status_name(status: &ToolCallStatus) -> &'static str {
 
 /// Flatten a tool call's content blocks into one text string, falling back to
 /// the pretty-printed raw output when there are no text blocks.
-fn tool_call_content(content: &[ToolCallContent], raw_output: &Option<serde_json::Value>) -> String {
+fn tool_call_content(
+    content: &[ToolCallContent],
+    raw_output: &Option<serde_json::Value>,
+) -> String {
     let mut parts = Vec::new();
     for c in content {
         if let ToolCallContent::Content(c) = c {
@@ -677,7 +688,11 @@ mod tests {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("probe timed out") {
-                Event::Models { agent, models, current } => {
+                Event::Models {
+                    agent,
+                    models,
+                    current,
+                } => {
                     println!("{agent}: {} models, active: {current:?}", models.len());
                     assert!(!models.is_empty());
                     break;

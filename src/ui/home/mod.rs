@@ -41,8 +41,8 @@ struct ToolRun {
 
 /// Live view of one session's in-flight turn. The answer is an
 /// incrementally-parsed markdown view; thinking and tool calls render as
-/// collapsible rows. All of it is transient: only the answer text is
-/// persisted on Done.
+/// collapsible rows. On Done the whole turn (reasoning, tool calls, answer)
+/// is persisted so the rows survive as message history.
 struct TurnState {
     started_at: std::time::Instant,
     /// Whether thinking chunks have arrived (rendered as a collapsible row).
@@ -81,6 +81,8 @@ pub struct KumuApp {
     selected: Option<i64>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
+    /// Message-history rows (thinking/tool) expanded by their list index.
+    expanded_rows: HashSet<String>,
     messages: Vec<Message>,
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
@@ -111,6 +113,7 @@ impl KumuApp {
             sessions: Vec::new(),
             selected: None,
             collapsed_projects: HashSet::new(),
+            expanded_rows: HashSet::new(),
             messages: Vec::new(),
             input_state: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -388,8 +391,23 @@ impl KumuApp {
             }
             acp::Event::Done(_) => {
                 if let Some(turn) = self.turns.remove(&session_id) {
-                    // Only the answer is persisted; thinking and tool rows
-                    // were transient views of the live turn.
+                    // Persist the whole turn as history: reasoning first,
+                    // then tool calls (serialized for re-rendering), then
+                    // the answer.
+                    if !turn.thinking_text.trim().is_empty() {
+                        self.store
+                            .insert_message(session_id, "thinking", &turn.thinking_text)
+                            .ok();
+                    }
+                    for run in &turn.tools {
+                        let payload = serde_json::json!({
+                            "title": run.title,
+                            "status": run.status,
+                            "content": run.content,
+                        })
+                        .to_string();
+                        self.store.insert_message(session_id, "tool", &payload).ok();
+                    }
                     let text = turn.answer_text;
                     if !text.trim().is_empty() {
                         self.store.insert_message(session_id, "agent", &text).ok();
