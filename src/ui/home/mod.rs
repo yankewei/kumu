@@ -39,36 +39,31 @@ struct ToolRun {
     open: bool,
 }
 
-/// Live view of one session's in-flight turn. The answer is an
-/// incrementally-parsed markdown view; thinking and tool calls render as
-/// collapsible rows. On Done the whole turn (reasoning, tool calls, answer)
-/// is persisted so the rows survive as message history.
+/// Blocks stay in arrival order; tool updates mutate their original block.
+enum TurnBlock {
+    Thinking {
+        text: String,
+        open: bool,
+    },
+    Tool(ToolRun),
+    Answer {
+        text: String,
+        view: Entity<TextViewState>,
+    },
+}
+
 struct TurnState {
     started_at: std::time::Instant,
-    /// Whether thinking chunks have arrived (rendered as a collapsible row).
-    thinking: bool,
-    /// Accumulated reasoning text, shown when the thinking row expands.
-    thinking_text: String,
-    /// Whether the thinking row is expanded.
-    thinking_open: bool,
-    answer: Entity<TextViewState>,
-    answer_len: usize,
-    /// Mirror of the answer source; persisted on Done.
-    answer_text: String,
-    tools: Vec<ToolRun>,
+    blocks: Vec<TurnBlock>,
+    active_thinking: Option<usize>,
 }
 
 impl TurnState {
-    fn new(cx: &mut App) -> Self {
+    fn new() -> Self {
         Self {
             started_at: std::time::Instant::now(),
-            thinking: false,
-            thinking_text: String::new(),
-            thinking_open: false,
-            answer: cx.new(|cx| TextViewState::markdown("", cx)),
-            answer_len: 0,
-            answer_text: String::new(),
-            tools: Vec::new(),
+            blocks: Vec::new(),
+            active_thinking: None,
         }
     }
 }
@@ -345,15 +340,29 @@ impl KumuApp {
                 // `push_str` appends incrementally instead of re-parsing the
                 // whole document on every chunk.
                 let turn = self.turn_entry(session_id, cx);
-                turn.answer
-                    .update(cx, |state, cx| state.push_str(&chunk, cx));
-                turn.answer_text.push_str(&chunk);
-                turn.answer_len += chunk.chars().count();
+                turn.active_thinking = None;
+                if let Some(TurnBlock::Answer { text, view }) = turn.blocks.last_mut() {
+                    view.update(cx, |state, cx| state.push_str(&chunk, cx));
+                    text.push_str(&chunk);
+                } else {
+                    let view = cx.new(|cx| TextViewState::markdown(&chunk, cx));
+                    turn.blocks.push(TurnBlock::Answer { text: chunk, view });
+                }
             }
             acp::Event::Thought(chunk) => {
                 let turn = self.turn_entry(session_id, cx);
-                turn.thinking = true;
-                turn.thinking_text.push_str(&chunk);
+                if let Some(TurnBlock::Thinking { text, .. }) = turn
+                    .active_thinking
+                    .and_then(|index| turn.blocks.get_mut(index))
+                {
+                    text.push_str(&chunk);
+                } else {
+                    turn.active_thinking = Some(turn.blocks.len());
+                    turn.blocks.push(TurnBlock::Thinking {
+                        text: chunk,
+                        open: false,
+                    });
+                }
             }
             acp::Event::ToolCall {
                 id,
@@ -362,7 +371,11 @@ impl KumuApp {
                 content,
             } => {
                 let turn = self.turn_entry(session_id, cx);
-                if let Some(run) = turn.tools.iter_mut().find(|t| t.id == id) {
+                turn.active_thinking = None;
+                if let Some(run) = turn.blocks.iter_mut().find_map(|block| match block {
+                    TurnBlock::Tool(run) if run.id == id => Some(run),
+                    _ => None,
+                }) {
                     if !status.is_empty() {
                         run.status = status;
                     }
@@ -373,13 +386,13 @@ impl KumuApp {
                         run.content = content;
                     }
                 } else {
-                    turn.tools.push(ToolRun {
+                    turn.blocks.push(TurnBlock::Tool(ToolRun {
                         id,
                         title,
                         status: if status.is_empty() { "running" } else { status },
                         content,
                         open: false,
-                    });
+                    }));
                 }
             }
             acp::Event::SessionTitle { title } => {
@@ -391,26 +404,23 @@ impl KumuApp {
             }
             acp::Event::Done(_) => {
                 if let Some(turn) = self.turns.remove(&session_id) {
-                    // Persist the whole turn as history: reasoning first,
-                    // then tool calls (serialized for re-rendering), then
-                    // the answer.
-                    if !turn.thinking_text.trim().is_empty() {
-                        self.store
-                            .insert_message(session_id, "thinking", &turn.thinking_text)
-                            .ok();
-                    }
-                    for run in &turn.tools {
-                        let payload = serde_json::json!({
-                            "title": run.title,
-                            "status": run.status,
-                            "content": run.content,
-                        })
-                        .to_string();
-                        self.store.insert_message(session_id, "tool", &payload).ok();
-                    }
-                    let text = turn.answer_text;
-                    if !text.trim().is_empty() {
-                        self.store.insert_message(session_id, "agent", &text).ok();
+                    for block in turn.blocks {
+                        let (role, text) = match block {
+                            TurnBlock::Thinking { text, .. } => ("thinking", text),
+                            TurnBlock::Answer { text, .. } => ("agent", text),
+                            TurnBlock::Tool(run) => (
+                                "tool",
+                                serde_json::json!({
+                                    "title": run.title,
+                                    "status": run.status,
+                                    "content": run.content,
+                                })
+                                .to_string(),
+                            ),
+                        };
+                        if !text.trim().is_empty() {
+                            self.store.insert_message(session_id, role, &text).ok();
+                        }
                     }
                     if self.selected == Some(session_id) {
                         self.messages = self.store.messages(session_id);
@@ -445,7 +455,7 @@ impl KumuApp {
     /// counting even when no ACP chunks arrive.
     fn turn_entry(&mut self, session_id: i64, cx: &mut Context<Self>) -> &mut TurnState {
         if !self.turns.contains_key(&session_id) {
-            self.turns.insert(session_id, TurnState::new(cx));
+            self.turns.insert(session_id, TurnState::new());
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()

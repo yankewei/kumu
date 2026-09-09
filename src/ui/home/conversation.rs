@@ -7,7 +7,7 @@ use gpui_kit::*;
 
 use gpui_kit::component::text::TextView;
 
-use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
+use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp, TurnBlock};
 use crate::db::Session;
 
 /// A persisted tool call, deserialized from the message content.
@@ -190,129 +190,136 @@ impl KumuApp {
                 }
             }));
         if let Some(turn) = turn {
-            // Thinking streams into a collapsible row: the header stays a
-            // bare status line, expanding it reveals the reasoning text.
-            if turn.thinking {
-                let open = turn.thinking_open;
-                let text = turn.thinking_text.clone();
-                rows = rows.child(
-                    Collapsible::new()
-                        .open(open)
-                        .motion_id("thinking")
-                        .child(
+            for (index, block) in turn.blocks.iter().enumerate() {
+                match block {
+                    TurnBlock::Thinking { text, open } => {
+                        let open = *open;
+                        let text = text.clone();
+                        let active = turn.active_thinking == Some(index);
+                        rows = rows.child(
+                            Collapsible::new()
+                                .open(open)
+                                .motion_id(SharedString::from(format!("thinking-{index}")))
+                                .child(
+                                    h_flex()
+                                        .id(SharedString::from(format!("thinking-header-{index}")))
+                                        .cursor_pointer()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .px_1()
+                                        .py_0p5()
+                                        .rounded(radius)
+                                        .hover(move |s| s.bg(muted))
+                                        .child(
+                                            Icon::new(if active {
+                                                IconName::LoaderCircle
+                                            } else {
+                                                IconName::CircleCheck
+                                            })
+                                            .small()
+                                            .text_color(muted_fg),
+                                        )
+                                        .child(
+                                            div().text_xs().text_color(muted_fg).truncate().child(
+                                                if active { "思考中…" } else { "已思考" },
+                                            ),
+                                        )
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .xsmall()
+                                                .flex_none()
+                                                .text_color(muted_fg)
+                                                .rotate(percentage(if open { 0.5 } else { 0. })),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(TurnBlock::Thinking { open, .. }) = this
+                                                .turns
+                                                .get_mut(&session_id)
+                                                .and_then(|turn| turn.blocks.get_mut(index))
+                                            {
+                                                *open = !*open;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .content(collapsed_body(
+                                    SharedString::from(format!("thinking-body-{index}")),
+                                    text,
+                                    muted_fg,
+                                )),
+                        );
+                    }
+                    TurnBlock::Tool(run) => {
+                        let (icon, color) = match run.status {
+                            "done" => (IconName::Check, success),
+                            "failed" => (IconName::Close, danger),
+                            _ => (IconName::LoaderCircle, muted_fg),
+                        };
+                        let header = |truncate_title: bool| {
                             h_flex()
-                                .id("thinking-header")
-                                .cursor_pointer()
                                 .items_center()
                                 .gap_1p5()
-                                .px_1()
-                                .py_0p5()
-                                .rounded(radius)
-                                .hover(move |s| s.bg(muted))
-                                .child(
-                                    Icon::new(IconName::LoaderCircle)
-                                        .small()
-                                        .text_color(muted_fg),
-                                )
+                                .child(Icon::new(icon).small().text_color(color))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(muted_fg)
-                                        .truncate()
-                                        .child("思考中…"),
+                                        .when(truncate_title, |this| this.truncate())
+                                        .child(run.title.clone()),
                                 )
+                        };
+                        if run.content.is_empty() {
+                            rows = rows.child(header(true).px_1().py_0p5());
+                            continue;
+                        }
+                        let open = run.open;
+                        let motion_id = SharedString::from(format!("tool-{}", run.id));
+                        let body_id = SharedString::from(format!("tool-body-{}", run.id));
+                        let header_id = SharedString::from(format!("tool-header-{}", run.id));
+                        let text = run.content.clone();
+                        rows = rows.child(
+                            Collapsible::new()
+                                .open(open)
+                                .motion_id(motion_id)
                                 .child(
-                                    Icon::new(IconName::ChevronDown)
-                                        .xsmall()
-                                        .flex_none()
-                                        .text_color(muted_fg)
-                                        .rotate(percentage(if open { 0.5 } else { 0. })),
+                                    header(true)
+                                        .id(header_id)
+                                        .cursor_pointer()
+                                        .px_1()
+                                        .py_0p5()
+                                        .rounded(radius)
+                                        .hover(move |s| s.bg(muted))
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .xsmall()
+                                                .flex_none()
+                                                .text_color(muted_fg)
+                                                .rotate(percentage(if open { 0.5 } else { 0. })),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(TurnBlock::Tool(run)) = this
+                                                .turns
+                                                .get_mut(&session_id)
+                                                .and_then(|turn| turn.blocks.get_mut(index))
+                                            {
+                                                run.open = !run.open;
+                                                cx.notify();
+                                            }
+                                        })),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(turn) = this.turns.get_mut(&session_id) {
-                                        turn.thinking_open = !turn.thinking_open;
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                        .content(collapsed_body("thinking-body", text, muted_fg)),
-                );
-            }
-            // Tool calls with output become collapsible rows; without
-            // output they stay compact status lines.
-            for run in &turn.tools {
-                let (icon, color) = match run.status {
-                    "done" => (IconName::Check, success),
-                    "failed" => (IconName::Close, danger),
-                    _ => (IconName::LoaderCircle, muted_fg),
-                };
-                let header = |truncate_title: bool| {
-                    h_flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(Icon::new(icon).small().text_color(color))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .when(truncate_title, |this| this.truncate())
-                                .child(run.title.clone()),
-                        )
-                };
-                if run.content.is_empty() {
-                    rows = rows.child(header(true));
-                    continue;
+                                .content(collapsed_body(body_id, text, muted_fg)),
+                        );
+                    }
+                    TurnBlock::Answer { view, .. } => {
+                        rows = rows.child(
+                            div().child(TextView::new(view).text_sm().line_height(relative(1.75))),
+                        );
+                    }
                 }
-                let open = run.open;
-                let motion_id = SharedString::from(format!("tool-{}", run.id));
-                let body_id = SharedString::from(format!("tool-body-{}", run.id));
-                let header_id = SharedString::from(format!("tool-header-{}", run.id));
-                let tool_id = run.id.clone();
-                let text = run.content.clone();
-                rows = rows.child(
-                    Collapsible::new()
-                        .open(open)
-                        .motion_id(motion_id)
-                        .child(
-                            header(true)
-                                .id(header_id)
-                                .cursor_pointer()
-                                .px_1()
-                                .py_0p5()
-                                .rounded(radius)
-                                .hover(move |s| s.bg(muted))
-                                .child(
-                                    Icon::new(IconName::ChevronDown)
-                                        .xsmall()
-                                        .flex_none()
-                                        .text_color(muted_fg)
-                                        .rotate(percentage(if open { 0.5 } else { 0. })),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(turn) = this.turns.get_mut(&session_id) {
-                                        if let Some(run) =
-                                            turn.tools.iter_mut().find(|t| t.id == tool_id)
-                                        {
-                                            run.open = !run.open;
-                                            cx.notify();
-                                        }
-                                    }
-                                })),
-                        )
-                        .content(collapsed_body(body_id, text, muted_fg)),
-                );
             }
-            // The answer streams incrementally; before the first
-            // chunk lands, show a bare ellipsis.
-            let body: AnyElement = if turn.answer_len == 0 {
-                div().text_sm().child("…").into_any_element()
-            } else {
-                TextView::new(&turn.answer)
-                    .text_sm()
-                    .line_height(relative(1.75))
-                    .into_any_element()
-            };
-            rows = rows.child(div().text_sm().text_color(muted_fg).child(body));
+            if turn.blocks.is_empty() {
+                rows = rows.child(div().text_sm().text_color(muted_fg).child("…"));
+            }
             // Working-time label at the bottom-left of the reply.
             let secs = turn.started_at.elapsed().as_secs();
             let label = if secs >= 60 {
@@ -388,7 +395,7 @@ fn collapsed_body(
         .overflow_y_scroll()
         .mt_1()
         .mb_0p5()
-        .ml_8()
+        .pl_8()
         .text_xs()
         .text_color(muted_fg)
         .child(text)
