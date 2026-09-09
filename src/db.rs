@@ -70,6 +70,10 @@ impl Store {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
         // Migration for dbs created before model was part of CREATE TABLE
@@ -187,6 +191,39 @@ impl Store {
         )?;
         Ok(self.conn.last_insert_rowid())
     }
+}
+
+/// Setting key holding the UI font family chosen in settings.
+pub const SETTING_FONT: &str = "font_family";
+
+/// Settings use a short-lived connection instead of the UI-owned Store: they
+/// are read once at startup (before any window exists) and written rarely
+/// from the settings window. A busy timeout covers collisions with Store
+/// writes.
+const SETTING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Read one app setting; None when unset.
+pub fn get_setting(key: &str) -> Option<String> {
+    let conn = Connection::open(&db_path()).ok()?;
+    conn.busy_timeout(SETTING_BUSY_TIMEOUT).ok()?;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Persist one app setting.
+pub fn set_setting(key: &str, value: &str) -> Result<()> {
+    let conn = Connection::open(&db_path())?;
+    conn.busy_timeout(SETTING_BUSY_TIMEOUT)?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 /// Default database location: ~/.kumu/kumu.db.

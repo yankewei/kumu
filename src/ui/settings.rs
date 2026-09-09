@@ -9,7 +9,11 @@ use super::widgets::{agent_logo, pill};
 use super::{AgentModels, ModelCatalog};
 use crate::acp;
 use crate::agents::AGENTS;
+use crate::db;
+use crate::theme;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -21,9 +25,37 @@ enum SettingsPage {
     General,
 }
 
+/// One font picker entry: shown as `label`, identified by `family`.
+#[derive(Clone)]
+struct FontItem {
+    label: SharedString,
+    family: SharedString,
+}
+
+impl SearchableListItem for FontItem {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &SharedString {
+        &self.family
+    }
+
+    /// Preview the family in its own typeface inside the dropdown.
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .font_family(self.family.clone())
+            .child(self.label.clone())
+    }
+}
+
 pub struct SettingsWindow {
     settings_page: SettingsPage,
     search_state: Entity<InputState>,
+    /// UI font picker over the system's installed families.
+    font_select: Entity<SelectState<SearchableVec<FontItem>>>,
     /// Probed model catalogs per agent id.
     models: HashMap<&'static str, ModelCatalog>,
     /// Agents whose probe is still running.
@@ -96,12 +128,48 @@ impl SettingsWindow {
         })
         .detach();
 
+        // Font picker: every installed family, preselecting the theme's
+        // current one (None = placeholder if it's no longer installed).
+        let font_select = cx.new(|cx| {
+            let items = theme::system_fonts(cx)
+                .into_iter()
+                .map(|(label, family)| FontItem { label, family })
+                .collect::<Vec<_>>();
+            let current = cx.theme().font_family.to_string();
+            let selected = items
+                .iter()
+                .position(|i| i.family.as_ref() == current.as_str())
+                .map(IndexPath::new);
+            SelectState::new(SearchableVec::from(items), selected, window, cx).searchable(true)
+        });
+        cx.subscribe_in(&font_select, window, |this, _, ev, _, cx| {
+            this.on_font_selected(ev, cx);
+        })
+        .detach();
+
         Self {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
+            font_select,
             models,
             probing,
         }
+    }
+
+    /// Commit a font pick: persist the family and apply it app-wide.
+    fn on_font_selected(
+        &mut self,
+        ev: &SelectEvent<SearchableVec<FontItem>>,
+        cx: &mut Context<Self>,
+    ) {
+        let SelectEvent::Confirm(Some(family)) = ev else {
+            return;
+        };
+        if cx.theme().font_family.as_ref() == family.as_ref() {
+            return;
+        }
+        db::set_setting(db::SETTING_FONT, family).ok();
+        theme::set_font_family(cx, family);
     }
 
     fn render_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -410,7 +478,7 @@ impl SettingsWindow {
         let switch = Switch::new("dark-mode")
             .checked(dark)
             .on_click(|checked, window, cx| {
-                Theme::change(
+                theme::change_mode(
                     if *checked {
                         ThemeMode::Dark
                     } else {
@@ -421,12 +489,25 @@ impl SettingsWindow {
                 );
             })
             .into_any_element();
+        let font_select = div()
+            .w_48()
+            .child(
+                Select::new(&self.font_select).small().placeholder("选择字体"),
+            )
+            .into_any_element();
 
         self.card(if dark { muted } else { gpui_kit::gpui::white() })
             .child(row(
                 "深色外观",
                 "在亮色与暗色主题之间切换。",
                 switch,
+                border,
+                false,
+            ))
+            .child(row(
+                "界面字体",
+                "选择应用的界面字体。",
+                font_select,
                 border,
                 false,
             ))
