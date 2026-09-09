@@ -13,7 +13,8 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionNotification, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
+    SessionNotification, SetSessionConfigOptionRequest, TextContent, ToolCallContent,
+    ToolCallStatus,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Client, ConnectionTo, Result, on_receive_notification,
@@ -30,10 +31,12 @@ pub enum Event {
     Thought(String),
     /// A tool call started or changed. `title`/`status` are empty when the
     /// update didn't touch them; `status` is one of pending/running/done/failed.
+    /// `content` is the flattened text output (empty when none).
     ToolCall {
         id: String,
         title: String,
         status: &'static str,
+        content: String,
     },
     /// The agent named the session (session/info update with a title).
     SessionTitle { title: String },
@@ -167,8 +170,8 @@ fn emit(tx: &Sender<Event>, ev: Event) {
         match &ev {
             Event::Agent(t) => eprintln!("[acp] agent: {t}"),
             Event::Thought(t) => eprintln!("[acp] thought: {t}"),
-            Event::ToolCall { id, title, status } => {
-                eprintln!("[acp] tool {id}: {title} ({status})")
+            Event::ToolCall { id, title, status, content } => {
+                eprintln!("[acp] tool {id}: {title} ({status}) content={} chars", content.len())
             }
             Event::SessionTitle { title } => eprintln!("[acp] title: {title}"),
             Event::Done(s) => eprintln!("[acp] done: {s}"),
@@ -369,6 +372,26 @@ fn status_name(status: &ToolCallStatus) -> &'static str {
     }
 }
 
+/// Flatten a tool call's content blocks into one text string, falling back to
+/// the pretty-printed raw output when there are no text blocks.
+fn tool_call_content(content: &[ToolCallContent], raw_output: &Option<serde_json::Value>) -> String {
+    let mut parts = Vec::new();
+    for c in content {
+        if let ToolCallContent::Content(c) = c {
+            if let ContentBlock::Text(t) = &c.content {
+                parts.push(t.text.clone());
+            }
+        }
+    }
+    if !parts.is_empty() {
+        return parts.join("\n");
+    }
+    raw_output
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_default()
+}
+
 async fn run(
     cfg: Config,
     cwd: PathBuf,
@@ -411,16 +434,24 @@ async fn run(
                         }
                     }
                     SessionUpdate::ToolCall(call) => {
+                        let content = tool_call_content(&call.content, &call.raw_output);
                         emit(
                             &notif_tx,
                             Event::ToolCall {
                                 id: call.tool_call_id.0.to_string(),
                                 title: call.title,
                                 status: status_name(&call.status),
+                                content,
                             },
                         );
                     }
                     SessionUpdate::ToolCallUpdate(update) => {
+                        let content = update
+                            .fields
+                            .content
+                            .as_ref()
+                            .map(|c| tool_call_content(c, &update.fields.raw_output))
+                            .unwrap_or_default();
                         emit(
                             &notif_tx,
                             Event::ToolCall {
@@ -432,6 +463,7 @@ async fn run(
                                     .as_ref()
                                     .map(status_name)
                                     .unwrap_or(""),
+                                content,
                             },
                         );
                     }

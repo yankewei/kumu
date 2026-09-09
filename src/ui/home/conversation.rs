@@ -1,6 +1,7 @@
 //! Upper right: session title, message history, and live reply.
 
 use gpui_kit::component::*;
+use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -12,13 +13,15 @@ use crate::db::Session;
 impl KumuApp {
     pub(super) fn render_conversation(&self, session: &Session, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
-        let (radius, muted_fg, primary, success, danger) = (
+        let (radius, muted, muted_fg, primary, success, danger) = (
             theme.radius,
+            theme.muted,
             theme.muted_foreground,
             theme.primary,
             theme.success,
             theme.danger,
         );
+        let session_id = session.id;
         let title = session.title.clone();
         let messages = self.messages.clone();
         let turn = self.turns.get(&session.id);
@@ -42,37 +45,74 @@ impl KumuApp {
                 } else {
                     // Agent replies arrive as markdown (ACP text
                     // blocks SHOULD render as markdown).
-                    div().text_sm().child(TextView::markdown(
-                        SharedString::from(format!("msg-{ix}")),
-                        m.content,
-                    ))
+                    div().child(
+                        TextView::markdown(
+                            SharedString::from(format!("msg-{ix}")),
+                            m.content,
+                        )
+                        .text_sm()
+                        .line_height(relative(1.75)),
+                    )
                 }
             }));
         if let Some(turn) = turn {
-            // Thinking is collapsed: a bare status row, never the
-            // raw reasoning text.
+            // Thinking streams into a collapsible row: the header stays a
+            // bare status line, expanding it reveals the reasoning text.
             if turn.thinking {
+                let open = turn.thinking_open;
+                let text = turn.thinking_text.clone();
                 rows = rows.child(
-                    h_flex()
-                        .items_center()
-                        .gap_1p5()
+                    Collapsible::new()
+                        .open(open)
+                        .motion_id("thinking")
                         .child(
-                            Icon::new(IconName::LoaderCircle)
-                                .small()
-                                .text_color(muted_fg),
+                            h_flex()
+                                .id("thinking-header")
+                                .cursor_pointer()
+                                .items_center()
+                                .gap_1p5()
+                                .px_1()
+                                .py_0p5()
+                                .rounded(radius)
+                                .hover(move |s| s.bg(muted))
+                                .child(
+                                    Icon::new(IconName::LoaderCircle)
+                                        .small()
+                                        .text_color(muted_fg),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .truncate()
+                                        .child("思考中…"),
+                                )
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .xsmall()
+                                        .flex_none()
+                                        .text_color(muted_fg)
+                                        .rotate(percentage(if open { 0.5 } else { 0. })),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(turn) = this.turns.get_mut(&session_id) {
+                                        turn.thinking_open = !turn.thinking_open;
+                                        cx.notify();
+                                    }
+                                })),
                         )
-                        .child(div().text_xs().text_color(muted_fg).child("思考中…")),
+                        .content(collapsed_body("thinking-body", text, muted_fg)),
                 );
             }
-            // Tool calls: one compact status row each, in
-            // first-seen order.
+            // Tool calls with output become collapsible rows; without
+            // output they stay compact status lines.
             for run in &turn.tools {
                 let (icon, color) = match run.status {
                     "done" => (IconName::Check, success),
                     "failed" => (IconName::Close, danger),
                     _ => (IconName::LoaderCircle, muted_fg),
                 };
-                rows = rows.child(
+                let header = |truncate_title: bool| {
                     h_flex()
                         .items_center()
                         .gap_1p5()
@@ -81,19 +121,61 @@ impl KumuApp {
                             div()
                                 .text_xs()
                                 .text_color(muted_fg)
-                                .truncate()
+                                .when(truncate_title, |this| this.truncate())
                                 .child(run.title.clone()),
-                        ),
+                        )
+                };
+                if run.content.is_empty() {
+                    rows = rows.child(header(true));
+                    continue;
+                }
+                let open = run.open;
+                let motion_id = SharedString::from(format!("tool-{}", run.id));
+                let body_id = SharedString::from(format!("tool-body-{}", run.id));
+                let header_id = SharedString::from(format!("tool-header-{}", run.id));
+                let tool_id = run.id.clone();
+                let text = run.content.clone();
+                rows = rows.child(
+                    Collapsible::new()
+                        .open(open)
+                        .motion_id(motion_id)
+                        .child(
+                            header(true)
+                                .id(header_id)
+                                .cursor_pointer()
+                                .px_1()
+                                .py_0p5()
+                                .rounded(radius)
+                                .hover(move |s| s.bg(muted))
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .xsmall()
+                                        .flex_none()
+                                        .text_color(muted_fg)
+                                        .rotate(percentage(if open { 0.5 } else { 0. })),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(turn) = this.turns.get_mut(&session_id) {
+                                        if let Some(run) =
+                                            turn.tools.iter_mut().find(|t| t.id == tool_id)
+                                        {
+                                            run.open = !run.open;
+                                            cx.notify();
+                                        }
+                                    }
+                                })),
+                        )
+                        .content(collapsed_body(body_id, text, muted_fg)),
                 );
             }
             // The answer streams incrementally; before the first
             // chunk lands, show a bare ellipsis.
             let body: AnyElement = if turn.answer_len == 0 {
-                div().child("…").into_any_element()
+                div().text_sm().child("…").into_any_element()
             } else {
-                div()
+                TextView::new(&turn.answer)
                     .text_sm()
-                    .child(TextView::new(&turn.answer))
+                    .line_height(relative(1.75))
                     .into_any_element()
             };
             rows = rows.child(div().text_sm().text_color(muted_fg).child(body));
@@ -156,4 +238,19 @@ impl KumuApp {
                     ),
             )
     }
+}
+
+/// Collapsible row body: the captured text, capped in height with its own
+/// scroll so long reasoning/output doesn't flood the conversation.
+fn collapsed_body(id: impl Into<SharedString>, text: String, muted_fg: gpui::Hsla) -> Stateful<Div> {
+    div()
+        .id(id.into())
+        .max_h(rems(16.))
+        .overflow_y_scroll()
+        .mt_1()
+        .mb_0p5()
+        .ml_5()
+        .text_xs()
+        .text_color(muted_fg)
+        .child(text)
 }

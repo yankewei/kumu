@@ -33,16 +33,24 @@ struct ToolRun {
     title: String,
     /// pending / running / done / failed
     status: &'static str,
+    /// Flattened text output from the agent, expandable in the UI.
+    content: String,
+    /// Whether the content is expanded.
+    open: bool,
 }
 
 /// Live view of one session's in-flight turn. The answer is an
-/// incrementally-parsed markdown view; thinking is collapsed into a status
-/// row and tool calls into status rows. All of it is transient: only the
-/// answer text is persisted on Done.
+/// incrementally-parsed markdown view; thinking and tool calls render as
+/// collapsible rows. All of it is transient: only the answer text is
+/// persisted on Done.
 struct TurnState {
     started_at: std::time::Instant,
-    /// Whether thinking chunks have arrived (rendered as a collapsed status).
+    /// Whether thinking chunks have arrived (rendered as a collapsible row).
     thinking: bool,
+    /// Accumulated reasoning text, shown when the thinking row expands.
+    thinking_text: String,
+    /// Whether the thinking row is expanded.
+    thinking_open: bool,
     answer: Entity<TextViewState>,
     answer_len: usize,
     /// Mirror of the answer source; persisted on Done.
@@ -55,6 +63,8 @@ impl TurnState {
         Self {
             started_at: std::time::Instant::now(),
             thinking: false,
+            thinking_text: String::new(),
+            thinking_open: false,
             answer: cx.new(|cx| TextViewState::markdown("", cx)),
             answer_len: 0,
             answer_text: String::new(),
@@ -338,10 +348,16 @@ impl KumuApp {
                 turn.answer_len += chunk.chars().count();
             }
             acp::Event::Thought(chunk) => {
-                let _ = chunk;
-                self.turn_entry(session_id, cx).thinking = true;
+                let turn = self.turn_entry(session_id, cx);
+                turn.thinking = true;
+                turn.thinking_text.push_str(&chunk);
             }
-            acp::Event::ToolCall { id, title, status } => {
+            acp::Event::ToolCall {
+                id,
+                title,
+                status,
+                content,
+            } => {
                 let turn = self.turn_entry(session_id, cx);
                 if let Some(run) = turn.tools.iter_mut().find(|t| t.id == id) {
                     if !status.is_empty() {
@@ -350,11 +366,16 @@ impl KumuApp {
                     if !title.is_empty() {
                         run.title = title;
                     }
+                    if !content.is_empty() {
+                        run.content = content;
+                    }
                 } else {
                     turn.tools.push(ToolRun {
                         id,
                         title,
                         status: if status.is_empty() { "running" } else { status },
+                        content,
+                        open: false,
                     });
                 }
             }
