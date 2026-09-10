@@ -4,6 +4,7 @@
 mod composer;
 mod conversation;
 mod model_picker;
+mod permission;
 mod sidebar;
 
 // Shared column width keeps the conversation and composer aligned.
@@ -14,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use futures::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
 
 use super::{AgentModels, ModelCatalog, SettingsWindow};
 use crate::acp;
@@ -27,6 +27,26 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+/// A permission request waiting for the user, shown above the composer while
+/// its tool call is still parked on the agent's side.
+struct PendingPermission {
+    request_id: String,
+    title: String,
+    detail: String,
+    options: Vec<acp::PermissionOptionInfo>,
+}
+
+/// Whether `conn_id` is still the connection registered for this session.
+///
+/// A session's connection is replaced when the agent is switched, so a bridge
+/// task must verify identity before acting: late events and teardown from the
+/// old connection must not touch the session that a newer one now owns.
+fn owns_connection(conns: &HashMap<i64, acp::Connection>, session_id: i64, conn_id: u64) -> bool {
+    conns
+        .get(&session_id)
+        .is_some_and(|conn| conn.id() == conn_id)
+}
+
 /// One tool call observed during the live turn, in first-seen order.
 struct ToolRun {
     id: String,
@@ -37,6 +57,11 @@ struct ToolRun {
     content: String,
     /// Whether the content is expanded.
     open: bool,
+    /// Authorization the agent is still waiting on for this call.
+    pending_permission: Option<PendingPermission>,
+    /// The choice the user made (the agent's own option label), kept on the row
+    /// so the conversation shows how the call was authorized.
+    decision: Option<String>,
 }
 
 /// Blocks stay in arrival order; tool updates mutate their original block.
@@ -81,7 +106,7 @@ pub struct KumuApp {
     messages: Vec<Message>,
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
-    acp_txs: HashMap<i64, UnboundedSender<acp::Cmd>>,
+    conns: HashMap<i64, acp::Connection>,
     /// Live turn state keyed by session id: streaming thinking, tool calls,
     /// and the answer being built. Dropped when the turn ends.
     turns: HashMap<i64, TurnState>,
@@ -118,7 +143,7 @@ impl KumuApp {
                     // inserts a newline (the textarea handles the newline).
                     .submit_on_enter(true)
             }),
-            acp_txs: HashMap::new(),
+            conns: HashMap::new(),
             turns: HashMap::new(),
             conversation_scroll: ScrollHandle::new(),
             follow_tail: true,
@@ -277,8 +302,8 @@ impl KumuApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
 
         self.ensure_connection(&session, cx);
-        if let Some(tx) = self.acp_txs.get(&session_id) {
-            let _ = tx.send(acp::Cmd::Prompt(text));
+        if let Some(conn) = self.conns.get(&session_id) {
+            conn.send(acp::Cmd::Prompt(text));
         }
         cx.notify();
     }
@@ -286,7 +311,7 @@ impl KumuApp {
     /// Get or open the ACP connection for a session's agent, and start the
     /// task that folds ACP events back into this view.
     fn ensure_connection(&mut self, session: &Session, cx: &mut Context<Self>) {
-        if self.acp_txs.contains_key(&session.id) {
+        if self.conns.contains_key(&session.id) {
             return;
         }
         let agent_id = AGENTS.iter().find(|a| a.id == session.agent).map(|a| a.id);
@@ -306,13 +331,16 @@ impl KumuApp {
         // ACP thread -> std channel -> forwarder thread -> async channel ->
         // UI task (same bridge pattern as the settings window's probes).
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
-        let cmd_tx = acp::spawn(cfg, cwd, ev_tx);
+        let conn = acp::spawn(cfg, cwd, ev_tx);
+        // Remember which connection this bridge task belongs to, so its events
+        // and teardown can be ignored once a newer one takes over the session.
+        let conn_id = conn.id();
         // Re-apply the session's stored model on a fresh connection; queued
         // until the ACP thread finishes initialize + session/new.
         if let Some(model) = session.model.clone() {
-            let _ = cmd_tx.send(acp::Cmd::SetModel(model));
+            conn.send(acp::Cmd::SetModel(model));
         }
-        self.acp_txs.insert(session.id, cmd_tx);
+        self.conns.insert(session.id, conn);
 
         let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<acp::Event>();
         std::thread::spawn(move || {
@@ -325,12 +353,130 @@ impl KumuApp {
         let session_id = session.id;
         cx.spawn(async move |this, cx| {
             while let Some(ev) = bridge_rx.next().await {
-                let _ = this.update(cx, |app, cx| {
-                    app.on_acp_event(session_id, ev, cx);
-                });
+                // A replaced connection (agent switched) must not feed the
+                // session that a newer one now owns.
+                let current = this
+                    .update(cx, |app, cx| {
+                        if !owns_connection(&app.conns, session_id, conn_id) {
+                            return false;
+                        }
+                        app.on_acp_event(session_id, ev, cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    break;
+                }
             }
+            let _ = this.update(cx, |app, cx| {
+                app.on_connection_closed(session_id, conn_id, cx)
+            });
         })
         .detach();
+    }
+
+    /// The agent exited or the connection dropped. Forget the handle and clear
+    /// any prompt still on screen: its answer can never be delivered now.
+    fn on_connection_closed(&mut self, session_id: i64, conn_id: u64, cx: &mut Context<Self>) {
+        // Only the session's current connection may tear it down; a stale one
+        // must not remove the connection that replaced it.
+        if !owns_connection(&self.conns, session_id, conn_id) {
+            return;
+        }
+        // Settle the prompts before dropping the handle, so the agent gets an
+        // answer rather than a silent disconnect.
+        self.cancel_pending_permissions(session_id);
+        self.conns.remove(&session_id);
+        cx.notify();
+    }
+
+    /// Answer every outstanding permission prompt for a session with the
+    /// protocol's `Cancelled` outcome and drop it from the rows. Used when the
+    /// turn ends or the connection goes away, so the agent is never left
+    /// waiting on a prompt that no longer exists in the UI.
+    fn cancel_pending_permissions(&mut self, session_id: i64) {
+        let request_ids: Vec<String> = self
+            .turns
+            .get(&session_id)
+            .map(|turn| {
+                turn.blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        TurnBlock::Tool(run) => run
+                            .pending_permission
+                            .as_ref()
+                            .map(|pending| pending.request_id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(conn) = self.conns.get(&session_id) {
+            for request_id in &request_ids {
+                conn.resolve_permission(request_id, None);
+            }
+        }
+
+        if let Some(turn) = self.turns.get_mut(&session_id) {
+            for block in &mut turn.blocks {
+                if let TurnBlock::Tool(run) = block {
+                    run.pending_permission = None;
+                }
+            }
+        }
+    }
+
+    /// Whether any tool call in this session is still waiting on the user.
+    fn has_pending_permission(&self, session_id: i64) -> bool {
+        self.pending_permission_for(session_id).is_some()
+    }
+
+    /// The oldest outstanding permission prompt for a session, if any.
+    ///
+    /// Only one is shown at a time: the agent is blocked on the earliest request
+    /// anyway, and a single card keeps the input area from growing unbounded.
+    fn pending_permission_for(&self, session_id: i64) -> Option<&PendingPermission> {
+        self.turns
+            .get(&session_id)?
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                TurnBlock::Tool(run) => run.pending_permission.as_ref(),
+                _ => None,
+            })
+    }
+
+    /// Record the user's decision for a pending permission and hand it to the
+    /// agent. `option_id` of `None` cancels the request.
+    fn resolve_permission(
+        &mut self,
+        session_id: i64,
+        request_id: &str,
+        option_id: Option<String>,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conn) = self.conns.get(&session_id) {
+            conn.resolve_permission(request_id, option_id);
+        }
+        if let Some(turn) = self.turns.get_mut(&session_id) {
+            for block in &mut turn.blocks {
+                let TurnBlock::Tool(run) = block else {
+                    continue;
+                };
+                let matches_request = run
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|p| p.request_id == request_id);
+                if matches_request {
+                    run.pending_permission = None;
+                    run.decision = Some(label);
+                    break;
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn on_acp_event(&mut self, session_id: i64, ev: acp::Event, cx: &mut Context<Self>) {
@@ -392,7 +538,52 @@ impl KumuApp {
                         status: if status.is_empty() { "running" } else { status },
                         content,
                         open: false,
+                        pending_permission: None,
+                        decision: None,
                     }));
+                }
+            }
+            acp::Event::PermissionRequest {
+                tool_call_id,
+                request_id,
+                title,
+                detail,
+                options,
+            } => {
+                let conn = self.conns.get(&session_id).cloned();
+                let turn = self.turn_entry(session_id, cx);
+                turn.active_thinking = None;
+                let index = match turn.blocks.iter().position(
+                    |block| matches!(block, TurnBlock::Tool(run) if run.id == tool_call_id),
+                ) {
+                    Some(index) => index,
+                    None => {
+                        // The request can arrive before the tool call it refers
+                        // to; seed the row from what the request itself carries
+                        // so the prompt is never dropped.
+                        turn.blocks.push(TurnBlock::Tool(ToolRun {
+                            id: tool_call_id,
+                            title: title.clone(),
+                            status: "pending",
+                            content: String::new(),
+                            open: false,
+                            pending_permission: None,
+                            decision: None,
+                        }));
+                        turn.blocks.len() - 1
+                    }
+                };
+                if let Some(TurnBlock::Tool(run)) = turn.blocks.get_mut(index) {
+                    // One prompt per row: settle any earlier one as cancelled.
+                    if let (Some(previous), Some(conn)) = (run.pending_permission.take(), conn) {
+                        conn.resolve_permission(&previous.request_id, None);
+                    }
+                    run.pending_permission = Some(PendingPermission {
+                        request_id,
+                        title,
+                        detail,
+                        options,
+                    });
                 }
             }
             acp::Event::SessionTitle { title } => {
@@ -403,6 +594,8 @@ impl KumuApp {
                 cx.notify();
             }
             acp::Event::Done(_) => {
+                // The turn is over, so nothing can still be authorized.
+                self.cancel_pending_permissions(session_id);
                 if let Some(turn) = self.turns.remove(&session_id) {
                     for block in turn.blocks {
                         let (role, text) = match block {
@@ -414,6 +607,7 @@ impl KumuApp {
                                     "title": run.title,
                                     "status": run.status,
                                     "content": run.content,
+                                    "decision": run.decision,
                                 })
                                 .to_string(),
                             ),
@@ -428,6 +622,7 @@ impl KumuApp {
                 }
             }
             acp::Event::Error(err) => {
+                self.cancel_pending_permissions(session_id);
                 self.turns.remove(&session_id);
                 self.system_message(session_id, err);
             }
@@ -537,6 +732,12 @@ impl KumuApp {
                     .min_w_0()
                     .child(self.render_conversation(session, cx))
                     .child(div().h_px().w_full().bg(theme.border))
+                    // A pending authorization sits directly above the input, so
+                    // the decision is always in reach.
+                    .children(
+                        self.pending_permission_for(session.id)
+                            .map(|pending| self.render_permission_card(session.id, pending, cx)),
+                    )
                     .child(self.render_composer(session, cx)),
                 None => v_flex()
                     .flex_1()
@@ -577,5 +778,41 @@ impl KumuApp {
 impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_home(window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
+    // scope through the glob, so the built-in one is imported explicitly.
+    use core::prelude::v1::test;
+
+    use super::owns_connection;
+    use crate::acp;
+    use std::collections::HashMap;
+
+    /// A session's connection is replaced when the agent is switched. Events
+    /// and teardown from the replaced connection must not be attributed to the
+    /// session, or they would clobber the connection that succeeded it.
+    #[test]
+    fn only_the_registered_connection_owns_a_session() {
+        let mut conns: HashMap<i64, acp::Connection> = HashMap::new();
+        conns.insert(7, acp::Connection::detached_for_test(1));
+
+        assert!(owns_connection(&conns, 7, 1));
+        assert!(!owns_connection(&conns, 7, 2), "another connection");
+        assert!(!owns_connection(&conns, 8, 1), "another session");
+
+        // Replacement under the same session id: the old connection is stale.
+        conns.insert(7, acp::Connection::detached_for_test(2));
+        assert!(
+            !owns_connection(&conns, 7, 1),
+            "the replaced connection must not match"
+        );
+        assert!(owns_connection(&conns, 7, 2));
+
+        // Once gone, nothing owns the session.
+        conns.remove(&7);
+        assert!(!owns_connection(&conns, 7, 2));
     }
 }

@@ -4,7 +4,7 @@
 
 A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → conversation). Built on GPUI (gpui-kit) + Agent Client Protocol, with sessions and messages stored in local SQLite (`~/.kumu/kumu.db`).
 
-Currently a capability demo: two windows — Home (session tree + conversation) and Settings (providers/general, dark mode). The ACP client layer is implemented but not wired into the UI yet.
+Two windows: Home (session tree + conversation) and Settings (providers/general, dark mode). ACP is wired into the UI — a prompt streams the agent's thinking, tool calls and markdown reply into the conversation, and the composer picks the agent's model. When an agent asks for authorization (`session/request_permission`), the choices appear on the tool row they belong to and are never auto-approved; the answer is passed back as the agent's own option id.
 
 ## Installation
 

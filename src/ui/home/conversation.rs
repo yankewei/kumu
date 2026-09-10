@@ -16,6 +16,10 @@ struct ToolPayload {
     title: String,
     status: String,
     content: String,
+    /// How the call was authorized, when the agent asked. Absent on rows
+    /// stored before permissions were surfaced.
+    #[serde(default)]
+    decision: Option<String>,
 }
 
 impl KumuApp {
@@ -110,67 +114,75 @@ impl KumuApp {
                                 _ => (IconName::LoaderCircle, muted_fg),
                             };
                             let key = format!("tool-{ix}");
-                            let motion_id = SharedString::from(format!("tool-{ix}"));
-                            let header_id = SharedString::from(format!("tool-header-{ix}"));
-                            let body_id = SharedString::from(format!("tool-body-{ix}"));
                             let open = expanded.contains(&key);
                             let title_text = payload.title;
                             let text = payload.content;
-                            if text.is_empty() {
-                                return h_flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .px_1()
-                                    .py_0p5()
-                                    .child(Icon::new(icon).small().text_color(color))
+                            let decision = payload.decision;
+                            let header = h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .px_1()
+                                .py_0p5()
+                                .child(Icon::new(icon).small().text_color(color))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted_fg)
+                                        .truncate()
+                                        .child(title_text),
+                                );
+                            let row = if text.is_empty() {
+                                header.into_any_element()
+                            } else {
+                                let motion_id = SharedString::from(format!("tool-{ix}"));
+                                let header_id = SharedString::from(format!("tool-header-{ix}"));
+                                let body_id = SharedString::from(format!("tool-body-{ix}"));
+                                Collapsible::new()
+                                    .open(open)
+                                    .motion_id(motion_id)
                                     .child(
+                                        header
+                                            .id(header_id)
+                                            .cursor_pointer()
+                                            .rounded(radius)
+                                            .hover(move |s| s.bg(muted))
+                                            .child(
+                                                Icon::new(IconName::ChevronDown)
+                                                    .xsmall()
+                                                    .flex_none()
+                                                    .text_color(muted_fg)
+                                                    .rotate(percentage(if open {
+                                                        0.5
+                                                    } else {
+                                                        0.
+                                                    })),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if this.expanded_rows.contains(&key) {
+                                                    this.expanded_rows.remove(&key);
+                                                } else {
+                                                    this.expanded_rows.insert(key.clone());
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .content(collapsed_body(body_id, text, muted_fg))
+                                    .into_any_element()
+                            };
+                            // A stored decision explains how the call was
+                            // authorized, which the status alone does not.
+                            let mut container = v_flex().child(row);
+                            if let Some(decision) = decision {
+                                container = container.child(
+                                    div().ml_8().px_1().py_0p5().child(
                                         div()
                                             .text_xs()
                                             .text_color(muted_fg)
-                                            .truncate()
-                                            .child(title_text),
-                                    )
-                                    .into_any_element();
+                                            .child(format!("权限 · {decision}")),
+                                    ),
+                                );
                             }
-                            Collapsible::new()
-                                .open(open)
-                                .motion_id(motion_id)
-                                .child(
-                                    h_flex()
-                                        .id(header_id)
-                                        .cursor_pointer()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .px_1()
-                                        .py_0p5()
-                                        .rounded(radius)
-                                        .hover(move |s| s.bg(muted))
-                                        .child(Icon::new(icon).small().text_color(color))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted_fg)
-                                                .truncate()
-                                                .child(title_text),
-                                        )
-                                        .child(
-                                            Icon::new(IconName::ChevronDown)
-                                                .xsmall()
-                                                .flex_none()
-                                                .text_color(muted_fg)
-                                                .rotate(percentage(if open { 0.5 } else { 0. })),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if this.expanded_rows.contains(&key) {
-                                                this.expanded_rows.remove(&key);
-                                            } else {
-                                                this.expanded_rows.insert(key.clone());
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .content(collapsed_body(body_id, text, muted_fg))
-                                .into_any_element()
+                            container.into_any_element()
                         }
                         Err(_) => div()
                             .text_xs()
@@ -270,45 +282,56 @@ impl KumuApp {
                         };
                         if run.content.is_empty() {
                             rows = rows.child(header(true).px_1().py_0p5());
-                            continue;
+                        } else {
+                            let open = run.open;
+                            let motion_id = SharedString::from(format!("tool-{}", run.id));
+                            let body_id = SharedString::from(format!("tool-body-{}", run.id));
+                            let header_id = SharedString::from(format!("tool-header-{}", run.id));
+                            let text = run.content.clone();
+                            rows = rows.child(
+                                Collapsible::new()
+                                    .open(open)
+                                    .motion_id(motion_id)
+                                    .child(
+                                        header(true)
+                                            .id(header_id)
+                                            .cursor_pointer()
+                                            .px_1()
+                                            .py_0p5()
+                                            .rounded(radius)
+                                            .hover(move |s| s.bg(muted))
+                                            .child(
+                                                Icon::new(IconName::ChevronDown)
+                                                    .xsmall()
+                                                    .flex_none()
+                                                    .text_color(muted_fg)
+                                                    .rotate(percentage(if open {
+                                                        0.5
+                                                    } else {
+                                                        0.
+                                                    })),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(TurnBlock::Tool(run)) = this
+                                                    .turns
+                                                    .get_mut(&session_id)
+                                                    .and_then(|turn| turn.blocks.get_mut(index))
+                                                {
+                                                    run.open = !run.open;
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                    .content(collapsed_body(body_id, text, muted_fg)),
+                            );
                         }
-                        let open = run.open;
-                        let motion_id = SharedString::from(format!("tool-{}", run.id));
-                        let body_id = SharedString::from(format!("tool-body-{}", run.id));
-                        let header_id = SharedString::from(format!("tool-header-{}", run.id));
-                        let text = run.content.clone();
-                        rows = rows.child(
-                            Collapsible::new()
-                                .open(open)
-                                .motion_id(motion_id)
-                                .child(
-                                    header(true)
-                                        .id(header_id)
-                                        .cursor_pointer()
-                                        .px_1()
-                                        .py_0p5()
-                                        .rounded(radius)
-                                        .hover(move |s| s.bg(muted))
-                                        .child(
-                                            Icon::new(IconName::ChevronDown)
-                                                .xsmall()
-                                                .flex_none()
-                                                .text_color(muted_fg)
-                                                .rotate(percentage(if open { 0.5 } else { 0. })),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(TurnBlock::Tool(run)) = this
-                                                .turns
-                                                .get_mut(&session_id)
-                                                .and_then(|turn| turn.blocks.get_mut(index))
-                                            {
-                                                run.open = !run.open;
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .content(collapsed_body(body_id, text, muted_fg)),
-                        );
+                        // The prompt itself lives above the composer; the row
+                        // only records how the call ended up authorized.
+                        if run.pending_permission.is_none()
+                            && let Some(decision) = run.decision.as_deref()
+                        {
+                            rows = rows.child(self.render_permission_decision(decision, cx));
+                        }
                     }
                     TurnBlock::Answer { view, .. } => {
                         rows = rows.child(

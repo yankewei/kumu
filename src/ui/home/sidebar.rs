@@ -97,6 +97,9 @@ impl KumuApp {
                     let sid = s.id;
                     let title = s.title.clone();
                     let agent = AGENTS.iter().find(|a| a.id == s.agent).and_then(|a| a.logo);
+                    // A prompt can be waiting on a session the user is not
+                    // looking at, so mark the row that needs an answer.
+                    let waiting = self.has_pending_permission(sid);
                     tree.push(
                         div()
                             .id(format!("session-{sid}"))
@@ -117,6 +120,15 @@ impl KumuApp {
                                     .items_center()
                                     .gap_2()
                                     .child(div().flex_1().text_xs().child(title))
+                                    .when(waiting, |this| {
+                                        this.child(
+                                            div()
+                                                .size(px(6.))
+                                                .flex_none()
+                                                .rounded(px(3.))
+                                                .bg(theme.warning),
+                                        )
+                                    })
                                     .child(agent_logo(agent, px(14.), tag)),
                             ),
                     );

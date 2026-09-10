@@ -33,22 +33,22 @@ impl KumuApp {
             .ok();
         self.refresh();
         if agent_changed {
-            // Dropping the sender closes the old agent subprocess; the fresh
+            // Dropping the handle closes the old agent subprocess; the fresh
             // connection below re-applies the stored model on session/new.
-            // The in-flight reply (if any) is abandoned with it.
-            self.acp_txs.remove(&session_id);
+            // Any prompt still waiting on the old connection is settled first,
+            // and the in-flight reply (if any) is abandoned with it.
+            self.cancel_pending_permissions(session_id);
+            self.conns.remove(&session_id);
             self.turns.remove(&session_id);
         }
         if let Some(session) = self.selected_session().cloned() {
             // A connection that already existed needs the model pushed
             // explicitly; a fresh one from ensure_connection re-applies the
             // just-stored model itself.
-            let existed = self.acp_txs.contains_key(&session_id);
+            let existed = self.conns.contains_key(&session_id);
             self.ensure_connection(&session, cx);
-            if existed {
-                if let Some(tx) = self.acp_txs.get(&session_id) {
-                    let _ = tx.send(acp::Cmd::SetModel(model_value));
-                }
+            if existed && let Some(conn) = self.conns.get(&session_id) {
+                conn.send(acp::Cmd::SetModel(model_value));
             }
         }
         cx.notify();
