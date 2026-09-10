@@ -7,8 +7,8 @@
 use gpui_kit::component::*;
 use gpui_kit::*;
 
-pub const THEME_LIGHT: &str = include_str!("../themes/zed-light.json");
-pub const THEME_DARK: &str = include_str!("../themes/zed-dark.json");
+pub const THEME_LIGHT: &str = include_str!("../themes/light.json");
+pub const THEME_DARK: &str = include_str!("../themes/dark.json");
 pub const THEME_LIGHT_NAME: &str = "Kumu Light";
 pub const THEME_DARK_NAME: &str = "Zed Dark";
 
