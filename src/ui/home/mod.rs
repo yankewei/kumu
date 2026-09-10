@@ -20,7 +20,8 @@ use super::{AgentModels, ModelCatalog, SettingsWindow};
 use crate::acp;
 use crate::agents::AGENTS;
 use crate::db::{Message, Project, Session, Store, db_path};
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::*;
@@ -45,6 +46,27 @@ fn owns_connection(conns: &HashMap<i64, acp::Connection>, session_id: i64, conn_
     conns
         .get(&session_id)
         .is_some_and(|conn| conn.id() == conn_id)
+}
+
+/// Which session to select after `id` is deleted.
+///
+/// The nearest sibling in the same project (the next one, else the previous),
+/// else the first session left anywhere, else none — so the conversation pane
+/// never goes blank while sessions remain.
+fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
+    let project = sessions.iter().find(|s| s.id == id)?.project_id;
+    let mut siblings: Vec<i64> = sessions
+        .iter()
+        .filter(|s| s.project_id == project)
+        .map(|s| s.id)
+        .collect();
+    siblings.sort_unstable();
+    siblings
+        .iter()
+        .copied()
+        .find(|&sid| sid > id)
+        .or_else(|| siblings.iter().rev().copied().find(|&sid| sid < id))
+        .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
 }
 
 /// One tool call observed during the live turn, in first-seen order.
@@ -267,6 +289,65 @@ impl KumuApp {
             self.refresh();
             self.select_session(id);
         }
+    }
+
+    /// Ask before deleting: the session and its whole history go away for good.
+    fn confirm_delete_session(
+        &self,
+        session_id: i64,
+        weak: WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let weak = weak.clone();
+            alert
+                .title("删除会话")
+                .description(format!(
+                    "「{title}」的全部消息将被永久删除，此操作无法撤销。"
+                ))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("删除")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = weak.update(cx, |app, cx| app.delete_session(session_id, cx));
+                    true
+                })
+        });
+    }
+
+    /// Delete a session: settle anything it was waiting on, drop its live
+    /// connection (which tears down the agent subprocess), forget its turn
+    /// state, then remove the row and its history.
+    fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        // Pick the fallback while the doomed row is still in the list.
+        let next = neighbor_session(&self.sessions, session_id);
+        self.cancel_pending_permissions(session_id);
+        self.conns.remove(&session_id);
+        self.turns.remove(&session_id);
+        self.store.delete_session(session_id).ok();
+        self.refresh();
+
+        if self.selected == Some(session_id) {
+            match next.filter(|next| self.sessions.iter().any(|s| s.id == *next)) {
+                Some(next) => self.select_session(next),
+                None => {
+                    self.selected = None;
+                    self.messages.clear();
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -787,9 +868,21 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::owns_connection;
+    use super::{neighbor_session, owns_connection};
     use crate::acp;
+    use crate::db::Session;
     use std::collections::HashMap;
+
+    fn session(id: i64, project_id: i64) -> Session {
+        Session {
+            id,
+            project_id,
+            agent: "omp".into(),
+            title: format!("会话 {id}"),
+            cwd: "/tmp".into(),
+            model: None,
+        }
+    }
 
     /// A session's connection is replaced when the agent is switched. Events
     /// and teardown from the replaced connection must not be attributed to the
@@ -814,5 +907,36 @@ mod tests {
         // Once gone, nothing owns the session.
         conns.remove(&7);
         assert!(!owns_connection(&conns, 7, 2));
+    }
+
+    /// Deleting the session the user is looking at must land them next door,
+    /// not on a blank pane.
+    #[test]
+    fn deletion_falls_back_to_the_nearest_sibling() {
+        let sessions = vec![session(1, 10), session(2, 10), session(3, 10)];
+
+        assert_eq!(neighbor_session(&sessions, 2), Some(3), "the next one");
+        assert_eq!(
+            neighbor_session(&sessions, 3),
+            Some(2),
+            "no next: the previous one"
+        );
+        assert_eq!(
+            neighbor_session(&sessions, 1),
+            Some(2),
+            "the first one skips forward too"
+        );
+    }
+
+    /// With no sibling left in the project, the other project's sessions still
+    /// beat the empty state; only a truly empty list returns `None`.
+    #[test]
+    fn deletion_falls_back_across_projects_then_to_nothing() {
+        let sessions = vec![session(1, 10), session(2, 20)];
+
+        assert_eq!(neighbor_session(&sessions, 1), Some(2), "another project");
+        assert_eq!(neighbor_session(&sessions, 2), Some(1), "and back");
+        assert_eq!(neighbor_session(&[session(1, 10)], 1), None, "the last one");
+        assert_eq!(neighbor_session(&[], 1), None, "unknown id");
     }
 }

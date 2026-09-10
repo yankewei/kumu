@@ -143,6 +143,17 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Delete a session and all of its messages.
+    ///
+    /// The messages FK cascade does not fire here (SQLite's `foreign_keys`
+    /// pragma is off), so the rows are removed explicitly, in one transaction.
+    pub fn delete_session(&self, id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.commit()
+    }
+
     pub fn update_session_agent_model(
         &self,
         id: i64,
@@ -228,4 +239,52 @@ pub fn set_setting(key: &str, value: &str) -> Result<()> {
 pub fn db_path() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
     std::path::PathBuf::from(home).join(".kumu").join("kumu.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        let store = Store {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        store.init().unwrap();
+        store
+    }
+
+    /// Deleting a session drops its history with it, and touches nothing else:
+    /// the cascade on `messages` never fires (the pragma is off), so this is
+    /// the only thing keeping orphan rows out of the db.
+    #[test]
+    fn deleting_a_session_removes_only_its_messages() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let doomed = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+        let kept = store
+            .insert_session(project, "omp", "会话 2", "/tmp")
+            .unwrap();
+        store.insert_message(doomed, "user", "删除我").unwrap();
+        store.insert_message(kept, "user", "留下我").unwrap();
+
+        store.delete_session(doomed).unwrap();
+
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, kept);
+        assert!(store.messages(doomed).is_empty());
+        assert_eq!(store.messages(kept).len(), 1);
+        assert_eq!(store.messages(kept)[0].content, "留下我");
+    }
+
+    /// Deleting an unknown id is a no-op rather than an error, so a stale
+    /// menu action can never break the db.
+    #[test]
+    fn deleting_an_unknown_session_is_harmless() {
+        let store = store();
+        store.delete_session(404).unwrap();
+        assert!(store.sessions().is_empty());
+    }
 }

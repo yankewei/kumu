@@ -1,5 +1,6 @@
 //! Left column: projects, sessions, and settings entry.
 
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -20,9 +21,12 @@ impl KumuApp {
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
         let selected = self.selected;
+        // Row context menus outlive this render, so they reach the view
+        // through a weak handle.
+        let weak = cx.entity().downgrade();
 
         // ---- Left: sidebar surface with the project/session tree. ----
-        let mut tree: Vec<Stateful<Div>> = Vec::new();
+        let mut tree: Vec<AnyElement> = Vec::new();
         for project in &self.projects {
             let project_name = project.name.clone();
             let project_id = project.id;
@@ -78,7 +82,8 @@ impl KumuApp {
                                 cx.notify();
                             }))
                             .child(Icon::new(IconName::Plus).small()),
-                    ),
+                    )
+                    .into_any_element(),
             );
             let project_sessions = self
                 .sessions
@@ -130,7 +135,28 @@ impl KumuApp {
                                         )
                                     })
                                     .child(agent_logo(agent, px(14.), tag)),
-                            ),
+                            )
+                            // Right-click the row for its actions; deleting is
+                            // destructive, so it asks for confirmation first.
+                            .context_menu({
+                                let weak = weak.clone();
+                                move |menu, _, _| {
+                                    let weak = weak.clone();
+                                    menu.item(
+                                        PopupMenuItem::new("删除会话")
+                                            .icon(IconName::Delete)
+                                            .on_click(move |_, window, cx| {
+                                                let handle = weak.clone();
+                                                let _ = weak.update(cx, move |app, cx| {
+                                                    app.confirm_delete_session(
+                                                        sid, handle, window, cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                }
+                            })
+                            .into_any_element(),
                     );
                 }
             }
