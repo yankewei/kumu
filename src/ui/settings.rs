@@ -11,6 +11,7 @@ use crate::acp;
 use crate::agents::AGENTS;
 use crate::db;
 use crate::theme;
+use crate::ui::layers;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -172,7 +173,8 @@ impl SettingsWindow {
         theme::set_font_family(cx, family);
     }
 
-    fn render_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let overlays = layers::window_layers(window, cx);
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
         let (foreground, muted_fg, border, radius) = (
@@ -337,6 +339,7 @@ impl SettingsWindow {
                     .child(div().w_px().h_full().bg(sidebar_border))
                     .child(right),
             )
+            .child(overlays)
     }
 
     /// One card: elevated surface (muted bg) with hairline-separated rows.

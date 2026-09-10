@@ -20,6 +20,7 @@ use super::{AgentModels, ModelCatalog, SettingsWindow};
 use crate::acp;
 use crate::agents::AGENTS;
 use crate::db::{Message, Project, Session, Store, db_path};
+use crate::ui::layers;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
@@ -292,13 +293,9 @@ impl KumuApp {
     }
 
     /// Ask before deleting: the session and its whole history go away for good.
-    fn confirm_delete_session(
-        &self,
-        session_id: i64,
-        weak: WeakEntity<Self>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    fn confirm_delete_session(&self, session_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        // The dialog outlives this call, so it reaches the view weakly.
+        let weak = cx.weak_entity();
         let title = self
             .sessions
             .iter()
@@ -803,7 +800,8 @@ impl KumuApp {
         }
     }
 
-    fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let overlays = layers::window_layers(window, cx);
         let theme = cx.theme();
         let right =
             match self.selected_session() {
@@ -853,6 +851,7 @@ impl KumuApp {
                     .child(div().w_px().h_full().bg(theme.border))
                     .child(right),
             )
+            .child(overlays)
     }
 }
 

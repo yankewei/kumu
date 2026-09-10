@@ -142,18 +142,13 @@ impl KumuApp {
                                 let weak = weak.clone();
                                 move |menu, _, _| {
                                     let weak = weak.clone();
-                                    menu.item(
-                                        PopupMenuItem::new("删除会话")
-                                            .icon(IconName::Delete)
-                                            .on_click(move |_, window, cx| {
-                                                let handle = weak.clone();
-                                                let _ = weak.update(cx, move |app, cx| {
-                                                    app.confirm_delete_session(
-                                                        sid, handle, window, cx,
-                                                    )
-                                                });
-                                            }),
-                                    )
+                                    menu.item(PopupMenuItem::new("删除").on_click(
+                                        move |_, window, cx| {
+                                            let _ = weak.update(cx, move |app, cx| {
+                                                app.confirm_delete_session(sid, window, cx)
+                                            });
+                                        },
+                                    ))
                                 }
                             })
                             .into_any_element(),
