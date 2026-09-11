@@ -28,8 +28,8 @@ use agent_client_protocol::{
 use super::config::Config;
 use super::connection::WeakPermissions;
 use super::convert::{
-    model_catalog, permission_detail, permission_kind, permission_outcome, status_name,
-    tool_call_content, variant_name,
+    mode_catalog, model_catalog, permission_detail, permission_kind, permission_outcome,
+    status_name, tool_call_content, variant_name,
 };
 use super::event::{Cmd, Event, PermissionOptionInfo, emit};
 
@@ -53,6 +53,10 @@ pub(super) async fn run(
     let perm_tx = ev_tx.clone();
     let log_tx = ev_tx.clone();
     let auto_prompt = cfg.auto_prompt.clone();
+    // Both the notification handler and the connection closure report this
+    // agent's session options; `cfg` itself is moved into the latter, so take
+    // the id out first.
+    let agent_id = cfg.agent;
     // Distinguishes permission requests on this connection; the agent does not
     // give us one of its own.
     let next_perm_id = Arc::new(AtomicU64::new(1));
@@ -121,6 +125,25 @@ pub(super) async fn run(
                                 emit(&notif_tx, Event::SessionTitle { title });
                             }
                         }
+                    }
+                    SessionUpdate::ConfigOptionUpdate(update) => {
+                        // The notification carries the complete state, so both
+                        // catalogs are rebuilt from it. This is what keeps the
+                        // pickers honest when the agent changes its own model
+                        // or mode (e.g. leaving a plan mode on its own).
+                        let config_options = Some(update.config_options);
+                        let (_, current_model, models) = model_catalog(&config_options);
+                        let (_, current_mode, modes) = mode_catalog(&config_options);
+                        emit(
+                            &notif_tx,
+                            Event::SessionOptions {
+                                agent: agent_id,
+                                models,
+                                current_model,
+                                modes,
+                                current_mode,
+                            },
+                        );
                     }
                     other => {
                         let name = variant_name(&other).to_string();
@@ -224,15 +247,21 @@ pub(super) async fn run(
                 let session_id = new_session.session_id;
                 emit(&log_tx, Event::Log(format!("session ready: {session_id}")));
 
-                // Read the model config option: its id lets the UI switch the
-                // session's model later; the catalog feeds the model picker.
-                let (model_option_id, current, models) = model_catalog(&new_session.config_options);
+                // Read the model and mode config options: their ids let the UI
+                // switch either later; the catalogs feed the composer's
+                // pickers.
+                let (model_option_id, current_model, models) =
+                    model_catalog(&new_session.config_options);
+                let (mode_option_id, current_mode, modes) =
+                    mode_catalog(&new_session.config_options);
                 emit(
                     &ev_tx,
-                    Event::Models {
-                        agent: cfg.agent,
+                    Event::SessionOptions {
+                        agent: agent_id,
                         models,
-                        current,
+                        current_model,
+                        modes,
+                        current_mode,
                     },
                 );
 
@@ -280,6 +309,26 @@ pub(super) async fn run(
                             }
                             None => {
                                 emit(&log_tx, Event::Log("no model config option to set".into()))
+                            }
+                        },
+                        Cmd::SetMode(value) => match &mode_option_id {
+                            Some(option_id) => {
+                                if let Err(err) = connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        session_id.clone(),
+                                        option_id.clone(),
+                                        value.as_str(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    emit(&log_tx, Event::Log(format!("set mode failed: {err}")));
+                                } else {
+                                    emit(&log_tx, Event::Log(format!("mode set: {value}")));
+                                }
+                            }
+                            None => {
+                                emit(&log_tx, Event::Log("no mode config option to set".into()))
                             }
                         },
                     }
@@ -331,15 +380,19 @@ mod tests {
             tx,
         );
 
-        // Wait for the model catalog, then pick its first model before
-        // prompting — exercises session/set_config_option on the live path.
+        // Wait for the catalogs, then pick a model and a mode before prompting
+        // — exercises session/set_config_option on the live path for both, in
+        // the order they are queued.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("catalog timed out") {
-                Event::Models { models, .. } => {
+                Event::SessionOptions { models, modes, .. } => {
                     if let Some(model) = models.first() {
                         conn.send(Cmd::SetModel(model.value.clone()));
+                    }
+                    if let Some(mode) = modes.get(1) {
+                        conn.send(Cmd::SetMode(mode.value.clone()));
                     }
                     break;
                 }

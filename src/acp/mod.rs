@@ -15,7 +15,7 @@
 //!   - `config`     — how to launch an agent subprocess;
 //!   - `connection` — the UI-side handle, the permission table, the thread;
 //!   - `session`    — the live session loop and its two handlers;
-//!   - `probe`      — the throwaway connection that discovers models;
+//!   - `probe`      — the throwaway connection that discovers session options;
 //!   - `convert`    — protocol -> app translation, where protocol types stop.
 
 mod config;
@@ -30,5 +30,5 @@ mod test_support;
 
 pub use config::Config;
 pub use connection::{Connection, spawn};
-pub use event::{Cmd, Event, ModelInfo, PermissionKind, PermissionOptionInfo};
+pub use event::{Cmd, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo};
 pub use probe::probe;

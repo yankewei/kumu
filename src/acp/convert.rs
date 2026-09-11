@@ -12,56 +12,125 @@ use agent_client_protocol::schema::v1::{
     ToolCallStatus, ToolCallUpdate,
 };
 
-use super::event::{ModelInfo, PermissionKind};
+use super::event::{ModeInfo, ModelInfo, PermissionKind};
+
+/// A select session config option, located by [`select`].
+struct Select<'a> {
+    id: &'a SessionConfigId,
+    current: &'a str,
+    options: &'a SessionConfigSelectOptions,
+}
+
+/// Find the select config option for `category`, falling back to the option
+/// whose id is `fallback_id`.
+///
+/// The category is what the spec reserves for a given selector (`model`,
+/// `mode`); the id fallback covers agents that omit it, since categories are
+/// explicitly "UX purposes only" and must be handled gracefully when missing.
+fn select<'a>(
+    config_options: &'a Option<Vec<SessionConfigOption>>,
+    category: SessionConfigOptionCategory,
+    fallback_id: &str,
+) -> Option<Select<'a>> {
+    for option in config_options.as_deref()? {
+        let matches =
+            option.category.as_ref() == Some(&category) || option.id.0.as_ref() == fallback_id;
+        if !matches {
+            continue;
+        }
+        if let SessionConfigKind::Select(select) = &option.kind {
+            return Some(Select {
+                id: &option.id,
+                current: select.current_value.0.as_ref(),
+                options: &select.options,
+            });
+        }
+    }
+    None
+}
+
+/// Flatten a select's values, grouped or not, keeping the agent's order.
+fn select_values(options: &SessionConfigSelectOptions) -> Vec<(&str, &str)> {
+    let mut values = Vec::new();
+    match options {
+        SessionConfigSelectOptions::Ungrouped(flat) => {
+            for option in flat {
+                values.push(select_value(option));
+            }
+        }
+        SessionConfigSelectOptions::Grouped(groups) => {
+            for group in groups {
+                for option in &group.options {
+                    values.push(select_value(option));
+                }
+            }
+        }
+        _ => {}
+    }
+    values
+}
+
+/// One select value as `(value, name)`; an option's optional description is
+/// not carried through, since neither picker shows one.
+fn select_value(option: &SessionConfigSelectOption) -> (&str, &str) {
+    (option.value.0.as_ref(), option.name.as_str())
+}
 
 /// Extract the session's model config option: its id (for
 /// `session/set_config_option`), the value the agent reports as active, and
 /// the selectable models, grouped flat.
+///
+/// Models are sorted by provider then name so the picker groups them — the one
+/// place kumu overrides the agent's own ordering.
 pub(super) fn model_catalog(
     config_options: &Option<Vec<SessionConfigOption>>,
 ) -> (Option<SessionConfigId>, Option<String>, Vec<ModelInfo>) {
-    let mut option_id = None;
-    let mut current = None;
-    let mut models: Vec<ModelInfo> = Vec::new();
-    if let Some(options) = config_options {
-        for option in options {
-            let is_model = matches!(&option.category, Some(SessionConfigOptionCategory::Model))
-                || option.id.0.as_ref() == "model";
-            if !is_model {
-                continue;
+    let Some(select) = select(config_options, SessionConfigOptionCategory::Model, "model") else {
+        return (None, None, Vec::new());
+    };
+    let mut models = select_values(select.options)
+        .into_iter()
+        .map(|(value, name)| {
+            let provider = value.split('/').next().unwrap_or(value).to_string();
+            ModelInfo {
+                value: value.to_string(),
+                name: strip_provider_prefix(name, &provider),
+                provider,
             }
-            if let SessionConfigKind::Select(select) = &option.kind {
-                option_id = Some(option.id.clone());
-                current = Some(select.current_value.0.as_ref().to_string());
-                let mut add = |value: &SessionConfigSelectOption| {
-                    let raw = value.value.0.as_ref();
-                    let provider = raw.split('/').next().unwrap_or(raw).to_string();
-                    models.push(ModelInfo {
-                        value: raw.to_string(),
-                        name: strip_provider_prefix(&value.name, &provider),
-                        provider,
-                    });
-                };
-                match &select.options {
-                    SessionConfigSelectOptions::Ungrouped(values) => {
-                        for v in values {
-                            add(v);
-                        }
-                    }
-                    SessionConfigSelectOptions::Grouped(groups) => {
-                        for group in groups {
-                            for v in &group.options {
-                                add(v);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
     models.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
-    (option_id, current, models)
+    (
+        Some(select.id.clone()),
+        Some(select.current.to_string()),
+        models,
+    )
+}
+
+/// Extract the session's mode config option: its id (for
+/// `session/set_config_option`), the value the agent reports as active, and
+/// the selectable modes.
+///
+/// Modes keep the agent's own order, unlike models: the spec asks clients to
+/// display options in the order given, and that order carries intent.
+pub(super) fn mode_catalog(
+    config_options: &Option<Vec<SessionConfigOption>>,
+) -> (Option<SessionConfigId>, Option<String>, Vec<ModeInfo>) {
+    let Some(select) = select(config_options, SessionConfigOptionCategory::Mode, "mode") else {
+        return (None, None, Vec::new());
+    };
+    let modes = select_values(select.options)
+        .into_iter()
+        .map(|(value, name)| ModeInfo {
+            value: value.to_string(),
+            name: name.to_string(),
+        })
+        .collect();
+    (
+        Some(select.id.clone()),
+        Some(select.current.to_string()),
+        modes,
+    )
 }
 
 /// Drop the provider prefix from a display name ("OpenCode Go/GLM-5.3" →
@@ -200,7 +269,6 @@ pub(super) fn variant_name(u: &SessionUpdate) -> &'static str {
         SessionUpdate::Plan(_) => "plan",
         SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
         SessionUpdate::CurrentModeUpdate(_) => "current_mode_update",
-        SessionUpdate::ConfigOptionUpdate(_) => "config_option_update",
         SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
         SessionUpdate::UsageUpdate(_) => "usage_update",
         _ => "other",
@@ -210,7 +278,9 @@ pub(super) fn variant_name(u: &SessionUpdate) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{TextContent, ToolCallUpdateFields};
+    use agent_client_protocol::schema::v1::{
+        SessionConfigSelectGroup, TextContent, ToolCallUpdateFields,
+    };
 
     /// Every known option kind maps to itself; the enum is `#[non_exhaustive]`
     /// so anything else must fall back to the neutral variant rather than being
@@ -296,5 +366,183 @@ mod tests {
         let detail = permission_detail(&tool_call);
         assert!(detail.contains("Overwrite the config"), "got: {detail}");
         assert!(!detail.contains("/tmp/a"), "got: {detail}");
+    }
+
+    /// Build an ungrouped select option from `(value, name, description)`.
+    fn select_option(
+        id: &str,
+        category: Option<SessionConfigOptionCategory>,
+        current: &str,
+        values: Vec<(&str, &str, &str)>,
+    ) -> SessionConfigOption {
+        let values = values
+            .into_iter()
+            .map(|(value, name, description)| {
+                SessionConfigSelectOption::new(value.to_string(), name).description(
+                    if description.is_empty() {
+                        None
+                    } else {
+                        Some(description.to_string())
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let option = SessionConfigOption::select(
+            id.to_string(),
+            id,
+            current.to_string(),
+            SessionConfigSelectOptions::Ungrouped(values),
+        );
+        match category {
+            Some(category) => option.category(category),
+            None => option,
+        }
+    }
+
+    /// The mode option is found by its spec category, and its values keep the
+    /// order the agent gave — that order carries intent, so unlike models it
+    /// must not be sorted. The values here carry descriptions, as the real
+    /// agents' do, and they are simply not carried through.
+    #[test]
+    fn mode_catalog_keeps_the_agents_order() {
+        let config_options = Some(vec![
+            select_option(
+                "model",
+                Some(SessionConfigOptionCategory::Model),
+                "zeta/z",
+                vec![("zeta/z", "Z", "")],
+            ),
+            select_option(
+                "mode",
+                Some(SessionConfigOptionCategory::Mode),
+                "ask",
+                vec![
+                    ("ask", "Ask", "Request permission before making any changes"),
+                    ("build", "Build", "Write and modify code"),
+                ],
+            ),
+        ]);
+
+        let (id, current, modes) = mode_catalog(&config_options);
+
+        assert_eq!(id.expect("mode option id").0.as_ref(), "mode");
+        assert_eq!(current.as_deref(), Some("ask"));
+        assert_eq!(
+            modes.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
+            ["ask", "build"]
+        );
+        assert_eq!(
+            modes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            ["Ask", "Build"]
+        );
+    }
+
+    /// An agent that omits the category is still understood: the option id the
+    /// spec reserves for modes is the fallback.
+    #[test]
+    fn mode_catalog_falls_back_to_the_option_id() {
+        let config_options = Some(vec![select_option(
+            "mode",
+            None,
+            "plan",
+            vec![("plan", "Plan", "")],
+        )]);
+
+        let (id, current, modes) = mode_catalog(&config_options);
+
+        assert_eq!(id.expect("mode option id").0.as_ref(), "mode");
+        assert_eq!(current.as_deref(), Some("plan"));
+        assert_eq!(modes.len(), 1);
+        assert_eq!(modes[0].name, "Plan");
+    }
+
+    /// Having no mode option is normal (the agent has no modes), and a
+    /// non-select option must not be mistaken for one.
+    #[test]
+    fn mode_catalog_is_empty_without_a_select_mode_option() {
+        let no_modes: Option<Vec<SessionConfigOption>> = None;
+        assert!(mode_catalog(&no_modes).0.is_none());
+
+        let model_only = Some(vec![select_option(
+            "model",
+            Some(SessionConfigOptionCategory::Model),
+            "a/x",
+            vec![("a/x", "X", "")],
+        )]);
+        let (id, current, modes) = mode_catalog(&model_only);
+        assert!(id.is_none(), "the model option is not a mode option");
+        assert!(current.is_none());
+        assert!(modes.is_empty());
+
+        let boolean = Some(vec![
+            SessionConfigOption::boolean("mode", "Mode", true)
+                .category(SessionConfigOptionCategory::Mode),
+        ]);
+        assert!(
+            mode_catalog(&boolean).0.is_none(),
+            "a boolean option is not a select"
+        );
+    }
+
+    /// Guard for the shared lookup: grouped values flatten flat, the provider
+    /// prefix is stripped from a name that repeats it, and the result stays
+    /// sorted by provider then name.
+    #[test]
+    fn model_catalog_flattens_groups_and_sorts_by_provider() {
+        let grouped = SessionConfigSelectOptions::Grouped(vec![
+            SessionConfigSelectGroup::new(
+                "zeta",
+                "Zeta",
+                vec![SessionConfigSelectOption::new("zeta/z2", "Zeta Z2")],
+            ),
+            SessionConfigSelectGroup::new(
+                "alpha",
+                "Alpha",
+                vec![SessionConfigSelectOption::new("alpha/a2", "Model Two")],
+            ),
+        ]);
+        let config_options = Some(vec![
+            SessionConfigOption::select("model", "Model", "zeta/z2", grouped)
+                .category(SessionConfigOptionCategory::Model),
+            select_option(
+                "mode",
+                Some(SessionConfigOptionCategory::Mode),
+                "ask",
+                vec![("ask", "Ask", "")],
+            ),
+        ]);
+
+        let (id, current, models) = model_catalog(&config_options);
+
+        assert_eq!(id.expect("model option id").0.as_ref(), "model");
+        assert_eq!(current.as_deref(), Some("zeta/z2"));
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| m.provider.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"],
+            "groups flatten into one list, sorted by provider not group order"
+        );
+        assert_eq!(models[1].name, "Zeta Z2");
+
+        let prefixed = Some(vec![select_option(
+            "model",
+            Some(SessionConfigOptionCategory::Model),
+            "alpha/a1",
+            vec![
+                ("alpha/a1", "Alpha/Model One", ""),
+                ("zeta/z2", "Zeta Z2", ""),
+            ],
+        )]);
+        let models = model_catalog(&prefixed).2;
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| (m.provider.as_str(), m.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("alpha", "Model One"), ("zeta", "Zeta Z2")],
+            "a name repeating its provider is stripped, and provider sorts first"
+        );
     }
 }

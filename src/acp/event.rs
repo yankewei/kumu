@@ -47,13 +47,17 @@ pub enum Event {
     },
     /// A fatal error occurred.
     Error(String),
-    /// The models an agent exposes, from its session's model config option
-    /// (sent by both probes and live connections).
-    Models {
+    /// The options an agent exposes for a session — its models and modes —
+    /// each with the value the agent reports as active. Sent by both probes
+    /// and live connections, and re-sent when the agent changes them itself
+    /// (`config_option_update`). Both come from the same session config
+    /// options, so they travel together.
+    SessionOptions {
         agent: &'static str,
         models: Vec<ModelInfo>,
-        /// The value the agent reports as active for this session.
-        current: Option<String>,
+        current_model: Option<String>,
+        modes: Vec<ModeInfo>,
+        current_mode: Option<String>,
     },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
@@ -68,6 +72,17 @@ pub struct ModelInfo {
     pub name: String,
     /// Provider inferred from the value prefix before `/`.
     pub provider: String,
+}
+
+/// One selectable session mode as exposed by an agent's mode config option.
+/// The set is the agent's own (there is no fixed read-only / ask / code
+/// vocabulary), and so is its order.
+#[derive(Clone, Debug)]
+pub struct ModeInfo {
+    /// Value to pass to `session/set_config_option`.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
 }
 
 /// What a permission option means, used to pick the UI treatment. The label is
@@ -99,6 +114,8 @@ pub enum Cmd {
     Prompt(String),
     /// Select the session's model by its config-option value.
     SetModel(String),
+    /// Select the session's mode by its config-option value.
+    SetMode(String),
 }
 
 /// Send an event to the UI, echoing to stderr when KUMU_DEBUG is set (handy
@@ -132,19 +149,26 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
             ),
             Event::Error(s) => eprintln!("[acp] error: {s}"),
             Event::Log(s) => eprintln!("[acp] log: {s}"),
-            Event::Models {
+            Event::SessionOptions {
                 agent,
                 models,
-                current,
+                current_model,
+                modes,
+                current_mode,
             } => eprintln!(
-                "[acp] models: {agent} exposes {} models (active: {:?}) across {} providers",
+                "[acp] options: {agent} exposes {} models (active: {current_model:?}) across {} providers; \
+                 modes: [{}] (active: {current_mode:?})",
                 models.len(),
-                current,
                 models
                     .iter()
                     .map(|m| m.provider.clone())
                     .collect::<std::collections::HashSet<_>>()
-                    .len()
+                    .len(),
+                modes
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
             Event::ProbeFailed { agent } => eprintln!("[acp] probe {agent} failed"),
         }

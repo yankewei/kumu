@@ -22,6 +22,8 @@ pub struct Session {
     pub cwd: String,
     /// Selected model (config-option value); None = agent default.
     pub model: Option<String>,
+    /// Selected session mode (config-option value); None = agent default.
+    pub mode: Option<String>,
 }
 
 /// A chat message stored in a session.
@@ -61,6 +63,7 @@ impl Store {
                 title TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 model TEXT,
+                mode TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -76,10 +79,14 @@ impl Store {
                 value TEXT NOT NULL
             );",
         )?;
-        // Migration for dbs created before model was part of CREATE TABLE
-        // (duplicate-column errors on fresh dbs are expected and ignored).
+        // Migrations for dbs created before model/mode were part of CREATE
+        // TABLE (duplicate-column errors on fresh dbs are expected and
+        // ignored).
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
+            .ok();
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN mode TEXT", [])
             .ok();
         Ok(())
     }
@@ -112,7 +119,9 @@ impl Store {
     pub fn sessions(&self) -> Vec<Session> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, project_id, agent, title, cwd, model FROM sessions ORDER BY id")
+            .prepare(
+                "SELECT id, project_id, agent, title, cwd, model, mode FROM sessions ORDER BY id",
+            )
             .unwrap();
         stmt.query_map([], |row| {
             Ok(Session {
@@ -122,6 +131,7 @@ impl Store {
                 title: row.get(3)?,
                 cwd: row.get(4)?,
                 model: row.get(5)?,
+                mode: row.get(6)?,
             })
         })
         .unwrap()
@@ -163,6 +173,17 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
             params![agent, model, id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the session's mode, or clear it (`None`) when it no longer
+    /// applies — mode ids are agent-specific, so switching agents invalidates
+    /// the stored one.
+    pub fn update_session_mode(&self, id: i64, mode: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET mode = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![mode, id],
         )?;
         Ok(())
     }
@@ -286,5 +307,28 @@ mod tests {
         let store = store();
         store.delete_session(404).unwrap();
         assert!(store.sessions().is_empty());
+    }
+
+    /// The chosen mode is remembered across reads, and clearing it is how a
+    /// session falls back to the agent's default — mode ids are agent-specific,
+    /// so switching agents has to be able to drop a stale one.
+    #[test]
+    fn session_mode_round_trips_and_clears() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+        assert_eq!(
+            store.sessions()[0].mode,
+            None,
+            "a new session stores no mode"
+        );
+
+        store.update_session_mode(session, Some("ask")).unwrap();
+        assert_eq!(store.sessions()[0].mode.as_deref(), Some("ask"));
+
+        store.update_session_mode(session, None).unwrap();
+        assert_eq!(store.sessions()[0].mode, None);
     }
 }

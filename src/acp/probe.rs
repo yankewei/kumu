@@ -1,5 +1,5 @@
-//! Model discovery: a throwaway connection that handshakes, creates one
-//! session, reads its model config option and returns.
+//! Session option discovery: a throwaway connection that handshakes, creates
+//! one session, reads its model and mode config options and returns.
 //!
 //! Nothing is kept alive — the connection dropping is what kills the agent
 //! subprocess, so a probe never leaves a process behind.
@@ -11,12 +11,13 @@ use agent_client_protocol::schema::v1::{InitializeRequest, NewSessionRequest};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectionTo};
 
 use super::config::Config;
-use super::convert::model_catalog;
+use super::convert::{mode_catalog, model_catalog};
 use super::event::{Event, emit};
 
-/// Probe an agent over ACP just to discover its models: initialize, create
-/// one throwaway session, read the model config option, then return — the
-/// connection teardown kills the agent subprocess. Fails after `TIMEOUT`.
+/// Probe an agent over ACP just to discover its session options: initialize,
+/// create one throwaway session, read the model and mode config options, then
+/// return — the connection teardown kills the agent subprocess. Fails after
+/// `TIMEOUT`.
 pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
     std::thread::Builder::new()
         .name(format!("kumu-probe-{agent}"))
@@ -53,14 +54,18 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                                     .send_request(NewSessionRequest::new(cwd))
                                     .block_task()
                                     .await?;
-                                let (_, current, models) =
+                                let (_, current_model, models) =
                                     model_catalog(&new_session.config_options);
+                                let (_, current_mode, modes) =
+                                    mode_catalog(&new_session.config_options);
                                 emit(
                                     &ev_tx,
-                                    Event::Models {
+                                    Event::SessionOptions {
                                         agent,
                                         models,
-                                        current,
+                                        current_model,
+                                        modes,
+                                        current_mode,
                                     },
                                 );
                                 Ok(())
@@ -112,12 +117,19 @@ mod tests {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("probe timed out") {
-                Event::Models {
+                Event::SessionOptions {
                     agent,
                     models,
-                    current,
+                    current_model,
+                    modes,
+                    current_mode,
                 } => {
-                    println!("{agent}: {} models, active: {current:?}", models.len());
+                    println!(
+                        "{agent}: {} models, active: {current_model:?}; modes: {:?}, active: \
+                         {current_mode:?}",
+                        models.len(),
+                        modes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                    );
                     assert!(!models.is_empty());
                     break;
                 }
@@ -150,7 +162,7 @@ mod tests {
                 .recv_timeout(remaining)
                 .expect("probe ended without ProbeFailed")
             {
-                Event::Models { .. } => panic!("unexpected probe success"),
+                Event::SessionOptions { .. } => panic!("unexpected probe success"),
                 Event::ProbeFailed { agent } => {
                     assert_eq!(agent, "missing");
                     break;

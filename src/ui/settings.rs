@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use futures::StreamExt;
 
 use super::widgets::{agent_logo, pill};
-use super::{AgentModels, ModelCatalog};
+use super::{AgentSessionOptions, SessionOptions};
 use crate::acp;
 use crate::agents::AGENTS;
 use crate::db;
@@ -57,27 +57,27 @@ pub struct SettingsWindow {
     search_state: Entity<InputState>,
     /// UI font picker over the system's installed families.
     font_select: Entity<SelectState<SearchableVec<FontItem>>>,
-    /// Probed model catalogs per agent id.
-    models: HashMap<&'static str, ModelCatalog>,
+    /// Probed session options (models and modes) per agent id.
+    session_options: HashMap<&'static str, SessionOptions>,
     /// Agents whose probe is still running.
     probing: HashSet<&'static str>,
 }
 
 impl SettingsWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let models = if cx.has_global::<AgentModels>() {
-            cx.global::<AgentModels>().0.clone()
+        let session_options = if cx.has_global::<AgentSessionOptions>() {
+            cx.global::<AgentSessionOptions>().0.clone()
         } else {
             // Must exist up front: the probe handler below calls global_mut.
-            cx.set_global(AgentModels::default());
+            cx.set_global(AgentSessionOptions::default());
             HashMap::new()
         };
 
-        // Probe every not-yet-cached agent over ACP for its model list.
+        // Probe every not-yet-cached agent over ACP for its session options.
         let mut probing = HashSet::new();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
         for a in AGENTS.iter() {
-            if models.contains_key(a.id) {
+            if session_options.contains_key(a.id) {
                 continue;
             }
             if let Some(cfg) = acp::Config::for_agent(a.id) {
@@ -100,28 +100,34 @@ impl SettingsWindow {
         cx.spawn(async move |this, cx| {
             while let Some(ev) = bridge_rx.next().await {
                 let outcome = match &ev {
-                    acp::Event::Models {
+                    acp::Event::SessionOptions {
                         agent,
                         models,
-                        current,
+                        current_model,
+                        modes,
+                        current_mode,
                     } => Some((
                         *agent,
-                        Some(ModelCatalog {
+                        Some(SessionOptions {
                             models: models.clone(),
-                            current: current.clone(),
+                            current_model: current_model.clone(),
+                            modes: modes.clone(),
+                            current_mode: current_mode.clone(),
                         }),
                     )),
                     acp::Event::ProbeFailed { agent } => Some((*agent, None)),
                     _ => None,
                 };
-                let Some((agent, catalog)) = outcome else {
+                let Some((agent, options)) = outcome else {
                     continue;
                 };
                 let _ = this.update(cx, |settings, cx| {
                     settings.probing.remove(&agent);
-                    if let Some(catalog) = catalog {
-                        settings.models.insert(agent, catalog.clone());
-                        cx.global_mut::<AgentModels>().0.insert(agent, catalog);
+                    if let Some(options) = options {
+                        settings.session_options.insert(agent, options.clone());
+                        cx.global_mut::<AgentSessionOptions>()
+                            .0
+                            .insert(agent, options);
                     }
                     cx.notify();
                 });
@@ -152,7 +158,7 @@ impl SettingsWindow {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
             font_select,
-            models,
+            session_options,
             probing,
         }
     }
@@ -366,7 +372,7 @@ impl SettingsWindow {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let status_pill = if let Some(catalog) = self.models.get(a.id) {
+                let status_pill = if let Some(catalog) = self.session_options.get(a.id) {
                     let providers = catalog
                         .models
                         .iter()

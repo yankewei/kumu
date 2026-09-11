@@ -13,8 +13,8 @@ use super::KumuApp;
 use crate::acp;
 use crate::agents::AGENTS;
 use crate::db::Session;
-use crate::ui::AgentModels;
-use crate::ui::widgets::agent_logo;
+use crate::ui::AgentSessionOptions;
+use crate::ui::widgets::{ChipTrigger, agent_logo, select_row};
 
 impl KumuApp {
     /// Switch a session's agent and/or model: persists the choice, reopens the
@@ -31,8 +31,12 @@ impl KumuApp {
         self.store
             .update_session_agent_model(session_id, agent_id, Some(&model_value))
             .ok();
-        self.refresh();
         if agent_changed {
+            // Mode ids are the agent's own vocabulary, so the stored one stops
+            // meaning anything: drop it, and the picker falls back to the new
+            // agent's default until the user chooses again. Written before the
+            // refresh below so the re-applied mode comes from the fresh row.
+            self.store.update_session_mode(session_id, None).ok();
             // Dropping the handle closes the old agent subprocess; the fresh
             // connection below re-applies the stored model on session/new.
             // Any prompt still waiting on the old connection is settled first,
@@ -41,6 +45,7 @@ impl KumuApp {
             self.conns.remove(&session_id);
             self.turns.remove(&session_id);
         }
+        self.refresh();
         if let Some(session) = self.selected_session().cloned() {
             // A connection that already existed needs the model pushed
             // explicitly; a fresh one from ensure_connection re-applies the
@@ -59,12 +64,12 @@ impl KumuApp {
     /// back to the model the agent reports as active, then the agent name.
     fn picker_label(&self, session: &Session, cx: &App) -> String {
         let catalog = cx
-            .try_global::<AgentModels>()
+            .try_global::<AgentSessionOptions>()
             .and_then(|g| g.0.get(session.agent.as_str()));
         let model_value = session
             .model
             .as_deref()
-            .or(catalog.and_then(|c| c.current.as_deref()));
+            .or(catalog.and_then(|c| c.current_model.as_deref()));
         match model_value {
             Some(value) => catalog
                 .and_then(|c| c.models.iter().find(|m| m.value == value))
@@ -137,8 +142,8 @@ impl KumuApp {
             })
             .trigger(chip)
             .content(move |_state, _window, cx| {
-                let cache = if cx.has_global::<AgentModels>() {
-                    cx.global::<AgentModels>().0.clone()
+                let cache = if cx.has_global::<AgentSessionOptions>() {
+                    cx.global::<AgentSessionOptions>().0.clone()
                 } else {
                     HashMap::new()
                 };
@@ -220,9 +225,9 @@ impl KumuApp {
                             .find(|a| a.id == agent_id)
                             .map(|a| a.name)
                             .unwrap_or("?");
-                        list = list.child(model_row(
+                        list = list.child(select_row(
                             &model.name,
-                            format!("{agent_name} · {}", model.provider),
+                            Some(format!("{agent_name} · {}", model.provider)),
                             agent_id == cur_agent
                                 && cur_model.as_deref() == Some(model.value.as_str()),
                             radius,
@@ -250,9 +255,9 @@ impl KumuApp {
                         Some(catalog) if !catalog.models.is_empty() => {
                             let agent_id = list_agent.unwrap();
                             for model in catalog.models.iter() {
-                                list = list.child(model_row(
+                                list = list.child(select_row(
                                     &model.name,
-                                    model.provider.clone(),
+                                    Some(model.provider.clone()),
                                     agent_id == cur_agent
                                         && cur_model.as_deref() == Some(model.value.as_str()),
                                     radius,
@@ -314,77 +319,6 @@ impl KumuApp {
                     )
             })
     }
-}
-
-/// A Waku-style chip trigger for the picker's popover: a plain interactive
-/// div wrapped so it can carry the popover's `selected` (open) state.
-struct ChipTrigger {
-    element: Stateful<Div>,
-}
-
-impl Selectable for ChipTrigger {
-    fn selected(self, _selected: bool) -> Self {
-        // The open-state tint is applied at build time from the controlled
-        // flag; nothing to do here.
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        false
-    }
-}
-
-impl IntoElement for ChipTrigger {
-    type Element = AnyElement;
-
-    fn into_element(self) -> Self::Element {
-        self.element.into_any_element()
-    }
-}
-
-/// One selectable model row in the picker's list.
-fn model_row(
-    name: &str,
-    subtitle: String,
-    selected: bool,
-    radius: Pixels,
-    muted: Hsla,
-    muted_fg: Hsla,
-    accent: Hsla,
-    accent_fg: Hsla,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(SharedString::from(format!("model-row-{name}-{subtitle}")))
-        .px_2p5()
-        .py_1p5()
-        .gap_2()
-        .rounded(radius)
-        .flex()
-        .items_center()
-        .min_w_0()
-        .cursor_pointer()
-        .when(selected, |el| el.bg(accent))
-        .when(!selected, |el| el.hover(move |s| s.bg(muted)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_xs()
-                .font_medium()
-                .truncate()
-                .text_color(if selected { accent_fg } else { muted_fg })
-                .child(name.to_string()),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .text_color(if selected { accent_fg } else { muted_fg })
-                .truncate()
-                .child(subtitle),
-        )
-        .on_click(on_click)
 }
 
 /// Centered placeholder text for an empty model list.

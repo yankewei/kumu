@@ -3,6 +3,7 @@
 
 mod composer;
 mod conversation;
+mod mode_picker;
 mod model_picker;
 mod permission;
 mod sidebar;
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 
-use super::{AgentModels, ModelCatalog, SettingsWindow};
+use super::{AgentSessionOptions, SessionOptions, SettingsWindow};
 use crate::acp;
 use crate::agents::AGENTS;
 use crate::db::{Message, Project, Session, Store, db_path};
@@ -144,6 +145,8 @@ pub struct KumuApp {
     model_picker_open: bool,
     model_picker_tab: Option<&'static str>,
     model_search: Entity<InputState>,
+    /// Mode picker open flag; the mode list is short enough to need no search.
+    mode_picker_open: bool,
 }
 
 impl KumuApp {
@@ -173,6 +176,7 @@ impl KumuApp {
             model_picker_open: false,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
+            mode_picker_open: false,
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
@@ -188,18 +192,18 @@ impl KumuApp {
         app
     }
 
-    /// Probe agents whose model catalog isn't cached yet, so the composer's
-    /// model picker has data even before settings was opened.
+    /// Probe agents whose session options aren't cached yet, so the composer's
+    /// model and mode pickers have data even before settings was opened.
     fn probe_models(&mut self, cx: &mut Context<Self>) {
         let mut missing = Vec::new();
-        if cx.has_global::<AgentModels>() {
+        if cx.has_global::<AgentSessionOptions>() {
             for a in AGENTS.iter() {
-                if !cx.global::<AgentModels>().0.contains_key(a.id) {
+                if !cx.global::<AgentSessionOptions>().0.contains_key(a.id) {
                     missing.push(a.id);
                 }
             }
         } else {
-            cx.set_global(AgentModels::default());
+            cx.set_global(AgentSessionOptions::default());
             missing.extend(AGENTS.iter().map(|a| a.id));
         }
         if missing.is_empty() {
@@ -413,10 +417,13 @@ impl KumuApp {
         // Remember which connection this bridge task belongs to, so its events
         // and teardown can be ignored once a newer one takes over the session.
         let conn_id = conn.id();
-        // Re-apply the session's stored model on a fresh connection; queued
-        // until the ACP thread finishes initialize + session/new.
+        // Re-apply the session's stored model and mode on a fresh connection;
+        // queued until the ACP thread finishes initialize + session/new.
         if let Some(model) = session.model.clone() {
             conn.send(acp::Cmd::SetModel(model));
+        }
+        if let Some(mode) = session.mode.clone() {
+            conn.send(acp::Cmd::SetMode(mode));
         }
         self.conns.insert(session.id, conn);
 
@@ -704,19 +711,27 @@ impl KumuApp {
                 self.turns.remove(&session_id);
                 self.system_message(session_id, err);
             }
-            acp::Event::Models {
+            // Either can be absent (an agent may offer only one of them), so
+            // an empty report is not worth caching.
+            acp::Event::SessionOptions {
                 agent,
                 models,
-                current,
-            } => {
-                if !models.is_empty() {
-                    if !cx.has_global::<AgentModels>() {
-                        cx.set_global(AgentModels::default());
-                    }
-                    cx.global_mut::<AgentModels>()
-                        .0
-                        .insert(agent, ModelCatalog { models, current });
+                current_model,
+                modes,
+                current_mode,
+            } if !models.is_empty() || !modes.is_empty() => {
+                if !cx.has_global::<AgentSessionOptions>() {
+                    cx.set_global(AgentSessionOptions::default());
                 }
+                cx.global_mut::<AgentSessionOptions>().0.insert(
+                    agent,
+                    SessionOptions {
+                        models,
+                        current_model,
+                        modes,
+                        current_mode,
+                    },
+                );
             }
             _ => {}
         }
@@ -880,6 +895,7 @@ mod tests {
             title: format!("会话 {id}"),
             cwd: "/tmp".into(),
             model: None,
+            mode: None,
         }
     }
 

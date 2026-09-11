@@ -51,6 +51,7 @@ impl KumuApp {
                             .px_2()
                             .py_1p5()
                             .child(self.model_picker(session, cx))
+                            .children(self.mode_picker(session, cx))
                             .child(div().flex_1())
                             .child(
                                 Button::new("send")
