@@ -7,8 +7,8 @@ use futures::StreamExt;
 
 use super::widgets::{agent_logo, pill};
 use super::{AgentSessionOptions, SessionOptions};
-use crate::acp;
 use crate::agents::AGENTS;
+use crate::backend;
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -75,13 +75,13 @@ impl SettingsWindow {
 
         // Probe every not-yet-cached agent over ACP for its session options.
         let mut probing = HashSet::new();
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
         for a in AGENTS.iter() {
             if session_options.contains_key(a.id) {
                 continue;
             }
-            if let Some(cfg) = acp::Config::for_agent(a.id) {
-                acp::probe(a.id, cfg, ev_tx.clone());
+            if let Some(cfg) = backend::Config::for_agent(a.id) {
+                backend::probe(a.id, cfg, ev_tx.clone());
                 probing.insert(a.id);
             }
         }
@@ -89,7 +89,7 @@ impl SettingsWindow {
 
         // Bridge the ACP threads' std channel into the UI: a plain forwarder
         // thread feeds an async channel the main thread can await.
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<acp::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -100,12 +100,16 @@ impl SettingsWindow {
         cx.spawn(async move |this, cx| {
             while let Some(ev) = bridge_rx.next().await {
                 let outcome = match &ev {
-                    acp::Event::SessionOptions {
+                    backend::Event::SessionOptions {
                         agent,
                         models,
                         current_model,
                         modes,
                         current_mode,
+                        sandboxes,
+                        current_sandbox,
+                        reasoning,
+                        current_reasoning,
                     } => Some((
                         *agent,
                         Some(SessionOptions {
@@ -113,9 +117,13 @@ impl SettingsWindow {
                             current_model: current_model.clone(),
                             modes: modes.clone(),
                             current_mode: current_mode.clone(),
+                            sandboxes: sandboxes.clone(),
+                            current_sandbox: current_sandbox.clone(),
+                            reasoning: reasoning.clone(),
+                            current_reasoning: current_reasoning.clone(),
                         }),
                     )),
-                    acp::Event::ProbeFailed { agent } => Some((*agent, None)),
+                    backend::Event::ProbeFailed { agent } => Some((*agent, None)),
                     _ => None,
                 };
                 let Some((agent, options)) = outcome else {

@@ -11,7 +11,7 @@ pub struct AgentDef {
     pub logo: Option<&'static str>,
 }
 
-pub const AGENTS: [AgentDef; 2] = [
+pub const AGENTS: [AgentDef; 3] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
@@ -23,5 +23,11 @@ pub const AGENTS: [AgentDef; 2] = [
         name: "Oh My Pi",
         desc: "omp · ACP v1",
         logo: Some("omp.png"),
+    },
+    AgentDef {
+        id: "codex",
+        name: "Codex",
+        desc: "codex app-server",
+        logo: Some("codex.svg"),
     },
 ];

@@ -51,7 +51,11 @@ impl KumuApp {
                             .px_2()
                             .py_1p5()
                             .child(self.model_picker(session, cx))
+                            // Reasoning sits beside the model because it is
+                            // that model's axis, not a session-wide setting.
+                            .children(self.reasoning_picker(session, cx))
                             .children(self.mode_picker(session, cx))
+                            .children(self.sandbox_picker(session, cx))
                             .child(div().flex_1())
                             .child(
                                 Button::new("send")

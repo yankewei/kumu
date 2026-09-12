@@ -7,7 +7,7 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::KumuApp;
-use crate::acp;
+use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
@@ -44,7 +44,7 @@ impl KumuApp {
             .ok();
         self.refresh();
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(acp::Cmd::SetMode(value));
+            conn.send(backend::Cmd::SetMode(value));
         }
         cx.notify();
     }
@@ -169,7 +169,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::mode_label;
-    use crate::acp::ModeInfo;
+    use crate::backend::ModeInfo;
     use crate::ui::SessionOptions;
 
     fn mode(value: &str, name: &str) -> ModeInfo {

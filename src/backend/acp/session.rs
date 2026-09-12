@@ -25,15 +25,19 @@ use agent_client_protocol::{
     on_receive_request,
 };
 
-use super::config::Config;
-use super::connection::WeakPermissions;
 use super::convert::{
     mode_catalog, model_catalog, permission_detail, permission_kind, permission_outcome,
-    status_name, tool_call_content, variant_name,
+    reasoning_catalog, status_name, tool_call_content, variant_name,
 };
-use super::event::{Cmd, Event, PermissionOptionInfo, emit};
+use crate::backend::config::Config;
+use crate::backend::connection::WeakPermissions;
+use crate::backend::event::{Cmd, Event, PermissionOptionInfo, emit};
 
-pub(super) async fn run(
+/// Drive one ACP session to completion. Called by the shared [`spawn`]
+/// dispatcher, which is one level up, so the visibility follows the caller.
+///
+/// [`spawn`]: crate::backend::spawn
+pub(in crate::backend) async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
@@ -127,13 +131,14 @@ pub(super) async fn run(
                         }
                     }
                     SessionUpdate::ConfigOptionUpdate(update) => {
-                        // The notification carries the complete state, so both
-                        // catalogs are rebuilt from it. This is what keeps the
-                        // pickers honest when the agent changes its own model
-                        // or mode (e.g. leaving a plan mode on its own).
+                        // The notification carries the complete state, so every
+                        // catalog is rebuilt from it. This is what keeps the
+                        // pickers honest when the agent changes its own model,
+                        // mode or reasoning level.
                         let config_options = Some(update.config_options);
                         let (_, current_model, models) = model_catalog(&config_options);
                         let (_, current_mode, modes) = mode_catalog(&config_options);
+                        let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
                         emit(
                             &notif_tx,
                             Event::SessionOptions {
@@ -142,6 +147,11 @@ pub(super) async fn run(
                                 current_model,
                                 modes,
                                 current_mode,
+                                // ACP has no sandbox axis.
+                                sandboxes: Vec::new(),
+                                current_sandbox: None,
+                                reasoning,
+                                current_reasoning,
                             },
                         );
                     }
@@ -247,13 +257,15 @@ pub(super) async fn run(
                 let session_id = new_session.session_id;
                 emit(&log_tx, Event::Log(format!("session ready: {session_id}")));
 
-                // Read the model and mode config options: their ids let the UI
-                // switch either later; the catalogs feed the composer's
-                // pickers.
+                // Read the model, mode and reasoning config options: their ids
+                // let the UI switch any of them later; the catalogs feed the
+                // composer's pickers.
                 let (model_option_id, current_model, models) =
                     model_catalog(&new_session.config_options);
                 let (mode_option_id, current_mode, modes) =
                     mode_catalog(&new_session.config_options);
+                let (reasoning_option_id, current_reasoning, reasoning) =
+                    reasoning_catalog(&new_session.config_options);
                 emit(
                     &ev_tx,
                     Event::SessionOptions {
@@ -262,6 +274,10 @@ pub(super) async fn run(
                         current_model,
                         modes,
                         current_mode,
+                        sandboxes: Vec::new(),
+                        current_sandbox: None,
+                        reasoning,
+                        current_reasoning,
                     },
                 );
 
@@ -331,6 +347,36 @@ pub(super) async fn run(
                                 emit(&log_tx, Event::Log("no mode config option to set".into()))
                             }
                         },
+                        Cmd::SetSandbox(value) => {
+                            // ACP has no sandbox axis, so the UI offers no chip
+                            // for one and this should not arrive; saying so beats
+                            // dropping it silently.
+                            emit(&log_tx, Event::Log(format!("no sandbox to set: {value}")));
+                        }
+                        Cmd::SetReasoning(value) => match &reasoning_option_id {
+                            Some(option_id) => {
+                                if let Err(err) = connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        session_id.clone(),
+                                        option_id.clone(),
+                                        value.as_str(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    emit(
+                                        &log_tx,
+                                        Event::Log(format!("set reasoning failed: {err}")),
+                                    );
+                                } else {
+                                    emit(&log_tx, Event::Log(format!("reasoning set: {value}")));
+                                }
+                            }
+                            None => emit(
+                                &log_tx,
+                                Event::Log("no reasoning config option to set".into()),
+                            ),
+                        },
                     }
                 }
                 // Dropping the senders wakes any task still waiting on a user
@@ -351,8 +397,8 @@ pub(super) async fn run(
 mod tests {
     use std::path::PathBuf;
 
-    use super::super::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::acp::{Cmd, Config, Event, PermissionKind, spawn};
+    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::backend::{Cmd, Config, Event, PermissionKind, spawn};
 
     /// End-to-end: spawn a real agent (KUMU_AGENT, default omp), send one
     /// prompt, and expect streamed Agent chunks followed by Done — the same
@@ -387,12 +433,22 @@ mod tests {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("catalog timed out") {
-                Event::SessionOptions { models, modes, .. } => {
+                Event::SessionOptions {
+                    models,
+                    modes,
+                    reasoning,
+                    ..
+                } => {
                     if let Some(model) = models.first() {
                         conn.send(Cmd::SetModel(model.value.clone()));
                     }
                     if let Some(mode) = modes.get(1) {
                         conn.send(Cmd::SetMode(mode.value.clone()));
+                    }
+                    // The second effort differs from the reported one, so this
+                    // exercises setting a thought_level option over the wire.
+                    if let Some(effort) = reasoning.get(1) {
+                        conn.send(Cmd::SetReasoning(effort.value.clone()));
                     }
                     break;
                 }

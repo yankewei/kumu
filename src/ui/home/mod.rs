@@ -6,6 +6,8 @@ mod conversation;
 mod mode_picker;
 mod model_picker;
 mod permission;
+mod reasoning_picker;
+mod sandbox_picker;
 mod sidebar;
 
 // Shared column width keeps the conversation and composer aligned.
@@ -18,8 +20,8 @@ use std::path::PathBuf;
 use futures::StreamExt;
 
 use super::{AgentSessionOptions, SessionOptions, SettingsWindow};
-use crate::acp;
 use crate::agents::AGENTS;
+use crate::backend;
 use crate::db::{Message, Project, Session, Store, db_path};
 use crate::ui::layers;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
@@ -36,7 +38,7 @@ struct PendingPermission {
     request_id: String,
     title: String,
     detail: String,
-    options: Vec<acp::PermissionOptionInfo>,
+    options: Vec<backend::PermissionOptionInfo>,
 }
 
 /// Whether `conn_id` is still the connection registered for this session.
@@ -44,7 +46,11 @@ struct PendingPermission {
 /// A session's connection is replaced when the agent is switched, so a bridge
 /// task must verify identity before acting: late events and teardown from the
 /// old connection must not touch the session that a newer one now owns.
-fn owns_connection(conns: &HashMap<i64, acp::Connection>, session_id: i64, conn_id: u64) -> bool {
+fn owns_connection(
+    conns: &HashMap<i64, backend::Connection>,
+    session_id: i64,
+    conn_id: u64,
+) -> bool {
     conns
         .get(&session_id)
         .is_some_and(|conn| conn.id() == conn_id)
@@ -130,7 +136,7 @@ pub struct KumuApp {
     messages: Vec<Message>,
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
-    conns: HashMap<i64, acp::Connection>,
+    conns: HashMap<i64, backend::Connection>,
     /// Live turn state keyed by session id: streaming thinking, tool calls,
     /// and the answer being built. Dropped when the turn ends.
     turns: HashMap<i64, TurnState>,
@@ -147,6 +153,10 @@ pub struct KumuApp {
     model_search: Entity<InputState>,
     /// Mode picker open flag; the mode list is short enough to need no search.
     mode_picker_open: bool,
+    /// Sandbox picker open flag; like the mode list, short enough for no search.
+    sandbox_picker_open: bool,
+    /// Reasoning picker open flag; its list is a handful of efforts at most.
+    reasoning_picker_open: bool,
 }
 
 impl KumuApp {
@@ -177,6 +187,8 @@ impl KumuApp {
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
             mode_picker_open: false,
+            sandbox_picker_open: false,
+            reasoning_picker_open: false,
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
@@ -210,15 +222,15 @@ impl KumuApp {
             return;
         }
 
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
         for agent in missing {
-            if let Some(cfg) = acp::Config::for_agent(agent) {
-                acp::probe(agent, cfg, ev_tx.clone());
+            if let Some(cfg) = backend::Config::for_agent(agent) {
+                backend::probe(agent, cfg, ev_tx.clone());
             }
         }
         drop(ev_tx);
 
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<acp::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -385,7 +397,7 @@ impl KumuApp {
 
         self.ensure_connection(&session, cx);
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(acp::Cmd::Prompt(text));
+            conn.send(backend::Cmd::Prompt(text));
         }
         cx.notify();
     }
@@ -401,7 +413,7 @@ impl KumuApp {
             self.system_message(session.id, format!("未支持的 agent：{}", session.agent));
             return;
         };
-        let Some(cfg) = acp::Config::for_agent(agent_id) else {
+        let Some(cfg) = backend::Config::for_agent(agent_id) else {
             return;
         };
         let cwd = if session.cwd.is_empty() {
@@ -412,22 +424,28 @@ impl KumuApp {
 
         // ACP thread -> std channel -> forwarder thread -> async channel ->
         // UI task (same bridge pattern as the settings window's probes).
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<acp::Event>();
-        let conn = acp::spawn(cfg, cwd, ev_tx);
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
+        let conn = backend::spawn(cfg, cwd, ev_tx);
         // Remember which connection this bridge task belongs to, so its events
         // and teardown can be ignored once a newer one takes over the session.
         let conn_id = conn.id();
-        // Re-apply the session's stored model and mode on a fresh connection;
-        // queued until the ACP thread finishes initialize + session/new.
+        // Re-apply the session's stored picks on a fresh connection; queued
+        // until the agent thread has finished its handshake.
         if let Some(model) = session.model.clone() {
-            conn.send(acp::Cmd::SetModel(model));
+            conn.send(backend::Cmd::SetModel(model));
         }
         if let Some(mode) = session.mode.clone() {
-            conn.send(acp::Cmd::SetMode(mode));
+            conn.send(backend::Cmd::SetMode(mode));
+        }
+        if let Some(sandbox) = session.sandbox.clone() {
+            conn.send(backend::Cmd::SetSandbox(sandbox));
+        }
+        if let Some(reasoning) = session.reasoning.clone() {
+            conn.send(backend::Cmd::SetReasoning(reasoning));
         }
         self.conns.insert(session.id, conn);
 
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<acp::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -564,9 +582,9 @@ impl KumuApp {
         cx.notify();
     }
 
-    fn on_acp_event(&mut self, session_id: i64, ev: acp::Event, cx: &mut Context<Self>) {
+    fn on_acp_event(&mut self, session_id: i64, ev: backend::Event, cx: &mut Context<Self>) {
         match ev {
-            acp::Event::Agent(chunk) => {
+            backend::Event::Agent(chunk) => {
                 // Feed the chunk straight into the session's markdown view:
                 // `push_str` appends incrementally instead of re-parsing the
                 // whole document on every chunk.
@@ -580,7 +598,7 @@ impl KumuApp {
                     turn.blocks.push(TurnBlock::Answer { text: chunk, view });
                 }
             }
-            acp::Event::Thought(chunk) => {
+            backend::Event::Thought(chunk) => {
                 let turn = self.turn_entry(session_id, cx);
                 if let Some(TurnBlock::Thinking { text, .. }) = turn
                     .active_thinking
@@ -595,7 +613,7 @@ impl KumuApp {
                     });
                 }
             }
-            acp::Event::ToolCall {
+            backend::Event::ToolCall {
                 id,
                 title,
                 status,
@@ -628,7 +646,7 @@ impl KumuApp {
                     }));
                 }
             }
-            acp::Event::PermissionRequest {
+            backend::Event::PermissionRequest {
                 tool_call_id,
                 request_id,
                 title,
@@ -671,14 +689,14 @@ impl KumuApp {
                     });
                 }
             }
-            acp::Event::SessionTitle { title } => {
+            backend::Event::SessionTitle { title } => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     session.title = title.clone();
                 }
                 self.store.update_session_title(session_id, &title).ok();
                 cx.notify();
             }
-            acp::Event::Done(_) => {
+            backend::Event::Done(_) => {
                 // The turn is over, so nothing can still be authorized.
                 self.cancel_pending_permissions(session_id);
                 if let Some(turn) = self.turns.remove(&session_id) {
@@ -706,20 +724,28 @@ impl KumuApp {
                     }
                 }
             }
-            acp::Event::Error(err) => {
+            backend::Event::Error(err) => {
                 self.cancel_pending_permissions(session_id);
                 self.turns.remove(&session_id);
                 self.system_message(session_id, err);
             }
-            // Either can be absent (an agent may offer only one of them), so
-            // an empty report is not worth caching.
-            acp::Event::SessionOptions {
+            // The axes are independent — an agent may offer any subset of them —
+            // so an entirely empty report is not worth caching.
+            backend::Event::SessionOptions {
                 agent,
                 models,
                 current_model,
                 modes,
                 current_mode,
-            } if !models.is_empty() || !modes.is_empty() => {
+                sandboxes,
+                current_sandbox,
+                reasoning,
+                current_reasoning,
+            } if !models.is_empty()
+                || !modes.is_empty()
+                || !sandboxes.is_empty()
+                || !reasoning.is_empty() =>
+            {
                 if !cx.has_global::<AgentSessionOptions>() {
                     cx.set_global(AgentSessionOptions::default());
                 }
@@ -730,6 +756,10 @@ impl KumuApp {
                         current_model,
                         modes,
                         current_mode,
+                        sandboxes,
+                        current_sandbox,
+                        reasoning,
+                        current_reasoning,
                     },
                 );
             }
@@ -883,7 +913,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::{neighbor_session, owns_connection};
-    use crate::acp;
+    use crate::backend;
     use crate::db::Session;
     use std::collections::HashMap;
 
@@ -896,6 +926,8 @@ mod tests {
             cwd: "/tmp".into(),
             model: None,
             mode: None,
+            sandbox: None,
+            reasoning: None,
         }
     }
 
@@ -904,15 +936,15 @@ mod tests {
     /// session, or they would clobber the connection that succeeded it.
     #[test]
     fn only_the_registered_connection_owns_a_session() {
-        let mut conns: HashMap<i64, acp::Connection> = HashMap::new();
-        conns.insert(7, acp::Connection::detached_for_test(1));
+        let mut conns: HashMap<i64, backend::Connection> = HashMap::new();
+        conns.insert(7, backend::Connection::detached_for_test(1));
 
         assert!(owns_connection(&conns, 7, 1));
         assert!(!owns_connection(&conns, 7, 2), "another connection");
         assert!(!owns_connection(&conns, 8, 1), "another session");
 
         // Replacement under the same session id: the old connection is stale.
-        conns.insert(7, acp::Connection::detached_for_test(2));
+        conns.insert(7, backend::Connection::detached_for_test(2));
         assert!(
             !owns_connection(&conns, 7, 1),
             "the replaced connection must not match"

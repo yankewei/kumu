@@ -2,21 +2,25 @@
 
 ## What it is
 
-A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → conversation). Built on GPUI (gpui-kit) + Agent Client Protocol, with sessions and messages stored in local SQLite (`~/.kumu/kumu.db`).
+A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → conversation). Built on GPUI (gpui-kit), with sessions and messages stored in local SQLite (`~/.kumu/kumu.db`).
 
-Two windows: Home (session tree + conversation) and Settings (providers/general, dark mode). ACP is wired into the UI — a prompt streams the agent's thinking, tool calls and markdown reply into the conversation, and the composer picks the agent's model. When an agent asks for authorization (`session/request_permission`), the choices appear on the tool row they belong to and are never auto-approved; the answer is passed back as the agent's own option id.
+Each agent is driven over its own protocol on a stdio subprocess — [Agent Client Protocol](https://agentclientprotocol.com/) for opencode and omp, `codex app-server` for Codex — behind one backend layer (`src/backend/`) that reduces them all to the same events. Nothing above that layer knows which agent is talking.
+
+Two windows: Home (session tree + conversation) and Settings (providers/general, dark mode). A prompt streams the agent's thinking, tool calls and markdown reply into the conversation, and the composer picks the agent's model. When an agent asks for authorization, the choices appear on the tool row they belong to and are never auto-approved; the answer is passed back as the agent's own option id.
 
 ## Installation
 
-Requires Rust (`cargo`) and a local agent binary (default `omp`, or `opencode`).
+Requires Rust (`cargo`) and a local agent binary (default `omp`; `opencode` and `codex` also work).
 
 ```bash
 git clone git@github.com:yankewei/kumu.git
 cd kumu
 cargo run                        # uses omp by default
 KUMU_AGENT=opencode cargo run    # or opencode
+KUMU_AGENT=codex cargo run       # or Codex
 ```
 
-- `OMP_BIN` / `OPENCODE_BIN`: path to the agent binary if it is not on PATH.
+- `OMP_BIN` / `OPENCODE_BIN` / `CODEX_BIN`: path to the agent binary if it is not on PATH. For Codex the usual install locations are also checked, since a GUI-launched app does not inherit the shell's PATH.
 - opencode needs `OPENCODE_API_KEY` (env first, otherwise read automatically from `~/.local/share/opencode/auth.json`); omp needs no setup.
-- `KUMU_DEBUG=1 cargo run`: print ACP events to stderr for headless verification.
+- Codex must be signed in first: run `codex login` once (kumu says so plainly if it is missing). Nothing extra gets installed — `codex` is a single native binary, so no Node runtime is involved.
+- `KUMU_DEBUG=1 cargo run`: print agent events to stderr for headless verification.

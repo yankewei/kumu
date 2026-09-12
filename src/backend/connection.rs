@@ -1,8 +1,10 @@
-//! The UI-side handle to one live ACP connection, and the thread that runs it.
+//! The UI-side handle to one live agent connection, and the thread that runs it.
 //!
 //! Dropping the last [`Connection`] clone is the teardown signal: the command
 //! channel closes, the session loop ends, and the agent subprocess is
-//! reclaimed. This is also why the permission table lives here.
+//! reclaimed. This is also why the permission table lives here — and why it is
+//! shared by every backend, since all of them park their transport on the
+//! prompt that is waiting for the answer.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,15 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 
-use super::config::Config;
+use super::config::{Backend, Config};
 use super::event::{Cmd, Event};
-use super::session;
+use super::{acp, codex};
 
 /// The table of pending permission requests awaiting a user decision, keyed by
 /// request id.
 ///
 /// The senders are handed to the UI so it can answer without going through
-/// [`crate::acp::Cmd`]: the ACP thread is parked on the prompt that is waiting
+/// [`crate::backend::Cmd`]: the ACP thread is parked on the prompt that is waiting
 /// for this very answer, so routing the reply through the command channel would
 /// deadlock.
 ///
@@ -82,31 +84,51 @@ impl Connection {
     }
 }
 
-/// Spawn the ACP thread and return the UI-side connection handle.
+/// Spawn the backend thread for `cfg`'s protocol and return the UI-side
+/// connection handle.
+///
+/// The UI never names a protocol: both arms take the same arguments and report
+/// through the same [`Event`] channel, so this match is the whole of the
+/// dispatch.
 pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
     // Shared so the UI can answer permission requests without the command queue.
     // The thread only borrows it, so dropping the handle can still free it.
     let permissions: SharedPermissions = Arc::new(Mutex::new(HashMap::new()));
     let thread_permissions = Arc::downgrade(&permissions);
+    let backend = cfg.backend;
     std::thread::Builder::new()
-        .name("kumu-acp".into())
+        .name("kumu-backend".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
-            if let Err(err) = rt.block_on(session::run(
-                cfg,
-                cwd,
-                ev_tx.clone(),
-                cmd_rx,
-                thread_permissions,
-            )) {
-                super::event::emit(&ev_tx, Event::Error(err.to_string()));
+            // Both backends report failure as a string, so the error path below
+            // is written once; ACP's own error type is flattened only here.
+            let outcome = match backend {
+                Backend::Acp => rt
+                    .block_on(acp::session::run(
+                        cfg,
+                        cwd,
+                        ev_tx.clone(),
+                        cmd_rx,
+                        thread_permissions,
+                    ))
+                    .map_err(|err| err.to_string()),
+                Backend::Codex => rt.block_on(codex::session::run(
+                    cfg,
+                    cwd,
+                    ev_tx.clone(),
+                    cmd_rx,
+                    thread_permissions,
+                )),
+            };
+            if let Err(err) = outcome {
+                super::event::emit(&ev_tx, Event::Error(err));
             }
         })
-        .expect("failed to spawn acp thread");
+        .expect("failed to spawn backend thread");
     Connection {
         id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         cmd_tx,

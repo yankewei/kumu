@@ -1,8 +1,9 @@
-//! The vocabulary crossing the ACP boundary: what the UI sends down ([`Cmd`])
-//! and what comes back up ([`Event`]), plus the value types they carry.
+//! The vocabulary crossing the backend boundary: what the UI sends down
+//! ([`Cmd`]) and what comes back up ([`Event`]), plus the value types they
+//! carry.
 //!
 //! Everything the UI sees is defined here, so no protocol type leaks out of
-//! this module tree.
+//! this module tree — and nothing here names a protocol either.
 
 use std::sync::mpsc::Sender;
 
@@ -29,7 +30,7 @@ pub enum Event {
     Done(String),
     /// The agent is asking for authorization before running a tool call. The UI
     /// shows the options on the matching tool row and answers back via
-    /// [`crate::acp::Connection::resolve_permission`].
+    /// [`crate::backend::Connection::resolve_permission`].
     PermissionRequest {
         /// Tool call this request belongs to, so the UI can attach the prompt
         /// to the row it already rendered.
@@ -47,17 +48,31 @@ pub enum Event {
     },
     /// A fatal error occurred.
     Error(String),
-    /// The options an agent exposes for a session — its models and modes —
-    /// each with the value the agent reports as active. Sent by both probes
-    /// and live connections, and re-sent when the agent changes them itself
-    /// (`config_option_update`). Both come from the same session config
-    /// options, so they travel together.
+    /// The options an agent exposes for a session — models, modes and sandbox
+    /// policy — each with the value the agent reports as active. Sent by both
+    /// probes and live connections.
+    ///
+    /// Agents differ in which axes they have: modes are an ACP config option,
+    /// the sandbox is Codex's own setting, and reasoning is an ACP config
+    /// option that Codex only has per model. An empty list is therefore the
+    /// normal way to say "this agent has no such axis", and the matching picker
+    /// renders nothing rather than an empty menu.
     SessionOptions {
         agent: &'static str,
         models: Vec<ModelInfo>,
         current_model: Option<String>,
         modes: Vec<ModeInfo>,
         current_mode: Option<String>,
+        sandboxes: Vec<SandboxInfo>,
+        current_sandbox: Option<String>,
+        /// The reasoning efforts the session offers. Session-level on purpose:
+        /// ACP reports it as its own config option, and Codex derives it from
+        /// the selected model, so the two shapes are reconciled inside each
+        /// backend and only one reaches the UI.
+        reasoning: Vec<ReasoningInfo>,
+        /// The effort the agent reports it is running at; `None` when it has no
+        /// such axis or has not reported one yet.
+        current_reasoning: Option<String>,
     },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
@@ -74,12 +89,41 @@ pub struct ModelInfo {
     pub provider: String,
 }
 
+/// One selectable reasoning effort, as exposed by an agent.
+///
+/// Deliberately not [`ModeInfo`]: modes and reasoning are different axes, and
+/// they are carried separately so an agent may have either, both, or neither.
+/// ACP's options are session-wide (`thought_level`); Codex advertises a set per
+/// model, which its backend reduces to this same session-level list.
+#[derive(Clone, Debug)]
+pub struct ReasoningInfo {
+    /// Value to send back when the user picks this effort.
+    pub value: String,
+    /// Human-readable label; falls back to the value for an agent that names
+    /// its efforts nothing better (Codex describes them but does not label
+    /// them).
+    pub name: String,
+}
+
 /// One selectable session mode as exposed by an agent's mode config option.
 /// The set is the agent's own (there is no fixed read-only / ask / code
 /// vocabulary), and so is its order.
 #[derive(Clone, Debug)]
 pub struct ModeInfo {
     /// Value to pass to `session/set_config_option`.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+}
+
+/// One selectable sandbox policy, for agents that expose one (Codex's
+/// `read-only` / `workspace-write` / `danger-full-access`).
+///
+/// Deliberately not [`ModeInfo`]: these are different axes, and an agent may
+/// have either, both, or neither.
+#[derive(Clone, Debug)]
+pub struct SandboxInfo {
+    /// Value to send back when the user picks this policy.
     pub value: String,
     /// Human-readable label.
     pub name: String,
@@ -109,22 +153,27 @@ pub struct PermissionOptionInfo {
     pub kind: PermissionKind,
 }
 
-/// UI -> ACP commands on the channel returned by [`crate::acp::spawn`].
+/// UI -> backend commands on the channel returned by [`crate::backend::spawn`].
 pub enum Cmd {
     Prompt(String),
     /// Select the session's model by its config-option value.
     SetModel(String),
     /// Select the session's mode by its config-option value.
     SetMode(String),
+    /// Select the session's sandbox policy by its value.
+    SetSandbox(String),
+    /// Select the session's reasoning effort by its value.
+    SetReasoning(String),
 }
 
 /// Send an event to the UI, echoing to stderr when KUMU_DEBUG is set (handy
-/// for headless verification).
+/// for headless verification). The prefix is the layer, not a protocol: every
+/// backend reports through here.
 pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
     if std::env::var("KUMU_DEBUG").is_ok() {
         match &ev {
-            Event::Agent(t) => eprintln!("[acp] agent: {t}"),
-            Event::Thought(t) => eprintln!("[acp] thought: {t}"),
+            Event::Agent(t) => eprintln!("[agent] agent: {t}"),
+            Event::Thought(t) => eprintln!("[agent] thought: {t}"),
             Event::ToolCall {
                 id,
                 title,
@@ -132,32 +181,37 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 content,
             } => {
                 eprintln!(
-                    "[acp] tool {id}: {title} ({status}) content={} chars",
+                    "[agent] tool {id}: {title} ({status}) content={} chars",
                     content.len()
                 )
             }
-            Event::SessionTitle { title } => eprintln!("[acp] title: {title}"),
-            Event::Done(s) => eprintln!("[acp] done: {s}"),
+            Event::SessionTitle { title } => eprintln!("[agent] title: {title}"),
+            Event::Done(s) => eprintln!("[agent] done: {s}"),
             Event::PermissionRequest {
                 tool_call_id,
                 request_id,
                 options,
                 ..
             } => eprintln!(
-                "[acp] permission {request_id} for tool {tool_call_id}: {} options",
+                "[agent] permission {request_id} for tool {tool_call_id}: {} options",
                 options.len()
             ),
-            Event::Error(s) => eprintln!("[acp] error: {s}"),
-            Event::Log(s) => eprintln!("[acp] log: {s}"),
+            Event::Error(s) => eprintln!("[agent] error: {s}"),
+            Event::Log(s) => eprintln!("[agent] log: {s}"),
             Event::SessionOptions {
                 agent,
                 models,
                 current_model,
                 modes,
                 current_mode,
+                sandboxes,
+                current_sandbox,
+                reasoning,
+                current_reasoning,
             } => eprintln!(
-                "[acp] options: {agent} exposes {} models (active: {current_model:?}) across {} providers; \
-                 modes: [{}] (active: {current_mode:?})",
+                "[agent] options: {agent} exposes {} models (active: {current_model:?}) across {} providers; \
+                 modes: [{}] (active: {current_mode:?}); sandboxes: [{}] (active: {current_sandbox:?}); \
+                 reasoning: [{}] (active: {current_reasoning:?})",
                 models.len(),
                 models
                     .iter()
@@ -169,8 +223,18 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                     .map(|m| m.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
+                sandboxes
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                reasoning
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
-            Event::ProbeFailed { agent } => eprintln!("[acp] probe {agent} failed"),
+            Event::ProbeFailed { agent } => eprintln!("[agent] probe {agent} failed"),
         }
     }
     let _ = tx.send(ev);

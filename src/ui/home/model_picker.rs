@@ -10,8 +10,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 
 use super::KumuApp;
-use crate::acp;
 use crate::agents::AGENTS;
+use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::widgets::{ChipTrigger, agent_logo, select_row};
@@ -32,11 +32,20 @@ impl KumuApp {
             .update_session_agent_model(session_id, agent_id, Some(&model_value))
             .ok();
         if agent_changed {
-            // Mode ids are the agent's own vocabulary, so the stored one stops
-            // meaning anything: drop it, and the picker falls back to the new
-            // agent's default until the user chooses again. Written before the
-            // refresh below so the re-applied mode comes from the fresh row.
+            // Mode ids, sandbox values and effort values are the agent's own
+            // vocabulary, so the stored ones stop meaning anything: drop them,
+            // and the pickers fall back to the new agent's defaults until the
+            // user chooses again. Written before the refresh below so the
+            // re-applied values come from the fresh row.
+            //
+            // A model change *within* an agent is deliberately not cleared here:
+            // whether a pick still applies is the backend's call — Codex drops
+            // one the new model does not advertise and restores it when a later
+            // model does, and an ACP agent's level does not depend on the model
+            // at all.
             self.store.update_session_mode(session_id, None).ok();
+            self.store.update_session_sandbox(session_id, None).ok();
+            self.store.update_session_reasoning(session_id, None).ok();
             // Dropping the handle closes the old agent subprocess; the fresh
             // connection below re-applies the stored model on session/new.
             // Any prompt still waiting on the old connection is settled first,
@@ -53,7 +62,7 @@ impl KumuApp {
             let existed = self.conns.contains_key(&session_id);
             self.ensure_connection(&session, cx);
             if existed && let Some(conn) = self.conns.get(&session_id) {
-                conn.send(acp::Cmd::SetModel(model_value));
+                conn.send(backend::Cmd::SetModel(model_value));
             }
         }
         cx.notify();
@@ -201,7 +210,7 @@ impl KumuApp {
                 // ---- Right: search field + model rows. ----
                 let mut list = v_flex().gap_0p5().p_1p5();
                 if searching {
-                    let matched: Vec<(&'static str, &acp::ModelInfo)> = AGENTS
+                    let matched: Vec<(&'static str, &backend::ModelInfo)> = AGENTS
                         .iter()
                         .flat_map(|a| {
                             cache

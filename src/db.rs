@@ -24,6 +24,13 @@ pub struct Session {
     pub model: Option<String>,
     /// Selected session mode (config-option value); None = agent default.
     pub mode: Option<String>,
+    /// Selected sandbox policy (value); None = whatever the agent's own
+    /// configuration says, which is also what an agent without the concept
+    /// keeps here.
+    pub sandbox: Option<String>,
+    /// Selected reasoning effort (value); None = the model's own default. Only
+    /// agents whose models advertise efforts keep anything here.
+    pub reasoning: Option<String>,
 }
 
 /// A chat message stored in a session.
@@ -64,6 +71,8 @@ impl Store {
                 cwd TEXT NOT NULL,
                 model TEXT,
                 mode TEXT,
+                sandbox TEXT,
+                reasoning TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -79,14 +88,20 @@ impl Store {
                 value TEXT NOT NULL
             );",
         )?;
-        // Migrations for dbs created before model/mode were part of CREATE
-        // TABLE (duplicate-column errors on fresh dbs are expected and
-        // ignored).
+        // Migrations for dbs created before model/mode/sandbox/reasoning were
+        // part of CREATE TABLE (duplicate-column errors on fresh dbs are
+        // expected and ignored).
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
             .ok();
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN mode TEXT", [])
+            .ok();
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN sandbox TEXT", [])
+            .ok();
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN reasoning TEXT", [])
             .ok();
         Ok(())
     }
@@ -120,7 +135,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, agent, title, cwd, model, mode FROM sessions ORDER BY id",
+                "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning FROM sessions ORDER BY id",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -132,6 +147,8 @@ impl Store {
                 cwd: row.get(4)?,
                 model: row.get(5)?,
                 mode: row.get(6)?,
+                sandbox: row.get(7)?,
+                reasoning: row.get(8)?,
             })
         })
         .unwrap()
@@ -184,6 +201,28 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET mode = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![mode, id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the session's sandbox policy, or clear it (`None`) when it no
+    /// longer applies — the values are Codex's own vocabulary, so switching to
+    /// an agent without the concept invalidates the stored one.
+    pub fn update_session_sandbox(&self, id: i64, sandbox: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET sandbox = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![sandbox, id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the session's reasoning effort, or clear it (`None`) when it no
+    /// longer applies — the set is advertised per model, so switching the model
+    /// (or the agent) invalidates a stored one.
+    pub fn update_session_reasoning(&self, id: i64, reasoning: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET reasoning = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![reasoning, id],
         )?;
         Ok(())
     }
@@ -330,5 +369,54 @@ mod tests {
 
         store.update_session_mode(session, None).unwrap();
         assert_eq!(store.sessions()[0].mode, None);
+    }
+
+    /// The chosen sandbox policy is remembered across reads, and clearing it is
+    /// how a session goes back to whatever the agent's own configuration says.
+    #[test]
+    fn session_sandbox_round_trips_and_clears() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "codex", "会话 1", "/tmp")
+            .unwrap();
+        assert_eq!(
+            store.sessions()[0].sandbox,
+            None,
+            "a new session overrides nothing"
+        );
+
+        store
+            .update_session_sandbox(session, Some("read-only"))
+            .unwrap();
+        assert_eq!(store.sessions()[0].sandbox.as_deref(), Some("read-only"));
+
+        store.update_session_sandbox(session, None).unwrap();
+        assert_eq!(store.sessions()[0].sandbox, None);
+    }
+
+    /// The chosen reasoning effort round-trips the same way, and clearing it is
+    /// how a session falls back to the model's own default — the effort set is
+    /// per model, so a model switch has to be able to drop a stale one.
+    #[test]
+    fn session_reasoning_round_trips_and_clears() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "codex", "会话 1", "/tmp")
+            .unwrap();
+        assert_eq!(
+            store.sessions()[0].reasoning,
+            None,
+            "a new session overrides nothing"
+        );
+
+        store
+            .update_session_reasoning(session, Some("xhigh"))
+            .unwrap();
+        assert_eq!(store.sessions()[0].reasoning.as_deref(), Some("xhigh"));
+
+        store.update_session_reasoning(session, None).unwrap();
+        assert_eq!(store.sessions()[0].reasoning, None);
     }
 }

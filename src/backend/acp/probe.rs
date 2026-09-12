@@ -10,9 +10,9 @@ use std::sync::mpsc::Sender;
 use agent_client_protocol::schema::v1::{InitializeRequest, NewSessionRequest};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectionTo};
 
-use super::config::Config;
-use super::convert::{mode_catalog, model_catalog};
-use super::event::{Event, emit};
+use super::convert::{mode_catalog, model_catalog, reasoning_catalog};
+use crate::backend::config::Config;
+use crate::backend::event::{Event, emit};
 
 /// Probe an agent over ACP just to discover its session options: initialize,
 /// create one throwaway session, read the model and mode config options, then
@@ -58,6 +58,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                                     model_catalog(&new_session.config_options);
                                 let (_, current_mode, modes) =
                                     mode_catalog(&new_session.config_options);
+                                let (_, current_reasoning, reasoning) =
+                                    reasoning_catalog(&new_session.config_options);
                                 emit(
                                     &ev_tx,
                                     Event::SessionOptions {
@@ -66,6 +68,11 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                                         current_model,
                                         modes,
                                         current_mode,
+                                        // ACP has no sandbox axis.
+                                        sandboxes: Vec::new(),
+                                        current_sandbox: None,
+                                        reasoning,
+                                        current_reasoning,
                                     },
                                 );
                                 Ok(())
@@ -92,9 +99,9 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{AGENT_TEST_LOCK, command_exists};
     use super::probe;
-    use crate::acp::{Config, Event};
+    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::backend::{Config, Event};
 
     /// End-to-end: probe a real local agent (KUMU_AGENT, default omp) and
     /// expect a Models event. Skipped when the agent binary is missing so the
@@ -123,14 +130,25 @@ mod tests {
                     current_model,
                     modes,
                     current_mode,
+                    reasoning,
+                    current_reasoning,
+                    ..
                 } => {
                     println!(
                         "{agent}: {} models, active: {current_model:?}; modes: {:?}, active: \
-                         {current_mode:?}",
+                         {current_mode:?}; reasoning: {:?}, active: {current_reasoning:?}",
                         models.len(),
                         modes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                        reasoning
+                            .iter()
+                            .map(|effort| effort.name.as_str())
+                            .collect::<Vec<_>>(),
                     );
                     assert!(!models.is_empty());
+                    assert!(
+                        !reasoning.is_empty(),
+                        "{agent} should expose its thought_level option"
+                    );
                     break;
                 }
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
@@ -148,6 +166,7 @@ mod tests {
             "missing",
             Config {
                 agent: "missing",
+                backend: crate::backend::config::Backend::Acp,
                 command: "/nonexistent/kumu-agent-test".into(),
                 args: vec![],
                 env: vec![],

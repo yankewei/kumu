@@ -11,7 +11,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp, PendingPermission};
-use crate::acp::PermissionKind;
+use crate::backend::PermissionKind;
 use crate::ui::widgets::pill;
 
 impl KumuApp {

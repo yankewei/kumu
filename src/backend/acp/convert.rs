@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     ToolCallStatus, ToolCallUpdate,
 };
 
-use super::event::{ModeInfo, ModelInfo, PermissionKind};
+use crate::backend::event::{ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
 
 /// A select session config option, located by [`select`].
 struct Select<'a> {
@@ -130,6 +130,38 @@ pub(super) fn mode_catalog(
         Some(select.id.clone()),
         Some(select.current.to_string()),
         modes,
+    )
+}
+
+/// Extract the session's reasoning-effort config option (`thought_level`): its
+/// id (for `session/set_config_option`), the value the agent reports as active,
+/// and the selectable efforts.
+///
+/// Unlike model and mode this has no id fallback: the category is the only
+/// stable name, because agents call the option whatever they like (`thinking`
+/// for omp, `effort` for opencode). An agent that exposes no such option simply
+/// has no reasoning axis.
+pub(super) fn reasoning_catalog(
+    config_options: &Option<Vec<SessionConfigOption>>,
+) -> (Option<SessionConfigId>, Option<String>, Vec<ReasoningInfo>) {
+    let Some(select) = select(
+        config_options,
+        SessionConfigOptionCategory::ThoughtLevel,
+        "",
+    ) else {
+        return (None, None, Vec::new());
+    };
+    let efforts = select_values(select.options)
+        .into_iter()
+        .map(|(value, name)| ReasoningInfo {
+            value: value.to_string(),
+            name: name.to_string(),
+        })
+        .collect();
+    (
+        Some(select.id.clone()),
+        Some(select.current.to_string()),
+        efforts,
     )
 }
 
@@ -482,6 +514,64 @@ mod tests {
             mode_catalog(&boolean).0.is_none(),
             "a boolean option is not a select"
         );
+    }
+
+    /// The reasoning option is found by its spec category alone — agents name it
+    /// differently, so unlike model and mode there is no id to fall back on —
+    /// and the labels stay the agent's own.
+    #[test]
+    fn reasoning_catalog_reads_the_thought_level_option() {
+        let config_options = Some(vec![
+            select_option(
+                "model",
+                Some(SessionConfigOptionCategory::Model),
+                "m",
+                vec![("m", "M", "")],
+            ),
+            select_option(
+                "thinking",
+                Some(SessionConfigOptionCategory::ThoughtLevel),
+                "max",
+                vec![("off", "Off", ""), ("low", "low", ""), ("max", "max", "")],
+            ),
+        ]);
+
+        let (id, current, efforts) = reasoning_catalog(&config_options);
+
+        assert_eq!(id.expect("reasoning option id").0.as_ref(), "thinking");
+        assert_eq!(current.as_deref(), Some("max"));
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|effort| effort.value.as_str())
+                .collect::<Vec<_>>(),
+            ["off", "low", "max"]
+        );
+        assert_eq!(efforts[1].name, "low", "the agent's own label is kept");
+    }
+
+    /// Having no reasoning option is normal, and an option that merely shares a
+    /// likely id (`effort`, opencode's) but is categorized otherwise must not be
+    /// mistaken for one — the category, not the id, is what decides.
+    #[test]
+    fn reasoning_catalog_is_empty_without_a_thought_level_option() {
+        let no_options: Option<Vec<SessionConfigOption>> = None;
+        assert!(reasoning_catalog(&no_options).0.is_none());
+
+        let wrong_category = Some(vec![
+            select_option(
+                "effort",
+                Some(SessionConfigOptionCategory::Model),
+                "a",
+                vec![("a", "A", "")],
+            ),
+            SessionConfigOption::boolean("thinking", "Thinking", true)
+                .category(SessionConfigOptionCategory::ThoughtLevel),
+        ]);
+        let (id, current, efforts) = reasoning_catalog(&wrong_category);
+        assert!(id.is_none(), "neither option is a reasoning select");
+        assert!(current.is_none());
+        assert!(efforts.is_empty());
     }
 
     /// Guard for the shared lookup: grouped values flatten flat, the provider
