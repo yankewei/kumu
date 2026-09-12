@@ -11,7 +11,7 @@ pub struct AgentDef {
     pub logo: Option<&'static str>,
 }
 
-pub const AGENTS: [AgentDef; 3] = [
+pub const AGENTS: [AgentDef; 4] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
@@ -29,5 +29,14 @@ pub const AGENTS: [AgentDef; 3] = [
         name: "Codex",
         desc: "codex app-server",
         logo: Some("codex.svg"),
+    },
+    // No logo asset yet, so the generic Bot icon stands in. Unlike the others
+    // this one is also honest about what works today: its session options are
+    // discovered, its session loop is not built.
+    AgentDef {
+        id: "claude",
+        name: "Claude Code",
+        desc: "claude -p · stream-json",
+        logo: None,
     },
 ];

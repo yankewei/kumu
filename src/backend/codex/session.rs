@@ -25,7 +25,8 @@ use super::convert;
 use super::protocol::{
     AccountResult, CommandApprovalParams, DeltaNotification, ErrorNotification,
     FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult,
-    ThreadStartResult, Turn, TurnCompletedNotification, TurnStartResult,
+    ThreadNameUpdatedNotification, ThreadStartResult, Turn, TurnCompletedNotification,
+    TurnStartResult,
 };
 use super::transport::{Message, Transport};
 
@@ -245,6 +246,22 @@ pub(in crate::backend) async fn run(
             started.model_provider
         )),
     );
+    // A thread that already carries a title reports it here; a freshly started
+    // one cannot, since `thread/start` takes no name — its title arrives later
+    // as a `thread/name/updated` notification, if the agent generates one.
+    if let Some(title) = started
+        .thread
+        .name
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        emit(
+            &ev_tx,
+            Event::SessionTitle {
+                title: title.to_string(),
+            },
+        );
+    }
 
     // The catalogues. An empty mode list is correct: the picker renders nothing
     // when the agent reports no modes.
@@ -512,6 +529,18 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             }
             if let Some(event) = convert::tool_event(&item) {
                 emit(&shared.ev_tx, event);
+            }
+        }
+        // The agent titles the thread as the conversation develops. A cleared
+        // name (`null`) is not a title, so the one already shown stands rather
+        // than being blanked.
+        "thread/name/updated" => {
+            let Ok(notification) = serde_json::from_value::<ThreadNameUpdatedNotification>(params)
+            else {
+                return;
+            };
+            if let Some(title) = notification.thread_name.filter(|t| !t.trim().is_empty()) {
+                emit(&shared.ev_tx, Event::SessionTitle { title });
             }
         }
         "turn/completed" => {

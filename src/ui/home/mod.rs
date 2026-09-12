@@ -391,14 +391,29 @@ impl KumuApp {
             }
         }
         self.store.insert_message(session_id, "user", &text).ok();
+        // The first message is what fixes the session's agent, so the list is
+        // re-read here rather than letting the flag lag a turn behind the
+        // picker that reads it.
+        self.refresh();
         self.messages = self.store.messages(session_id);
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
 
         self.ensure_connection(&session, cx);
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::Prompt(text));
-        }
+        // No connection means nothing will ever answer this prompt (an agent
+        // this build no longer supports, say), so leave it looking delivered
+        // rather than in flight. Still repaint: `ensure_connection` may have
+        // just written the notice that explains why.
+        let Some(conn) = self.conns.get(&session_id).cloned() else {
+            cx.notify();
+            return;
+        };
+        // Open the turn here rather than waiting for the first agent event:
+        // spawning the subprocess and streaming the first token can take a
+        // while, and until then the conversation would show no sign that the
+        // prompt was accepted.
+        self.turn_entry(session_id, cx);
+        conn.send(backend::Cmd::Prompt(text));
         cx.notify();
     }
 
@@ -489,6 +504,13 @@ impl KumuApp {
         // Settle the prompts before dropping the handle, so the agent gets an
         // answer rather than a silent disconnect.
         self.cancel_pending_permissions(session_id);
+        // Drop the in-flight turn with the connection: nothing can deliver its
+        // answer now, so the working indicator must not keep counting. The
+        // normal paths have already dropped it (a turn ends with `Done`, and a
+        // failure reports `Error` first); this covers a connection that died
+        // without either, which would otherwise leave the turn — and the
+        // composer, which refuses to send while one exists — stuck for good.
+        self.turns.remove(&session_id);
         self.conns.remove(&session_id);
         cx.notify();
     }
@@ -928,6 +950,7 @@ mod tests {
             mode: None,
             sandbox: None,
             reasoning: None,
+            has_conversation: false,
         }
     }
 

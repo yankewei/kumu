@@ -13,88 +13,61 @@ use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectionTo};
 use super::convert::{mode_catalog, model_catalog, reasoning_catalog};
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
+use crate::backend::probe::run;
 
 /// Probe an agent over ACP just to discover its session options: initialize,
 /// create one throwaway session, read the model and mode config options, then
-/// return — the connection teardown kills the agent subprocess. Fails after
-/// `TIMEOUT`.
+/// return — the connection teardown kills the agent subprocess.
 pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
-    std::thread::Builder::new()
-        .name(format!("kumu-probe-{agent}"))
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
-            let result = rt.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-                    let mut launch = AcpAgentConfig::new(&cfg.command);
-                    for a in &cfg.args {
-                        launch = launch.arg(a.clone());
-                    }
-                    for (k, v) in &cfg.env {
-                        launch = launch.env(k.clone(), v.clone());
-                    }
-                    let ev_tx = ev_tx.clone();
-                    Client
-                        .builder()
-                        .name("kumu-probe")
-                        .connect_with(
-                            AcpAgent::new(launch),
-                            move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
-                                connection
-                                    .send_request(InitializeRequest::new(
-                                        agent_client_protocol::schema::ProtocolVersion::V1,
-                                    ))
-                                    .block_task()
-                                    .await?;
-                                let new_session = connection
-                                    .send_request(NewSessionRequest::new(cwd))
-                                    .block_task()
-                                    .await?;
-                                let (_, current_model, models) =
-                                    model_catalog(&new_session.config_options);
-                                let (_, current_mode, modes) =
-                                    mode_catalog(&new_session.config_options);
-                                let (_, current_reasoning, reasoning) =
-                                    reasoning_catalog(&new_session.config_options);
-                                emit(
-                                    &ev_tx,
-                                    Event::SessionOptions {
-                                        agent,
-                                        models,
-                                        current_model,
-                                        modes,
-                                        current_mode,
-                                        // ACP has no sandbox axis.
-                                        sandboxes: Vec::new(),
-                                        current_sandbox: None,
-                                        reasoning,
-                                        current_reasoning,
-                                    },
-                                );
-                                Ok(())
-                            },
-                        )
-                        .await
-                })
-                .await
-            });
-            let fail = |msg: String| {
-                if std::env::var("KUMU_DEBUG").is_ok() {
-                    eprintln!("[acp] probe {agent} failed: {msg}");
-                }
-                emit(&ev_tx, Event::ProbeFailed { agent });
-            };
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => fail(err.to_string()),
-                Err(err) => fail(format!("timed out: {err}")),
-            }
-        })
-        .expect("failed to spawn probe thread");
+    run(agent, "acp", ev_tx, move |ev_tx| async move {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut launch = AcpAgentConfig::new(&cfg.command);
+        for a in &cfg.args {
+            launch = launch.arg(a.clone());
+        }
+        for (k, v) in &cfg.env {
+            launch = launch.env(k.clone(), v.clone());
+        }
+        Client
+            .builder()
+            .name("kumu-probe")
+            .connect_with(
+                AcpAgent::new(launch),
+                move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        ))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    let (_, current_model, models) = model_catalog(&new_session.config_options);
+                    let (_, current_mode, modes) = mode_catalog(&new_session.config_options);
+                    let (_, current_reasoning, reasoning) =
+                        reasoning_catalog(&new_session.config_options);
+                    emit(
+                        &ev_tx,
+                        Event::SessionOptions {
+                            agent,
+                            models,
+                            current_model,
+                            modes,
+                            current_mode,
+                            // ACP has no sandbox axis.
+                            sandboxes: Vec::new(),
+                            current_sandbox: None,
+                            reasoning,
+                            current_reasoning,
+                        },
+                    );
+                    Ok(())
+                },
+            )
+            .await
+    });
 }
 
 #[cfg(test)]

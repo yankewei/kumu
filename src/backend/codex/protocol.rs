@@ -146,6 +146,12 @@ pub(super) enum SandboxPolicy {
 #[derive(Debug, Deserialize)]
 pub(super) struct ThreadSummary {
     pub id: String,
+    /// The thread's user-facing title, when it already has one. A freshly
+    /// started thread does not — `thread/start` accepts no name, so the title
+    /// is generated as the conversation develops and arrives later as a
+    /// `thread/name/updated` notification. A resumed thread does have one.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Result of `turn/start`.
@@ -202,6 +208,20 @@ pub(super) struct ErrorNotification {
     /// showing the user.
     #[serde(rename = "willRetry", default)]
     pub will_retry: bool,
+}
+
+/// Params of `thread/name/updated`: the thread's title as the agent now reports
+/// it.
+///
+/// `threadId` is on the wire and deliberately not modelled, matching every
+/// other notification here: kumu runs one thread per process, so there is
+/// nothing to demultiplex.
+#[derive(Debug, Deserialize)]
+pub(super) struct ThreadNameUpdatedNotification {
+    /// The new title, or `None` when the agent cleared it. `null` is a normal
+    /// value for this field, and a cleared name is not a title to display.
+    #[serde(rename = "threadName", default)]
+    pub thread_name: Option<String>,
 }
 
 /// Params of `item/commandExecution/requestApproval`.
@@ -445,5 +465,40 @@ mod tests {
         .unwrap();
         assert_eq!(notification.error.message, "boom");
         assert!(notification.will_retry);
+    }
+
+    /// The title the agent reports for a thread, and the two ways it can say
+    /// there is none: `null`, or the field left out entirely. Both must read as
+    /// absent rather than failing the parse, since a cleared name is a normal
+    /// state and not an error.
+    #[test]
+    fn thread_name_updated_reads_the_title_or_its_absence() {
+        let named: ThreadNameUpdatedNotification =
+            serde_json::from_str(r#"{"threadId":"t1","threadName":"排查网络质量问题"}"#).unwrap();
+        assert_eq!(named.thread_name.as_deref(), Some("排查网络质量问题"));
+
+        let cleared: ThreadNameUpdatedNotification =
+            serde_json::from_str(r#"{"threadId":"t1","threadName":null}"#).unwrap();
+        assert!(cleared.thread_name.is_none());
+
+        let omitted: ThreadNameUpdatedNotification =
+            serde_json::from_str(r#"{"threadId":"t1"}"#).unwrap();
+        assert!(omitted.thread_name.is_none());
+    }
+
+    /// A thread carries its title when it has one. A freshly started thread
+    /// omits the field, which must parse as absent rather than break the
+    /// handshake.
+    #[test]
+    fn thread_start_reads_the_threads_name_when_present() {
+        let named: ThreadStartResult =
+            serde_json::from_str(r#"{"thread":{"id":"t1","name":"排查网络质量问题"}}"#).unwrap();
+        assert_eq!(named.thread.id, "t1");
+        assert_eq!(named.thread.name.as_deref(), Some("排查网络质量问题"));
+
+        let fresh: ThreadStartResult =
+            serde_json::from_str(r#"{"thread":{"id":"t2"},"model":"gpt-5.6-sol"}"#).unwrap();
+        assert_eq!(fresh.thread.id, "t2");
+        assert!(fresh.thread.name.is_none());
     }
 }

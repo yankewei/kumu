@@ -17,9 +17,13 @@ use crate::ui::AgentSessionOptions;
 use crate::ui::widgets::{ChipTrigger, agent_logo, select_row};
 
 impl KumuApp {
-    /// Switch a session's agent and/or model: persists the choice, reopens the
-    /// ACP connection when the agent changes, and applies the model over the
-    /// session's model config option.
+    /// Switch a session's agent and/or model: persist the choice, drop the old
+    /// agent's connection when the agent changes, then apply the model over the
+    /// session's model config option. A session with no live connection just
+    /// stores the pick, which is re-applied when one is opened.
+    ///
+    /// The agent half is only available while the session has no conversation —
+    /// see the guard below.
     fn pick_model(&mut self, agent_id: &'static str, model_value: String, cx: &mut Context<Self>) {
         let Some(session_id) = self.selected else {
             return;
@@ -28,6 +32,16 @@ impl KumuApp {
             return;
         };
         let agent_changed = session.agent != agent_id;
+        // A session keeps its agent once it has a conversation: the transcript
+        // was written by that agent, and a different one would be handed
+        // history it never produced (the transcript is persisted, but the
+        // agent's own context is not, so the switch is a silent amnesia even
+        // for the same agent's later process). The picker does not offer the
+        // switch in this state — this is the backstop that keeps the rule true
+        // for anything else that reaches here.
+        if agent_changed && session.has_conversation {
+            return;
+        }
         self.store
             .update_session_agent_model(session_id, agent_id, Some(&model_value))
             .ok();
@@ -55,15 +69,12 @@ impl KumuApp {
             self.turns.remove(&session_id);
         }
         self.refresh();
-        if let Some(session) = self.selected_session().cloned() {
-            // A connection that already existed needs the model pushed
-            // explicitly; a fresh one from ensure_connection re-applies the
-            // just-stored model itself.
-            let existed = self.conns.contains_key(&session_id);
-            self.ensure_connection(&session, cx);
-            if existed && let Some(conn) = self.conns.get(&session_id) {
-                conn.send(backend::Cmd::SetModel(model_value));
-            }
+        // Opening a connection here just to deliver the value would start an
+        // agent subprocess the user never prompted — and for an agent that
+        // cannot run a session, that is an error written into a conversation
+        // that has not begun.
+        if let Some(conn) = self.conns.get(&session_id) {
+            conn.send(backend::Cmd::SetModel(model_value));
         }
         cx.notify();
     }
@@ -156,14 +167,17 @@ impl KumuApp {
                 } else {
                     HashMap::new()
                 };
-                let (cur_agent, cur_model) = weak
+                let (cur_agent, cur_model, has_conversation) = weak
                     .upgrade()
                     .and_then(|app| app.read(cx).selected_session().cloned())
-                    .map(|s| (s.agent, s.model))
+                    .map(|s| (s.agent, s.model, s.has_conversation))
                     .unwrap_or_default();
                 let tab = weak.upgrade().and_then(|app| app.read(cx).model_picker_tab);
                 let query = search.read(cx).value().trim().to_lowercase();
                 let searching = !query.is_empty();
+                // A session with a conversation keeps its agent, so nothing may
+                // browse away from it — not a stale tab, not a search hit.
+                let tab = tab.filter(|_| !has_conversation);
                 // The rail highlights the active tab; with no tab picked it
                 // follows the session's current agent.
                 let active_agent = tab.unwrap_or_else(|| cur_agent.as_str());
@@ -212,6 +226,9 @@ impl KumuApp {
                 if searching {
                     let matched: Vec<(&'static str, &backend::ModelInfo)> = AGENTS
                         .iter()
+                        // A locked session only searches its own agent, so a hit
+                        // from another one cannot offer an impossible switch.
+                        .filter(|a| !has_conversation || a.id == cur_agent.as_str())
                         .flat_map(|a| {
                             cache
                                 .get(a.id)
@@ -306,7 +323,11 @@ impl KumuApp {
                     .bg(background)
                     .shadow_lg()
                     .overflow_hidden()
-                    .child(rail)
+                    // The rail exists only to choose an agent. Once the session
+                    // has a conversation its agent is fixed, so the chooser goes
+                    // away rather than being shown with every choice disabled —
+                    // a control that cannot act is worse than no control.
+                    .when(!has_conversation, |el| el.child(rail))
                     .child(
                         v_flex()
                             .flex_1()

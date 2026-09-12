@@ -31,6 +31,16 @@ pub struct Session {
     /// Selected reasoning effort (value); None = the model's own default. Only
     /// agents whose models advertise efforts keep anything here.
     pub reasoning: Option<String>,
+    /// Whether the conversation has begun, which is what fixes the session's
+    /// agent: a switched agent would be handed a transcript it never wrote, so
+    /// switching is only offered while this is false.
+    ///
+    /// Counts every message except kumu's own notices (`system`). Excluding
+    /// those is deliberate — a backend error is a `system` row, and a session
+    /// whose only content is one of those has no conversation to preserve, so
+    /// counting them would lock a session to whichever agent happened to fail
+    /// first.
+    pub has_conversation: bool,
 }
 
 /// A chat message stored in a session.
@@ -86,7 +96,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );",
+            );
+            -- Every read of a session's history, and the `has_conversation`
+            -- probe in `sessions()`, filters on `session_id`; without this each
+            -- one is a full scan of a table that only grows.
+            CREATE INDEX IF NOT EXISTS idx_messages_session_id
+                ON messages(session_id);",
         )?;
         // Migrations for dbs created before model/mode/sandbox/reasoning were
         // part of CREATE TABLE (duplicate-column errors on fresh dbs are
@@ -135,7 +150,12 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning FROM sessions ORDER BY id",
+                "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning,
+                        EXISTS(
+                            SELECT 1 FROM messages
+                            WHERE messages.session_id = sessions.id AND messages.role <> 'system'
+                        )
+                 FROM sessions ORDER BY id",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -149,6 +169,7 @@ impl Store {
                 mode: row.get(6)?,
                 sandbox: row.get(7)?,
                 reasoning: row.get(8)?,
+                has_conversation: row.get(9)?,
             })
         })
         .unwrap()
@@ -418,5 +439,67 @@ mod tests {
 
         store.update_session_reasoning(session, None).unwrap();
         assert_eq!(store.sessions()[0].reasoning, None);
+    }
+
+    /// `has_conversation` is what fixes a session's agent, so it must stay false
+    /// for a session whose only rows are kumu's own notices — otherwise a
+    /// backend error would lock a session to whichever agent failed first — and
+    /// it must be per-session, since the query behind it is correlated.
+    #[test]
+    fn has_conversation_ignores_kumus_own_notices() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "claude", "会话 1", "/tmp")
+            .unwrap();
+        let other = store
+            .insert_session(project, "omp", "会话 2", "/tmp")
+            .unwrap();
+        assert!(
+            !store.sessions()[0].has_conversation,
+            "a fresh session is still open to an agent switch"
+        );
+
+        store
+            .insert_message(session, "system", "Claude Code 会话尚未实现")
+            .unwrap();
+        assert!(
+            !store.sessions()[0].has_conversation,
+            "a notice is not a conversation, so the agent stays changeable"
+        );
+
+        store.insert_message(other, "user", "你好").unwrap();
+        let sessions = store.sessions();
+        assert!(
+            sessions[1].has_conversation,
+            "the session that was prompted has a conversation"
+        );
+        assert!(
+            !sessions[0].has_conversation,
+            "and the one that was not still has none"
+        );
+    }
+
+    /// Both `messages()` and the `has_conversation` probe filter on
+    /// `session_id`, on a table that only grows, so the index must exist — and
+    /// `init` runs on every open, so re-opening an old database must leave
+    /// exactly one.
+    #[test]
+    fn messages_are_indexed_by_session() {
+        let store = store();
+        store.init().unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_messages_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly one session_id index, however often init runs"
+        );
     }
 }

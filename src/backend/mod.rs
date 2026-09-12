@@ -6,8 +6,9 @@
 //! [`Config::for_agent`] and dispatched in [`spawn`] and [`probe`].
 //!
 //! Backends:
-//!   - `acp`   — Agent Client Protocol v1 over stdio (`opencode acp`, `omp acp`);
-//!   - `codex` — OpenAI Codex `app-server` JSON-RPC over stdio.
+//!   - `acp`    — Agent Client Protocol v1 over stdio (`opencode acp`, `omp acp`);
+//!   - `codex`  — OpenAI Codex `app-server` JSON-RPC over stdio;
+//!   - `claude` — Claude Code's headless stream-json protocol over stdio.
 //!
 //! Runs on a dedicated tokio runtime thread. UI -> here via an unbounded tokio
 //! channel (send is non-blocking, safe from the gpui thread); here -> UI via a
@@ -26,9 +27,11 @@
 //!   - `connection` — the UI-side handle, the permission table, the thread;
 //!   - `probe`      — discovery, dispatched to the backend that owns the agent;
 //!   - `acp/`       — the ACP backend (session, probe, protocol translation);
-//!   - `codex/`     — the Codex app-server backend.
+//!   - `codex/`     — the Codex app-server backend;
+//!   - `claude/`    — the Claude Code backend.
 
 mod acp;
+mod claude;
 mod codex;
 mod config;
 mod connection;

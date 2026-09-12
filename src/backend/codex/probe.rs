@@ -10,77 +10,52 @@ use serde_json::json;
 
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
+use crate::backend::probe::run;
 
 use super::protocol::ModelListResult;
 use super::{client_info, convert};
 
 /// Probe a Codex agent just far enough to learn its models: initialize, ask
 /// `model/list`, report, and return — the dropped child kills the process.
-/// Fails after `TIMEOUT`.
 pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
-    std::thread::Builder::new()
-        .name(format!("kumu-probe-{agent}"))
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
-            let result = rt.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                    // The receiver is held (not dropped) for the whole probe:
-                    // when it goes away the reader stops and every later
-                    // request would fail.
-                    let (transport, _messages, _child) =
-                        super::transport::spawn(&cfg.command, &cfg.args, &cfg.env)
-                            .map_err(|err| err.to_string())?;
-                    transport.request("initialize", client_info()).await?;
-                    transport.notify("initialized", json!({}));
-                    let listed = transport.request("model/list", json!({})).await?;
-                    let listed: ModelListResult =
-                        serde_json::from_value(listed).map_err(|err| err.to_string())?;
-                    let (current_model, models) = convert::model_catalog(&listed);
-                    let efforts = convert::model_reasoning(&listed);
-                    // A probe has no thread to echo an effort, so the effective
-                    // one is the selected model's own default.
-                    let reasoning = convert::reasoning_options(&efforts, current_model.as_deref());
-                    let current_reasoning =
-                        convert::default_effort(&efforts, current_model.as_deref());
-                    emit(
-                        &ev_tx,
-                        Event::SessionOptions {
-                            agent,
-                            models,
-                            current_model,
-                            // Codex exposes no mode selector this backend maps.
-                            modes: Vec::new(),
-                            current_mode: None,
-                            // The policies are a fixed vocabulary, so they can be
-                            // offered before any session exists. Which one is
-                            // *in force* is only learnable from a live thread's
-                            // own report, so nothing is claimed here.
-                            sandboxes: convert::sandbox_options(),
-                            current_sandbox: None,
-                            reasoning,
-                            current_reasoning,
-                        },
-                    );
-                    Ok::<(), String>(())
-                })
-                .await
-            });
-            let fail = |msg: String| {
-                if std::env::var("KUMU_DEBUG").is_ok() {
-                    eprintln!("[codex] probe {agent} failed: {msg}");
-                }
-                emit(&ev_tx, Event::ProbeFailed { agent });
-            };
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => fail(err),
-                Err(err) => fail(format!("timed out: {err}")),
-            }
-        })
-        .expect("failed to spawn probe thread");
+    run(agent, "codex", ev_tx, move |ev_tx| async move {
+        // The receiver is held (not dropped) for the whole probe: when it goes
+        // away the reader stops and every later request would fail.
+        let (transport, _messages, _child) =
+            super::transport::spawn(&cfg.command, &cfg.args, &cfg.env)
+                .map_err(|err| err.to_string())?;
+        transport.request("initialize", client_info()).await?;
+        transport.notify("initialized", json!({}));
+        let listed = transport.request("model/list", json!({})).await?;
+        let listed: ModelListResult =
+            serde_json::from_value(listed).map_err(|err| err.to_string())?;
+        let (current_model, models) = convert::model_catalog(&listed);
+        let efforts = convert::model_reasoning(&listed);
+        // A probe has no thread to echo an effort, so the effective one is the
+        // selected model's own default.
+        let reasoning = convert::reasoning_options(&efforts, current_model.as_deref());
+        let current_reasoning = convert::default_effort(&efforts, current_model.as_deref());
+        emit(
+            &ev_tx,
+            Event::SessionOptions {
+                agent,
+                models,
+                current_model,
+                // Codex exposes no mode selector this backend maps.
+                modes: Vec::new(),
+                current_mode: None,
+                // The policies are a fixed vocabulary, so they can be offered
+                // before any session exists. Which one is *in force* is only
+                // learnable from a live thread's own report, so nothing is
+                // claimed here.
+                sandboxes: convert::sandbox_options(),
+                current_sandbox: None,
+                reasoning,
+                current_reasoning,
+            },
+        );
+        Ok::<(), String>(())
+    });
 }
 
 #[cfg(test)]

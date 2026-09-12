@@ -1,6 +1,7 @@
 //! Upper right: session title, message history, and live reply.
 
 use gpui_kit::component::collapsible::Collapsible;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -222,15 +223,18 @@ impl KumuApp {
                                         .py_0p5()
                                         .rounded(radius)
                                         .hover(move |s| s.bg(muted))
-                                        .child(
-                                            Icon::new(if active {
-                                                IconName::LoaderCircle
-                                            } else {
-                                                IconName::CircleCheck
-                                            })
-                                            .small()
-                                            .text_color(muted_fg),
-                                        )
+                                        .child(if active {
+                                            Spinner::new()
+                                                .icon(Icon::new(IconName::LoaderCircle))
+                                                .small()
+                                                .color(muted_fg)
+                                                .into_any_element()
+                                        } else {
+                                            Icon::new(IconName::CircleCheck)
+                                                .small()
+                                                .text_color(muted_fg)
+                                                .into_any_element()
+                                        })
                                         .child(
                                             div().text_xs().text_color(muted_fg).truncate().child(
                                                 if active { "思考中…" } else { "已思考" },
@@ -355,9 +359,10 @@ impl KumuApp {
                     .items_center()
                     .gap_1p5()
                     .child(
-                        Icon::new(IconName::LoaderCircle)
+                        Spinner::new()
+                            .icon(Icon::new(IconName::LoaderCircle))
                             .small()
-                            .text_color(muted_fg),
+                            .color(muted_fg),
                     )
                     .child(div().text_xs().text_color(muted_fg).child(label)),
             );

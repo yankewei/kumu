@@ -18,6 +18,9 @@ pub enum Backend {
     Acp,
     /// OpenAI Codex `app-server` JSON-RPC over stdio.
     Codex,
+    /// Claude Code's own headless protocol: newline-delimited JSON in and out
+    /// of a single `claude -p` process.
+    Claude,
 }
 
 /// How to launch the local agent subprocess.
@@ -40,6 +43,7 @@ impl Config {
             "opencode" => Some(Self::opencode(id)),
             "omp" => Some(Self::omp(id)),
             "codex" => Some(Self::codex(id)),
+            "claude" => Some(Self::claude(id)),
             _ => None,
         }
     }
@@ -82,6 +86,37 @@ impl Config {
             backend: Backend::Codex,
             command: codex_bin(),
             args: vec!["app-server".to_string()],
+            env: Vec::new(),
+            auto_prompt: auto_prompt_env(),
+        }
+    }
+
+    /// `claude -p` speaking newline-delimited JSON in both directions.
+    ///
+    /// One process per session, like the other backends: the flag combination
+    /// below keeps a single conversation alive across prompts rather than
+    /// answering one and exiting. `--verbose` is required by `claude` itself
+    /// alongside `stream-json`.
+    ///
+    /// Two flags are deliberately not passed. `--bare` is out because it stops
+    /// Claude Code reading OAuth credentials or the system keychain, which
+    /// would break a Pro/Max subscription login; and no `--permission-mode` or
+    /// `--model` is forced, so an untouched session inherits the user's own
+    /// Claude Code configuration instead of having kumu's defaults imposed on
+    /// it.
+    fn claude(agent: &'static str) -> Self {
+        Self {
+            agent,
+            backend: Backend::Claude,
+            command: claude_bin(),
+            args: vec![
+                "-p".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ],
             env: Vec::new(),
             auto_prompt: auto_prompt_env(),
         }
@@ -129,6 +164,30 @@ fn codex_bin() -> String {
             }
         }
         "codex".to_string()
+    })
+}
+
+/// Resolve the `claude` executable: env override, then the usual install
+/// locations, then PATH.
+///
+/// The absolute candidates matter for the same reason as Codex's: a
+/// GUI-launched process does not inherit the shell's PATH. The native installer
+/// links `~/.local/bin/claude` into `~/.local/share/claude/versions/`, and both
+/// Homebrew casks land in a `bin` directory above.
+fn claude_bin() -> String {
+    std::env::var("CLAUDE_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin/claude"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
+        candidates.push(PathBuf::from("/usr/local/bin/claude"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "claude".to_string()
     })
 }
 
