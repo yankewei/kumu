@@ -11,31 +11,52 @@ use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, select_row};
+use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
 
-/// The label for the mode chip: the user's stored pick, else the value the
-/// agent reports as active, resolved to a name through the catalog.
+/// The label for the mode chip: the user's stored pick while the agent still
+/// offers it, else the value the agent reports as active, resolved to a name
+/// through the catalogue.
 ///
-/// A value the catalog no longer lists still shows as itself rather than
-/// leaving the chip blank, and no catalog entry means there is no chip at all.
-fn mode_label(options: Option<&SessionOptions>, stored: Option<&str>) -> Option<String> {
+/// The membership test is what keeps one stored value from leaking across axes:
+/// an agent with both a work mode and an access policy (Claude Code) stores
+/// whichever the user picked last, so a stored `acceptEdits` must drop out of
+/// this chip and let the reported work mode take over — the same rule the
+/// reasoning picker applies to a pick its agent no longer lists. A *reported*
+/// value the catalogue does not list still shows as itself rather than leaving
+/// the chip blank. No catalogue — or a catalogue with no modes — means there is
+/// no such axis and therefore no chip at all.
+fn mode_label(
+    options: Option<&SessionOptions>,
+    stored: Option<&str>,
+    agent: &str,
+) -> Option<String> {
     let options = options?;
-    let value = stored.or(options.current_mode.as_deref())?;
-    Some(
-        options
+    if options.modes.is_empty() {
+        return None;
+    }
+    let value = stored
+        .filter(|value| options.modes.iter().any(|mode| mode.value == *value))
+        .or(options.current_mode.as_deref());
+    Some(match value {
+        Some(value) => options
             .modes
             .iter()
             .find(|mode| mode.value == value)
             .map(|mode| mode.name.clone())
             .unwrap_or_else(|| value.to_string()),
-    )
+        None => inherited_label(agent),
+    })
 }
 
 impl KumuApp {
     /// Switch the session's mode: persist it, then apply it over the session's
     /// mode config option. A session with no live connection just stores the
     /// pick, which is re-applied when one is opened.
-    fn pick_mode(&mut self, value: String, cx: &mut Context<Self>) {
+    ///
+    /// The access chip calls this too: an agent that has both axes (Claude Code)
+    /// stores and reports them as one permission mode, so a pick on either chip
+    /// is the same write.
+    pub(super) fn pick_mode(&mut self, value: String, cx: &mut Context<Self>) {
         let Some(session_id) = self.selected else {
             return;
         };
@@ -49,20 +70,22 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// The composer's mode picker: a text chip showing the current mode, which
+    /// The composer's mode picker: a text chip showing the mode in force, which
     /// opens the modes the agent offers.
     ///
-    /// Modes are optional, so this renders nothing for an agent that reports
-    /// none — and nothing before a probe or session has reported any.
+    /// Renders nothing for an agent that reports no modes at all — the axis does
+    /// not exist there — and the inherited label when it reports modes but
+    /// nothing in force yet.
     pub(super) fn mode_picker(&self, session: &Session, cx: &Context<Self>) -> Option<AnyElement> {
         let options = cx
             .try_global::<AgentSessionOptions>()
             .and_then(|catalogs| catalogs.0.get(session.agent.as_str()))
             .cloned()?;
-        if options.modes.is_empty() {
-            return None;
-        }
-        let label = mode_label(Some(&options), session.mode.as_deref())?;
+        let label = mode_label(
+            Some(&options),
+            session.mode.as_deref(),
+            &self.agent_name(&session.agent),
+        )?;
         // The stored pick is what the user last chose; the catalog's value is
         // what the agent says it is actually in.
         let current = session
@@ -168,6 +191,8 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
+    use crate::ui::widgets::inherited_label;
+
     use super::mode_label;
     use crate::backend::ModeInfo;
     use crate::ui::SessionOptions;
@@ -193,28 +218,56 @@ mod tests {
     fn mode_label_prefers_the_stored_pick() {
         let options = options(Some("ask"));
         assert_eq!(
-            mode_label(Some(&options), Some("build")).as_deref(),
+            mode_label(Some(&options), Some("build"), "Claude Code").as_deref(),
             Some("Build")
         );
-        assert_eq!(mode_label(Some(&options), None).as_deref(), Some("Ask"));
+        assert_eq!(
+            mode_label(Some(&options), None, "Claude Code").as_deref(),
+            Some("Ask")
+        );
     }
 
-    /// A value the catalog no longer lists still shows as itself rather than
-    /// leaving the chip blank.
+    /// A pick the agent no longer lists yields to what it reports, and a
+    /// *reported* value the catalogue does not list still shows as itself
+    /// rather than leaving the chip blank.
     #[test]
-    fn mode_label_falls_back_to_the_raw_value() {
-        let options = options(Some("ask"));
+    fn mode_label_yields_a_stale_pick_but_shows_a_stale_report() {
+        let listed = options(Some("ask"));
         assert_eq!(
-            mode_label(Some(&options), Some("gone")).as_deref(),
+            mode_label(Some(&listed), Some("gone"), "Claude Code").as_deref(),
+            Some("Ask"),
+            "the report decides once the pick is off the menu"
+        );
+
+        let unlisted = SessionOptions {
+            current_mode: Some("gone".into()),
+            ..options(None)
+        };
+        assert_eq!(
+            mode_label(Some(&unlisted), None, "Claude Code").as_deref(),
             Some("gone")
         );
     }
 
-    /// No modes reported (or no value at all) means there is nothing to label,
-    /// which is what keeps the chip off the toolbar.
+    /// No modes reported means the axis does not exist, which is what keeps the
+    /// chip off the toolbar (an agent with no mode selector has nothing to open).
     #[test]
     fn mode_label_is_none_without_a_mode() {
-        assert_eq!(mode_label(None, Some("ask")), None);
-        assert_eq!(mode_label(Some(&SessionOptions::default()), None), None);
+        assert_eq!(mode_label(None, Some("ask"), "Claude Code"), None);
+        assert_eq!(
+            mode_label(Some(&SessionOptions::default()), None, "Claude Code"),
+            None
+        );
+    }
+
+    /// An agent that offers modes but reports none in force still gets a chip:
+    /// Claude Code's probe claims nothing until a session exists, and a chip
+    /// that hides until then is a menu the user cannot open.
+    #[test]
+    fn mode_label_says_so_when_nothing_is_in_force() {
+        assert_eq!(
+            mode_label(Some(&options(None)), None, "Claude Code").as_deref(),
+            Some(inherited_label("Claude Code").as_str())
+        );
     }
 }

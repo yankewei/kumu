@@ -15,19 +15,18 @@ use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, select_row};
-
-/// What the chip says when the user has not picked a policy: the agent's own
-/// configuration decides, which is the honest default and worth stating rather
-/// than showing nothing.
-const INHERITED_LABEL: &str = "跟随 Agent 配置";
+use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
 
 /// The label for the sandbox chip: the user's stored pick, else the policy the
 /// agent reports it is running under, resolved to a name through the catalogue.
 ///
 /// A value the catalogue no longer lists still shows as itself rather than
 /// leaving the chip blank, and an agent with no sandbox axis has no chip at all.
-fn sandbox_label(options: Option<&SessionOptions>, stored: Option<&str>) -> Option<String> {
+fn sandbox_label(
+    options: Option<&SessionOptions>,
+    stored: Option<&str>,
+    agent: &str,
+) -> Option<String> {
     let options = options?;
     if options.sandboxes.is_empty() {
         return None;
@@ -39,7 +38,7 @@ fn sandbox_label(options: Option<&SessionOptions>, stored: Option<&str>) -> Opti
             .find(|sandbox| sandbox.value == value)
             .map(|sandbox| sandbox.name.clone())
             .unwrap_or_else(|| value.to_string()),
-        None => INHERITED_LABEL.to_string(),
+        None => inherited_label(agent),
     })
 }
 
@@ -78,7 +77,11 @@ impl KumuApp {
         if options.sandboxes.is_empty() {
             return None;
         }
-        let label = sandbox_label(Some(&options), session.sandbox.as_deref())?;
+        let label = sandbox_label(
+            Some(&options),
+            session.sandbox.as_deref(),
+            &self.agent_name(&session.agent),
+        )?;
         // The stored pick is what the user last chose; the catalogue's value is
         // what the agent says it is actually running under.
         let current = session
@@ -188,7 +191,9 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::{INHERITED_LABEL, sandbox_label};
+    use crate::ui::widgets::inherited_label;
+
+    use super::sandbox_label;
     use crate::backend::SandboxInfo;
     use crate::ui::SessionOptions;
 
@@ -216,10 +221,13 @@ mod tests {
     fn sandbox_label_prefers_the_stored_pick() {
         let options = options(Some("read-only"));
         assert_eq!(
-            sandbox_label(Some(&options), Some("workspace-write")).as_deref(),
+            sandbox_label(Some(&options), Some("workspace-write"), "Claude Code").as_deref(),
             Some("工作区写入")
         );
-        assert_eq!(sandbox_label(Some(&options), None).as_deref(), Some("只读"));
+        assert_eq!(
+            sandbox_label(Some(&options), None, "Claude Code").as_deref(),
+            Some("只读")
+        );
     }
 
     /// A value the catalogue no longer lists still shows as itself rather than
@@ -228,7 +236,7 @@ mod tests {
     fn sandbox_label_falls_back_to_the_raw_value() {
         let options = options(Some("read-only"));
         assert_eq!(
-            sandbox_label(Some(&options), Some("gone")).as_deref(),
+            sandbox_label(Some(&options), Some("gone"), "Claude Code").as_deref(),
             Some("gone")
         );
     }
@@ -238,8 +246,8 @@ mod tests {
     #[test]
     fn sandbox_label_says_so_when_nothing_is_overridden() {
         assert_eq!(
-            sandbox_label(Some(&options(None)), None).as_deref(),
-            Some(INHERITED_LABEL)
+            sandbox_label(Some(&options(None)), None, "Claude Code").as_deref(),
+            Some(inherited_label("Claude Code").as_str())
         );
     }
 
@@ -247,7 +255,10 @@ mod tests {
     /// toolbar.
     #[test]
     fn sandbox_label_is_none_without_a_sandbox_axis() {
-        assert_eq!(sandbox_label(None, Some("read-only")), None);
-        assert_eq!(sandbox_label(Some(&SessionOptions::default()), None), None);
+        assert_eq!(sandbox_label(None, Some("read-only"), "Claude Code"), None);
+        assert_eq!(
+            sandbox_label(Some(&SessionOptions::default()), None, "Claude Code"),
+            None
+        );
     }
 }

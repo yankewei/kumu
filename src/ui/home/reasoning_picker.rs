@@ -17,11 +17,7 @@ use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, select_row};
-
-/// What the chip says when neither a pick nor the agent's report names an
-/// effort: nothing is being overridden, or what is has no name to show.
-const INHERITED_LABEL: &str = "跟随 Agent 配置";
+use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
 
 /// The effort in force: the user's stored pick when the agent still offers it,
 /// else the value the agent reports.
@@ -46,7 +42,7 @@ fn effective_value<'a>(options: &'a SessionOptions, stored: Option<&'a str>) -> 
 ///
 /// A value the agent no longer lists still shows as itself rather than going
 /// blank.
-fn reasoning_label(options: &SessionOptions, stored: Option<&str>) -> String {
+fn reasoning_label(options: &SessionOptions, stored: Option<&str>, agent: &str) -> String {
     match effective_value(options, stored) {
         Some(value) => options
             .reasoning
@@ -54,7 +50,7 @@ fn reasoning_label(options: &SessionOptions, stored: Option<&str>) -> String {
             .find(|effort| effort.value == value)
             .map(|effort| effort.name.clone())
             .unwrap_or_else(|| value.to_string()),
-        None => INHERITED_LABEL.to_string(),
+        None => inherited_label(agent),
     }
 }
 
@@ -93,7 +89,11 @@ impl KumuApp {
         if options.reasoning.is_empty() {
             return None;
         }
-        let label = reasoning_label(&options, session.reasoning.as_deref());
+        let label = reasoning_label(
+            &options,
+            session.reasoning.as_deref(),
+            &self.agent_name(&session.agent),
+        );
         let current = effective_value(&options, session.reasoning.as_deref()).map(str::to_string);
         let efforts = options.reasoning;
 
@@ -204,9 +204,10 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::{INHERITED_LABEL, effective_value, reasoning_label};
+    use super::{effective_value, reasoning_label};
     use crate::backend::ReasoningInfo;
     use crate::ui::SessionOptions;
+    use crate::ui::widgets::inherited_label;
 
     fn effort(value: &str, name: &str) -> ReasoningInfo {
         ReasoningInfo {
@@ -252,16 +253,19 @@ mod tests {
             vec![effort("low", "low"), effort("high", "High")],
             Some("low"),
         );
-        assert_eq!(reasoning_label(&options, Some("high")), "High");
-        assert_eq!(reasoning_label(&options, None), "low");
         assert_eq!(
-            reasoning_label(&options, Some("gone")),
+            reasoning_label(&options, Some("high"), "Claude Code"),
+            "High"
+        );
+        assert_eq!(reasoning_label(&options, None, "Claude Code"), "low");
+        assert_eq!(
+            reasoning_label(&options, Some("gone"), "Claude Code"),
             "low",
             "a dropped pick yields to the agent's report"
         );
 
         let stale = session_options(vec![effort("low", "Low")], Some("ultra"));
-        assert_eq!(reasoning_label(&stale, None), "ultra");
+        assert_eq!(reasoning_label(&stale, None, "Claude Code"), "ultra");
     }
 
     /// With nothing to report at all the chip still says something, rather than
@@ -269,6 +273,9 @@ mod tests {
     #[test]
     fn reasoning_label_says_so_when_nothing_is_in_force() {
         let options = session_options(vec![effort("low", "Low")], None);
-        assert_eq!(reasoning_label(&options, None), INHERITED_LABEL);
+        assert_eq!(
+            reasoning_label(&options, None, "Claude Code"),
+            inherited_label("Claude Code")
+        );
     }
 }

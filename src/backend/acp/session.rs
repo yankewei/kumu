@@ -147,6 +147,8 @@ pub(in crate::backend) async fn run(
                                 current_model,
                                 modes,
                                 current_mode,
+                                access: Vec::new(),
+                                current_access: None,
                                 // ACP has no sandbox axis.
                                 sandboxes: Vec::new(),
                                 current_sandbox: None,
@@ -274,6 +276,8 @@ pub(in crate::backend) async fn run(
                         current_model,
                         modes,
                         current_mode,
+                        access: Vec::new(),
+                        current_access: None,
                         sandboxes: Vec::new(),
                         current_sandbox: None,
                         reasoning,

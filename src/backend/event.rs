@@ -61,8 +61,17 @@ pub enum Event {
         agent: &'static str,
         models: Vec<ModelInfo>,
         current_model: Option<String>,
+        /// The work modes the session offers: what the agent is doing, as
+        /// opposed to how much it may do on its own. ACP agents report their
+        /// own (`build` / `plan`); Claude Code has no such flag, so its backend
+        /// derives the same two from the one permission mode it does have.
         modes: Vec<ModeInfo>,
         current_mode: Option<String>,
+        /// The access policies the session offers — how much the agent may do
+        /// before it has to ask. Claude Code's permission modes fill this axis;
+        /// nothing else kumu drives exposes one yet.
+        access: Vec<AccessInfo>,
+        current_access: Option<String>,
         sandboxes: Vec<SandboxInfo>,
         current_sandbox: Option<String>,
         /// The reasoning efforts the session offers. Session-level on purpose:
@@ -111,6 +120,17 @@ pub struct ReasoningInfo {
 #[derive(Clone, Debug)]
 pub struct ModeInfo {
     /// Value to pass to `session/set_config_option`.
+    pub value: String,
+    /// Human-readable label.
+    pub name: String,
+}
+
+/// One selectable access policy: how much the agent may do before it has to
+/// ask, as opposed to what it is doing ([`ModeInfo`]) or the boundary it runs
+/// inside ([`SandboxInfo`]).
+#[derive(Clone, Debug)]
+pub struct AccessInfo {
+    /// Value to send back when the user picks this policy.
     pub value: String,
     /// Human-readable label.
     pub name: String,
@@ -204,13 +224,15 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 current_model,
                 modes,
                 current_mode,
+                access,
+                current_access,
                 sandboxes,
                 current_sandbox,
                 reasoning,
                 current_reasoning,
             } => eprintln!(
                 "[agent] options: {agent} exposes {} models (active: {current_model:?}) across {} providers; \
-                 modes: [{}] (active: {current_mode:?}); sandboxes: [{}] (active: {current_sandbox:?}); \
+                 modes: [{}] (active: {current_mode:?}); access: {} (active: {current_access:?}); sandboxes: [{}] (active: {current_sandbox:?}); \
                  reasoning: [{}] (active: {current_reasoning:?})",
                 models.len(),
                 models
@@ -221,6 +243,11 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 modes
                     .iter()
                     .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                access
+                    .iter()
+                    .map(|a| a.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
                 sandboxes

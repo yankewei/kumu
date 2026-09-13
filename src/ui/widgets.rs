@@ -4,6 +4,13 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+/// What a chip says when nothing is in force on its axis: the agent's own
+/// configuration decides, and it says which agent, so the label answers "what
+/// will happen" rather than reading like the name of a config file.
+pub fn inherited_label(agent_name: &str) -> String {
+    format!("跟随 {agent_name} 配置")
+}
+
 /// A small status pill (accent = link-tinted, neutral = muted), Zed-badge style.
 pub fn pill(
     accent: bool,

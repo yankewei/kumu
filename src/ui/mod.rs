@@ -27,6 +27,8 @@ pub struct SessionOptions {
     pub current_model: Option<String>,
     pub modes: Vec<backend::ModeInfo>,
     pub current_mode: Option<String>,
+    pub access: Vec<backend::AccessInfo>,
+    pub current_access: Option<String>,
     pub sandboxes: Vec<backend::SandboxInfo>,
     pub current_sandbox: Option<String>,
     pub reasoning: Vec<backend::ReasoningInfo>,

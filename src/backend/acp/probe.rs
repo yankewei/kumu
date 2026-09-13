@@ -56,6 +56,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                             current_model,
                             modes,
                             current_mode,
+                            access: Vec::new(),
+                            current_access: None,
                             // ACP has no sandbox axis.
                             sandboxes: Vec::new(),
                             current_sandbox: None,
@@ -144,6 +146,7 @@ mod tests {
                 args: vec![],
                 env: vec![],
                 auto_prompt: None,
+                session: Default::default(),
             },
             tx,
         );

@@ -116,6 +116,8 @@ impl SessionState {
                 current_model: self.model.clone(),
                 modes: Vec::new(),
                 current_mode: None,
+                access: Vec::new(),
+                current_access: None,
                 sandboxes: convert::sandbox_options(),
                 current_sandbox: self
                     .sandbox

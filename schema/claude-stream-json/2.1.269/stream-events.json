@@ -1,0 +1,124 @@
+[
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "message_start",
+      "message": {
+        "id": "84202d7f-930e-470a-8d52-eac1aa4b9665",
+        "type": "message",
+        "role": "assistant",
+        "model": "deepseek-v4-pro",
+        "content": [],
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 18059,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "service_tier": "standard"
+        }
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>",
+    "ttft_ms": 200
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "thinking",
+        "thinking": "",
+        "signature": ""
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "thinking_delta",
+        "thinking": "The"
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "content_block_delta",
+      "index": 1,
+      "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{"
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "message_delta",
+      "delta": {
+        "stop_reason": "tool_use",
+        "stop_sequence": null
+      },
+      "usage": {
+        "input_tokens": 18059,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 299,
+        "service_tier": "standard"
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "message_stop"
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  },
+  {
+    "type": "stream_event",
+    "event": {
+      "type": "content_block_delta",
+      "index": 1,
+      "delta": {
+        "type": "text_delta",
+        "text": "The"
+      }
+    },
+    "session_id": "<session>",
+    "parent_tool_use_id": null,
+    "uuid": "<uuid>"
+  }
+]

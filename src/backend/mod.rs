@@ -41,10 +41,10 @@ mod probe;
 #[cfg(test)]
 mod test_support;
 
-pub use config::Config;
+pub use config::{Config, SessionPicks};
 pub use connection::{Connection, spawn};
 pub use event::{
-    Cmd, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo,
-    SandboxInfo,
+    AccessInfo, Cmd, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
+    ReasoningInfo, SandboxInfo,
 };
 pub use probe::probe;

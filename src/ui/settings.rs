@@ -52,15 +52,42 @@ impl SearchableListItem for FontItem {
     }
 }
 
+/// One UI font-size picker entry, in px.
+#[derive(Clone)]
+struct FontSizeItem(u32);
+
+impl SearchableListItem for FontSizeItem {
+    type Value = u32;
+
+    fn title(&self) -> SharedString {
+        self.0.to_string().into()
+    }
+
+    fn value(&self) -> &u32 {
+        &self.0
+    }
+}
+
 pub struct SettingsWindow {
     settings_page: SettingsPage,
     search_state: Entity<InputState>,
     /// UI font picker over the system's installed families.
     font_select: Entity<SelectState<SearchableVec<FontItem>>>,
+    /// UI font-size picker over the app's type scale.
+    font_size_select: Entity<SelectState<SearchableVec<FontSizeItem>>>,
     /// Probed session options (models and modes) per agent id.
     session_options: HashMap<&'static str, SessionOptions>,
     /// Agents whose probe is still running.
     probing: HashSet<&'static str>,
+}
+
+/// The registry agents this process has no cached options for, in registry order.
+fn agents_missing_from(cached: &HashMap<&'static str, SessionOptions>) -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .map(|agent| agent.id)
+        .filter(|id| !cached.contains_key(id))
+        .collect()
 }
 
 impl SettingsWindow {
@@ -73,21 +100,77 @@ impl SettingsWindow {
             HashMap::new()
         };
 
-        // Probe every not-yet-cached agent over ACP for its session options.
-        let mut probing = HashSet::new();
+        // Font picker: every installed family, preselecting the theme's
+        // current one (None = placeholder if it's no longer installed).
+        let font_select = cx.new(|cx| {
+            let items = theme::system_fonts(cx)
+                .into_iter()
+                .map(|(label, family)| FontItem { label, family })
+                .collect::<Vec<_>>();
+            let current = cx.theme().font_family.to_string();
+            let selected = items
+                .iter()
+                .position(|i| i.family.as_ref() == current.as_str())
+                .map(IndexPath::new);
+            SelectState::new(SearchableVec::from(items), selected, window, cx).searchable(true)
+        });
+        cx.subscribe_in(&font_select, window, |this, _, ev, _, cx| {
+            this.on_font_selected(ev, cx);
+        })
+        .detach();
+
+        // Font-size picker over the app's type scale, preselecting the size in
+        // force — the theme's, which the persisted setting has already set.
+        let font_size_select = cx.new(|cx| {
+            let items = theme::FONT_SIZES
+                .into_iter()
+                .map(FontSizeItem)
+                .collect::<Vec<_>>();
+            let current = cx.theme().font_size;
+            let selected = items
+                .iter()
+                .position(|item| px(item.0 as f32) == current)
+                .map(IndexPath::new);
+            SelectState::new(SearchableVec::from(items), selected, window, cx)
+        });
+        cx.subscribe_in(&font_size_select, window, |this, _, ev, _, cx| {
+            this.on_font_size_selected(ev, cx);
+        })
+        .detach();
+
+        // Ask for whatever this process has not discovered yet. The refresh
+        // control on the providers card re-runs the same fan-out over every
+        // agent.
+        let missing = agents_missing_from(&session_options);
+        let mut settings = Self {
+            settings_page: SettingsPage::Providers,
+            search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
+            font_select,
+            font_size_select,
+            session_options,
+            probing: HashSet::new(),
+        };
+        settings.probe(missing, cx);
+        settings
+    }
+
+    /// Ask each agent for its session options, replacing whatever is cached as
+    /// the answers arrive.
+    ///
+    /// This is what the composer's pickers read, and so the only way to refresh
+    /// a catalogue mid-run: an agent that was updated, restarted, or pointed at
+    /// another account is otherwise cached for the life of the process.
+    fn probe(&mut self, agents: Vec<&'static str>, cx: &mut Context<Self>) {
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
-        for a in AGENTS.iter() {
-            if session_options.contains_key(a.id) {
-                continue;
-            }
-            if let Some(cfg) = backend::Config::for_agent(a.id) {
-                backend::probe(a.id, cfg, ev_tx.clone());
-                probing.insert(a.id);
+        for agent in agents {
+            if let Some(cfg) = backend::Config::for_agent(agent) {
+                backend::probe(agent, cfg, ev_tx.clone());
+                self.probing.insert(agent);
             }
         }
         drop(ev_tx);
 
-        // Bridge the ACP threads' std channel into the UI: a plain forwarder
+        // Bridge the agent threads' std channel into the UI: a plain forwarder
         // thread feeds an async channel the main thread can await.
         let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
         std::thread::spawn(move || {
@@ -106,6 +189,8 @@ impl SettingsWindow {
                         current_model,
                         modes,
                         current_mode,
+                        access,
+                        current_access,
                         sandboxes,
                         current_sandbox,
                         reasoning,
@@ -117,6 +202,8 @@ impl SettingsWindow {
                             current_model: current_model.clone(),
                             modes: modes.clone(),
                             current_mode: current_mode.clone(),
+                            access: access.clone(),
+                            current_access: current_access.clone(),
                             sandboxes: sandboxes.clone(),
                             current_sandbox: current_sandbox.clone(),
                             reasoning: reasoning.clone(),
@@ -142,33 +229,6 @@ impl SettingsWindow {
             }
         })
         .detach();
-
-        // Font picker: every installed family, preselecting the theme's
-        // current one (None = placeholder if it's no longer installed).
-        let font_select = cx.new(|cx| {
-            let items = theme::system_fonts(cx)
-                .into_iter()
-                .map(|(label, family)| FontItem { label, family })
-                .collect::<Vec<_>>();
-            let current = cx.theme().font_family.to_string();
-            let selected = items
-                .iter()
-                .position(|i| i.family.as_ref() == current.as_str())
-                .map(IndexPath::new);
-            SelectState::new(SearchableVec::from(items), selected, window, cx).searchable(true)
-        });
-        cx.subscribe_in(&font_select, window, |this, _, ev, _, cx| {
-            this.on_font_selected(ev, cx);
-        })
-        .detach();
-
-        Self {
-            settings_page: SettingsPage::Providers,
-            search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
-            font_select,
-            session_options,
-            probing,
-        }
     }
 
     /// Commit a font pick: persist the family and apply it app-wide.
@@ -185,6 +245,23 @@ impl SettingsWindow {
         }
         db::set_setting(db::SETTING_FONT, family).ok();
         theme::set_font_family(cx, family);
+    }
+
+    /// Commit a font-size pick: persist the size and apply it app-wide, which
+    /// hands every window a new rem size to lay out and draw against.
+    fn on_font_size_selected(
+        &mut self,
+        ev: &SelectEvent<SearchableVec<FontSizeItem>>,
+        cx: &mut Context<Self>,
+    ) {
+        let SelectEvent::Confirm(Some(size)) = ev else {
+            return;
+        };
+        if px(*size as f32) == cx.theme().font_size {
+            return;
+        }
+        db::set_setting(db::SETTING_FONT_SIZE, &size.to_string()).ok();
+        theme::set_font_size(cx, *size as f32);
     }
 
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -296,6 +373,7 @@ impl SettingsWindow {
 
         let cards: Vec<AnyElement> = match self.settings_page {
             SettingsPage::Providers => vec![self.render_providers_card(
+                cx,
                 dark,
                 theme.background,
                 radius,
@@ -363,6 +441,7 @@ impl SettingsWindow {
 
     fn render_providers_card(
         &self,
+        cx: &Context<Self>,
         dark: bool,
         base_bg: Hsla,
         radius: Pixels,
@@ -443,14 +522,44 @@ impl SettingsWindow {
 
         self.card(card_bg)
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(div().text_xs().font_medium().child("编码 Agent"))
+                h_flex()
+                    .items_start()
+                    .gap_6()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().text_xs().font_medium().child("编码 Agent"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child("探测本机 agent 的模型与可用选项"),
+                            ),
+                    )
+                    // Plain text, like every other action here: the agent's own
+                    // probe is what fills the model pickers, so re-running it is
+                    // how a catalogue changed on this machine is picked up —
+                    // otherwise it stays cached for the life of the process. The
+                    // rows' own pills show which agents are being asked.
                     .child(
                         div()
+                            .id("refresh-agents")
+                            .flex_none()
+                            .cursor_pointer()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(radius)
                             .text_xs()
-                            .text_color(muted_fg)
-                            .child("通过 ACP 发现的本机 agent"),
+                            .text_color(link)
+                            .hover(move |style| style.bg(muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let all = AGENTS.iter().map(|agent| agent.id).collect();
+                                this.probe(all, cx);
+                                cx.notify();
+                            }))
+                            .child("刷新"),
                     ),
             )
             .child(v_flex().mt_1().children(rows))
@@ -508,6 +617,16 @@ impl SettingsWindow {
                     .placeholder("选择字体"),
             )
             .into_any_element();
+        // Same control width as the family picker above, so the two typography
+        // rows read as one column.
+        let font_size_select = div()
+            .w_48()
+            .child(
+                Select::new(&self.font_size_select)
+                    .small()
+                    .placeholder("选择字号"),
+            )
+            .into_any_element();
 
         self.card(if dark { muted } else { gpui_kit::gpui::white() })
             .child(row(
@@ -525,6 +644,13 @@ impl SettingsWindow {
                 false,
             ))
             .child(row(
+                "界面字体大小",
+                "界面文字与间距的基础字号。",
+                font_size_select,
+                border,
+                false,
+            ))
+            .child(row(
                 "本地数据",
                 "会话与消息保存在 ~/.kumu/kumu.db。",
                 pill(false, "SQLite", radius, primary, link, muted, muted_fg).into_any_element(),
@@ -538,5 +664,34 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_settings(window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
+    // scope through the glob, so the built-in one is imported explicitly.
+    use core::prelude::v1::test;
+
+    use super::{AGENTS, agents_missing_from};
+    use crate::ui::SessionOptions;
+    use std::collections::HashMap;
+
+    /// Startup asks only for what this process has not discovered, so opening
+    /// settings does not re-spawn every agent; the card's refresh control is what
+    /// asks for all of them.
+    #[test]
+    fn startup_probes_only_the_agents_with_no_cached_options() {
+        let mut cached = HashMap::new();
+        cached.insert("codex", SessionOptions::default());
+
+        let missing = agents_missing_from(&cached);
+        assert!(!missing.contains(&"codex"), "a cached agent is left alone");
+        assert_eq!(
+            missing.len(),
+            AGENTS.len() - 1,
+            "every other registry agent is asked for"
+        );
+        assert_eq!(agents_missing_from(&HashMap::new()).len(), AGENTS.len());
     }
 }

@@ -288,6 +288,9 @@ impl Store {
 /// Setting key holding the UI font family chosen in settings.
 pub const SETTING_FONT: &str = "font_family";
 
+/// Setting key holding the UI font size chosen in settings, in px.
+pub const SETTING_FONT_SIZE: &str = "font_size";
+
 /// Settings use a short-lived connection instead of the UI-owned Store: they
 /// are read once at startup (before any window exists) and written rarely
 /// from the settings window. A busy timeout covers collisions with Store

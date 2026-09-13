@@ -44,6 +44,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                 // Codex exposes no mode selector this backend maps.
                 modes: Vec::new(),
                 current_mode: None,
+                access: Vec::new(),
+                current_access: None,
                 // The policies are a fixed vocabulary, so they can be offered
                 // before any session exists. Which one is *in force* is only
                 // learnable from a live thread's own report, so nothing is

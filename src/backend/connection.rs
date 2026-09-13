@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::config::{Backend, Config};
 use super::event::{Cmd, Event};
-use super::{acp, codex};
+use super::{acp, claude, codex};
 
 /// The table of pending permission requests awaiting a user decision, keyed by
 /// request id.
@@ -123,14 +123,13 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
                     cmd_rx,
                     thread_permissions,
                 )),
-                // The Claude Code backend has its session options but no
-                // session loop yet (see `claude`). Saying so plainly is better
-                // than starting a subprocess nothing drives: an unanswered
-                // agent would park the turn behind a prompt no one can see.
-                Backend::Claude => Err(
-                    "Claude Code 会话尚未实现：当前只支持会话选项探测，请先选择其它 Agent。"
-                        .to_string(),
-                ),
+                Backend::Claude => rt.block_on(claude::session::run(
+                    cfg,
+                    cwd,
+                    ev_tx.clone(),
+                    cmd_rx,
+                    thread_permissions,
+                )),
             };
             if let Err(err) = outcome {
                 super::event::emit(&ev_tx, Event::Error(err));

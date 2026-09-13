@@ -1,0 +1,9 @@
+{
+  "type": "system",
+  "subtype": "permission_denied",
+  "tool_name": "Write",
+  "tool_use_id": "call_00_6UkCnJ3VxDjVpGRzS3W67427",
+  "message": "Claude requested permissions to write to <capture>/probe/probe.txt, but you haven't granted it yet.",
+  "uuid": "<uuid>",
+  "session_id": "<session>"
+}

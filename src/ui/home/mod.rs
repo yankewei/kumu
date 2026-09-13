@@ -1,6 +1,7 @@
 //! Home window: projects → sessions tree on the left, the selected session's
 //! conversation on the right. Owns the settings window handle.
 
+mod access_picker;
 mod composer;
 mod conversation;
 mod mode_picker;
@@ -131,7 +132,9 @@ pub struct KumuApp {
     selected: Option<i64>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
-    /// Message-history rows (thinking/tool) expanded by their list index.
+    /// Expanded rows in the conversation, keyed by the row's element id: a
+    /// history row's list index, or a tool run's first call. Live turn blocks
+    /// carry an `open` flag of their own instead.
     expanded_rows: HashSet<String>,
     messages: Vec<Message>,
     input_state: Entity<TextareaState>,
@@ -157,6 +160,8 @@ pub struct KumuApp {
     sandbox_picker_open: bool,
     /// Reasoning picker open flag; its list is a handful of efforts at most.
     reasoning_picker_open: bool,
+    /// Access picker open flag; like the mode list it needs no search.
+    access_picker_open: bool,
 }
 
 impl KumuApp {
@@ -189,6 +194,7 @@ impl KumuApp {
             mode_picker_open: false,
             sandbox_picker_open: false,
             reasoning_picker_open: false,
+            access_picker_open: false,
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
@@ -437,6 +443,18 @@ impl KumuApp {
             PathBuf::from(&session.cwd)
         };
 
+        // The session's stored picks travel both ways: on the command line for
+        // the backend that takes an axis at launch (Claude Code), and over the
+        // command channel below for the ones that apply theirs after their
+        // handshake. Whether either applies is the backend's business — the UI
+        // only says what the session is set to.
+        let picks = backend::SessionPicks {
+            model: session.model.clone(),
+            mode: session.mode.clone(),
+            reasoning: session.reasoning.clone(),
+        };
+        let cfg = cfg.with_session(picks);
+
         // ACP thread -> std channel -> forwarder thread -> async channel ->
         // UI task (same bridge pattern as the settings window's probes).
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
@@ -445,7 +463,9 @@ impl KumuApp {
         // and teardown can be ignored once a newer one takes over the session.
         let conn_id = conn.id();
         // Re-apply the session's stored picks on a fresh connection; queued
-        // until the agent thread has finished its handshake.
+        // until the agent thread has finished its handshake. A backend that
+        // already launched with them (Claude Code) sees the same value twice
+        // and skips the repeat.
         if let Some(model) = session.model.clone() {
             conn.send(backend::Cmd::SetModel(model));
         }
@@ -759,6 +779,8 @@ impl KumuApp {
                 current_model,
                 modes,
                 current_mode,
+                access,
+                current_access,
                 sandboxes,
                 current_sandbox,
                 reasoning,
@@ -778,6 +800,8 @@ impl KumuApp {
                         current_model,
                         modes,
                         current_mode,
+                        access,
+                        current_access,
                         sandboxes,
                         current_sandbox,
                         reasoning,

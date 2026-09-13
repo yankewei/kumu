@@ -23,29 +23,91 @@ struct ToolPayload {
     decision: Option<String>,
 }
 
+/// One tool call as the conversation renders it, normalized from either a
+/// persisted history row or the live turn so both share one renderer.
+struct ToolRow {
+    /// Element-id stem, unique within the column. A run of calls also keys its
+    /// summary row off the first call's stem.
+    id: String,
+    title: String,
+    status: String,
+    content: String,
+    decision: Option<String>,
+    open: bool,
+    /// How this row flips `open`.
+    toggle: RowToggle,
+}
+
+/// Where a row's expanded state lives, so its click handler can flip it.
+///
+/// History rows and tool runs are keyed in [`KumuApp::expanded_rows`]; a live
+/// turn block owns an `open` flag of its own.
+enum RowToggle {
+    Key(String),
+    Block(usize),
+}
+
+/// One item of the conversation column before folding: a tool call, which
+/// joins the run of calls around it, or anything else already rendered.
+enum ColumnItem {
+    Tool(ToolRow),
+    Element(AnyElement),
+}
+
+/// The click handler that flips a row's expanded state, wherever it lives.
+fn row_toggle_click(
+    cx: &Context<KumuApp>,
+    session_id: i64,
+    toggle: RowToggle,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |this, _, _, cx| {
+        match &toggle {
+            RowToggle::Key(key) => {
+                // `insert` reports whether the key was new, so a second click
+                // on the same row collapses it again.
+                if !this.expanded_rows.insert(key.clone()) {
+                    this.expanded_rows.remove(key);
+                }
+            }
+            RowToggle::Block(index) => {
+                if let Some(block) = this
+                    .turns
+                    .get_mut(&session_id)
+                    .and_then(|turn| turn.blocks.get_mut(*index))
+                {
+                    match block {
+                        TurnBlock::Thinking { open, .. } => *open = !*open,
+                        TurnBlock::Tool(run) => run.open = !run.open,
+                        // Only expandable blocks are ever wrapped in `Block`.
+                        TurnBlock::Answer { .. } => {}
+                    }
+                }
+            }
+        }
+        cx.notify();
+    })
+}
+
 impl KumuApp {
     pub(super) fn render_conversation(&self, session: &Session, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
-        let (radius, muted, muted_fg, primary, success, danger) = (
+        let (radius, muted, muted_fg, primary) = (
             theme.radius,
             theme.muted,
             theme.muted_foreground,
             theme.primary,
-            theme.success,
-            theme.danger,
         );
         let session_id = session.id;
         let title = session.title.clone();
-        let messages = self.messages.clone();
-        let expanded = self.expanded_rows.clone();
-        let turn = self.turns.get(&session.id);
-        // One centered column shared by messages and composer: capped
-        // width for readability, floored so it never gets too skinny.
-        let mut rows = v_flex()
-            .gap_3()
-            .children(messages.into_iter().enumerate().map(move |(ix, m)| {
-                match m.role.as_str() {
-                    "user" => h_flex()
+
+        // Two sources, one column: persisted history first, then the live turn.
+        // Both become the same items, so a run of tool calls folds the same way
+        // wherever it appears.
+        let mut items: Vec<ColumnItem> = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            items.push(match message.role.as_str() {
+                "user" => ColumnItem::Element(
+                    h_flex()
                         .justify_end()
                         .child(
                             div()
@@ -54,27 +116,28 @@ impl KumuApp {
                                 .py_2()
                                 .rounded(radius)
                                 .bg(primary.opacity(0.1))
-                                .child(div().text_sm().child(m.content)),
+                                .child(div().text_sm().child(message.content.clone())),
                         )
                         .into_any_element(),
-                    "system" => div()
+                ),
+                "system" => ColumnItem::Element(
+                    div()
                         .text_xs()
                         .text_color(muted_fg)
-                        .child(m.content)
+                        .child(message.content.clone())
                         .into_any_element(),
-                    "thinking" => {
-                        let key = format!("think-{ix}");
-                        let motion_id = SharedString::from(format!("think-{ix}"));
-                        let header_id = SharedString::from(format!("think-header-{ix}"));
-                        let body_id = SharedString::from(format!("think-body-{ix}"));
-                        let open = expanded.contains(&key);
-                        let text = m.content;
+                ),
+                "thinking" => {
+                    let key = format!("think-{index}");
+                    let open = self.expanded_rows.contains(&key);
+                    let text = message.content.clone();
+                    ColumnItem::Element(
                         Collapsible::new()
                             .open(open)
-                            .motion_id(motion_id)
+                            .motion_id(SharedString::from(format!("think-{index}")))
                             .child(
                                 h_flex()
-                                    .id(header_id)
+                                    .id(SharedString::from(format!("think-header-{index}")))
                                     .cursor_pointer()
                                     .items_center()
                                     .gap_1p5()
@@ -95,121 +158,68 @@ impl KumuApp {
                                             .text_color(muted_fg)
                                             .rotate(percentage(if open { 0.5 } else { 0. })),
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if this.expanded_rows.contains(&key) {
-                                            this.expanded_rows.remove(&key);
-                                        } else {
-                                            this.expanded_rows.insert(key.clone());
-                                        }
-                                        cx.notify();
-                                    })),
+                                    .on_click(row_toggle_click(
+                                        cx,
+                                        session_id,
+                                        RowToggle::Key(key),
+                                    )),
                             )
-                            .content(collapsed_body(body_id, text, muted_fg))
-                            .into_any_element()
+                            .content(collapsed_body(
+                                SharedString::from(format!("think-body-{index}")),
+                                text,
+                                muted_fg,
+                            ))
+                            .into_any_element(),
+                    )
+                }
+                "tool" => match serde_json::from_str::<ToolPayload>(&message.content) {
+                    Ok(payload) => {
+                        let id = format!("tool-{index}");
+                        let open = self.expanded_rows.contains(&id);
+                        ColumnItem::Tool(ToolRow {
+                            id: id.clone(),
+                            title: payload.title,
+                            status: payload.status,
+                            content: payload.content,
+                            decision: payload.decision,
+                            open,
+                            toggle: RowToggle::Key(id),
+                        })
                     }
-                    "tool" => match serde_json::from_str::<ToolPayload>(&m.content) {
-                        Ok(payload) => {
-                            let (icon, color) = match payload.status.as_str() {
-                                "done" => (IconName::Check, success),
-                                "failed" => (IconName::Close, danger),
-                                _ => (IconName::LoaderCircle, muted_fg),
-                            };
-                            let key = format!("tool-{ix}");
-                            let open = expanded.contains(&key);
-                            let title_text = payload.title;
-                            let text = payload.content;
-                            let decision = payload.decision;
-                            let header = h_flex()
-                                .items_center()
-                                .gap_1p5()
-                                .px_1()
-                                .py_0p5()
-                                .child(Icon::new(icon).small().text_color(color))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .truncate()
-                                        .child(title_text),
-                                );
-                            let row = if text.is_empty() {
-                                header.into_any_element()
-                            } else {
-                                let motion_id = SharedString::from(format!("tool-{ix}"));
-                                let header_id = SharedString::from(format!("tool-header-{ix}"));
-                                let body_id = SharedString::from(format!("tool-body-{ix}"));
-                                Collapsible::new()
-                                    .open(open)
-                                    .motion_id(motion_id)
-                                    .child(
-                                        header
-                                            .id(header_id)
-                                            .cursor_pointer()
-                                            .rounded(radius)
-                                            .hover(move |s| s.bg(muted))
-                                            .child(
-                                                Icon::new(IconName::ChevronDown)
-                                                    .xsmall()
-                                                    .flex_none()
-                                                    .text_color(muted_fg)
-                                                    .rotate(percentage(if open {
-                                                        0.5
-                                                    } else {
-                                                        0.
-                                                    })),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if this.expanded_rows.contains(&key) {
-                                                    this.expanded_rows.remove(&key);
-                                                } else {
-                                                    this.expanded_rows.insert(key.clone());
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .content(collapsed_body(body_id, text, muted_fg))
-                                    .into_any_element()
-                            };
-                            // A stored decision explains how the call was
-                            // authorized, which the status alone does not.
-                            let mut container = v_flex().child(row);
-                            if let Some(decision) = decision {
-                                container = container.child(
-                                    div().ml_8().px_1().py_0p5().child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .child(format!("权限 · {decision}")),
-                                    ),
-                                );
-                            }
-                            container.into_any_element()
-                        }
-                        Err(_) => div()
+                    // Not a payload this build writes: show it as it stands
+                    // rather than dropping the row.
+                    Err(_) => ColumnItem::Element(
+                        div()
                             .text_xs()
                             .text_color(muted_fg)
-                            .child(m.content)
+                            .child(message.content.clone())
                             .into_any_element(),
-                    },
-                    // Agent replies arrive as markdown (ACP text
-                    // blocks SHOULD render as markdown).
-                    _ => div()
+                    ),
+                },
+                // Agent replies arrive as markdown (ACP text
+                // blocks SHOULD render as markdown).
+                _ => ColumnItem::Element(
+                    div()
                         .child(
-                            TextView::markdown(SharedString::from(format!("msg-{ix}")), m.content)
-                                .text_sm()
-                                .line_height(relative(1.75)),
+                            TextView::markdown(
+                                SharedString::from(format!("msg-{index}")),
+                                message.content.clone(),
+                            )
+                            .text_sm()
+                            .line_height(relative(1.75)),
                         )
                         .into_any_element(),
-                }
-            }));
-        if let Some(turn) = turn {
+                ),
+            });
+        }
+
+        if let Some(turn) = self.turns.get(&session_id) {
             for (index, block) in turn.blocks.iter().enumerate() {
                 match block {
                     TurnBlock::Thinking { text, open } => {
-                        let open = *open;
-                        let text = text.clone();
+                        let (open, text) = (*open, text.clone());
                         let active = turn.active_thinking == Some(index);
-                        rows = rows.child(
+                        items.push(ColumnItem::Element(
                             Collapsible::new()
                                 .open(open)
                                 .motion_id(SharedString::from(format!("thinking-{index}")))
@@ -247,105 +257,51 @@ impl KumuApp {
                                                 .text_color(muted_fg)
                                                 .rotate(percentage(if open { 0.5 } else { 0. })),
                                         )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(TurnBlock::Thinking { open, .. }) = this
-                                                .turns
-                                                .get_mut(&session_id)
-                                                .and_then(|turn| turn.blocks.get_mut(index))
-                                            {
-                                                *open = !*open;
-                                                cx.notify();
-                                            }
-                                        })),
+                                        .on_click(row_toggle_click(
+                                            cx,
+                                            session_id,
+                                            RowToggle::Block(index),
+                                        )),
                                 )
                                 .content(collapsed_body(
                                     SharedString::from(format!("thinking-body-{index}")),
                                     text,
                                     muted_fg,
-                                )),
-                        );
+                                ))
+                                .into_any_element(),
+                        ));
                     }
-                    TurnBlock::Tool(run) => {
-                        let (icon, color) = match run.status {
-                            "done" => (IconName::Check, success),
-                            "failed" => (IconName::Close, danger),
-                            _ => (IconName::LoaderCircle, muted_fg),
-                        };
-                        let header = |truncate_title: bool| {
-                            h_flex()
-                                .items_center()
-                                .gap_1p5()
-                                .child(Icon::new(icon).small().text_color(color))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted_fg)
-                                        .when(truncate_title, |this| this.truncate())
-                                        .child(run.title.clone()),
-                                )
-                        };
-                        if run.content.is_empty() {
-                            rows = rows.child(header(true).px_1().py_0p5());
-                        } else {
-                            let open = run.open;
-                            let motion_id = SharedString::from(format!("tool-{}", run.id));
-                            let body_id = SharedString::from(format!("tool-body-{}", run.id));
-                            let header_id = SharedString::from(format!("tool-header-{}", run.id));
-                            let text = run.content.clone();
-                            rows = rows.child(
-                                Collapsible::new()
-                                    .open(open)
-                                    .motion_id(motion_id)
-                                    .child(
-                                        header(true)
-                                            .id(header_id)
-                                            .cursor_pointer()
-                                            .px_1()
-                                            .py_0p5()
-                                            .rounded(radius)
-                                            .hover(move |s| s.bg(muted))
-                                            .child(
-                                                Icon::new(IconName::ChevronDown)
-                                                    .xsmall()
-                                                    .flex_none()
-                                                    .text_color(muted_fg)
-                                                    .rotate(percentage(if open {
-                                                        0.5
-                                                    } else {
-                                                        0.
-                                                    })),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(TurnBlock::Tool(run)) = this
-                                                    .turns
-                                                    .get_mut(&session_id)
-                                                    .and_then(|turn| turn.blocks.get_mut(index))
-                                                {
-                                                    run.open = !run.open;
-                                                    cx.notify();
-                                                }
-                                            })),
-                                    )
-                                    .content(collapsed_body(body_id, text, muted_fg)),
-                            );
-                        }
+                    TurnBlock::Tool(run) => items.push(ColumnItem::Tool(ToolRow {
+                        id: format!("tool-live-{}", run.id),
+                        title: run.title.clone(),
+                        status: run.status.to_string(),
+                        content: run.content.clone(),
                         // The prompt itself lives above the composer; the row
-                        // only records how the call ended up authorized.
-                        if run.pending_permission.is_none()
-                            && let Some(decision) = run.decision.as_deref()
-                        {
-                            rows = rows.child(self.render_permission_decision(decision, cx));
-                        }
-                    }
-                    TurnBlock::Answer { view, .. } => {
-                        rows = rows.child(
-                            div().child(TextView::new(view).text_sm().line_height(relative(1.75))),
-                        );
-                    }
+                        // only records how the call ended up authorized, and
+                        // stays quiet while a prompt is still parked on it.
+                        decision: run
+                            .pending_permission
+                            .is_none()
+                            .then(|| run.decision.clone())
+                            .flatten(),
+                        open: run.open,
+                        toggle: RowToggle::Block(index),
+                    })),
+                    TurnBlock::Answer { view, .. } => items.push(ColumnItem::Element(
+                        div()
+                            .child(TextView::new(view).text_sm().line_height(relative(1.75)))
+                            .into_any_element(),
+                    )),
                 }
             }
             if turn.blocks.is_empty() {
-                rows = rows.child(div().text_sm().text_color(muted_fg).child("…"));
+                items.push(ColumnItem::Element(
+                    div()
+                        .text_sm()
+                        .text_color(muted_fg)
+                        .child("…")
+                        .into_any_element(),
+                ));
             }
             // Working-time label at the bottom-left of the reply.
             let secs = turn.started_at.elapsed().as_secs();
@@ -354,7 +310,7 @@ impl KumuApp {
             } else {
                 format!("{secs}s")
             };
-            rows = rows.child(
+            items.push(ColumnItem::Element(
                 h_flex()
                     .items_center()
                     .gap_1p5()
@@ -364,9 +320,12 @@ impl KumuApp {
                             .small()
                             .color(muted_fg),
                     )
-                    .child(div().text_xs().text_color(muted_fg).child(label)),
-            );
+                    .child(div().text_xs().text_color(muted_fg).child(label))
+                    .into_any_element(),
+            ));
         }
+
+        let rows = self.render_column(items, session_id, cx);
         // Pin to the bottom of this frame's content while
         // following: re-armed every render, consumed at paint,
         // so async markdown growth stays glued to the tail.
@@ -407,6 +366,187 @@ impl KumuApp {
                             .child(rows),
                     ),
             )
+    }
+
+    /// Lay the column out, folding each run of consecutive tool calls into a
+    /// single summary row. A run is flushed as soon as anything else separates
+    /// it from the next call, and once more at the end.
+    fn render_column(&self, items: Vec<ColumnItem>, session_id: i64, cx: &Context<Self>) -> Div {
+        let mut column = v_flex().gap_3();
+        let mut run: Vec<ToolRow> = Vec::new();
+        for item in items {
+            match item {
+                ColumnItem::Tool(row) => run.push(row),
+                ColumnItem::Element(element) => {
+                    if !run.is_empty() {
+                        let rows = std::mem::take(&mut run);
+                        column = column.child(self.render_tool_run(rows, session_id, cx));
+                    }
+                    column = column.child(element);
+                }
+            }
+        }
+        if !run.is_empty() {
+            column = column.child(self.render_tool_run(run, session_id, cx));
+        }
+        column
+    }
+
+    /// A run of consecutive tool calls. A lone call is left as its own row —
+    /// there is nothing to summarize — while two or more hide behind one line
+    /// that expands to the calls themselves.
+    fn render_tool_run(
+        &self,
+        rows: Vec<ToolRow>,
+        session_id: i64,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (radius, muted, muted_fg, success, danger) = (
+            theme.radius,
+            theme.muted,
+            theme.muted_foreground,
+            theme.success,
+            theme.danger,
+        );
+        if rows.len() == 1 {
+            let row = rows
+                .into_iter()
+                .next()
+                .expect("a run holds at least one call");
+            return self.render_tool_row(row, session_id, cx);
+        }
+
+        let failures = rows.iter().filter(|row| row.status == "failed").count();
+        // Same reading of status as a single row: anything not settled is
+        // still in flight.
+        let running = rows
+            .iter()
+            .any(|row| !matches!(row.status.as_str(), "done" | "failed"));
+        // The summary carries the worst status in the run: a failure outranks
+        // work still in flight, which outranks a run that came back clean.
+        // With the calls folded away this row is the only sign they are still
+        // moving, so an unfinished run gets a spinner rather than a still icon.
+        let status = if failures > 0 {
+            Icon::new(IconName::Close)
+                .small()
+                .text_color(danger)
+                .into_any_element()
+        } else if running {
+            Spinner::new()
+                .icon(Icon::new(IconName::LoaderCircle))
+                .small()
+                .color(muted_fg)
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Check)
+                .small()
+                .text_color(success)
+                .into_any_element()
+        };
+        let mut label = format!("{} 个工具调用", rows.len());
+        if failures > 0 {
+            label.push_str(&format!(" · {failures} 个失败"));
+        }
+
+        let id = format!("group-{}", rows[0].id);
+        let open = self.expanded_rows.contains(&id);
+        Collapsible::new()
+            .open(open)
+            .motion_id(SharedString::from(id.clone()))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("{id}-header")))
+                    .cursor_pointer()
+                    .items_center()
+                    .gap_1p5()
+                    .px_1()
+                    .py_0p5()
+                    .rounded(radius)
+                    .hover(move |s| s.bg(muted))
+                    .child(status)
+                    .child(div().text_xs().text_color(muted_fg).child(label))
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .xsmall()
+                            .flex_none()
+                            .text_color(muted_fg)
+                            .rotate(percentage(if open { 0.5 } else { 0. })),
+                    )
+                    .on_click(row_toggle_click(cx, session_id, RowToggle::Key(id))),
+            )
+            .content(
+                v_flex().gap_1().pl_4().children(
+                    rows.into_iter()
+                        .map(|row| self.render_tool_row(row, session_id, cx)),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// One tool call: its status, its title, and — for a call that produced
+    /// output — the output behind its own expander.
+    fn render_tool_row(&self, row: ToolRow, session_id: i64, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (radius, muted, muted_fg, success, danger) = (
+            theme.radius,
+            theme.muted,
+            theme.muted_foreground,
+            theme.success,
+            theme.danger,
+        );
+        let (icon, color) = match row.status.as_str() {
+            "done" => (IconName::Check, success),
+            "failed" => (IconName::Close, danger),
+            _ => (IconName::LoaderCircle, muted_fg),
+        };
+        let open = row.open;
+        let header = h_flex()
+            .items_center()
+            .gap_1p5()
+            .px_1()
+            .py_0p5()
+            .child(Icon::new(icon).small().text_color(color))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .truncate()
+                    .child(row.title),
+            );
+        let element = if row.content.is_empty() {
+            header.into_any_element()
+        } else {
+            let id = row.id;
+            let body_id = SharedString::from(format!("{id}-body"));
+            Collapsible::new()
+                .open(open)
+                .motion_id(SharedString::from(id.clone()))
+                .child(
+                    header
+                        .id(SharedString::from(format!("{id}-header")))
+                        .cursor_pointer()
+                        .rounded(radius)
+                        .hover(move |s| s.bg(muted))
+                        .child(
+                            Icon::new(IconName::ChevronDown)
+                                .xsmall()
+                                .flex_none()
+                                .text_color(muted_fg)
+                                .rotate(percentage(if open { 0.5 } else { 0. })),
+                        )
+                        .on_click(row_toggle_click(cx, session_id, row.toggle)),
+                )
+                .content(collapsed_body(body_id, row.content, muted_fg))
+                .into_any_element()
+        };
+        // A stored decision explains how the call was authorized, which the
+        // status alone does not.
+        let mut container = v_flex().child(element);
+        if let Some(decision) = row.decision {
+            container = container.child(self.render_permission_decision(&decision, cx));
+        }
+        container.into_any_element()
     }
 }
 

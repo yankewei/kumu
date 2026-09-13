@@ -9,6 +9,12 @@ pub struct AgentDef {
     /// tinted with the theme; other formats (e.g. png) keep their own colors.
     /// The generic Bot icon is used when `None`.
     pub logo: Option<&'static str>,
+    /// Whether kumu can drive a session with this agent yet. A backend may
+    /// discover an agent's session options without having a session loop to
+    /// apply them, so the composer keeps the session-scoped controls off an
+    /// agent that cannot be driven instead of offering picks that could never
+    /// take effect.
+    pub drives_sessions: bool,
 }
 
 pub const AGENTS: [AgentDef; 4] = [
@@ -17,26 +23,28 @@ pub const AGENTS: [AgentDef; 4] = [
         name: "Opencode",
         desc: "ACP v1",
         logo: Some("opencode.png"),
+        drives_sessions: true,
     },
     AgentDef {
         id: "omp",
         name: "Oh My Pi",
         desc: "omp · ACP v1",
         logo: Some("omp.png"),
+        drives_sessions: true,
     },
     AgentDef {
         id: "codex",
         name: "Codex",
         desc: "codex app-server",
         logo: Some("codex.svg"),
+        drives_sessions: true,
     },
-    // No logo asset yet, so the generic Bot icon stands in. Unlike the others
-    // this one is also honest about what works today: its session options are
-    // discovered, its session loop is not built.
+    // No logo asset yet, so the generic Bot icon stands in.
     AgentDef {
         id: "claude",
         name: "Claude Code",
         desc: "claude -p · stream-json",
         logo: None,
+        drives_sessions: true,
     },
 ];

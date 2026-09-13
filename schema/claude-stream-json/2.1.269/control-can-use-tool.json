@@ -1,0 +1,22 @@
+{
+  "type": "control_request",
+  "request_id": "<request-id>",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "Write",
+    "display_name": "Write",
+    "input": {
+      "file_path": "<capture>/probe/probe.txt",
+      "content": "hi"
+    },
+    "description": "probe.txt",
+    "permission_suggestions": [
+      {
+        "type": "setMode",
+        "mode": "acceptEdits",
+        "destination": "session"
+      }
+    ],
+    "tool_use_id": "call_00_P8yukSl0EITLfI4IQ37H1745"
+  }
+}

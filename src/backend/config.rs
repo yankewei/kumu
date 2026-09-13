@@ -23,6 +23,21 @@ pub enum Backend {
     Claude,
 }
 
+/// The session axes a connection is opened with: the values the user has picked
+/// on the session row.
+///
+/// They live here as well as on the command channel because a backend may need
+/// them at launch. Claude Code takes its model, effort and permission mode on
+/// the command line; ACP and Codex apply theirs after the handshake and ignore
+/// these. Sandbox policies are absent on purpose: no backend takes one at
+/// launch — Codex's is sent as a command, and Claude's lives in its own settings.
+#[derive(Clone, Default, Debug)]
+pub struct SessionPicks {
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub reasoning: Option<String>,
+}
+
 /// How to launch the local agent subprocess.
 pub struct Config {
     /// Static registry id this config was built for (used in events).
@@ -34,9 +49,28 @@ pub struct Config {
     pub env: Vec<(String, String)>,
     /// If set, send this prompt automatically once the session is ready.
     pub auto_prompt: Option<String>,
+    /// The session's stored picks, empty until [`Config::with_session`] is
+    /// called. Only the backends that take an axis at launch read this.
+    pub session: SessionPicks,
 }
 
 impl Config {
+    /// Fold a session's stored picks into this launch config.
+    ///
+    /// Only Claude Code needs them on the command line; ACP and Codex take their
+    /// axes over the command channel after the handshake, so for them this only
+    /// records what the session was opened with.
+    ///
+    /// Nothing is sent for an axis the user has not chosen: an unset value means
+    /// the agent's own configuration decides, which is never kumu's to override.
+    pub fn with_session(mut self, session: SessionPicks) -> Self {
+        if matches!(self.backend, Backend::Claude) {
+            self.args.extend(super::claude::session_args(&session));
+        }
+        self.session = session;
+        self
+    }
+
     /// Build the config for a known agent id from the static registry.
     pub fn for_agent(id: &'static str) -> Option<Self> {
         match id {
@@ -62,6 +96,7 @@ impl Config {
             args: vec!["acp".to_string()],
             env,
             auto_prompt: auto_prompt_env(),
+            session: SessionPicks::default(),
         }
     }
 
@@ -74,6 +109,7 @@ impl Config {
             args: vec!["acp".to_string()],
             env: Vec::new(),
             auto_prompt: auto_prompt_env(),
+            session: SessionPicks::default(),
         }
     }
 
@@ -88,6 +124,7 @@ impl Config {
             args: vec!["app-server".to_string()],
             env: Vec::new(),
             auto_prompt: auto_prompt_env(),
+            session: SessionPicks::default(),
         }
     }
 
@@ -98,10 +135,17 @@ impl Config {
     /// answering one and exiting. `--verbose` is required by `claude` itself
     /// alongside `stream-json`.
     ///
+    /// `--include-partial-messages` is what makes a reply stream token by token
+    /// instead of arriving block by block, and `--permission-prompt-tool stdio`
+    /// is what makes the CLI ask *kumu* about a tool call — without it the very
+    /// same request comes back as a denial. Both were checked against claude
+    /// 2.1.269; see `schema/claude-stream-json/2.1.269/README.md`.
+    ///
     /// Two flags are deliberately not passed. `--bare` is out because it stops
     /// Claude Code reading OAuth credentials or the system keychain, which
     /// would break a Pro/Max subscription login; and no `--permission-mode` or
-    /// `--model` is forced, so an untouched session inherits the user's own
+    /// `--model` is forced here — those arrive only through
+    /// [`Config::with_session`], so an untouched session inherits the user's own
     /// Claude Code configuration instead of having kumu's defaults imposed on
     /// it.
     fn claude(agent: &'static str) -> Self {
@@ -116,9 +160,13 @@ impl Config {
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--verbose".to_string(),
+                "--include-partial-messages".to_string(),
+                "--permission-prompt-tool".to_string(),
+                "stdio".to_string(),
             ],
             env: Vec::new(),
             auto_prompt: auto_prompt_env(),
+            session: SessionPicks::default(),
         }
     }
 }

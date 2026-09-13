@@ -1,0 +1,8 @@
+{
+  "type": "control_request",
+  "request_id": "<request-id>",
+  "request": {
+    "subtype": "initialize",
+    "hooks": null
+  }
+}
