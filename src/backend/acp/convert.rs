@@ -8,11 +8,12 @@
 use agent_client_protocol::schema::v1::{
     ContentBlock, Diff, PermissionOptionKind, RequestPermissionOutcome, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionUpdate, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionUpdate, StopReason,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
 
 use crate::backend::event::{ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
+use crate::backend::session::CANCELLED;
 
 /// A select session config option, located by [`select`].
 struct Select<'a> {
@@ -193,6 +194,20 @@ pub(super) fn status_name(status: &ToolCallStatus) -> &'static str {
         ToolCallStatus::Completed => "done",
         ToolCallStatus::Failed => "failed",
         _ => "pending",
+    }
+}
+
+/// How a turn ended, in the one spelling the boundary uses.
+///
+/// The protocol has a dedicated stop reason for a turn the client cancelled —
+/// the one an agent is required to return after `session/cancel` — and it is
+/// reported as [`CANCELLED`] so the UI can tell a stopped turn from a finished
+/// one without knowing this protocol. Every other reason is passed through by
+/// name, which is what the log has always shown.
+pub(super) fn stop_reason(reason: &StopReason) -> String {
+    match reason {
+        StopReason::Cancelled => CANCELLED.to_string(),
+        other => format!("{other:?}"),
     }
 }
 

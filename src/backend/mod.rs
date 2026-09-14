@@ -8,7 +8,8 @@
 //! Backends:
 //!   - `acp`    — Agent Client Protocol v1 over stdio (`opencode acp`, `omp acp`);
 //!   - `codex`  — OpenAI Codex `app-server` JSON-RPC over stdio;
-//!   - `claude` — Claude Code's headless stream-json protocol over stdio.
+//!   - `claude` — Claude Code's headless stream-json protocol over stdio;
+//!   - `pi`     — Pi's own RPC mode over stdio.
 //!
 //! Runs on a dedicated tokio runtime thread. UI -> here via an unbounded tokio
 //! channel (send is non-blocking, safe from the gpui thread); here -> UI via a
@@ -25,10 +26,12 @@
 //!   - `event`      — the event/command vocabulary and the value types;
 //!   - `config`     — which backend, and how to launch its subprocess;
 //!   - `connection` — the UI-side handle, the permission table, the thread;
+//!   - `session`    — the contract the four session loops share;
 //!   - `probe`      — discovery, dispatched to the backend that owns the agent;
 //!   - `acp/`       — the ACP backend (session, probe, protocol translation);
 //!   - `codex/`     — the Codex app-server backend;
-//!   - `claude/`    — the Claude Code backend.
+//!   - `claude/`    — the Claude Code backend;
+//!   - `pi/`        — the Pi backend.
 
 mod acp;
 mod claude;
@@ -36,7 +39,9 @@ mod codex;
 mod config;
 mod connection;
 mod event;
+mod pi;
 mod probe;
+mod session;
 
 #[cfg(test)]
 mod test_support;

@@ -423,6 +423,22 @@ impl KumuApp {
         cx.notify();
     }
 
+    /// Stop the turn in flight, if there is one.
+    ///
+    /// The cancel travels out of band rather than as a [`backend::Cmd`]: the
+    /// backend's command loop is parked on the very turn being cancelled, so a
+    /// command would not be read until that turn had already ended. The turn
+    /// stays open here until the backend reports it settled, because the agent is
+    /// still running until it says otherwise.
+    fn cancel_turn(&mut self) {
+        let Some(session_id) = self.selected else {
+            return;
+        };
+        if let Some(conn) = self.conns.get(&session_id) {
+            conn.cancel();
+        }
+    }
+
     /// Get or open the ACP connection for a session's agent, and start the
     /// task that folds ACP events back into this view.
     fn ensure_connection(&mut self, session: &Session, cx: &mut Context<Self>) {

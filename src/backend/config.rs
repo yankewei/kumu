@@ -21,6 +21,9 @@ pub enum Backend {
     /// Claude Code's own headless protocol: newline-delimited JSON in and out
     /// of a single `claude -p` process.
     Claude,
+    /// Pi's own RPC mode: newline-delimited JSON commands in, replies and
+    /// events out, over a single `pi --mode rpc` process.
+    Pi,
 }
 
 /// The session axes a connection is opened with: the values the user has picked
@@ -78,6 +81,7 @@ impl Config {
             "omp" => Some(Self::omp(id)),
             "codex" => Some(Self::codex(id)),
             "claude" => Some(Self::claude(id)),
+            "pi" => Some(Self::pi(id)),
             _ => None,
         }
     }
@@ -169,6 +173,39 @@ impl Config {
             session: SessionPicks::default(),
         }
     }
+
+    /// `pi --mode rpc`, Pi's own embedding protocol.
+    ///
+    /// One process per session, like the other backends: RPC mode exists so an
+    /// external client can drive Pi through a whole conversation rather than a
+    /// single print-mode turn, and the process holds it across prompts.
+    ///
+    /// `--approve` stands in for an access posture Pi does not have. Pi has no
+    /// permission system — nothing asks, and nothing could be answered if it
+    /// did — so `--approve` is what lets it read the project's own files; there
+    /// is no supervised mode to degrade to, which is why kumu offers no access
+    /// axis for this agent at all.
+    ///
+    /// No env is injected: Pi resolves its own credentials, so the user's own
+    /// `pi auth` is what authenticates it. Its startup update check is not
+    /// suppressed either — 0.85.1 advertises `--offline` for that rather than
+    /// the `PI_SKIP_VERSION_CHECK` variable older builds honoured, and the check
+    /// does not sit in front of the RPC loop either way.
+    fn pi(agent: &'static str) -> Self {
+        Self {
+            agent,
+            backend: Backend::Pi,
+            command: pi_bin(),
+            args: vec![
+                "--mode".to_string(),
+                "rpc".to_string(),
+                "--approve".to_string(),
+            ],
+            env: Vec::new(),
+            auto_prompt: auto_prompt_env(),
+            session: SessionPicks::default(),
+        }
+    }
 }
 
 fn auto_prompt_env() -> Option<String> {
@@ -236,6 +273,31 @@ fn claude_bin() -> String {
             }
         }
         "claude".to_string()
+    })
+}
+
+/// Resolve the `pi` executable: env override, then the usual install
+/// locations, then PATH.
+///
+/// The absolute candidates matter for the same reason as the other agents': a
+/// GUI-launched process does not inherit the shell's PATH. Pi installs through
+/// npm and into a per-user prefix — the npm global `bin` is where a default
+/// `npm install -g` puts it — so neither would be found otherwise.
+fn pi_bin() -> String {
+    std::env::var("PI_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin/pi"));
+            candidates.push(PathBuf::from(&home).join(".npm-global/bin/pi"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/pi"));
+        candidates.push(PathBuf::from("/usr/local/bin/pi"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "pi".to_string()
     })
 }
 

@@ -1,0 +1,44 @@
+{
+  "model": {
+    "id": "deepseek-v4-flash",
+    "name": "DeepSeek V4 Flash",
+    "api": "openai-responses",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "reasoning": true,
+    "thinkingLevelMap": {
+      "off": "none",
+      "minimal": "low",
+      "low": "low",
+      "medium": "high",
+      "high": "high",
+      "xhigh": "high",
+      "max": "max"
+    },
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0.15,
+      "output": 0.6,
+      "cacheRead": 0.003,
+      "cacheWrite": 0
+    },
+    "contextWindow": 1000000,
+    "maxTokens": 384000,
+    "compat": {
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": false,
+      "supportsStrictMode": false
+    },
+    "provider": "opencode-go"
+  },
+  "thinkingLevel": "high",
+  "isStreaming": false,
+  "isCompacting": false,
+  "steeringMode": "one-at-a-time",
+  "followUpMode": "one-at-a-time",
+  "sessionId": "<session-id>",
+  "autoCompactionEnabled": true,
+  "messageCount": 0,
+  "pendingMessageCount": 0
+}

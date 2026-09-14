@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backend::config::Config;
 use crate::backend::connection::WeakPermissions;
 use crate::backend::event::{Cmd, Event, ModelInfo, emit};
+use crate::backend::session::{
+    CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
+    forget_stale_cancels, release_pending_permissions, settle,
+};
 
 use super::convert;
 use super::protocol::{
@@ -108,25 +112,22 @@ impl SessionState {
     /// axis. Sent again whenever the model changes, because the reasoning set is
     /// the model's.
     fn emit(&self, agent: &'static str, ev_tx: &Sender<Event>) {
-        emit(
-            ev_tx,
-            Event::SessionOptions {
-                agent,
-                models: self.models.clone(),
-                current_model: self.model.clone(),
-                modes: Vec::new(),
-                current_mode: None,
-                access: Vec::new(),
-                current_access: None,
-                sandboxes: convert::sandbox_options(),
-                current_sandbox: self
-                    .sandbox
+        // Codex has no mode or access axis; its own sandbox policy is the one
+        // boundary it exposes.
+        let event = SessionOptionsBuilder::new(agent)
+            .models(self.models.clone(), self.model.clone())
+            .sandboxes(
+                convert::sandbox_options(),
+                self.sandbox
                     .clone()
                     .or_else(|| self.reported_sandbox.clone()),
-                reasoning: convert::reasoning_options(&self.efforts, self.model.as_deref()),
-                current_reasoning: self.reasoning.clone(),
-            },
-        );
+            )
+            .reasoning(
+                convert::reasoning_options(&self.efforts, self.model.as_deref()),
+                self.reasoning.clone(),
+            )
+            .build();
+        emit(ev_tx, event);
     }
 }
 
@@ -135,6 +136,7 @@ pub(in crate::backend) async fn run(
     cwd: PathBuf,
     ev_tx: Sender<Event>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    mut cancels: CancelRequests,
     permissions: WeakPermissions,
 ) -> Result<(), String> {
     emit(
@@ -313,6 +315,7 @@ pub(in crate::backend) async fn run(
                 reasoning: state.reasoning.as_deref(),
             },
             &auto,
+            &mut cancels,
         )
         .await;
     }
@@ -338,6 +341,7 @@ pub(in crate::backend) async fn run(
                         reasoning: state.reasoning.as_deref(),
                     },
                     &text,
+                    &mut cancels,
                 )
                 .await;
             }
@@ -371,11 +375,9 @@ pub(in crate::backend) async fn run(
         }
     }
 
-    // Same as the ACP backend: wake anything still waiting on a decision, so
-    // the agent is never left hanging on a connection that is going away.
-    if let Some(table) = shared.permissions.upgrade() {
-        table.lock().unwrap().clear();
-    }
+    // Wake anything still waiting on a decision, so the agent is never left
+    // hanging on a connection that is going away.
+    release_pending_permissions(&shared.permissions);
     emit(&ev_tx, Event::Log("connection closing".into()));
     Ok(())
 }
@@ -403,7 +405,9 @@ async fn run_turn(
     thread_id: &str,
     overrides: TurnOverrides<'_>,
     text: &str,
+    cancels: &mut CancelRequests,
 ) {
+    forget_stale_cancels(cancels);
     // Installed before the turn starts, so a completion cannot arrive before
     // anyone is listening for it.
     let (done_tx, done_rx) = oneshot::channel();
@@ -430,11 +434,17 @@ async fn run_turn(
         params["effort"] = json!(effort);
     }
     emit(ev_tx, Event::Log("prompt sent".into()));
-    match request::<TurnStartResult>(transport, "turn/start", params).await {
-        Ok(started) => emit(
-            ev_tx,
-            Event::Log(format!("turn started: {}", started.turn.id)),
-        ),
+    // The turn's id is what an interrupt addresses, and `turn/start` is where it
+    // is handed over — earlier than the `turn/started` notification, which this
+    // backend only logs.
+    let turn_id = match request::<TurnStartResult>(transport, "turn/start", params).await {
+        Ok(started) => {
+            emit(
+                ev_tx,
+                Event::Log(format!("turn started: {}", started.turn.id)),
+            );
+            started.turn.id
+        }
         Err(err) => {
             // Nothing will complete, so drop the waiter rather than leave the
             // next prompt to inherit it.
@@ -442,19 +452,44 @@ async fn run_turn(
             emit(ev_tx, Event::Error(err));
             return;
         }
-    }
-    match done_rx.await {
+    };
+
+    // The interrupt has to reach the agent while the turn is running, so it is
+    // watched for here rather than on the command channel: the loop is parked on
+    // this very await.
+    tokio::pin!(done_rx);
+    let mut asked = false;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut done_rx => break outcome,
+            _ = cancels.recv(), if !asked => {
+                asked = true;
+                emit(ev_tx, Event::Log("cancel requested".into()));
+                let params = json!({"threadId": thread_id, "turnId": turn_id.as_str()});
+                if let Err(err) = transport.request("turn/interrupt", params).await {
+                    emit(ev_tx, Event::Log(format!("turn/interrupt failed: {err}")));
+                }
+            }
+        }
+    };
+
+    match outcome {
         Ok(turn) => {
-            // Flushed first, then the failure. The UI drops a session's
-            // in-progress turn when it is told about an error, so reporting
-            // before `Done` would throw away the work the turn had shown.
-            emit(ev_tx, Event::Done(turn.status.clone()));
-            if turn.status == "failed" {
-                let message = turn
-                    .error
+            let failure = (turn.status == "failed").then(|| {
+                turn.error
                     .map(|error| error.message)
-                    .unwrap_or_else(|| "本轮失败".to_string());
-                emit(ev_tx, Event::Error(message));
+                    .unwrap_or_else(|| "本轮失败".to_string())
+            });
+            // `interrupted` is the wire's word for the cancel the user asked
+            // for, so the boundary reports it as such rather than passing the
+            // agent's spelling through to the UI.
+            let stop = if turn.status == "interrupted" {
+                CANCELLED.to_string()
+            } else {
+                turn.status.clone()
+            };
+            for event in settle(stop, failure) {
+                emit(ev_tx, event);
             }
         }
         // The handler went away with the connection.
@@ -642,38 +677,29 @@ fn handle_request(shared: &Arc<Shared>, id: Value, method: &str, params: Value) 
         return;
     };
 
-    let request_id = format!(
-        "perm-{}",
-        shared.next_request_id.fetch_add(1, Ordering::Relaxed)
-    );
-    let (tx, rx) = oneshot::channel();
-    table.lock().unwrap().insert(request_id.clone(), tx);
-    // Released before spawning below, so the guard never crosses an await.
-    drop(table);
-    emit(
-        &shared.ev_tx,
-        Event::PermissionRequest {
-            tool_call_id: prompt.item_id,
-            request_id,
-            title: prompt.title,
-            detail: prompt.detail,
-            options: convert::approval_options(),
-        },
-    );
-
     // Waiting here would stall every notification queued behind it, so the
     // answer is awaited on its own task; the wire id travels with it because
     // the transport needs the agent's id, not ours.
     let transport = shared.transport.clone();
     let ev_tx = shared.ev_tx.clone();
-    tokio::spawn(async move {
-        let option_id = rx.await.ok().flatten();
-        emit(
-            &ev_tx,
-            Event::Log(format!("permission answered: {option_id:?}")),
-        );
-        transport.respond(id, decision_payload(option_id.as_deref()));
-    });
+    ask_user(
+        table,
+        &shared.next_request_id,
+        &shared.ev_tx,
+        PermissionQuestion {
+            tool_call_id: prompt.item_id,
+            title: prompt.title,
+            detail: prompt.detail,
+            options: convert::approval_options(),
+        },
+        move |option_id| {
+            emit(
+                &ev_tx,
+                Event::Log(format!("permission answered: {option_id:?}")),
+            );
+            transport.respond(id, decision_payload(option_id.as_deref()));
+        },
+    );
 }
 
 /// The response body for an approval. The protocol wraps the decision in an

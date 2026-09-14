@@ -45,8 +45,10 @@ mod tests {
         assert!(KumuAssetSource.load("opencode.png").unwrap().is_some());
         assert!(KumuAssetSource.load("codex.svg").unwrap().is_some());
         // kumu's own icons layer on top of gpui-kit's bundled set (the reason
-        // chip's brain glyph, which the bundled set does not ship).
+        // chip's brain glyph, and the composer's stop glyph while a turn runs,
+        // neither of which the bundled set ships).
         assert!(KumuAssetSource.load("icons/brain.svg").unwrap().is_some());
+        assert!(KumuAssetSource.load("icons/stop.svg").unwrap().is_some());
         // gpui-kit's bundled icons resolve through the fallback.
         assert!(
             KumuAssetSource

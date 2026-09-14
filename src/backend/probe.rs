@@ -25,6 +25,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         Backend::Acp => super::acp::probe::probe(agent, cfg, ev_tx),
         Backend::Codex => super::codex::probe::probe(agent, cfg, ev_tx),
         Backend::Claude => super::claude::probe::probe(agent, cfg, ev_tx),
+        Backend::Pi => super::pi::probe::probe(agent, cfg, ev_tx),
     }
 }
 

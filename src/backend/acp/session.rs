@@ -12,13 +12,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, TextContent,
+    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Client, ConnectionTo, Result, on_receive_notification,
@@ -27,11 +27,15 @@ use agent_client_protocol::{
 
 use super::convert::{
     mode_catalog, model_catalog, permission_detail, permission_kind, permission_outcome,
-    reasoning_catalog, status_name, tool_call_content, variant_name,
+    reasoning_catalog, status_name, stop_reason, tool_call_content, variant_name,
 };
 use crate::backend::config::Config;
 use crate::backend::connection::WeakPermissions;
 use crate::backend::event::{Cmd, Event, PermissionOptionInfo, emit};
+use crate::backend::session::{
+    CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user, forget_stale_cancels,
+    release_pending_permissions,
+};
 
 /// Drive one ACP session to completion. Called by the shared [`spawn`]
 /// dispatcher, which is one level up, so the visibility follows the caller.
@@ -42,6 +46,7 @@ pub(in crate::backend) async fn run(
     cwd: PathBuf,
     ev_tx: Sender<Event>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    mut cancels: CancelRequests,
     permissions: WeakPermissions,
 ) -> Result<()> {
     let mut launch = AcpAgentConfig::new(&cfg.command);
@@ -139,23 +144,13 @@ pub(in crate::backend) async fn run(
                         let (_, current_model, models) = model_catalog(&config_options);
                         let (_, current_mode, modes) = mode_catalog(&config_options);
                         let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
-                        emit(
-                            &notif_tx,
-                            Event::SessionOptions {
-                                agent: agent_id,
-                                models,
-                                current_model,
-                                modes,
-                                current_mode,
-                                access: Vec::new(),
-                                current_access: None,
-                                // ACP has no sandbox axis.
-                                sandboxes: Vec::new(),
-                                current_sandbox: None,
-                                reasoning,
-                                current_reasoning,
-                            },
-                        );
+                        // ACP has no access or sandbox axis, so neither is set.
+                        let options = SessionOptionsBuilder::new(agent_id)
+                            .models(models, current_model)
+                            .modes(modes, current_mode)
+                            .reasoning(reasoning, current_reasoning)
+                            .build();
+                        emit(&notif_tx, options);
                     }
                     other => {
                         let name = variant_name(&other).to_string();
@@ -186,51 +181,35 @@ pub(in crate::backend) async fn run(
                     return Ok(());
                 };
 
-                let request_id = format!("perm-{}", next_perm_id.fetch_add(1, Ordering::Relaxed));
-                let tool_call_id = request.tool_call.tool_call_id.0.to_string();
-                let title = request.tool_call.fields.title.clone().unwrap_or_default();
-                let detail = permission_detail(&request.tool_call);
-                let options = request
-                    .options
-                    .iter()
-                    .map(|o| PermissionOptionInfo {
-                        id: o.option_id.0.to_string(),
-                        name: o.name.clone(),
-                        kind: permission_kind(&o.kind),
-                    })
-                    .collect::<Vec<_>>();
-
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                // The guard is released before spawning, so it never crosses an
-                // await; the upgraded handle is dropped so teardown is not held
-                // up by this registration.
-                table.lock().unwrap().insert(request_id.clone(), tx);
-                drop(table);
-                emit(
+                let log_tx = perm_tx.clone();
+                ask_user(
+                    table,
+                    &next_perm_id,
                     &perm_tx,
-                    Event::PermissionRequest {
-                        tool_call_id,
-                        request_id,
-                        title,
-                        detail,
-                        options,
+                    PermissionQuestion {
+                        tool_call_id: request.tool_call.tool_call_id.0.to_string(),
+                        title: request.tool_call.fields.title.clone().unwrap_or_default(),
+                        detail: permission_detail(&request.tool_call),
+                        options: request
+                            .options
+                            .iter()
+                            .map(|o| PermissionOptionInfo {
+                                id: o.option_id.0.to_string(),
+                                name: o.name.clone(),
+                                kind: permission_kind(&o.kind),
+                            })
+                            .collect(),
+                    },
+                    move |option_id| {
+                        emit(
+                            &log_tx,
+                            Event::Log(format!("permission answered: {option_id:?}")),
+                        );
+                        let _ = responder.respond(RequestPermissionResponse::new(
+                            permission_outcome(option_id),
+                        ));
                     },
                 );
-
-                // Waiting for the user here would block the dispatch loop and
-                // stall every other message on this connection, so the responder
-                // moves into its own task instead.
-                let log_tx = perm_tx.clone();
-                tokio::spawn(async move {
-                    let option_id = rx.await.ok().flatten();
-                    emit(
-                        &log_tx,
-                        Event::Log(format!("permission answered: {option_id:?}")),
-                    );
-                    let _ = responder.respond(RequestPermissionResponse::new(permission_outcome(
-                        option_id,
-                    )));
-                });
                 Ok(())
             },
             on_receive_request!(),
@@ -268,22 +247,12 @@ pub(in crate::backend) async fn run(
                     mode_catalog(&new_session.config_options);
                 let (reasoning_option_id, current_reasoning, reasoning) =
                     reasoning_catalog(&new_session.config_options);
-                emit(
-                    &ev_tx,
-                    Event::SessionOptions {
-                        agent: agent_id,
-                        models,
-                        current_model,
-                        modes,
-                        current_mode,
-                        access: Vec::new(),
-                        current_access: None,
-                        sandboxes: Vec::new(),
-                        current_sandbox: None,
-                        reasoning,
-                        current_reasoning,
-                    },
-                );
+                let options = SessionOptionsBuilder::new(agent_id)
+                    .models(models, current_model)
+                    .modes(modes, current_mode)
+                    .reasoning(reasoning, current_reasoning)
+                    .build();
+                emit(&ev_tx, options);
 
                 // Headless convenience: send one prompt before the UI loop.
                 if let Some(auto) = auto_prompt {
@@ -295,21 +264,50 @@ pub(in crate::backend) async fn run(
                         ))
                         .block_task()
                         .await?;
-                    emit(&ev_tx, Event::Done(format!("{:?}", response.stop_reason)));
+                    emit(&ev_tx, Event::Done(stop_reason(&response.stop_reason)));
                 }
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         Cmd::Prompt(text) => {
+                            forget_stale_cancels(&mut cancels);
                             emit(&log_tx, Event::Log("prompt sent".into()));
-                            let response = connection
+                            let prompt = connection
                                 .send_request(PromptRequest::new(
                                     session_id.clone(),
                                     vec![ContentBlock::Text(TextContent::new(text))],
                                 ))
-                                .block_task()
-                                .await?;
-                            emit(&ev_tx, Event::Done(format!("{:?}", response.stop_reason)));
+                                .block_task();
+                            // The cancel has to reach the agent while this request
+                            // is outstanding, so it is watched for here rather
+                            // than on the command channel: this loop is parked on
+                            // the very request it would cancel.
+                            tokio::pin!(prompt);
+                            let mut asked = false;
+                            let response = loop {
+                                tokio::select! {
+                                    response = &mut prompt => break response?,
+                                    _ = cancels.recv(), if !asked => {
+                                        asked = true;
+                                        emit(&log_tx, Event::Log("cancel requested".into()));
+                                        // A notification, not the request's
+                                        // answer: the prompt is still outstanding
+                                        // and its own response carries the stop
+                                        // reason this backend reports below.
+                                        let _ = connection.send_notification(
+                                            CancelNotification::new(session_id.clone()),
+                                        );
+                                        // The protocol requires every pending
+                                        // permission request to be answered
+                                        // `Cancelled` when a turn is cancelled, or
+                                        // it parks behind a prompt nobody can
+                                        // answer. Dropping the senders is what
+                                        // makes the waiting tasks do exactly that.
+                                        release_pending_permissions(&permissions);
+                                    }
+                                }
+                            };
+                            emit(&ev_tx, Event::Done(stop_reason(&response.stop_reason)));
                         }
                         Cmd::SetModel(value) => match &model_option_id {
                             Some(option_id) => {
@@ -383,13 +381,10 @@ pub(in crate::backend) async fn run(
                         },
                     }
                 }
-                // Dropping the senders wakes any task still waiting on a user
+                // The dropped senders wake any task still waiting on a user
                 // decision; it answers `Cancelled` so the agent is never left
-                // hanging on a connection that is going away. (If the UI already
-                // dropped its handle the table is gone and this is unnecessary.)
-                if let Some(table) = permissions.upgrade() {
-                    table.lock().unwrap().clear();
-                }
+                // hanging on a connection that is going away.
+                release_pending_permissions(&permissions);
                 emit(&log_tx, Event::Log("connection closing".into()));
                 Ok(())
             },

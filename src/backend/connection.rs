@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::config::{Backend, Config};
 use super::event::{Cmd, Event};
-use super::{acp, claude, codex};
+use super::{acp, claude, codex, pi};
 
 /// The table of pending permission requests awaiting a user decision, keyed by
 /// request id.
@@ -29,7 +29,8 @@ use super::{acp, claude, codex};
 /// table, which drops every pending sender and makes the waiting tasks answer
 /// `Cancelled` — the only thing that can unblock a prompt whose agent is sitting
 /// on a permission request.
-type PermissionTable = Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>;
+pub(super) type PermissionTable =
+    Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>;
 type SharedPermissions = Arc<PermissionTable>;
 pub(super) type WeakPermissions = Weak<PermissionTable>;
 
@@ -48,6 +49,12 @@ pub struct Connection {
     /// still belongs to the session's current connection.
     id: u64,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    /// Asks the backend to cancel the turn in flight.
+    ///
+    /// Out of band, for the same reason the permission table is: the command
+    /// loop is parked on the very turn being cancelled, so routing this through
+    /// [`Cmd`] would not deliver it until that turn had already ended.
+    cancel_tx: tokio::sync::mpsc::UnboundedSender<()>,
     permissions: SharedPermissions,
 }
 
@@ -61,6 +68,15 @@ impl Connection {
     /// Queue a command; non-blocking.
     pub fn send(&self, cmd: Cmd) {
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Ask the backend to cancel the turn in flight; non-blocking.
+    ///
+    /// A no-op when no turn is open: the request is simply dropped before the
+    /// next turn starts, so a click that races the end of a turn cannot settle
+    /// the one after it.
+    pub fn cancel(&self) {
+        let _ = self.cancel_tx.send(());
     }
 
     /// Answer a pending permission request. `option_id` of `None` responds with
@@ -79,6 +95,7 @@ impl Connection {
         Self {
             id,
             cmd_tx: tokio::sync::mpsc::unbounded_channel().0,
+            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -92,6 +109,9 @@ impl Connection {
 /// dispatch.
 pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+    // Cancels travel beside the command queue rather than on it, because the
+    // loop that reads commands is parked on the turn a cancel is meant to end.
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     // Shared so the UI can answer permission requests without the command queue.
     // The thread only borrows it, so dropping the handle can still free it.
     let permissions: SharedPermissions = Arc::new(Mutex::new(HashMap::new()));
@@ -113,6 +133,7 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
                         cwd,
                         ev_tx.clone(),
                         cmd_rx,
+                        cancel_rx,
                         thread_permissions,
                     ))
                     .map_err(|err| err.to_string()),
@@ -121,6 +142,7 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
                     cwd,
                     ev_tx.clone(),
                     cmd_rx,
+                    cancel_rx,
                     thread_permissions,
                 )),
                 Backend::Claude => rt.block_on(claude::session::run(
@@ -128,6 +150,15 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
                     cwd,
                     ev_tx.clone(),
                     cmd_rx,
+                    cancel_rx,
+                    thread_permissions,
+                )),
+                Backend::Pi => rt.block_on(pi::session::run(
+                    cfg,
+                    cwd,
+                    ev_tx.clone(),
+                    cmd_rx,
+                    cancel_rx,
                     thread_permissions,
                 )),
             };
@@ -139,6 +170,7 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
     Connection {
         id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         cmd_tx,
+        cancel_tx,
         permissions,
     }
 }
@@ -156,6 +188,7 @@ mod tests {
         let conn = Connection {
             id: 1,
             cmd_tx,
+            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: permissions.clone(),
         };
 
@@ -188,6 +221,7 @@ mod tests {
         let conn = Connection {
             id: 1,
             cmd_tx,
+            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: permissions.clone(),
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();

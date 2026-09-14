@@ -1,0 +1,159 @@
+[
+  {
+    "type": "agent_start"
+  },
+  {
+    "type": "turn_start"
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Run the bash command `ls /tmp` and then reply with exactly: ok"
+        }
+      ],
+      "timestamp": 1789360828780
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Run the bash command `ls /tmp` and then reply with exactly: ok"
+        }
+      ],
+      "timestamp": 1789360828780
+    }
+  },
+  {
+    "type": "message_start",
+    "message": {
+      "role": "assistant",
+      "content": [],
+      "api": "openai-responses",
+      "provider": "opencode-go",
+      "model": "deepseek-v4-flash",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "error",
+      "timestamp": 1789360828805,
+      "errorMessage": "<176 chars of output>"
+    }
+  },
+  {
+    "type": "message_end",
+    "message": {
+      "role": "assistant",
+      "content": [],
+      "api": "openai-responses",
+      "provider": "opencode-go",
+      "model": "deepseek-v4-flash",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "error",
+      "timestamp": 1789360828805,
+      "errorMessage": "<176 chars of output>"
+    }
+  },
+  {
+    "type": "turn_end",
+    "message": {
+      "role": "assistant",
+      "content": [],
+      "api": "openai-responses",
+      "provider": "opencode-go",
+      "model": "deepseek-v4-flash",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "stopReason": "error",
+      "timestamp": 1789360828805,
+      "errorMessage": "<176 chars of output>"
+    },
+    "toolResults": []
+  },
+  {
+    "type": "agent_end",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Run the bash command `ls /tmp` and then reply with exactly: ok"
+          }
+        ],
+        "timestamp": 1789360828780
+      },
+      {
+        "role": "assistant",
+        "content": [],
+        "api": "openai-responses",
+        "provider": "opencode-go",
+        "model": "deepseek-v4-flash",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "error",
+        "timestamp": 1789360828805,
+        "errorMessage": "<176 chars of output>"
+      }
+    ],
+    "willRetry": false
+  },
+  {
+    "type": "agent_settled"
+  }
+]

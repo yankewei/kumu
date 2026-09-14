@@ -14,6 +14,7 @@ use super::convert::{mode_catalog, model_catalog, reasoning_catalog};
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
 use crate::backend::probe::run;
+use crate::backend::session::SessionOptionsBuilder;
 
 /// Probe an agent over ACP just to discover its session options: initialize,
 /// create one throwaway session, read the model and mode config options, then
@@ -48,23 +49,13 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                     let (_, current_mode, modes) = mode_catalog(&new_session.config_options);
                     let (_, current_reasoning, reasoning) =
                         reasoning_catalog(&new_session.config_options);
-                    emit(
-                        &ev_tx,
-                        Event::SessionOptions {
-                            agent,
-                            models,
-                            current_model,
-                            modes,
-                            current_mode,
-                            access: Vec::new(),
-                            current_access: None,
-                            // ACP has no sandbox axis.
-                            sandboxes: Vec::new(),
-                            current_sandbox: None,
-                            reasoning,
-                            current_reasoning,
-                        },
-                    );
+                    // ACP has no access or sandbox axis, so neither is set.
+                    let options = SessionOptionsBuilder::new(agent)
+                        .models(models, current_model)
+                        .modes(modes, current_mode)
+                        .reasoning(reasoning, current_reasoning)
+                        .build();
+                    emit(&ev_tx, options);
                     Ok(())
                 },
             )

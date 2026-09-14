@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
 use crate::backend::probe::run;
+use crate::backend::session::SessionOptionsBuilder;
 
 use super::protocol::ModelListResult;
 use super::{client_info, convert};
@@ -35,27 +36,16 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         // selected model's own default.
         let reasoning = convert::reasoning_options(&efforts, current_model.as_deref());
         let current_reasoning = convert::default_effort(&efforts, current_model.as_deref());
-        emit(
-            &ev_tx,
-            Event::SessionOptions {
-                agent,
-                models,
-                current_model,
-                // Codex exposes no mode selector this backend maps.
-                modes: Vec::new(),
-                current_mode: None,
-                access: Vec::new(),
-                current_access: None,
-                // The policies are a fixed vocabulary, so they can be offered
-                // before any session exists. Which one is *in force* is only
-                // learnable from a live thread's own report, so nothing is
-                // claimed here.
-                sandboxes: convert::sandbox_options(),
-                current_sandbox: None,
-                reasoning,
-                current_reasoning,
-            },
-        );
+        // Codex exposes no mode or access axis. The sandbox policies are a fixed
+        // vocabulary, so they can be offered before any session exists; which
+        // one is *in force* is only learnable from a live thread's own report,
+        // so nothing is claimed here.
+        let options = SessionOptionsBuilder::new(agent)
+            .models(models, current_model)
+            .sandboxes(convert::sandbox_options(), None)
+            .reasoning(reasoning, current_reasoning)
+            .build();
+        emit(&ev_tx, options);
         Ok::<(), String>(())
     });
 }

@@ -22,7 +22,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +36,10 @@ use crate::backend::config::{Config, SessionPicks};
 use crate::backend::connection::WeakPermissions;
 use crate::backend::event::{
     AccessInfo, Cmd, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit,
+};
+use crate::backend::session::{
+    CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
+    forget_stale_cancels, release_pending_permissions, settle,
 };
 
 /// What the next `result` line settles.
@@ -79,6 +83,10 @@ struct Shared {
     /// Message ids whose text and thinking already arrived as deltas.
     streamed: Mutex<HashSet<String>>,
     options: Mutex<Options>,
+    /// Whether an interrupt was asked for the turn now in flight, so the pump
+    /// reports its `result` as a cancel rather than as a failure. Cleared when
+    /// the next prompt starts, since only one turn is ever open.
+    cancelled: AtomicBool,
     /// What this connection was launched with, so a command that only repeats
     /// it does not need saying again.
     launched: SessionPicks,
@@ -89,22 +97,14 @@ impl Shared {
     /// again whenever an axis changes, matching the other backends.
     fn emit_options(&self) {
         let options = self.options.lock().unwrap();
-        emit(
-            &self.ev_tx,
-            Event::SessionOptions {
-                agent: self.agent,
-                models: options.models.clone(),
-                current_model: options.current_model.clone(),
-                modes: options.modes.clone(),
-                current_mode: options.current_mode.clone(),
-                access: options.access.clone(),
-                current_access: options.current_access.clone(),
-                sandboxes: options.sandboxes.clone(),
-                current_sandbox: options.current_sandbox.clone(),
-                reasoning: options.reasoning.clone(),
-                current_reasoning: options.current_reasoning.clone(),
-            },
-        );
+        let event = SessionOptionsBuilder::new(self.agent)
+            .models(options.models.clone(), options.current_model.clone())
+            .modes(options.modes.clone(), options.current_mode.clone())
+            .access(options.access.clone(), options.current_access.clone())
+            .sandboxes(options.sandboxes.clone(), options.current_sandbox.clone())
+            .reasoning(options.reasoning.clone(), options.current_reasoning.clone())
+            .build();
+        emit(&self.ev_tx, event);
     }
 
     /// Send a slash command as a user message. Its result settles the queue
@@ -120,6 +120,7 @@ pub(in crate::backend) async fn run(
     cwd: PathBuf,
     ev_tx: Sender<Event>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    mut cancels: CancelRequests,
     permissions: WeakPermissions,
 ) -> Result<(), String> {
     let (transport, mut messages, _child) =
@@ -165,6 +166,7 @@ pub(in crate::backend) async fn run(
             current_reasoning: None,
         }),
         launched: cfg.session.clone(),
+        cancelled: AtomicBool::new(false),
     });
     shared.emit_options();
 
@@ -183,12 +185,12 @@ pub(in crate::backend) async fn run(
     // before the UI loop starts.
     if let Some(auto) = cfg.auto_prompt.clone() {
         emit(&ev_tx, Event::Log(format!("auto prompt: {auto}")));
-        prompt(&shared, &auto).await;
+        prompt(&shared, &auto, &mut cancels).await;
     }
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            Cmd::Prompt(text) => prompt(&shared, &text).await,
+            Cmd::Prompt(text) => prompt(&shared, &text, &mut cancels).await,
             Cmd::SetModel(value) => {
                 // The model is a launch flag, so a change mid-session rides the
                 // documented `/model` command instead.
@@ -241,21 +243,57 @@ pub(in crate::backend) async fn run(
 
     // The command channel closed, so the UI is gone. Release anyone still
     // waiting on a decision, then let the child go.
-    if let Some(table) = shared.permissions.upgrade() {
-        table.lock().unwrap().clear();
-    }
+    release_pending_permissions(&shared.permissions);
     pump.abort();
     emit(&ev_tx, Event::Log("connection closing".to_string()));
     Ok(())
 }
 
 /// Send one prompt and wait for the turn it opens to end.
-async fn prompt(shared: &Arc<Shared>, text: &str) {
+async fn prompt(shared: &Arc<Shared>, text: &str, cancels: &mut CancelRequests) {
+    forget_stale_cancels(cancels);
+    shared.cancelled.store(false, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     *shared.turn_done.lock().unwrap() = Some(tx);
     shared.awaiting.lock().unwrap().push_back(Awaiting::Prompt);
     shared.transport.send(user_message(text));
-    let _ = rx.await;
+    // The interrupt has to reach the CLI while the turn is running, so it is
+    // watched for here rather than on the command channel: the loop is parked on
+    // this very await.
+    tokio::pin!(rx);
+    let mut asked = false;
+    loop {
+        tokio::select! {
+            _ = &mut rx => break,
+            _ = cancels.recv(), if !asked => {
+                asked = true;
+                shared.cancelled.store(true, Ordering::Relaxed);
+                interrupt(shared).await;
+            }
+        }
+    }
+}
+
+/// Ask the CLI to interrupt the turn in flight.
+///
+/// The CLI answers this control request with `success`, and then ends the turn
+/// with an ordinary `result` line — which is what the pump settles on, and the
+/// same thing waku's Claude driver relies on. What that `result` says about the
+/// interruption is not documented and was not captured, so the turn is marked
+/// cancelled on this side and the settle pass reads the marking rather than the
+/// CLI's wording (see `Shared::cancelled`).
+async fn interrupt(shared: &Arc<Shared>) {
+    emit(&shared.ev_tx, Event::Log("cancel requested".into()));
+    if let Err(error) = shared
+        .transport
+        .control(json!({"subtype": "interrupt"}))
+        .await
+    {
+        emit(
+            &shared.ev_tx,
+            Event::Log(format!("interrupt 失败：{error}")),
+        );
+    }
 }
 
 /// The CLI's shape for a user message on stdin.
@@ -443,21 +481,24 @@ fn on_result(shared: &Shared, result: ResultEvent) {
             }
         }
         // A prompt's result, or one nobody claimed — a turn the CLI ended on
-        // its own. Either way the UI's turn is over: `Done` goes first so the
-        // turn's work is kept, then the failure, the order the Codex backend
-        // uses.
+        // its own. Either way the UI's turn is over.
         Some(Awaiting::Prompt) | None => {
-            emit(
-                &shared.ev_tx,
-                Event::Done(
-                    result
-                        .stop_reason
-                        .clone()
-                        .unwrap_or_else(|| result.subtype.clone()),
-                ),
-            );
-            if result.is_error {
-                emit(&shared.ev_tx, Event::Error(result.failure()));
+            // An interrupted turn is reported as cancelled rather than as
+            // whatever the CLI calls it, and its failure — if it reports one for
+            // being interrupted at all — is not shown as a failure, because the
+            // user asked for it.
+            let cancelled = shared.cancelled.load(Ordering::Relaxed);
+            let stop = if cancelled {
+                CANCELLED.to_string()
+            } else {
+                result
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| result.subtype.clone())
+            };
+            let failure = (!cancelled && result.is_error).then(|| result.failure());
+            for event in settle(stop, failure) {
+                emit(&shared.ev_tx, event);
             }
             if !result.permission_denials.is_empty() {
                 emit(
@@ -502,41 +543,31 @@ fn on_can_use_tool(shared: &Arc<Shared>, request_id: &str, body: protocol::Contr
             .respond(request_id, deny_response("会话已关闭"));
         return;
     };
-    let answer_id = format!(
-        "perm-{}",
-        shared.next_request_id.fetch_add(1, Ordering::Relaxed)
-    );
-    let (tx, rx) = oneshot::channel();
-    table.lock().unwrap().insert(answer_id.clone(), tx);
-    // The guard is dropped before the task below is spawned: the UI answers by
-    // taking the sender out of the same table.
-    drop(table);
-
-    emit(
+    let transport = shared.transport.clone();
+    let input = body.input.clone();
+    let agent_request_id = request_id.to_string();
+    ask_user(
+        table,
+        &shared.next_request_id,
         &shared.ev_tx,
-        Event::PermissionRequest {
+        PermissionQuestion {
             tool_call_id: body.tool_use_id.clone().unwrap_or_default(),
-            request_id: answer_id,
             title: convert::permission_title(&body),
             detail: convert::permission_detail(&body),
             options: convert::permission_options(),
         },
+        move |option_id| {
+            let allowed = option_id.as_deref() == Some(convert::ALLOW_OPTION);
+            let response = if allowed {
+                // The input is echoed back unchanged, which is what the CLI
+                // requires of an allow answer.
+                json!({"behavior": "allow", "updatedInput": input})
+            } else {
+                deny_response("用户拒绝了这次调用")
+            };
+            transport.respond(&agent_request_id, response);
+        },
     );
-
-    let transport = shared.transport.clone();
-    let input = body.input.clone();
-    let request_id = request_id.to_string();
-    tokio::spawn(async move {
-        let allowed = rx.await.ok().flatten().as_deref() == Some(convert::ALLOW_OPTION);
-        let response = if allowed {
-            // The input is echoed back unchanged, which is what the CLI
-            // requires of an allow answer.
-            json!({"behavior": "allow", "updatedInput": input})
-        } else {
-            deny_response("用户拒绝了这次调用")
-        };
-        transport.respond(&request_id, response);
-    });
 }
 
 /// The refusal the CLI accepts, whether the user said no or nobody could ask.

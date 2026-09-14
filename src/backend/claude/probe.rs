@@ -33,6 +33,7 @@ use serde_json::Value;
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
 use crate::backend::probe::run;
+use crate::backend::session::SessionOptionsBuilder;
 
 use super::convert;
 
@@ -154,33 +155,23 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                 cfg.command, output.status
             ));
         }
-        emit(
-            &ev_tx,
-            Event::SessionOptions {
-                agent,
-                models: convert::model_options(),
-                // No session exists, so no model is in force yet.
-                current_model: None,
-                modes: convert::mode_options(),
-                // A session starts in the mode this machine configures and at
-                // the effort it pins: read from Claude Code's own settings so
-                // the chips say something concrete before the first message.
-                current_mode: Some(mode.clone()),
-                access: convert::access_options(),
-                current_access: access.clone(),
-                // Claude Code does have an OS-level sandbox (Seatbelt on macOS,
-                // bubblewrap on Linux/WSL2), but kumu offers no axis for it: it
-                // is a switch plus filesystem/network rule lists in Claude Code's
-                // own settings, with no per-session form (every plausible
-                // control subtype is rejected — see
-                // `schema/claude-stream-json/2.1.269/README.md`). What carries
-                // "how much may it do on its own" here is the access mode above.
-                sandboxes: Vec::new(),
-                current_sandbox: None,
-                reasoning: convert::reasoning_options(),
-                current_reasoning: effort.clone(),
-            },
-        );
+        // No sandbox axis: Claude Code does have an OS-level boundary (Seatbelt
+        // on macOS, bubblewrap on Linux/WSL2), but it is a switch plus
+        // filesystem/network rule lists in Claude Code's own settings with no
+        // per-session form — every plausible control subtype is rejected (see
+        // `schema/claude-stream-json/2.1.269/README.md`). What carries "how much
+        // may it do on its own" is the access policy.
+        let options = SessionOptionsBuilder::new(agent)
+            // No session exists, so no model is in force yet.
+            .models(convert::model_options(), None)
+            // A session starts in the mode this machine configures and at the
+            // effort it pins: read from Claude Code's own settings so the chips
+            // say something concrete before the first message.
+            .modes(convert::mode_options(), Some(mode.clone()))
+            .access(convert::access_options(), access.clone())
+            .reasoning(convert::reasoning_options(), effort.clone())
+            .build();
+        emit(&ev_tx, options);
         Ok::<(), String>(())
     });
 }

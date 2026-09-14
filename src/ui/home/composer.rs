@@ -70,15 +70,27 @@ impl KumuApp {
                             .child(self.model_picker(session, cx))
                             .children(axes)
                             .child(div().flex_1())
-                            .child(
+                            .child(if self.turns.contains_key(&session.id) {
+                                // A turn is in flight, so sending is refused (see
+                                // `KumuApp::send`) and the slot offers the one
+                                // action that is available: stopping the turn
+                                // that is running.
+                                Button::new("stop")
+                                    .primary()
+                                    .small()
+                                    .icon(Icon::empty().path("icons/stop.svg"))
+                                    .on_click(cx.listener(|this, _, _, _| {
+                                        this.cancel_turn();
+                                    }))
+                            } else {
                                 Button::new("send")
                                     .primary()
                                     .small()
                                     .icon(IconName::ArrowUp)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.send(window, cx);
-                                    })),
-                            ),
+                                    }))
+                            }),
                     ),
             )
     }

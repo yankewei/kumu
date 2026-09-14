@@ -17,7 +17,7 @@ pub struct AgentDef {
     pub drives_sessions: bool,
 }
 
-pub const AGENTS: [AgentDef; 4] = [
+pub const AGENTS: [AgentDef; 5] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
@@ -44,6 +44,14 @@ pub const AGENTS: [AgentDef; 4] = [
         id: "claude",
         name: "Claude Code",
         desc: "claude -p · stream-json",
+        logo: None,
+        drives_sessions: true,
+    },
+    // No logo asset yet either.
+    AgentDef {
+        id: "pi",
+        name: "Pi",
+        desc: "pi --mode rpc",
         logo: None,
         drives_sessions: true,
     },
