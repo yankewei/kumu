@@ -2,6 +2,7 @@
 //! conversation on the right. Owns the settings window handle.
 
 mod access_picker;
+mod command_menu;
 mod composer;
 mod conversation;
 mod mode_picker;
@@ -20,7 +21,8 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 
-use super::{AgentSessionOptions, SessionOptions, SettingsWindow};
+use self::command_menu::matching_commands;
+use super::{AgentCommands, AgentSessionOptions, SessionOptions, SettingsWindow};
 use crate::agents::AGENTS;
 use crate::backend;
 use crate::db::{Message, Project, Session, Store, db_path};
@@ -76,6 +78,28 @@ fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
         .find(|&sid| sid > id)
         .or_else(|| siblings.iter().rev().copied().find(|&sid| sid < id))
         .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
+}
+
+/// What picking a folder for a new project resolves to.
+#[derive(Debug, PartialEq)]
+enum ProjectPick {
+    /// The folder is already a project; select it instead of inserting a
+    /// duplicate row.
+    Existing(i64),
+    /// A folder not seen before; its own name becomes the project's.
+    New { name: String },
+}
+
+/// Resolve a picked folder against the known projects — see [`ProjectPick`].
+fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
+    if let Some(existing) = projects.iter().find(|p| p.path == path) {
+        return ProjectPick::Existing(existing.id);
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    ProjectPick::New { name }
 }
 
 /// One tool call observed during the live turn, in first-seen order.
@@ -298,6 +322,45 @@ impl KumuApp {
         self.new_session_in(project_id);
     }
 
+    /// Add a project from a native folder picker; the picked folder's own
+    /// name becomes the project name, matching how Zed/waku open a project
+    /// (no separate naming step). Picking a folder that's already a project
+    /// selects it instead of inserting a duplicate row.
+    fn add_project(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择项目目录".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| app.finish_add_project(path, cx));
+        })
+        .detach();
+    }
+
+    fn finish_add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = path.to_string_lossy().into_owned();
+        match resolve_project_pick(&self.projects, &path) {
+            ProjectPick::Existing(id) => {
+                self.collapsed_projects.remove(&id);
+                cx.notify();
+            }
+            ProjectPick::New { name } => {
+                if self.store.insert_project(&name, &path).is_ok() {
+                    self.refresh();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn new_session_in(&mut self, project_id: i64) {
         let cwd = self
             .projects
@@ -449,13 +512,27 @@ impl KumuApp {
         let Some(session_id) = self.selected else {
             return;
         };
-        let text = self.input_state.read(cx).value().trim().to_string();
+        // The raw value rather than the trimmed one: a completed command ends
+        // with a space, and that space is what closes the menu — trimming it away
+        // would have the next Enter complete the same command again.
+        let typed = self.input_state.read(cx).value();
+        let text = typed.trim().to_string();
         if text.is_empty() || self.turns.contains_key(&session_id) {
             return;
         }
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
+        // Enter completes while the input is still a bare command, and the menu's
+        // first row is what it completes to, so the effect is visible before the
+        // key is pressed. Sending takes a second Enter.
+        if let Some(command) =
+            matching_commands(&self.session_commands(&session, cx), &typed).first()
+        {
+            let name = command.name.clone();
+            self.complete_command(&name, window, cx);
+            return;
+        }
         self.follow_tail = true;
         // Until the agent reports a real title (session/info), fall back to
         // the first line of the first user message.
@@ -857,6 +934,12 @@ impl KumuApp {
                 self.turns.remove(&session_id);
                 self.system_message(session_id, err);
             }
+            backend::Event::Commands { agent, commands } => {
+                if !cx.has_global::<AgentCommands>() {
+                    cx.set_global(AgentCommands::default());
+                }
+                cx.global_mut::<AgentCommands>().0.insert(agent, commands);
+            }
             // The axes are independent — an agent may offer any subset of them —
             // so an entirely empty report is not worth caching.
             backend::Event::SessionOptions {
@@ -1011,6 +1094,11 @@ impl KumuApp {
                         self.pending_permission_for(session.id)
                             .map(|pending| self.render_permission_card(session.id, pending, cx)),
                     )
+                    // The command menu goes closest to the input: it is about
+                    // what is being typed, and it is gone the moment the message
+                    // is sent, while the card above it answers a decision the
+                    // agent is still blocked on.
+                    .children(self.command_menu(session, cx))
                     .child(self.render_composer(session, cx)),
                 None => v_flex()
                     .flex_1()
@@ -1061,9 +1149,9 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::{neighbor_session, owns_connection};
+    use super::{ProjectPick, neighbor_session, owns_connection, resolve_project_pick};
     use crate::backend;
-    use crate::db::Session;
+    use crate::db::{Project, Session};
     use std::collections::HashMap;
 
     fn session(id: i64, project_id: i64) -> Session {
@@ -1080,6 +1168,49 @@ mod tests {
             title_manual: false,
             has_conversation: false,
         }
+    }
+
+    fn project(id: i64, path: &str) -> Project {
+        Project {
+            id,
+            name: format!("project-{id}"),
+            path: path.into(),
+        }
+    }
+
+    /// Picking a folder that is already a project selects it rather than
+    /// inserting a duplicate row.
+    #[test]
+    fn resolve_project_pick_selects_an_existing_folder() {
+        let projects = vec![project(1, "/repo/a"), project(2, "/repo/b")];
+        assert_eq!(
+            resolve_project_pick(&projects, "/repo/b"),
+            ProjectPick::Existing(2)
+        );
+    }
+
+    /// A folder not seen before is a new project named after itself.
+    #[test]
+    fn resolve_project_pick_names_a_new_folder_after_itself() {
+        let projects = vec![project(1, "/repo/a")];
+        assert_eq!(
+            resolve_project_pick(&projects, "/repo/kumu"),
+            ProjectPick::New {
+                name: "kumu".to_string()
+            }
+        );
+    }
+
+    /// A path with no file name of its own (the filesystem root) still
+    /// resolves to something rather than an empty label.
+    #[test]
+    fn resolve_project_pick_falls_back_to_the_whole_path() {
+        assert_eq!(
+            resolve_project_pick(&[], "/"),
+            ProjectPick::New {
+                name: "/".to_string()
+            }
+        );
     }
 
     /// A session's connection is replaced when the agent is switched. Events

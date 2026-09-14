@@ -41,3 +41,15 @@ pub struct SessionOptions {
 pub struct AgentSessionOptions(pub HashMap<&'static str, SessionOptions>);
 
 impl Global for AgentSessionOptions {}
+
+/// App-wide cache of each agent's slash commands, discovered the same way.
+///
+/// Deliberately not a field of [`SessionOptions`]: those are axes with a value in
+/// force, re-reported whole by several different events (a handshake, a config
+/// option update, a Claude axis change), any of which would clobber a command
+/// list cached beside them. A command list arrives on its own and is replaced
+/// only by another one.
+#[derive(Default)]
+pub struct AgentCommands(pub HashMap<&'static str, Vec<backend::CommandInfo>>);
+
+impl Global for AgentCommands {}

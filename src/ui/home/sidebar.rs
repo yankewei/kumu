@@ -173,6 +173,36 @@ impl KumuApp {
             .bg(sidebar)
             .text_color(sidebar_fg)
             .child(
+                h_flex()
+                    .id("sidebar-header")
+                    .px_3()
+                    .py_1p5()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(sidebar_border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(muted_fg)
+                            .child("项目"),
+                    )
+                    .child(
+                        div()
+                            .id("add-project")
+                            .rounded(radius)
+                            .p_0p5()
+                            .cursor_pointer()
+                            .text_color(muted_fg)
+                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_project(cx);
+                            }))
+                            .child(Icon::new(IconName::Plus).small()),
+                    ),
+            )
+            .child(
                 div()
                     .flex_1()
                     .id("session-tree")
