@@ -397,45 +397,30 @@ impl KumuApp {
             theme.success,
             theme.danger,
         );
-        if rows.len() == 1 {
+        let Some((run_status, label)) = fold_summary(&rows) else {
             let row = rows
                 .into_iter()
                 .next()
                 .expect("a run holds at least one call");
             return self.render_tool_row(row, session_id, cx);
-        }
-
-        let failures = rows.iter().filter(|row| row.status == "failed").count();
-        // Same reading of status as a single row: anything not settled is
-        // still in flight.
-        let running = rows
-            .iter()
-            .any(|row| !matches!(row.status.as_str(), "done" | "failed"));
-        // The summary carries the worst status in the run: a failure outranks
-        // work still in flight, which outranks a run that came back clean.
+        };
         // With the calls folded away this row is the only sign they are still
         // moving, so an unfinished run gets a spinner rather than a still icon.
-        let status = if failures > 0 {
-            Icon::new(IconName::Close)
+        let status = match run_status {
+            RunStatus::Failed => Icon::new(IconName::Close)
                 .small()
                 .text_color(danger)
-                .into_any_element()
-        } else if running {
-            Spinner::new()
+                .into_any_element(),
+            RunStatus::Running => Spinner::new()
                 .icon(Icon::new(IconName::LoaderCircle))
                 .small()
                 .color(muted_fg)
-                .into_any_element()
-        } else {
-            Icon::new(IconName::Check)
+                .into_any_element(),
+            RunStatus::Done => Icon::new(IconName::Check)
                 .small()
                 .text_color(success)
-                .into_any_element()
+                .into_any_element(),
         };
-        let mut label = format!("{} 个工具调用", rows.len());
-        if failures > 0 {
-            label.push_str(&format!(" · {failures} 个失败"));
-        }
 
         let id = format!("group-{}", rows[0].id);
         let open = self.expanded_rows.contains(&id);
@@ -526,6 +511,43 @@ impl KumuApp {
     }
 }
 
+/// The worst status in a folded run: a failure outranks work still in flight,
+/// which outranks a run that came back clean.
+#[derive(Debug, PartialEq)]
+enum RunStatus {
+    Failed,
+    Running,
+    Done,
+}
+
+/// Whether a run of tool calls folds into one summary row, and if so, its
+/// worst status and its label ("N 个工具调用 · M 个失败"). `None` means the run
+/// has nothing to summarize — a lone call is left as its own row instead (see
+/// [`KumuApp::render_tool_run`]).
+fn fold_summary(rows: &[ToolRow]) -> Option<(RunStatus, String)> {
+    if rows.len() <= 1 {
+        return None;
+    }
+    let failures = rows.iter().filter(|row| row.status == "failed").count();
+    // Same reading of status as a single row: anything not settled is still
+    // in flight.
+    let running = rows
+        .iter()
+        .any(|row| !matches!(row.status.as_str(), "done" | "failed"));
+    let status = if failures > 0 {
+        RunStatus::Failed
+    } else if running {
+        RunStatus::Running
+    } else {
+        RunStatus::Done
+    };
+    let mut label = format!("{} 个工具调用", rows.len());
+    if failures > 0 {
+        label.push_str(&format!(" · {failures} 个失败"));
+    }
+    Some((status, label))
+}
+
 /// The caret a foldable row turns: pointing down while the row is closed, half
 /// a turn once it is open.
 fn disclosure_caret(open: bool, muted_fg: gpui::Hsla) -> impl IntoElement {
@@ -553,4 +575,64 @@ fn collapsed_body(
         .text_xs()
         .text_color(muted_fg)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
+    // scope through the glob, so the built-in one is imported explicitly.
+    use core::prelude::v1::test;
+
+    use super::{RowToggle, RunStatus, ToolRow, fold_summary};
+
+    fn tool_row(status: &str) -> ToolRow {
+        ToolRow {
+            id: "t".into(),
+            title: "工具".into(),
+            status: status.into(),
+            content: String::new(),
+            decision: None,
+            open: false,
+            toggle: RowToggle::Key("t".into()),
+        }
+    }
+
+    /// A lone call has nothing to summarize, so it is left to render as its
+    /// own row rather than folding into a one-item group.
+    #[test]
+    fn a_lone_call_does_not_fold() {
+        assert_eq!(fold_summary(&[tool_row("done")]), None);
+        assert_eq!(fold_summary(&[]), None);
+    }
+
+    /// A settled run with nothing failed reads as done, and the label just
+    /// counts the calls.
+    #[test]
+    fn a_clean_run_labels_only_the_count() {
+        let (status, label) = fold_summary(&[tool_row("done"), tool_row("done")]).unwrap();
+        assert_eq!(status, RunStatus::Done);
+        assert_eq!(label, "2 个工具调用");
+    }
+
+    /// Anything not yet `done` or `failed` reads as still running, which is
+    /// what keeps the summary's spinner going while the folded calls finish.
+    #[test]
+    fn an_unsettled_call_keeps_the_run_running() {
+        let (status, label) = fold_summary(&[tool_row("done"), tool_row("running")]).unwrap();
+        assert_eq!(status, RunStatus::Running);
+        assert_eq!(
+            label, "2 个工具调用",
+            "no failures yet, so none are reported"
+        );
+    }
+
+    /// A failure outranks work still in flight: the run reads as failed even
+    /// with another call still unsettled, and the label says how many.
+    #[test]
+    fn a_failure_outranks_a_still_running_call() {
+        let (status, label) =
+            fold_summary(&[tool_row("failed"), tool_row("running"), tool_row("done")]).unwrap();
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(label, "3 个工具调用 · 1 个失败");
+    }
 }

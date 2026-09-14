@@ -14,7 +14,27 @@ use crate::agents::AGENTS;
 use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
+use crate::ui::SessionOptions;
 use crate::ui::widgets::{PickerChrome, agent_logo, picker_chip, picker_list, select_row};
+
+/// The model chip's label: the value in force — the stored pick, else the
+/// agent's own active report — resolved through the catalogue to its name.
+///
+/// Unlike the other axes this chip never disappears: an agent with no
+/// catalogue yet (no probe, no session) still needs a chip to open, so the
+/// fallback is the agent's own name rather than [`crate::ui::widgets::inherited_label`]
+/// — there is no "this axis does not exist" case for the model picker the way
+/// there is for mode/access/sandbox/reasoning.
+fn model_label(catalog: Option<&SessionOptions>, stored: Option<&str>, agent_name: &str) -> String {
+    let model_value = stored.or(catalog.and_then(|c| c.current_model.as_deref()));
+    match model_value {
+        Some(value) => catalog
+            .and_then(|c| c.models.iter().find(|m| m.value == value))
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| value.to_string()),
+        None => agent_name.to_string(),
+    }
+}
 
 impl KumuApp {
     /// Switch a session's agent and/or model: persist the choice, drop the old
@@ -86,17 +106,11 @@ impl KumuApp {
         let catalog = cx
             .try_global::<AgentSessionOptions>()
             .and_then(|g| g.0.get(session.agent.as_str()));
-        let model_value = session
-            .model
-            .as_deref()
-            .or(catalog.and_then(|c| c.current_model.as_deref()));
-        match model_value {
-            Some(value) => catalog
-                .and_then(|c| c.models.iter().find(|m| m.value == value))
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| value.to_string()),
-            None => self.agent_name(&session.agent),
-        }
+        model_label(
+            catalog,
+            session.model.as_deref(),
+            &self.agent_name(&session.agent),
+        )
     }
 
     /// The composer's model picker, Waku-style: a chip trigger opening a
@@ -343,4 +357,66 @@ fn empty_list_state(label: &'static str, muted_fg: Hsla) -> Div {
         .text_xs()
         .text_color(muted_fg)
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
+    // scope through the glob, so the built-in one is imported explicitly.
+    use core::prelude::v1::test;
+
+    use super::model_label;
+    use crate::backend::ModelInfo;
+    use crate::ui::SessionOptions;
+
+    fn model(value: &str, name: &str) -> ModelInfo {
+        ModelInfo {
+            value: value.into(),
+            name: name.into(),
+            provider: "test".into(),
+        }
+    }
+
+    fn catalog(current_model: Option<&str>) -> SessionOptions {
+        SessionOptions {
+            models: vec![model("gpt-5", "GPT-5"), model("opus", "Opus")],
+            current_model: current_model.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// The stored pick wins over the agent's active report, and either
+    /// resolves through the catalogue to the agent's own name for it.
+    #[test]
+    fn model_label_prefers_the_stored_pick() {
+        let catalog = catalog(Some("gpt-5"));
+        assert_eq!(
+            model_label(Some(&catalog), Some("opus"), "Claude Code"),
+            "Opus"
+        );
+        assert_eq!(model_label(Some(&catalog), None, "Claude Code"), "GPT-5");
+    }
+
+    /// A value the catalogue no longer lists still shows as itself rather than
+    /// leaving the chip blank.
+    #[test]
+    fn model_label_falls_back_to_the_raw_value() {
+        let catalog = catalog(None);
+        assert_eq!(
+            model_label(Some(&catalog), Some("gone"), "Claude Code"),
+            "gone"
+        );
+    }
+
+    /// Unlike the other axes, the model chip never disappears: with nothing in
+    /// force yet — no stored pick, no catalogue at all — it falls back to the
+    /// agent's own name rather than going blank or hiding.
+    #[test]
+    fn model_label_falls_back_to_the_agent_name_with_nothing_in_force() {
+        assert_eq!(model_label(None, None, "Claude Code"), "Claude Code");
+        assert_eq!(
+            model_label(Some(&SessionOptions::default()), None, "Claude Code"),
+            "Claude Code"
+        );
+    }
 }
