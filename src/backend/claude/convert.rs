@@ -160,6 +160,26 @@ pub(super) fn reasoning_options() -> Vec<ReasoningInfo> {
         .collect()
 }
 
+/// The level Claude Code runs a model at when nothing else names one.
+///
+/// Documented rather than reported: nothing in the protocol says what effort a
+/// session resolved to, so with nothing picked and nothing saved, the chip has
+/// only the model table to go on — `high` on every model that supports effort
+/// except Opus 4.7, which is `xhigh` (see
+/// <https://code.claude.com/docs/en/model-config#choose-an-effort-level>).
+/// `None` — a probe, which knows no model — gets `high` for the same reason,
+/// that being what the table gives every other model an account can land on.
+///
+/// This is what the model *would* run at, not what a locked-down account
+/// allows: a managed `maxEffortLevel` cap and a model's cross-session effort
+/// hold are both invisible from here (see [`super::settings`]).
+pub(super) fn default_effort(model: Option<&str>) -> &'static str {
+    match model {
+        Some(model) if model.contains("opus-4-7") => "xhigh",
+        _ => "high",
+    }
+}
+
 /// A live session's picker catalogue, as the `initialize` response reports it,
 /// falling back to the fixed vocabulary above when the report was empty — an
 /// older CLI, or a shape this backend does not recognise, should still leave
@@ -431,6 +451,21 @@ mod tests {
                 .all(|e| e.name == e.value && e.value != "ultracode"),
             "the value is the label, and ultracode is not a level"
         );
+    }
+
+    /// With nothing picked and nothing saved, the level a session runs at is the
+    /// model's own: `high` everywhere except Opus 4.7. A model is not always
+    /// known — a probe starts no session — and the same table applies.
+    #[test]
+    fn every_model_has_a_documented_default_effort() {
+        assert_eq!(default_effort(Some("claude-opus-5")), "high");
+        assert_eq!(default_effort(Some("claude-sonnet-5")), "high");
+        assert_eq!(
+            default_effort(Some("claude-opus-4-7[1m]")),
+            "xhigh",
+            "Opus 4.7 is the one model whose default is not high"
+        );
+        assert_eq!(default_effort(None), "high", "a probe knows no model");
     }
 
     fn reported_model(value: &str, resolved: &str, levels: &[&str]) -> ModelEntry {

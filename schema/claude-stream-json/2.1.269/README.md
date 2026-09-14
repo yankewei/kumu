@@ -57,7 +57,9 @@ What the runs settled, none of which the official docs state outright:
 - **Neither the handshake nor `system/init` reports an effort in force**, so the
   only way to know what a session will run at is the machine itself: this build
   reads `CLAUDE_CODE_EFFORT_LEVEL` (an env var or a settings `env` block — the
-  CLI's own text says it "overrides effort this session") for the effort, and
+  CLI's own text says it "overrides effort this session") for the effort, along
+  with the `effortLevel` and `modelSettings.<model>.effortLevel` keys a
+  `/effort` pick saves (`src/backend/claude/settings.rs`), and
   `permissions.defaultMode` for the permission mode. The key name, the managed
   settings directory (`/Library/Application Support/ClaudeCode` on macOS,
   `/etc/claude-code` elsewhere, `managed-settings.json`) and the absence of any
@@ -71,7 +73,8 @@ What the runs settled, none of which the official docs state outright:
 - **No effort in force is reported anywhere.** Neither the initialize response
   nor `system/init` names the active effort, so the reasoning axis has no
   current value to show. (`--effort` can also be overridden by the user's own
-  `CLAUDE_CODE_EFFORT_LEVEL`, which this machine sets to `max`.)
+  `CLAUDE_CODE_EFFORT_LEVEL` — the capture ran with it set to `max` — which is
+  why that variable outranks the flag.)
 - **`system/thinking_tokens` floods the stream** — one event per thinking chunk
   (674 of them in one short turn). It is not a status worth showing and must be
   ignored rather than logged.

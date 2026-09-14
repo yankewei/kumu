@@ -15,7 +15,9 @@
 //!     plus the control-request round trip;
 //!   - `convert`   — protocol -> app translation, where protocol types stop;
 //!   - `session`   — handshake, the message pump, and the command loop;
-//!   - `probe`     — session-option discovery for the settings window.
+//!   - `probe`     — session-option discovery for the settings window;
+//!   - `settings`  — a read of Claude Code's own configuration files, which is
+//!     where the axes the wire does not carry come from.
 //!
 //! [`Event`]: crate::backend::Event
 //! [`Cmd`]: crate::backend::Cmd
@@ -23,6 +25,7 @@
 pub(super) mod convert;
 pub(super) mod probe;
 pub(super) mod session;
+pub(super) mod settings;
 
 mod protocol;
 mod transport;

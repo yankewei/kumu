@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::convert;
 use super::protocol::{self, ContentBlock, Incoming, ResultEvent};
+use super::settings;
 use super::transport::{self, Message, Transport, debug_log};
 use crate::backend::config::{Config, SessionPicks};
 use crate::backend::connection::WeakPermissions;
@@ -115,6 +116,31 @@ impl Shared {
     }
 }
 
+/// The effort in force: kumu's own flag when it launched with one, else what
+/// Claude Code's configuration saves for this model.
+///
+/// A launch flag is an explicit choice and outranks a saved level, which is the
+/// order the CLI resolves them in. `model` is the model the session reported,
+/// when it has reported one: a saved level is keyed by model, so the answer gets
+/// closer once `system/init` names it.
+fn effort_in_force(launched: &SessionPicks, model: Option<&str>) -> Option<String> {
+    launched
+        .reasoning
+        .clone()
+        .or_else(|| settings::effort_in_force(model))
+}
+
+/// What the reasoning chip shows: the level in force, else the model's own
+/// documented default.
+///
+/// The CLI reports the level it resolved to nowhere, so a session that is
+/// neither launched at one nor covered by a saved one leaves the axis with only
+/// the model table to answer from — and it does answer, since every model that
+/// supports effort runs at one. [`convert::default_effort`] holds the table.
+fn reported_effort(launched: &SessionPicks, model: Option<&str>) -> String {
+    effort_in_force(launched, model).unwrap_or_else(|| convert::default_effort(model).to_string())
+}
+
 pub(in crate::backend) async fn run(
     cfg: Config,
     cwd: PathBuf,
@@ -162,8 +188,11 @@ pub(in crate::backend) async fn run(
             current_sandbox: None,
             reasoning: convert::session_reasoning(&reported.models),
             // The CLI reports no effort in force on either the handshake or
-            // `system/init`, so a pick is the only thing this axis can show.
-            current_reasoning: None,
+            // `system/init`, so this is read from its own configuration — or,
+            // failing that, the model's documented default. The session's own
+            // model pick is the best name available until `system/init` says
+            // which model the pick resolved to.
+            current_reasoning: Some(reported_effort(&cfg.session, cfg.session.model.as_deref())),
         }),
         launched: cfg.session.clone(),
         cancelled: AtomicBool::new(false),
@@ -338,9 +367,10 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
         // The session's own report, arriving with the first turn: the mode in
         // force and the model kumu's pick resolved to.
         "init" => {
+            let model = system.model.filter(|model| !model.is_empty());
             {
                 let mut options = shared.options.lock().unwrap();
-                if let Some(model) = system.model.filter(|model| !model.is_empty()) {
+                if let Some(model) = model.clone() {
                     options.current_model = Some(model);
                 }
                 if system.permission_mode.is_some() {
@@ -350,6 +380,11 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
                     options.current_access =
                         convert::current_access(system.permission_mode.as_deref());
                 }
+                // The model is what a saved effort level is keyed by, so this
+                // report is the first chance to look up the right one — and the
+                // only chance to apply the right model's default.
+                options.current_reasoning =
+                    Some(reported_effort(&shared.launched, model.as_deref()));
             }
             shared.emit_options();
         }
