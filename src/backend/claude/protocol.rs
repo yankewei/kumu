@@ -72,6 +72,16 @@ pub(super) struct SystemEvent {
     pub attempt: Option<u64>,
     #[serde(rename = "max_retries", default)]
     pub max_retries: Option<u64>,
+    /// The commands that only run in an interactive terminal. Sending one over
+    /// this wire does nothing, so they are not offered as commands. This is the
+    /// only signal that separates them from the rest, and it only arrives with
+    /// the first turn.
+    ///
+    /// `system/init` also lists every command by name; that list is not modelled
+    /// because the handshake's catalogue already carries them, with the hint each
+    /// takes.
+    #[serde(rename = "terminal_slash_commands", default)]
+    pub terminal_slash_commands: Vec<String>,
 }
 
 /// An `assistant` message, and — with the same envelope — a `user` message.
@@ -280,6 +290,24 @@ pub(super) struct InitializeResponse {
     pub models: Vec<ModelEntry>,
     #[serde(rename = "current_permission_mode", default)]
     pub current_permission_mode: Option<String>,
+    /// The slash commands the CLI will run for this session, in its own order.
+    ///
+    /// This is the only catalogue of them: it is here on the handshake and not
+    /// on `system/init`, which carries nothing but a list of names (see
+    /// [`SystemEvent::slash_commands`]).
+    #[serde(default)]
+    pub commands: Vec<CommandEntry>,
+}
+
+/// One entry of the CLI's command catalogue.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct CommandEntry {
+    #[serde(default)]
+    pub name: String,
+    /// What the command takes after its name, e.g. `[low|medium|high]`. Absent
+    /// or empty for a command that takes nothing.
+    #[serde(rename = "argumentHint", default)]
+    pub argument_hint: Option<String>,
 }
 
 /// One model the account offers.
@@ -449,6 +477,52 @@ mod tests {
         assert!(first.supports_effort);
         assert!(!first.supported_effort_levels.is_empty());
         assert_eq!(response.current_permission_mode.as_deref(), Some("default"));
+    }
+
+    /// The handshake is also where the CLI lists the commands it will run, each
+    /// with the hint it takes — the only place a hint appears.
+    #[test]
+    fn initialize_reports_the_command_catalogue() {
+        let response: InitializeResponse = serde_json::from_value(
+            captured("control-initialize-response")["response"]["response"].clone(),
+        )
+        .unwrap();
+        assert!(
+            !response.commands.is_empty(),
+            "the captured session offers commands"
+        );
+        assert!(
+            response
+                .commands
+                .iter()
+                .all(|command| !command.name.is_empty()),
+            "every entry names a command"
+        );
+        let compact = response
+            .commands
+            .iter()
+            .find(|command| command.name == "compact")
+            .expect("the captured session offers /compact");
+        assert!(
+            compact.argument_hint.is_some(),
+            "compact takes an optional instruction"
+        );
+    }
+
+    /// `system/init` names the commands that only work in an interactive
+    /// terminal, which is the one signal that separates them from the rest — and
+    /// it only arrives with the first turn.
+    #[test]
+    fn init_names_the_terminal_only_commands() {
+        let Incoming::System(init) = from_captured("init") else {
+            panic!("init.json is not a system message");
+        };
+        assert!(
+            init.terminal_slash_commands
+                .iter()
+                .any(|name| name == "doctor"),
+            "the terminal-only commands are the ones to stop offering"
+        );
     }
 
     /// A turn ends with a `result`; the error flag is absent on success.

@@ -1,37 +1,41 @@
 //! Session option discovery for the Claude Code backend.
 //!
-//! Unlike the ACP and Codex probes there is no handshake and no catalog to
-//! read, so this is deliberately the smallest thing that can still answer the
-//! question the settings window asks — plus, since the CLI reports neither the
-//! effort in force nor the mode a fresh session would start in, a read of Claude
-//! Code's own configuration for both ([`settings`]). kumu only reads it: with no
-//! pick nothing is ever sent.
+//! The axes are a fixed vocabulary plus a read of Claude Code's own
+//! configuration, because the CLI reports neither the effort in force nor the
+//! mode a fresh session would start in ([`settings`]). kumu only reads it: with
+//! no pick nothing is ever sent.
 //!
-//! Why there is nothing to discover: Claude Code's `system/init` event, which
-//! is the only place it describes a session, carries no list of anything. Its
-//! `model` is a single already-resolved string and its `permissionMode` is a
-//! single value; there is no model-list request that a catalog could come from
-//! (the way Codex's `model/list` supplies one), and `--effort` levels are
-//! documented rather than advertised. Checked against **claude 2.1.251**.
-//! What is left is a fixed vocabulary, which `convert` owns, plus a liveness
-//! check — and the liveness check is worth doing, because it is what tells the
-//! settings window the difference between "this agent is installed" and "this
-//! agent is not".
+//! Why the axes are not discovered: `system/init`, the event that describes a
+//! running session, arrives only with the first turn, and it carries no editable
+//! catalogue. Its `model` is a single already-resolved string and its
+//! `permissionMode` a single value; the effort levels are documented rather than
+//! advertised. So `convert` owns the vocabulary, and the liveness check below is
+//! what tells the settings window the difference between "this agent is
+//! installed" and "this agent is not".
 //!
-//! Deliberately not "probe a session": `system/init` only arrives once a real
-//! user message has been sent, and a message both costs a model round trip and
-//! writes a transcript under the user's `~/.claude/projects/`. A probe that
-//! did that would litter the user's Claude history — the same hazard the Codex
-//! probe avoids by never calling `thread/start` — so it is not done here.
+//! The commands *are* discovered, because the `initialize` control response —
+//! which kumu already sends on a live connection — carries a real catalogue
+//! (`commands`, with the hint each takes; see `schema/claude-stream-json/`,
+//! pinned to **claude 2.1.269**). That is a handshake, not a turn: the CLI
+//! answers it immediately, nothing is prompted, and no model call is billed.
+//!
+//! Deliberately not "probe a session": a turn both costs a model round trip and
+//! writes a transcript under the user's `~/.claude/projects/`, which is why
+//! nothing here sends a message. Whether the bare handshake leaves anything
+//! behind is checked by the test below, which runs it under a scratch `HOME`.
+//!
+//! [`settings`]: super::settings
 
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::backend::config::Config;
-use crate::backend::event::{Event, emit};
+use crate::backend::event::{CommandInfo, Event, emit};
 use crate::backend::probe::run;
 use crate::backend::session::SessionOptionsBuilder;
 
-use super::{convert, settings};
+use super::transport::{self, debug_log};
+use super::{convert, protocol, settings};
 
 /// Probe a local `claude` just far enough to know it runs, then report the
 /// fixed session vocabulary.
@@ -77,8 +81,41 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
             .reasoning(convert::reasoning_options(), Some(effort))
             .build();
         emit(&ev_tx, options);
+        // The commands are the one catalogue a probe can read without prompting:
+        // the handshake's response lists them, and asking for it starts no turn
+        // and costs no model call. Best-effort on purpose — a CLI that answers
+        // `--version` but not the control protocol (an older build, an account
+        // that cannot open a session) must still leave the axes above reported
+        // and the agent counted as installed, which is what this probe is for.
+        match command_catalogue(&cfg).await {
+            Ok(commands) => emit(&ev_tx, Event::Commands { agent, commands }),
+            Err(error) => debug_log(&format!("claude 命令目录：{error}")),
+        }
         Ok::<(), String>(())
     });
+}
+
+/// Read the CLI's command catalogue off a handshake, without prompting anything.
+///
+/// The argv is a session's own, because that is what decides which commands
+/// exist — the project's `.claude/commands/`, the account's plugins and skills —
+/// and the working directory is this process's, the same one a probe for the ACP
+/// agents uses.
+///
+/// Nothing is sent but the `initialize` control request, which the CLI answers
+/// immediately (see `schema/claude-stream-json/2.1.269/README.md`). The child is
+/// dropped when this returns, and `kill_on_drop` takes it from there.
+async fn command_catalogue(cfg: &Config) -> Result<Vec<CommandInfo>, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let (transport, _messages, _child) = transport::spawn(&cfg.command, &cfg.args, &cfg.env, &cwd)
+        .map_err(|error| format!("failed to launch {}: {error}", cfg.command))?;
+    let reported: protocol::InitializeResponse = transport
+        .control(serde_json::json!({"subtype": "initialize", "hooks": null}))
+        .await
+        .map(|payload| serde_json::from_value(payload).unwrap_or_default())?;
+    // Nothing can be terminal-only yet: that is only learnable from the first
+    // turn's `system/init`, which this probe deliberately never reaches.
+    Ok(convert::command_catalog(&reported.commands, &[]))
 }
 
 #[cfg(test)]
@@ -102,6 +139,18 @@ mod tests {
             );
             return;
         }
+        // A scratch home: the probe now also reads a catalogue over a handshake,
+        // and nothing it does may touch this machine's own Claude Code state. The
+        // same isolation the session test uses.
+        let home = std::env::temp_dir().join(format!("kumu-claude-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("a scratch home");
+        let mut cfg = cfg;
+        cfg.env
+            .push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        cfg.env.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            home.join(".claude").to_string_lossy().into_owned(),
+        ));
         let (tx, rx) = std::sync::mpsc::channel();
         probe("claude", cfg, tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -163,6 +212,26 @@ mod tests {
                 _ => {}
             }
         }
+        // The catalogue follows the axes — it comes from the handshake the probe
+        // runs after them — and it is what a fresh session's `/` menu offers.
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("the probe ended without a command catalogue")
+            {
+                Event::Commands { commands, .. } => {
+                    assert!(
+                        commands.iter().any(|command| command.name == "compact"),
+                        "the catalogue should hold the CLI's own commands: {commands:?}"
+                    );
+                    break;
+                }
+                Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
+                _ => {}
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// A probe against a missing binary must surface `ProbeFailed` rather than

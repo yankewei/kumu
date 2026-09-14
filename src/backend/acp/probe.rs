@@ -1,20 +1,34 @@
 //! Session option discovery: a throwaway connection that handshakes, creates
-//! one session, reads its model and mode config options and returns.
+//! one session, reads its model and mode config options, waits briefly for the
+//! command catalogue it advertises, and returns.
 //!
 //! Nothing is kept alive — the connection dropping is what kills the agent
 //! subprocess, so a probe never leaves a process behind.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{InitializeRequest, NewSessionRequest};
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectionTo};
+use agent_client_protocol::schema::v1::{
+    InitializeRequest, NewSessionRequest, SessionNotification, SessionUpdate,
+};
+use agent_client_protocol::{
+    AcpAgent, AcpAgentConfig, Client, ConnectionTo, on_receive_notification,
+};
 
-use super::convert::{mode_catalog, model_catalog, reasoning_catalog};
+use super::convert::{command_catalog, mode_catalog, model_catalog, reasoning_catalog};
 use crate::backend::config::Config;
 use crate::backend::event::{Event, emit};
 use crate::backend::probe::run;
 use crate::backend::session::SessionOptionsBuilder;
+
+/// How long to wait for the command catalogue after creating the session.
+///
+/// It arrives as a notification rather than in the `session/new` response, so
+/// there is nothing to read synchronously; an agent that offers no commands
+/// sends nothing at all, which is why this is a wait with a deadline and not a
+/// failure.
+const COMMAND_WAIT: Duration = Duration::from_secs(2);
 
 /// Probe an agent over ACP just to discover its session options: initialize,
 /// create one throwaway session, read the model and mode config options, then
@@ -22,6 +36,7 @@ use crate::backend::session::SessionOptionsBuilder;
 pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
     run(agent, "acp", ev_tx, move |ev_tx| async move {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let (commands_tx, mut commands_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut launch = AcpAgentConfig::new(&cfg.command);
         for a in &cfg.args {
             launch = launch.arg(a.clone());
@@ -32,6 +47,19 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         Client
             .builder()
             .name("kumu-probe")
+            // The command catalogue is a session notification, not part of the
+            // `session/new` response, so it is collected as it arrives and
+            // awaited after the session exists. The channel is unbounded, which
+            // is what makes an update that lands during `session/new` still count.
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    if let SessionUpdate::AvailableCommandsUpdate(update) = notification.update {
+                        let _ = commands_tx.send(command_catalog(&update.available_commands));
+                    }
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
             .connect_with(
                 AcpAgent::new(launch),
                 move |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
@@ -56,6 +84,15 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
                         .reasoning(reasoning, current_reasoning)
                         .build();
                     emit(&ev_tx, options);
+                    // The agent reports its commands after creating the session.
+                    // Waiting for a moment is what separates "this agent offers
+                    // none" from "not yet" — and an agent that offers none simply
+                    // sends nothing, so the wait ending empty is not a failure.
+                    if let Ok(Some(commands)) =
+                        tokio::time::timeout(COMMAND_WAIT, commands_rx.recv()).await
+                    {
+                        emit(&ev_tx, Event::Commands { agent, commands });
+                    }
                     Ok(())
                 },
             )
@@ -115,6 +152,32 @@ mod tests {
                         !reasoning.is_empty(),
                         "{agent} should expose its thought_level option"
                     );
+                    break;
+                }
+                Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
+                _ => {}
+            }
+        }
+        // The commands follow the axes, from the notification the agent sends
+        // after creating the session. This is also the check that the two ACP
+        // agents kumu drives advertise a catalogue at all.
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("the probe ended without a command catalogue")
+            {
+                Event::Commands { commands, .. } => {
+                    println!(
+                        "{agent}: {} commands ({})",
+                        commands.len(),
+                        commands
+                            .iter()
+                            .map(|command| command.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    assert!(!commands.is_empty(), "{agent} advertised no commands");
                     break;
                 }
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),

@@ -70,6 +70,18 @@ What the runs settled, none of which the official docs state outright:
   catalogue: `models` (value, `resolvedModel`, `displayName`, `supportsEffort`,
   `supportedEffortLevels`), `current_permission_mode`, `commands`, `agents`,
   `account`. `system/init` only arrives with the first turn and carries less.
+- **The slash commands are a real catalogue, and half of it is terminal-only.**
+  `initialize`'s `commands` is what the CLI will run for this session, each entry
+  with a `description` and an `argumentHint`; kumu reads the name and the hint and
+  offers the list in the composer (`src/backend/claude/`, `Event::Commands`),
+  because a client invokes one by sending `/name args` as an ordinary user
+  message — the same path `/model` and `/effort` already take. `system/init` then
+  names the subset that only works in an interactive terminal
+  (`terminal_slash_commands`: `doctor`, `color`, `reload-plugins` here), and those
+  are dropped once it arrives: sent over this wire they do nothing. That is the
+  only signal separating the two kinds, and it is not available until the first
+  turn, so a fresh session's menu lists them until then. `initialize` is also what
+  the *probe* now reads them from — a handshake, no prompt, no model call.
 - **No effort in force is reported anywhere.** Neither the initialize response
   nor `system/init` names the active effort, so the reasoning axis has no
   current value to show. (`--effort` can also be overridden by the user's own

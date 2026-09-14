@@ -83,6 +83,18 @@ pub enum Event {
         /// such axis or has not reported one yet.
         current_reasoning: Option<String>,
     },
+    /// The slash commands this agent says it will run, in the agent's own
+    /// order. Its own event rather than a field of [`Event::SessionOptions`]:
+    /// a command set has no value in force, and it arrives on its own schedule
+    /// — at the handshake, and again whenever the agent changes it.
+    ///
+    /// An empty list is the honest report for an agent that has none (Codex's
+    /// app-server exposes no such catalogue), which is what keeps the menu off
+    /// the composer there rather than offering commands that could not run.
+    Commands {
+        agent: &'static str,
+        commands: Vec<CommandInfo>,
+    },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
 }
@@ -96,6 +108,26 @@ pub struct ModelInfo {
     pub name: String,
     /// Provider inferred from the value prefix before `/`.
     pub provider: String,
+}
+
+/// One slash command an agent says it will run, as reported by its own
+/// catalogue.
+///
+/// Not an axis: a command has no value "in force", and the set may change
+/// mid-session (ACP re-sends it whenever it likes). It is also not something
+/// kumu resolves — the agent recognizes the `/name` prefix in a prompt, so
+/// invoking one is just sending it.
+///
+/// The description an agent offers is deliberately not carried: the composer's
+/// lists show the same source's long prose nowhere else (a picker row is the
+/// name and nothing more), so it is dropped at this boundary rather than
+/// carried up to be discarded at render time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandInfo {
+    /// The command's name, without a leading `/`.
+    pub name: String,
+    /// What the command expects after its name, when the agent says.
+    pub hint: Option<String>,
 }
 
 /// One selectable reasoning effort, as exposed by an agent.
@@ -258,6 +290,15 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 reasoning
                     .iter()
                     .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Event::Commands { agent, commands } => eprintln!(
+                "[agent] commands: {agent} offers {} ({})",
+                commands.len(),
+                commands
+                    .iter()
+                    .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
             ),

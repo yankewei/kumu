@@ -6,13 +6,14 @@
 //! rather than being mistaken for a rejection or a running tool call.
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Diff, PermissionOptionKind, RequestPermissionOutcome, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionUpdate, StopReason,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    AvailableCommand, AvailableCommandInput, ContentBlock, Diff, PermissionOptionKind,
+    RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate,
 };
 
-use crate::backend::event::{ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
+use crate::backend::event::{CommandInfo, ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
 use crate::backend::session::CANCELLED;
 
 /// A select session config option, located by [`select`].
@@ -164,6 +165,39 @@ pub(super) fn reasoning_catalog(
         Some(select.current.to_string()),
         efforts,
     )
+}
+
+/// The commands an agent says it will run, in the agent's own order.
+///
+/// Invoking one is a prompt like any other — the spec has the client include the
+/// command text in `session/prompt` — so this is a catalogue to choose from, not
+/// a mode. A nameless entry is dropped rather than offered as a bare `/`, and an
+/// empty hint is no hint.
+pub(super) fn command_catalog(commands: &[AvailableCommand]) -> Vec<CommandInfo> {
+    commands
+        .iter()
+        .filter(|command| !command.name.is_empty())
+        .map(|command| CommandInfo {
+            name: command.name.clone(),
+            hint: command
+                .input
+                .as_ref()
+                .and_then(command_hint)
+                .filter(|hint| !hint.trim().is_empty()),
+        })
+        .collect()
+}
+
+/// The hint an agent put on a command's input, if it described one.
+///
+/// The spec has a single input kind today (unstructured text), and the enum is
+/// `#[non_exhaustive]`, so a kind this build does not know simply has no hint
+/// rather than no command.
+fn command_hint(input: &AvailableCommandInput) -> Option<String> {
+    match input {
+        AvailableCommandInput::Unstructured(input) => Some(input.hint.clone()),
+        _ => None,
+    }
 }
 
 /// Drop the provider prefix from a display name ("OpenCode Go/GLM-5.3" →

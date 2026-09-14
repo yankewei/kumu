@@ -18,10 +18,18 @@ pi --mode rpc --approve --no-session --no-skills \
   --no-prompt-templates --no-context-files
 ```
 
-Exactly the argv the backend's probe uses, so what is captured is what a probe
-sees. (`--no-session` also means nothing lands in the real `~/.pi` history.)
-Every flag was checked against `pi --help` for 0.85.1 — Pi rejects an unknown
-flag outright, so the list cannot be padded.
+Exactly the argv the backend's probe used at the time of capture. (`--no-session`
+also means nothing lands in the real `~/.pi` history.) Every flag was checked
+against `pi --help` for 0.85.1 — Pi rejects an unknown flag outright, so the list
+cannot be padded.
+
+**The probe's argv has since changed**: it no longer passes `--no-skills` or
+`--no-prompt-templates`, because a probe is now asked for the session's *commands*
+as well (`get_commands`), and Pi reports skills and prompt templates as exactly
+those. `--no-session` and `--no-context-files` still stand. The captures above
+were not re-run, so the command lists in them are trimmed by those two flags —
+the `get_commands` shape documented below is Pi's own documentation, not a
+captured frame.
 
 The runs were:
 
@@ -68,6 +76,16 @@ follows from it:
   the levels that are *remapped* for that model (`xhigh`, `minimal` here) — it is
   a mapping table, not a menu. The advertised list is the complete one, and it
   includes `off` even for a model with no reasoning.
+- **The commands are a documented request, not a captured one.** `get_commands`
+  answers with `{name, description, source}` per entry (`source` is `extension`,
+  `prompt` or `skill`; a skill's name carries its `skill:` prefix). Pi's
+  documentation says these are invocable "via the `prompt` command by prefixing
+  with `/`", and that the built-in TUI commands (`/settings`, `/hotkeys`, …) are
+  deliberately **not** included because sending them over RPC would not execute —
+  which is what makes this list exactly the set worth offering. kumu reads it as
+  the composer's `/` menu (`src/backend/pi/`, `Event::Commands`). **Not verified
+  against a captured frame**: the captures above ran with `--no-skills` and
+  `--no-prompt-templates`, so their command lists are trimmed.
 - **The catalogue is per machine and dynamic.** This machine reports 105 models
   across four providers, with `provider` on each entry, which is why a model is
   addressed as `provider/id` and why the probe has to ask rather than use a

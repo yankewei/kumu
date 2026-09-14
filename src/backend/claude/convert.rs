@@ -1,18 +1,19 @@
-//! Protocol -> app translation. Claude Code exposes no discovery request to
-//! map yet, so everything here is a fixed vocabulary: the values `claude`
-//! accepts on its own flags, which the pickers can therefore offer before any
-//! session exists.
+//! Protocol -> app translation. What Claude Code reports about a session over
+//! the handshake (its model catalogue, its commands) is mapped here; everything
+//! else is a fixed vocabulary — the values `claude` accepts on its own flags,
+//! which the pickers can therefore offer before any session exists.
 //!
 //! The labels are kumu's own where the concept is kumu's to name (as with
 //! Codex's sandbox policies) and the agent's own where they are a scale the
 //! user types and reads in Claude Code itself.
 
 use crate::backend::event::{
-    AccessInfo, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo,
+    AccessInfo, CommandInfo, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
+    ReasoningInfo,
 };
 use serde_json::Value;
 
-use super::protocol::{ControlRequestBody, ModelEntry};
+use super::protocol::{CommandEntry, ControlRequestBody, ModelEntry};
 
 /// The provider label Claude Code's models are filed under.
 ///
@@ -231,6 +232,34 @@ pub(super) fn session_reasoning(reported: &[ModelEntry]) -> Vec<ReasoningInfo> {
     } else {
         efforts
     }
+}
+
+/// The commands a live session will run, as the `initialize` response lists
+/// them, minus the ones that only run in an interactive terminal.
+///
+/// Invoking one is just sending `/name` as a prompt — the CLI recognizes its own
+/// prefix — so the catalogue exists to show what may be sent, not to change how
+/// it travels. A name the response leaves empty is dropped rather than offered
+/// as a bare `/`.
+///
+/// The description each entry also carries is not read: a picker row is the
+/// name and nothing more (see [`crate::backend::CommandInfo`]).
+pub(super) fn command_catalog(
+    reported: &[CommandEntry],
+    terminal_only: &[String],
+) -> Vec<CommandInfo> {
+    reported
+        .iter()
+        .filter(|command| !command.name.is_empty())
+        .filter(|command| !terminal_only.iter().any(|name| name == &command.name))
+        .map(|command| CommandInfo {
+            name: command.name.clone(),
+            hint: command
+                .argument_hint
+                .clone()
+                .filter(|hint| !hint.trim().is_empty()),
+        })
+        .collect()
 }
 
 /// kumu's answers to a Claude Code permission request.
@@ -510,6 +539,47 @@ mod tests {
                 .map(|e| e.value.as_str())
                 .collect::<Vec<_>>(),
             ["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    /// The catalogue is what the CLI will run: a name it left empty is not an
+    /// offer, an empty hint is no hint at all, and the terminal-only names are
+    /// dropped as soon as the first turn has named them.
+    #[test]
+    fn command_catalog_drops_terminal_only_names_and_empty_hints() {
+        let reported = vec![
+            CommandEntry {
+                name: "compact".into(),
+                argument_hint: Some("<instructions>".into()),
+            },
+            CommandEntry {
+                name: "clear".into(),
+                argument_hint: Some("".into()),
+            },
+            CommandEntry {
+                name: "doctor".into(),
+                argument_hint: None,
+            },
+            CommandEntry {
+                name: String::new(),
+                argument_hint: None,
+            },
+        ];
+
+        let all = command_catalog(&reported, &[]);
+        assert_eq!(
+            all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["compact", "clear", "doctor"],
+            "a nameless entry is not a command"
+        );
+        assert_eq!(all[0].hint.as_deref(), Some("<instructions>"));
+        assert_eq!(all[1].hint, None, "an empty hint is no hint");
+
+        let filtered = command_catalog(&reported, &["doctor".to_string()]);
+        assert_eq!(
+            filtered.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["compact", "clear"],
+            "a terminal-only command cannot be sent over this wire"
         );
     }
 

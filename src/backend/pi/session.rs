@@ -412,13 +412,15 @@ async fn set_reasoning(shared: &Arc<Shared>, value: &str) {
     }
 }
 
-/// Re-read the session's state, catalogue and thinking levels, and report them.
+/// Re-read the session's state, catalogue, thinking levels and commands, and
+/// report them.
 ///
-/// The three are one report because they move together: which model is in force
-/// decides which levels exist. A catalogue request that fails keeps the last
-/// good one rather than emptying the menu — the session is still driven by
-/// commands either way, and a picker that silently lost its models would look
-/// like the agent had stopped offering any.
+/// The four are one report because they move together: which model is in force
+/// decides which levels exist, and a change of either usually means the session
+/// was reconfigured. A request that fails keeps the last good answer rather than
+/// emptying the menu — the session is still driven by commands either way, and a
+/// picker that silently lost its models would look like the agent had stopped
+/// offering any.
 async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
     let state = shared
         .transport
@@ -438,6 +440,16 @@ async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
         .await
         .ok()
         .map(|frame| convert::reasoning_catalog(frame.get("data").unwrap_or(&Value::Null)));
+    // The commands this session will run. Asked for alongside the rest because
+    // they move together — a skill loaded, an extension registered. A refused
+    // request reports nothing at all, which leaves the menu holding the last
+    // catalogue it was given rather than emptying it.
+    let commands = shared
+        .transport
+        .request(json!({"type": "get_commands"}))
+        .await
+        .ok()
+        .map(|frame| convert::command_catalog(frame.get("data").unwrap_or(&Value::Null)));
 
     let options = {
         let mut options = shared.options.lock().unwrap();
@@ -458,6 +470,15 @@ async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
             .build()
     };
     emit(&shared.ev_tx, options);
+    if let Some(commands) = commands {
+        emit(
+            &shared.ev_tx,
+            Event::Commands {
+                agent: shared.agent,
+                commands,
+            },
+        );
+    }
     if let Some(title) = convert::session_title(&data) {
         emit(&shared.ev_tx, Event::SessionTitle { title });
     }
@@ -684,6 +705,7 @@ mod tests {
                 Event::PermissionRequest { .. } => "permission",
                 Event::Error(_) => "error",
                 Event::SessionOptions { .. } => "options",
+                Event::Commands { .. } => "commands",
                 Event::ProbeFailed { .. } => "failed",
             })
             .collect()

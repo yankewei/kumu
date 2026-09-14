@@ -30,12 +30,12 @@ use super::transport;
 /// sessions — the same hazard the Codex probe avoids by never calling
 /// `thread/start`.
 ///
-/// The rest trim preparation for a turn this process will never run: skills,
-/// prompt templates and context files are all loaded at startup for the agent's
-/// benefit, not the catalogue's. Extensions are deliberately left enabled,
-/// because they can register model providers — the menu read here is only the
-/// same one a session would offer if the extensions contributing to it are
-/// loaded.
+/// Skills and prompt templates are deliberately left enabled, unlike the
+/// context files: they *are* part of what this probe is asked for, since Pi
+/// reports them as invocable commands (`get_commands`) and a menu that omitted
+/// them would offer less than a session does. Loading them costs a directory
+/// read, not a model call. Context files stay off — nothing here reads them and
+/// no turn will run for their sake.
 ///
 /// `--approve` is not about this probe's own safety — it runs in a temporary
 /// directory and never executes a tool. It is there because an untrusted
@@ -51,8 +51,6 @@ fn probe_args() -> Vec<String> {
         "rpc",
         "--approve",
         "--no-session",
-        "--no-skills",
-        "--no-prompt-templates",
         "--no-context-files",
     ]
     .iter()
@@ -76,6 +74,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         let levels = transport
             .request(json!({"type": "get_available_thinking_levels"}))
             .await?;
+        let commands = transport.request(json!({"type": "get_commands"})).await?;
         let data = state
             .get("data")
             .cloned()
@@ -96,6 +95,17 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
             )
             .build();
         emit(&ev_tx, options);
+        // The commands this machine's Pi offers, in Pi's own form: what a session
+        // here would accept as `/name`.
+        emit(
+            &ev_tx,
+            Event::Commands {
+                agent,
+                commands: convert::command_catalog(
+                    commands.get("data").unwrap_or(&serde_json::Value::Null),
+                ),
+            },
+        );
         // Nothing is kept alive: the child is dropped here, and that kills it.
         Ok::<(), String>(())
     });
@@ -177,6 +187,32 @@ mod tests {
                     );
                     assert!(current_mode.is_none() && current_access.is_none());
                     assert!(current_sandbox.is_none());
+                    break;
+                }
+                Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
+                _ => {}
+            }
+        }
+        // The catalogue follows the axes, and it is what a fresh session's `/`
+        // menu offers: the extension commands, prompt templates and skills this
+        // machine has, since the probe no longer trims them.
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("the probe ended without a command catalogue")
+            {
+                Event::Commands { commands, .. } => {
+                    println!(
+                        "pi: {} commands ({})",
+                        commands.len(),
+                        commands
+                            .iter()
+                            .map(|command| command.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    assert!(!commands.is_empty(), "pi reported no commands");
                     break;
                 }
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),

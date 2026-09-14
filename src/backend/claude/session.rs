@@ -36,7 +36,7 @@ use super::transport::{self, Message, Transport, debug_log};
 use crate::backend::config::{Config, SessionPicks};
 use crate::backend::connection::WeakPermissions;
 use crate::backend::event::{
-    AccessInfo, Cmd, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit,
+    AccessInfo, Cmd, CommandInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit,
 };
 use crate::backend::session::{
     CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
@@ -81,9 +81,24 @@ struct Shared {
     awaiting: Mutex<VecDeque<Awaiting>>,
     /// Set while a prompt is in flight, so the pump can wake the command loop.
     turn_done: Mutex<Option<oneshot::Sender<ResultEvent>>>,
-    /// Message ids whose text and thinking already arrived as deltas.
+    /// `"{message id}:text"` / `"{message id}:thinking"` for each kind of
+    /// content that already arrived as deltas for that message — kept apart
+    /// because the two do not always stream together: text reliably does, but
+    /// a model may hand back a short or unstreamed thinking block for the same
+    /// message, and marking the whole message "streamed" from text alone would
+    /// wrongly swallow that thinking when the complete message repeats it.
     streamed: Mutex<HashSet<String>>,
+    /// The message currently streaming. `message_start` is the only event that
+    /// names it; every delta after that carries no id of its own and belongs to
+    /// whichever message started most recently (see `ApiEvent::message_id`'s own
+    /// doc comment).
+    current_message: Mutex<Option<String>>,
     options: Mutex<Options>,
+    /// The commands this session will run, as the handshake reported them. Held
+    /// because the only other word on them — which of the names are terminal-only
+    /// — arrives with the first turn, and the catalogue has to be re-reported
+    /// without them then.
+    commands: Mutex<Vec<CommandInfo>>,
     /// Whether an interrupt was asked for the turn now in flight, so the pump
     /// reports its `result` as a cancel rather than as a failure. Cleared when
     /// the next prompt starts, since only one turn is ever open.
@@ -106,6 +121,22 @@ impl Shared {
             .reasoning(options.reasoning.clone(), options.current_reasoning.clone())
             .build();
         emit(&self.ev_tx, event);
+    }
+
+    /// Report the commands this session will run.
+    ///
+    /// Sent after the handshake, and again when the first turn names the
+    /// terminal-only ones. An invocation is a prompt like any other — the CLI
+    /// recognizes its own `/` prefix — so this is a catalogue to choose from,
+    /// not a mode the session is in.
+    fn emit_commands(&self) {
+        emit(
+            &self.ev_tx,
+            Event::Commands {
+                agent: self.agent,
+                commands: self.commands.lock().unwrap().clone(),
+            },
+        );
     }
 
     /// Send a slash command as a user message. Its result settles the queue
@@ -172,6 +203,7 @@ pub(in crate::backend) async fn run(
         awaiting: Mutex::new(VecDeque::new()),
         turn_done: Mutex::new(None),
         streamed: Mutex::new(HashSet::new()),
+        current_message: Mutex::new(None),
         options: Mutex::new(Options {
             models: convert::session_models(&reported.models),
             // Until a session says otherwise, nothing is claimed: the mode
@@ -194,10 +226,15 @@ pub(in crate::backend) async fn run(
             // which model the pick resolved to.
             current_reasoning: Some(reported_effort(&cfg.session, cfg.session.model.as_deref())),
         }),
+        // The handshake's catalogue. Nothing can be terminal-only yet: the CLI
+        // only says which names are on the first turn, so every command it lists
+        // is offered until `system/init` says otherwise.
+        commands: Mutex::new(convert::command_catalog(&reported.commands, &[])),
         launched: cfg.session.clone(),
         cancelled: AtomicBool::new(false),
     });
     shared.emit_options();
+    shared.emit_commands();
 
     // The pump owns the CLI's side: stream lines, tool rows, and the permission
     // prompts that arrive mid-turn.
@@ -387,6 +424,21 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
                     Some(reported_effort(&shared.launched, model.as_deref()));
             }
             shared.emit_options();
+            // The first turn is also where the CLI names the commands that only
+            // run in an interactive terminal. Sending one over this wire does
+            // nothing, so they are dropped from the catalogue the composer
+            // offers rather than left there as an entry that cannot act.
+            if !system.terminal_slash_commands.is_empty() {
+                let terminal = system.terminal_slash_commands;
+                let mut commands = shared.commands.lock().unwrap();
+                let before = commands.len();
+                commands.retain(|command| !terminal.iter().any(|name| name == &command.name));
+                let changed = commands.len() != before;
+                drop(commands);
+                if changed {
+                    shared.emit_commands();
+                }
+            }
         }
         // One event per thinking chunk — 674 of them in one short turn — so
         // this is a subtype to drop rather than to show.
@@ -416,11 +468,22 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
 /// blocks' deltas have already been streamed.
 fn on_assistant(shared: &Shared, message: &protocol::AssistantMessage) {
     let id = message.message.id.as_str();
-    let streamed = !id.is_empty() && shared.streamed.lock().unwrap().contains(id);
+    // Checked per kind, not once for the whole message: text reliably streams,
+    // but a model may hand back thinking that never did (or the reverse), and
+    // the message's other kind having streamed must not swallow the one that
+    // did not.
+    let streamed = |kind: &str| {
+        !id.is_empty()
+            && shared
+                .streamed
+                .lock()
+                .unwrap()
+                .contains(&format!("{id}:{kind}"))
+    };
     // A message whose content is a bare string is text without blocks; the CLI
     // sends that shape for some of its own replies.
     if let protocol::ContentBlocks::Text(text) = &message.message.content {
-        if !streamed && !text.is_empty() {
+        if !streamed("text") && !text.is_empty() {
             emit(&shared.ev_tx, Event::Agent(text.clone()));
         }
         return;
@@ -440,10 +503,10 @@ fn on_assistant(shared: &Shared, message: &protocol::AssistantMessage) {
             ),
             // Text and thinking already arrived as deltas, so only a message
             // that did not stream — the CLI's own replies — is shown here.
-            ContentBlock::Text { text } if !streamed => {
+            ContentBlock::Text { text } if !streamed("text") => {
                 emit(&shared.ev_tx, Event::Agent(text.clone()))
             }
-            ContentBlock::Thinking { thinking } if !streamed => {
+            ContentBlock::Thinking { thinking } if !streamed("thinking") => {
                 emit(&shared.ev_tx, Event::Thought(thinking.clone()))
             }
             _ => {}
@@ -480,21 +543,35 @@ fn on_user(shared: &Shared, message: &protocol::AssistantMessage) {
 fn on_stream_event(shared: &Shared, event: &protocol::StreamEvent) {
     let event = &event.event;
     if let Some(id) = event.message_id() {
-        // Remember that this message streamed, so its `assistant` twin is not
-        // appended a second time.
-        shared.streamed.lock().unwrap().insert(id.to_string());
+        // Only `message_start` names its message; every delta after that
+        // carries no id of its own, so this is remembered for them.
+        *shared.current_message.lock().unwrap() = Some(id.to_string());
     }
     if event.kind != "content_block_delta" {
         return;
     }
+    // A delta with nothing to attribute it to (no `message_start` seen yet)
+    // has nothing to mark as streamed, but the text or thinking is still worth
+    // showing.
+    let id = shared.current_message.lock().unwrap().clone();
     match event.delta.kind.as_str() {
         "text_delta" => {
             if let Some(text) = &event.delta.text {
+                if let Some(id) = &id {
+                    shared.streamed.lock().unwrap().insert(format!("{id}:text"));
+                }
                 emit(&shared.ev_tx, Event::Agent(text.clone()));
             }
         }
         "thinking_delta" => {
             if let Some(thinking) = &event.delta.thinking {
+                if let Some(id) = &id {
+                    shared
+                        .streamed
+                        .lock()
+                        .unwrap()
+                        .insert(format!("{id}:thinking"));
+                }
                 emit(&shared.ev_tx, Event::Thought(thinking.clone()));
             }
         }
@@ -614,6 +691,386 @@ fn deny_response(message: &str) -> Value {
 mod tests {
     use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
     use crate::backend::{Cmd, Config, Event, PermissionKind, SessionPicks, spawn};
+
+    use super::{Awaiting, CommandInfo, Message, Options, Shared, Transport, handle_message};
+    use serde_json::{Value, json};
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex, Weak};
+
+    /// A `Shared` wired to nowhere — a detached transport nothing reads, no
+    /// permissions table — plus the receiving half of its event channel, for
+    /// tests that drive the message handlers directly instead of a real `claude`
+    /// process. Mirrors the Pi backend's synthetic-stream tests, adapted to the
+    /// state this backend's handlers read from.
+    fn shared_for_test() -> (Shared, std::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Shared {
+            agent: "claude",
+            transport: Arc::new(Transport::detached_for_test()),
+            ev_tx: tx,
+            permissions: Weak::new(),
+            next_request_id: AtomicU64::new(1),
+            awaiting: Mutex::new(VecDeque::new()),
+            turn_done: Mutex::new(None),
+            streamed: Mutex::new(HashSet::new()),
+            current_message: Mutex::new(None),
+            options: Mutex::new(Options {
+                models: Vec::new(),
+                current_model: None,
+                modes: Vec::new(),
+                current_mode: None,
+                access: Vec::new(),
+                current_access: None,
+                sandboxes: Vec::new(),
+                current_sandbox: None,
+                reasoning: Vec::new(),
+                current_reasoning: None,
+            }),
+            commands: Mutex::new(Vec::new()),
+            launched: SessionPicks::default(),
+            cancelled: AtomicBool::new(false),
+        };
+        (shared, rx)
+    }
+
+    /// Feed raw stream lines through the same frame handler the pump calls.
+    fn drive(shared: &Arc<Shared>, lines: &[Value]) {
+        for line in lines {
+            handle_message(shared, Message::Line(line.clone()));
+        }
+    }
+
+    fn agent_chunks(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Agent(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Event` carries no `Debug` impl, so a failing assertion names what
+    /// actually came through by kind instead — same purpose as the Pi
+    /// backend's own `kinds` helper.
+    fn kinds(events: &[Event]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                Event::Log(_) => "log",
+                Event::Agent(_) => "agent",
+                Event::Thought(_) => "thought",
+                Event::ToolCall { .. } => "tool",
+                Event::SessionTitle { .. } => "title",
+                Event::Done(_) => "done",
+                Event::PermissionRequest { .. } => "permission",
+                Event::Error(_) => "error",
+                Event::SessionOptions { .. } => "options",
+                Event::Commands { .. } => "commands",
+                Event::ProbeFailed { .. } => "failed",
+            })
+            .collect()
+    }
+
+    /// Text that already streamed as deltas must not be repeated when its
+    /// `assistant` twin arrives — the CLI sends the complete blocks again once
+    /// the message settles.
+    #[test]
+    fn streamed_text_is_not_repeated_by_its_assistant_twin() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[
+                json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "message": {"id": "m1"},
+                        "delta": {"type": "text_delta", "text": "hi"},
+                    },
+                }),
+                json!({
+                    "type": "assistant",
+                    "message": {"id": "m1", "content": [{"type": "text", "text": "hi"}]},
+                }),
+            ],
+        );
+        assert_eq!(
+            agent_chunks(&rx.try_iter().collect::<Vec<_>>()),
+            vec!["hi"],
+            "the assistant twin repeats what already streamed and must be skipped"
+        );
+    }
+
+    /// A message that never streamed — the CLI's own reply to a slash command,
+    /// say — has no delta to have shown it, so its `assistant` line is the only
+    /// chance to show the text.
+    #[test]
+    fn an_assistant_message_that_never_streamed_shows_its_text() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({
+                "type": "assistant",
+                "message": {"id": "m2", "content": [{"type": "text", "text": "switched model"}]},
+            })],
+        );
+        assert_eq!(
+            agent_chunks(&rx.try_iter().collect::<Vec<_>>()),
+            vec!["switched model"]
+        );
+    }
+
+    /// Text and thinking are two different kinds of content on the same
+    /// message, and do not always stream together: a model can hand back text
+    /// deltas without ever sending a `thinking_delta` for the same reply.
+    /// Marking the whole message "streamed" from the text alone must not
+    /// swallow the thinking when the complete message repeats both.
+    #[test]
+    fn thinking_that_never_streamed_still_shows_when_only_text_did() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[
+                json!({
+                    "type": "stream_event",
+                    "event": {"type": "message_start", "message": {"id": "m1"}},
+                }),
+                json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "hi"},
+                    },
+                }),
+                json!({
+                    "type": "assistant",
+                    "message": {"id": "m1", "content": [
+                        {"type": "thinking", "thinking": "reasoning..."},
+                        {"type": "text", "text": "hi"},
+                    ]},
+                }),
+            ],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert_eq!(
+            agent_chunks(&events),
+            vec!["hi"],
+            "the assistant twin's text already streamed and must not repeat"
+        );
+        let thoughts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Thought(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thoughts,
+            vec!["reasoning..."],
+            "thinking that never streamed must still show when the complete message arrives: {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// A command sent as a message (`/model`, `/effort`) is queued as a command
+    /// rather than a prompt, so its `result` must not end a turn — only log a
+    /// failure when the command itself did not take.
+    #[test]
+    fn a_commands_result_does_not_end_a_turn() {
+        let (shared, rx) = shared_for_test();
+        shared.awaiting.lock().unwrap().push_back(Awaiting::Command);
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({"type": "result", "subtype": "success", "is_error": false})],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Done(_))),
+            "a command's result must not settle the turn: {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// A prompt's `result` is where the turn ends, carrying the CLI's stop
+    /// reason.
+    #[test]
+    fn a_prompts_result_settles_the_turn() {
+        let (shared, rx) = shared_for_test();
+        shared.awaiting.lock().unwrap().push_back(Awaiting::Prompt);
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "stop_reason": "end_turn",
+                "permission_denials": [],
+            })],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Done(stop) if stop == "end_turn")),
+            "expected a Done(\"end_turn\"): {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// An interrupted turn is reported as cancelled on kumu's own say-so, not
+    /// whatever the CLI's `result` line happens to call it — the CLI's wording
+    /// for an interruption is undocumented and was never captured.
+    #[test]
+    fn an_interrupted_turn_reports_cancelled_not_the_clis_own_reason() {
+        let (shared, rx) = shared_for_test();
+        shared.awaiting.lock().unwrap().push_back(Awaiting::Prompt);
+        shared
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "result": "whatever the CLI calls an interruption",
+                "permission_denials": [],
+            })],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Done(stop) if stop == "cancelled")),
+            "expected a Done(\"cancelled\"): {:?}",
+            kinds(&events)
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error(_))),
+            "the user asked for this, so it is not shown as a failure: {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// `system/init` reports the model the session resolved to and projects the
+    /// one permission mode onto both the work-mode and access-policy chips.
+    #[test]
+    fn system_init_reports_the_resolved_model_and_permission_mode() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({
+                "type": "system",
+                "subtype": "init",
+                "model": "opus",
+                "permissionMode": "default",
+            })],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        let options = events
+            .iter()
+            .find_map(|e| match e {
+                Event::SessionOptions {
+                    current_model,
+                    current_mode,
+                    current_access,
+                    ..
+                } => Some((current_model, current_mode, current_access)),
+                _ => None,
+            })
+            .expect("system/init should emit SessionOptions");
+        assert_eq!(options.0.as_deref(), Some("opus"));
+        assert_eq!(options.1.as_deref(), Some("default"));
+        assert_eq!(options.2.as_deref(), Some("default"));
+    }
+
+    /// The handshake lists every command the CLI will run. The first turn then
+    /// names the ones that only run in an interactive terminal, and those are
+    /// re-reported without them: sending one over this wire does nothing, so a
+    /// menu offering it would be offering an entry that cannot act.
+    #[test]
+    fn terminal_only_commands_are_dropped_when_the_first_turn_names_them() {
+        let (shared, rx) = shared_for_test();
+        *shared.commands.lock().unwrap() = vec![
+            CommandInfo {
+                name: "compact".into(),
+                hint: None,
+            },
+            CommandInfo {
+                name: "doctor".into(),
+                hint: None,
+            },
+        ];
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[json!({
+                "type": "system",
+                "subtype": "init",
+                "permissionMode": "default",
+                "terminal_slash_commands": ["doctor"],
+            })],
+        );
+        let commands = rx
+            .try_iter()
+            .find_map(|event| match event {
+                Event::Commands { commands, .. } => Some(commands),
+                _ => None,
+            })
+            .expect("the first turn should re-report the catalogue");
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["compact"],
+            "the terminal-only command is not offered"
+        );
+    }
+
+    /// A tool call is two lines: the `assistant` half starts it running, the
+    /// `user` half — the tool result — settles it as done or failed depending on
+    /// the CLI's own `is_error` flag.
+    #[test]
+    fn a_tool_calls_two_halves_report_running_then_its_outcome() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[
+                json!({
+                    "type": "assistant",
+                    "message": {"id": "m3", "content": [
+                        {"type": "tool_use", "id": "call_1", "name": "Write", "input": {"file_path": "a.txt"}},
+                    ]},
+                }),
+                json!({
+                    "type": "user",
+                    "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "is_error": true, "content": "denied"},
+                    ]},
+                }),
+            ],
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        let statuses: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolCall { id, status, .. } if id == "call_1" => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec!["running", "failed"]);
+    }
 
     /// End-to-end: spawn a real `claude -p`, take one turn, and walk the whole
     /// path the home window walks — the handshake catalogue, streamed text, a
@@ -771,6 +1228,16 @@ mod tests {
                 }
                 Event::Done(_) => {
                     println!("claude replied: {text:?}");
+                    // An unauthenticated CLI answers in-band rather than with
+                    // an `Event::Error` — this is the other half of "a CLI with
+                    // no credentials says so instead of answering", which the
+                    // `Event::Error` arm above only catches when the CLI fails
+                    // outright instead of replying with the same news.
+                    if text.to_lowercase().contains("not logged in") {
+                        println!("skipping session_prompts_claude_end_to_end: not logged in");
+                        std::fs::remove_dir_all(&home).ok();
+                        return;
+                    }
                     assert!(
                         asked,
                         "a Write call should have asked the host for permission"

@@ -26,8 +26,9 @@ use agent_client_protocol::{
 };
 
 use super::convert::{
-    mode_catalog, model_catalog, permission_detail, permission_kind, permission_outcome,
-    reasoning_catalog, status_name, stop_reason, tool_call_content, variant_name,
+    command_catalog, mode_catalog, model_catalog, permission_detail, permission_kind,
+    permission_outcome, reasoning_catalog, status_name, stop_reason, tool_call_content,
+    variant_name,
 };
 use crate::backend::config::Config;
 use crate::backend::connection::WeakPermissions;
@@ -36,6 +37,80 @@ use crate::backend::session::{
     CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user, forget_stale_cancels,
     release_pending_permissions,
 };
+
+/// Translate one session update into the event it produces, or none for an
+/// update kind nobody renders — every kind maps to at most one `Event`.
+///
+/// Stateless, unlike the Claude and Codex backends' own message handlers:
+/// this protocol's notifications carry no history to consult (no
+/// delta/complete-text dedup, no output to accumulate), so there is nothing
+/// here to seed beyond the agent's own id.
+fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<Event> {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
+            ContentBlock::Text(t) => Some(Event::Agent(t.text)),
+            _ => None,
+        },
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(t) => Some(Event::Thought(t.text)),
+            _ => None,
+        },
+        SessionUpdate::ToolCall(call) => {
+            let content = tool_call_content(&call.content, &call.raw_output);
+            Some(Event::ToolCall {
+                id: call.tool_call_id.0.to_string(),
+                title: call.title,
+                status: status_name(&call.status),
+                content,
+            })
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let content = update
+                .fields
+                .content
+                .as_ref()
+                .map(|c| tool_call_content(c, &update.fields.raw_output))
+                .unwrap_or_default();
+            Some(Event::ToolCall {
+                id: update.tool_call_id.0.to_string(),
+                title: update.fields.title.unwrap_or_default(),
+                status: update.fields.status.as_ref().map(status_name).unwrap_or(""),
+                content,
+            })
+        }
+        SessionUpdate::SessionInfoUpdate(info) => info
+            .title
+            .take()
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .map(|title| Event::SessionTitle { title }),
+        // The agent's command catalogue, replaced whole whenever it says so:
+        // these are usually the commands its own TUI offers, and invoking one is
+        // a prompt that starts with the command text.
+        SessionUpdate::AvailableCommandsUpdate(update) => Some(Event::Commands {
+            agent: agent_id,
+            commands: command_catalog(&update.available_commands),
+        }),
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            // The notification carries the complete state, so every catalog is
+            // rebuilt from it. This is what keeps the pickers honest when the
+            // agent changes its own model, mode or reasoning level.
+            let config_options = Some(update.config_options);
+            let (_, current_model, models) = model_catalog(&config_options);
+            let (_, current_mode, modes) = mode_catalog(&config_options);
+            let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
+            // ACP has no access or sandbox axis, so neither is set.
+            Some(
+                SessionOptionsBuilder::new(agent_id)
+                    .models(models, current_model)
+                    .modes(modes, current_mode)
+                    .reasoning(reasoning, current_reasoning)
+                    .build(),
+            )
+        }
+        other => Some(Event::Log(format!("update: {}", variant_name(&other)))),
+    }
+}
 
 /// Drive one ACP session to completion. Called by the shared [`spawn`]
 /// dispatcher, which is one level up, so the visibility follows the caller.
@@ -82,80 +157,8 @@ pub(in crate::backend) async fn run(
         .name("kumu-demo")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                match notification.update {
-                    SessionUpdate::AgentMessageChunk(chunk) => {
-                        if let ContentBlock::Text(t) = chunk.content {
-                            emit(&notif_tx, Event::Agent(t.text));
-                        }
-                    }
-                    SessionUpdate::AgentThoughtChunk(chunk) => {
-                        if let ContentBlock::Text(t) = chunk.content {
-                            emit(&notif_tx, Event::Thought(t.text));
-                        }
-                    }
-                    SessionUpdate::ToolCall(call) => {
-                        let content = tool_call_content(&call.content, &call.raw_output);
-                        emit(
-                            &notif_tx,
-                            Event::ToolCall {
-                                id: call.tool_call_id.0.to_string(),
-                                title: call.title,
-                                status: status_name(&call.status),
-                                content,
-                            },
-                        );
-                    }
-                    SessionUpdate::ToolCallUpdate(update) => {
-                        let content = update
-                            .fields
-                            .content
-                            .as_ref()
-                            .map(|c| tool_call_content(c, &update.fields.raw_output))
-                            .unwrap_or_default();
-                        emit(
-                            &notif_tx,
-                            Event::ToolCall {
-                                id: update.tool_call_id.0.to_string(),
-                                title: update.fields.title.unwrap_or_default(),
-                                status: update
-                                    .fields
-                                    .status
-                                    .as_ref()
-                                    .map(status_name)
-                                    .unwrap_or(""),
-                                content,
-                            },
-                        );
-                    }
-                    SessionUpdate::SessionInfoUpdate(info) => {
-                        if let Some(title) = info.title.take() {
-                            let title = title.trim().to_string();
-                            if !title.is_empty() {
-                                emit(&notif_tx, Event::SessionTitle { title });
-                            }
-                        }
-                    }
-                    SessionUpdate::ConfigOptionUpdate(update) => {
-                        // The notification carries the complete state, so every
-                        // catalog is rebuilt from it. This is what keeps the
-                        // pickers honest when the agent changes its own model,
-                        // mode or reasoning level.
-                        let config_options = Some(update.config_options);
-                        let (_, current_model, models) = model_catalog(&config_options);
-                        let (_, current_mode, modes) = mode_catalog(&config_options);
-                        let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
-                        // ACP has no access or sandbox axis, so neither is set.
-                        let options = SessionOptionsBuilder::new(agent_id)
-                            .models(models, current_model)
-                            .modes(modes, current_mode)
-                            .reasoning(reasoning, current_reasoning)
-                            .build();
-                        emit(&notif_tx, options);
-                    }
-                    other => {
-                        let name = variant_name(&other).to_string();
-                        emit(&notif_tx, Event::Log(format!("update: {name}")));
-                    }
+                if let Some(event) = notification_event(agent_id, notification.update) {
+                    emit(&notif_tx, event);
                 }
                 Ok(())
             },
@@ -398,6 +401,144 @@ mod tests {
 
     use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
     use crate::backend::{Cmd, Config, Event, PermissionKind, spawn};
+
+    use super::notification_event;
+    use agent_client_protocol::schema::v1::{
+        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
+        ContentChunk, Plan, SessionInfoUpdate, SessionUpdate, TextContent, ToolCall,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
+    };
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text(TextContent::new(t))
+    }
+
+    /// A reply chunk with text content becomes agent text; kumu renders none of
+    /// the other content kinds (image, audio, resource) inline, so those must
+    /// not turn into an `Event`.
+    #[test]
+    fn agent_message_text_streams_as_agent_text() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(text("hi"))),
+        );
+        assert!(matches!(event, Some(Event::Agent(t)) if t == "hi"));
+    }
+
+    /// The reasoning chunk is the same shape as the reply, but becomes a
+    /// `Thought` rather than `Agent` — the two must not be confused.
+    #[test]
+    fn agent_thought_text_streams_as_thought() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(text("considering..."))),
+        );
+        assert!(matches!(event, Some(Event::Thought(t)) if t == "considering..."));
+    }
+
+    /// A new tool call starts running under its own id and title, in the
+    /// agent's own words.
+    #[test]
+    fn a_new_tool_call_reports_its_id_and_title() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::ToolCall(ToolCall::new("call-1", "Write file")),
+        );
+        match event {
+            Some(Event::ToolCall {
+                id, title, status, ..
+            }) => {
+                assert_eq!(id, "call-1");
+                assert_eq!(title, "Write file");
+                assert_eq!(status, "pending", "a fresh call has no status yet");
+            }
+            _ => panic!("expected a ToolCall"),
+        }
+    }
+
+    /// A later update carries only what changed — an empty title, say, when
+    /// only the status moved — but always reports the same id, so the UI can
+    /// find the row it belongs to.
+    #[test]
+    fn a_tool_calls_update_reports_only_what_changed() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+        );
+        match event {
+            Some(Event::ToolCall {
+                id, title, status, ..
+            }) => {
+                assert_eq!(id, "call-1");
+                assert_eq!(title, "", "the title did not change on this update");
+                assert_eq!(status, "done");
+            }
+            _ => panic!("expected a ToolCall"),
+        }
+    }
+
+    /// A title the agent sets becomes the session's; a title it explicitly
+    /// clears (`null`, as opposed to one it never mentions) is not shown as
+    /// one — there is nothing to rename to.
+    #[test]
+    fn session_info_update_reports_a_title_but_not_a_clearing() {
+        let renamed = notification_event(
+            "omp",
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title("重构计划")),
+        );
+        assert!(matches!(renamed, Some(Event::SessionTitle { title }) if title == "重构计划"));
+
+        let cleared = notification_event(
+            "omp",
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(None::<String>)),
+        );
+        assert!(cleared.is_none());
+    }
+
+    /// The agent's command catalogue becomes a `Commands` event in the agent's
+    /// own order, carrying the input hint it described. A nameless entry is not
+    /// an offer, and a command with no hint is simply a command.
+    #[test]
+    fn available_commands_become_the_command_catalogue() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("web", "Search the web").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("query")),
+                ),
+                AvailableCommand::new("test", "Run tests"),
+                AvailableCommand::new("", "nameless"),
+            ])),
+        );
+        match event {
+            Some(Event::Commands { agent, commands }) => {
+                assert_eq!(agent, "omp");
+                assert_eq!(
+                    commands
+                        .iter()
+                        .map(|command| command.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["web", "test"],
+                    "the agent's order stands, and a nameless entry is dropped"
+                );
+                assert_eq!(commands[0].hint.as_deref(), Some("query"));
+                assert_eq!(commands[1].hint, None, "no input spec is no hint");
+            }
+            _ => panic!("expected a Commands event"),
+        }
+    }
+
+    /// An update kind nobody renders (the agent's plan, say) is not dropped
+    /// silently — it reaches the log under its own name, which is the canary
+    /// for the protocol growing an update kind this build should show.
+    #[test]
+    fn an_unrendered_update_is_logged_by_name() {
+        let event = notification_event("omp", SessionUpdate::Plan(Plan::new(Vec::new())));
+        assert!(matches!(event, Some(Event::Log(msg)) if msg.contains("plan")));
+    }
 
     /// End-to-end: spawn a real agent (KUMU_AGENT, default omp), send one
     /// prompt, and expect streamed Agent chunks followed by Done — the same

@@ -49,7 +49,7 @@ mod test_support;
 pub use config::{Config, SessionPicks};
 pub use connection::{Connection, spawn};
 pub use event::{
-    AccessInfo, Cmd, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
+    AccessInfo, Cmd, CommandInfo, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
     ReasoningInfo, SandboxInfo,
 };
 pub use probe::probe;

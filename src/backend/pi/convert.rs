@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::backend::event::{ModelInfo, ReasoningInfo};
+use crate::backend::event::{CommandInfo, ModelInfo, ReasoningInfo};
 
 /// Provider and model id are joined with `/` because that is the form Pi's own
 /// `--model` accepts, and therefore the form kumu sends back.
@@ -109,6 +109,36 @@ pub(super) fn reasoning_catalog(data: &Value) -> Vec<ReasoningInfo> {
                     // so the value is its label rather than a translation.
                     value: level.to_string(),
                     name: level.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The commands this Pi will run, from a `get_commands` reply.
+///
+/// Pi's own documentation says these are exactly the ones a client may invoke
+/// over RPC — by sending `/name` as a prompt — and deliberately excludes the
+/// commands its TUI handles itself. Its `source` (`extension` / `prompt` /
+/// `skill`) is not carried: the name already says which namespace it is in
+/// (`skill:` is part of it), and no row in a kumu menu names a source.
+///
+/// Pi reports a description for each and kumu carries none: a picker row is the
+/// name and nothing more, so it is dropped here rather than at render time.
+pub(super) fn command_catalog(data: &Value) -> Vec<CommandInfo> {
+    data.get("commands")
+        .and_then(Value::as_array)
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| command.get("name").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| CommandInfo {
+                    name: name.to_string(),
+                    // A command takes the rest of the line, but Pi says nothing
+                    // about what that should be.
+                    hint: None,
                 })
                 .collect()
         })
@@ -253,6 +283,33 @@ pub(super) fn failure(message: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The command catalogue is what Pi says a client may invoke — extension
+    /// commands, prompt templates and skills alike — in Pi's own order, with the
+    /// `skill:` prefix that makes a skill addressable part of the name. An entry
+    /// without a name is not an offer, and nothing here invents a hint.
+    #[test]
+    fn the_command_catalogue_is_the_sessions_own() {
+        let commands = command_catalog(&json!({
+            "commands": [
+                {"name": "session-name", "description": "Set or clear session name", "source": "extension"},
+                {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt"},
+                {"name": "skill:brave-search", "description": "Web search", "source": "skill"},
+                {"description": "nameless", "source": "prompt"},
+            ]
+        }));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["session-name", "fix-tests", "skill:brave-search"]
+        );
+        assert!(
+            commands.iter().all(|command| command.hint.is_none()),
+            "pi describes no input, so no row claims one"
+        );
+    }
 
     /// The catalogue is built from what the session reports, as `provider/id`
     /// values, and reads grouped by provider.
