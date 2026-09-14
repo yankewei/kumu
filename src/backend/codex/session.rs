@@ -766,6 +766,197 @@ mod tests {
     use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
     use crate::backend::{Cmd, Config, Event, PermissionKind, spawn};
 
+    use super::{Shared, Transport, handle_notification};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Weak};
+
+    /// A `Shared` wired to nowhere — a detached transport nothing reads, no
+    /// permissions table — plus the receiving half of its event channel, for
+    /// tests that drive `handle_notification` directly instead of a real
+    /// `codex app-server` process. Same shape as the Claude backend's own
+    /// synthetic-stream tests.
+    fn shared_for_test() -> (Shared, std::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Shared {
+            transport: Arc::new(Transport::detached_for_test()),
+            ev_tx: tx,
+            permissions: Weak::new(),
+            next_request_id: AtomicU64::new(1),
+            turn_done: Mutex::new(None),
+            output: Mutex::new(HashMap::new()),
+            details: Mutex::new(HashMap::new()),
+        };
+        (shared, rx)
+    }
+
+    /// `Event` carries no `Debug` impl, so a failing assertion names what
+    /// actually came through by kind instead.
+    fn kinds(events: &[Event]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                Event::Log(_) => "log",
+                Event::Agent(_) => "agent",
+                Event::Thought(_) => "thought",
+                Event::ToolCall { .. } => "tool",
+                Event::SessionTitle { .. } => "title",
+                Event::Done(_) => "done",
+                Event::PermissionRequest { .. } => "permission",
+                Event::Error(_) => "error",
+                Event::SessionOptions { .. } => "options",
+                Event::Commands { .. } => "commands",
+                Event::ProbeFailed { .. } => "failed",
+            })
+            .collect()
+    }
+
+    /// A reply streams in as agent-message deltas.
+    #[test]
+    fn an_agent_message_delta_streams_as_agent_text() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/agentMessage/delta",
+            json!({"itemId": "i1", "delta": "ok"}),
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::Agent(text)] if text == "ok"),
+            "expected one Agent(\"ok\"): {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// The UI replaces a tool row's content rather than appending to it, so
+    /// consecutive output deltas for the same item have to be summed before
+    /// being sent up — each `ToolCall` carries everything accumulated so far,
+    /// not just the new chunk.
+    #[test]
+    fn command_output_deltas_accumulate_before_sending() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/commandExecution/outputDelta",
+            json!({"itemId": "cmd1", "delta": "a"}),
+        );
+        handle_notification(
+            &shared,
+            "item/commandExecution/outputDelta",
+            json!({"itemId": "cmd1", "delta": "b"}),
+        );
+        let contents: Vec<String> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::ToolCall { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents, vec!["a", "ab"]);
+    }
+
+    /// An item starting then completing reports the same call twice: running,
+    /// then whatever its final status was — and the accumulated output for it
+    /// is dropped once the completed item's own aggregated output supersedes
+    /// it.
+    #[test]
+    fn item_started_then_completed_reports_running_then_its_outcome() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/commandExecution/outputDelta",
+            json!({"itemId": "cmd1", "delta": "partial"}),
+        );
+        handle_notification(
+            &shared,
+            "item/started",
+            json!({"item": {
+                "type": "commandExecution", "id": "cmd1", "command": "ls",
+                "status": "inProgress",
+            }}),
+        );
+        handle_notification(
+            &shared,
+            "item/completed",
+            json!({"item": {
+                "type": "commandExecution", "id": "cmd1", "command": "ls",
+                "status": "completed", "aggregatedOutput": "done output",
+            }}),
+        );
+        let statuses: Vec<&str> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::ToolCall { id, status, .. } if id == "cmd1" => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec!["", "running", "done"]);
+        assert!(
+            shared.output.lock().unwrap().get("cmd1").is_none(),
+            "the completed item's own output supersedes the accumulated deltas"
+        );
+    }
+
+    /// The agent's own title for the thread replaces kumu's; a cleared name
+    /// (`null`) is not a title, so nothing is emitted for it.
+    #[test]
+    fn thread_name_updated_reports_a_title_but_not_a_clearing() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "thread/name/updated",
+            json!({"threadName": "重构计划"}),
+        );
+        handle_notification(&shared, "thread/name/updated", json!({"threadName": null}));
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::SessionTitle { title }] if title == "重构计划"),
+            "expected exactly one title, and not for the clearing: {:?}",
+            kinds(&events)
+        );
+    }
+
+    /// `turn/completed` is what wakes the command loop's wait for the turn —
+    /// exactly like a `oneshot` reply — and clears the output accumulated for
+    /// it.
+    #[test]
+    fn turn_completed_wakes_whoever_is_waiting_on_the_turn() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/commandExecution/outputDelta",
+            json!({"itemId": "cmd1", "delta": "x"}),
+        );
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        *shared.turn_done.lock().unwrap() = Some(done_tx);
+        handle_notification(
+            &shared,
+            "turn/completed",
+            json!({"turn": {"id": "t1", "status": "completed"}}),
+        );
+        let turn = done_rx.try_recv().expect("turn/completed should wake it");
+        assert_eq!(turn.status, "completed");
+        assert!(shared.output.lock().unwrap().is_empty());
+        drop(rx);
+    }
+
+    /// A notification method this build has never seen still reaches the log
+    /// instead of being silently dropped — the canary for app-server growing a
+    /// new notification.
+    #[test]
+    fn an_unrecognized_notification_is_logged_not_dropped() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(&shared, "thread/something/new", json!({}));
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(&events[..], [Event::Log(msg)] if msg.contains("thread/something/new")),
+            "expected a log naming the unrecognized method: {:?}",
+            kinds(&events)
+        );
+    }
+
     /// End-to-end: spawn a real Codex session, send one prompt, and expect
     /// streamed agent text followed by `Done` — the same path the home window
     /// takes. Skipped when the binary is absent; a Codex that is not signed in

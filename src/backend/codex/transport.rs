@@ -47,6 +47,19 @@ pub(super) struct Transport {
 }
 
 impl Transport {
+    /// A transport with nowhere for its sends to go, for tests that drive the
+    /// session's notification/request handlers directly and never expect a
+    /// reply over the wire — mirrors the Claude backend's
+    /// `Transport::detached_for_test` and `Connection::detached_for_test`.
+    #[cfg(test)]
+    pub(super) fn detached_for_test() -> Self {
+        Self {
+            tx: mpsc::unbounded_channel().0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicI64::new(0),
+        }
+    }
+
     /// Send a request and wait for its response.
     pub(super) async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);

@@ -50,6 +50,18 @@ pub(super) struct Transport {
 }
 
 impl Transport {
+    /// A transport with nowhere for its sends to go, for tests that drive the
+    /// session's message handlers directly and never expect a reply over the
+    /// wire — mirrors [`crate::backend::connection::Connection::detached_for_test`].
+    #[cfg(test)]
+    pub(super) fn detached_for_test() -> Self {
+        Self {
+            tx: mpsc::unbounded_channel().0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
     /// Send a control request and wait for the CLI's `control_response`.
     pub(super) async fn control(&self, request: Value) -> Result<Value, String> {
         let request_id = request_id(self.next_id.fetch_add(1, Ordering::Relaxed));
