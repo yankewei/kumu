@@ -10,36 +10,30 @@ use gpui_kit::*;
 
 use gpui_kit::component::popover::Popover;
 
-use super::KumuApp;
+use super::{KumuApp, PickerAxis};
 use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
+use crate::ui::widgets::{
+    PickerChrome, axis_label, picker_chip, picker_list, picker_menu, select_row,
+};
 
-/// The label for the sandbox chip: the user's stored pick, else the policy the
-/// agent reports it is running under, resolved to a name through the catalogue.
+/// The label for the sandbox chip, or no chip at all when the agent reports no
+/// policies.
 ///
-/// A value the catalogue no longer lists still shows as itself rather than
-/// leaving the chip blank, and an agent with no sandbox axis has no chip at all.
+/// Unlike the mode and access chips there is no membership test: this axis has
+/// the session's stored value to itself, so a stored pick is always the pick in
+/// force — and one the catalogue no longer lists still shows as itself rather
+/// than leaving the chip blank.
 fn sandbox_label(
     options: Option<&SessionOptions>,
     stored: Option<&str>,
     agent: &str,
 ) -> Option<String> {
     let options = options?;
-    if options.sandboxes.is_empty() {
-        return None;
-    }
-    Some(match stored.or(options.current_sandbox.as_deref()) {
-        Some(value) => options
-            .sandboxes
-            .iter()
-            .find(|sandbox| sandbox.value == value)
-            .map(|sandbox| sandbox.name.clone())
-            .unwrap_or_else(|| value.to_string()),
-        None => inherited_label(agent),
-    })
+    let value = stored.or(options.current_sandbox.as_deref());
+    axis_label(&options.sandboxes, value, agent)
 }
 
 impl KumuApp {
@@ -90,34 +84,12 @@ impl KumuApp {
             .or_else(|| options.current_sandbox.clone());
 
         let weak = cx.entity().downgrade();
-        let open = self.sandbox_picker_open;
-        let (radius, muted, muted_fg, border, accent, accent_fg, background) = {
-            let theme = cx.theme();
-            (
-                theme.radius,
-                theme.muted,
-                theme.muted_foreground,
-                theme.border,
-                theme.sidebar_accent,
-                theme.sidebar_accent_foreground,
-                theme.background,
-            )
-        };
+        let chrome = PickerChrome::new(cx.theme());
+        let open = self.open_picker == Some(PickerAxis::Sandbox);
 
         // Plain text, like the other chips: the policy name is the whole
         // affordance.
-        let chip = ChipTrigger {
-            element: h_flex()
-                .id("sandbox-picker-chip")
-                .h(px(24.))
-                .px_1p5()
-                .rounded(radius)
-                .cursor_pointer()
-                .text_color(muted_fg)
-                .when(open, |el| el.bg(muted.opacity(0.6)))
-                .when(!open, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
-                .child(div().max_w(px(160.)).text_xs().truncate().child(label)),
-        };
+        let chip = picker_chip("sandbox-picker-chip", &chrome, label, None, open);
 
         Some(
             Popover::new("sandbox-picker")
@@ -129,14 +101,14 @@ impl KumuApp {
                     move |open, _window, cx| {
                         let open = *open;
                         let _ = weak.update(cx, |app, cx| {
-                            app.sandbox_picker_open = open;
+                            app.set_picker_open(PickerAxis::Sandbox, open);
                             cx.notify();
                         });
                     }
                 })
                 .trigger(chip)
                 .content(move |_state, _window, _cx| {
-                    let mut list = v_flex().gap_0p5().p_1p5();
+                    let mut list = picker_list();
                     for sandbox in &options.sandboxes {
                         let value = sandbox.value.clone();
                         let selected = current.as_deref() == Some(sandbox.value.as_str());
@@ -144,41 +116,20 @@ impl KumuApp {
                         // Name only, like the other pickers: what each policy
                         // means belongs in the docs, not in a menu row.
                         list = list.child(select_row(
+                            &chrome,
                             &sandbox.name,
                             None,
                             selected,
-                            radius,
-                            muted,
-                            muted_fg,
-                            accent,
-                            accent_fg,
                             move |_, _, cx| {
                                 let _ = weak.update(cx, |app, cx| {
                                     app.pick_sandbox(value.clone(), cx);
-                                    app.sandbox_picker_open = false;
+                                    app.open_picker = None;
                                     cx.notify();
                                 });
                             },
                         ));
                     }
-                    // Sized to the names, like the mode picker: content-driven
-                    // with a cap, so a list of bare labels reserves no room for a
-                    // description it has none of.
-                    v_flex()
-                        .max_w(px(320.))
-                        .max_h(px(320.))
-                        .rounded(radius)
-                        .border_1()
-                        .border_color(border)
-                        .bg(background)
-                        .shadow_lg()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("sandbox-picker-list")
-                                .overflow_y_scroll()
-                                .child(list),
-                        )
+                    picker_menu("sandbox-picker-list", &chrome, list)
                 })
                 .into_any_element(),
         )

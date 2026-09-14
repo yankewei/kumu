@@ -14,42 +14,29 @@ use gpui_kit::*;
 
 use gpui_kit::component::popover::Popover;
 
-use super::KumuApp;
+use super::{KumuApp, PickerAxis};
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
+use crate::ui::widgets::{
+    PickerChrome, axis_label, in_force, picker_chip, picker_list, picker_menu, select_row,
+};
 
-/// The label for the access chip: the user's stored pick while it is one of the
-/// offers, else the policy the agent reports as in force, resolved to a name
-/// through the catalogue.
+/// The label for the access chip: the value in force on the access axis,
+/// resolved to the agent's own name for it, and no chip at all when the agent
+/// reports no policies.
 ///
-/// The membership test matters because the session stores one value for both
-/// axes: a stored `plan` is a work mode, not an access policy, so it must drop
-/// out here rather than be shown as a policy kumu never offered. A policy the
-/// catalogue no longer lists still shows as itself. An agent with no access axis
-/// has no chip at all.
+/// On Claude Code this axis shares its stored value with the work mode — one
+/// permission mode, two chips — so a stored `plan` is a work mode, not a policy,
+/// and drops out here rather than being shown as a policy kumu never offered.
 fn access_label(
     options: Option<&SessionOptions>,
     stored: Option<&str>,
     agent: &str,
 ) -> Option<String> {
     let options = options?;
-    if options.access.is_empty() {
-        return None;
-    }
-    let value = stored
-        .filter(|value| options.access.iter().any(|policy| policy.value == *value))
-        .or(options.current_access.as_deref());
-    Some(match value {
-        Some(value) => options
-            .access
-            .iter()
-            .find(|policy| policy.value == value)
-            .map(|policy| policy.name.clone())
-            .unwrap_or_else(|| value.to_string()),
-        None => inherited_label(agent),
-    })
+    let value = in_force(&options.access, stored, options.current_access.as_deref());
+    axis_label(&options.access, value, agent)
 }
 
 impl KumuApp {
@@ -75,34 +62,12 @@ impl KumuApp {
         let policies = options.access;
 
         let weak = cx.entity().downgrade();
-        let open = self.access_picker_open;
-        let (radius, muted, muted_fg, border, accent, accent_fg, background) = {
-            let theme = cx.theme();
-            (
-                theme.radius,
-                theme.muted,
-                theme.muted_foreground,
-                theme.border,
-                theme.sidebar_accent,
-                theme.sidebar_accent_foreground,
-                theme.background,
-            )
-        };
+        let chrome = PickerChrome::new(cx.theme());
+        let open = self.open_picker == Some(PickerAxis::Access);
 
         // Plain text, like the other chips: the policy name is the whole
         // affordance.
-        let chip = ChipTrigger {
-            element: h_flex()
-                .id("access-picker-chip")
-                .h(px(24.))
-                .px_1p5()
-                .rounded(radius)
-                .cursor_pointer()
-                .text_color(muted_fg)
-                .when(open, |el| el.bg(muted.opacity(0.6)))
-                .when(!open, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
-                .child(div().max_w(px(160.)).text_xs().truncate().child(label)),
-        };
+        let chip = picker_chip("access-picker-chip", &chrome, label, None, open);
 
         Some(
             Popover::new("access-picker")
@@ -114,14 +79,14 @@ impl KumuApp {
                     move |open, _window, cx| {
                         let open = *open;
                         let _ = weak.update(cx, |app, cx| {
-                            app.access_picker_open = open;
+                            app.set_picker_open(PickerAxis::Access, open);
                             cx.notify();
                         });
                     }
                 })
                 .trigger(chip)
                 .content(move |_state, _window, _cx| {
-                    let mut list = v_flex().gap_0p5().p_1p5();
+                    let mut list = picker_list();
                     for policy in &policies {
                         let value = policy.value.clone();
                         let selected =
@@ -130,43 +95,22 @@ impl KumuApp {
                         // Name only, like the other pickers: what each policy
                         // means belongs in the docs, not in a menu row.
                         list = list.child(select_row(
+                            &chrome,
                             &policy.name,
                             None,
                             selected,
-                            radius,
-                            muted,
-                            muted_fg,
-                            accent,
-                            accent_fg,
                             move |_, _, cx| {
                                 let _ = weak.update(cx, |app, cx| {
                                     // Same store, same command as the work-mode
                                     // chip: the agent reports one value for both.
                                     app.pick_mode(value.clone(), cx);
-                                    app.access_picker_open = false;
+                                    app.open_picker = None;
                                     cx.notify();
                                 });
                             },
                         ));
                     }
-                    // Sized to the names, like the mode picker: content-driven
-                    // with a cap, so a list of bare labels reserves no room for a
-                    // description it has none of.
-                    v_flex()
-                        .max_w(px(320.))
-                        .max_h(px(320.))
-                        .rounded(radius)
-                        .border_1()
-                        .border_color(border)
-                        .bg(background)
-                        .shadow_lg()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("access-picker-list")
-                                .overflow_y_scroll()
-                                .child(list),
-                        )
+                    picker_menu("access-picker-list", &chrome, list)
                 })
                 .into_any_element(),
         )

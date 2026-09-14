@@ -12,46 +12,25 @@ use gpui_kit::*;
 
 use gpui_kit::component::popover::Popover;
 
-use super::KumuApp;
+use super::{KumuApp, PickerAxis};
 use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
-use crate::ui::widgets::{ChipTrigger, inherited_label, select_row};
-
-/// The effort in force: the user's stored pick when the agent still offers it,
-/// else the value the agent reports.
-///
-/// The membership test is what lets the UI stay protocol-blind: a Codex pick
-/// made for a model that has since changed is simply not in the list any more,
-/// so it drops out here and the agent's reported value takes over.
-fn effective_value<'a>(options: &'a SessionOptions, stored: Option<&'a str>) -> Option<&'a str> {
-    stored
-        .filter(|value| {
-            options
-                .reasoning
-                .iter()
-                .any(|effort| effort.value == *value)
-        })
-        .or(options.current_reasoning.as_deref())
-}
+use crate::ui::widgets::{
+    PickerChrome, choice_label, in_force, picker_chip, picker_list, picker_menu, select_row,
+};
 
 /// The label for the reasoning chip: the effort in force, resolved to the
 /// agent's own name for it. Falls back to saying nothing is overridden, so an
 /// agent offering the axis always has something to show.
-///
-/// A value the agent no longer lists still shows as itself rather than going
-/// blank.
 fn reasoning_label(options: &SessionOptions, stored: Option<&str>, agent: &str) -> String {
-    match effective_value(options, stored) {
-        Some(value) => options
-            .reasoning
-            .iter()
-            .find(|effort| effort.value == value)
-            .map(|effort| effort.name.clone())
-            .unwrap_or_else(|| value.to_string()),
-        None => inherited_label(agent),
-    }
+    let value = in_force(
+        &options.reasoning,
+        stored,
+        options.current_reasoning.as_deref(),
+    );
+    choice_label(&options.reasoning, value, agent)
 }
 
 impl KumuApp {
@@ -94,45 +73,33 @@ impl KumuApp {
             session.reasoning.as_deref(),
             &self.agent_name(&session.agent),
         );
-        let current = effective_value(&options, session.reasoning.as_deref()).map(str::to_string);
+        let current = in_force(
+            &options.reasoning,
+            session.reasoning.as_deref(),
+            options.current_reasoning.as_deref(),
+        )
+        .map(str::to_string);
         let efforts = options.reasoning;
 
         let weak = cx.entity().downgrade();
-        let open = self.reasoning_picker_open;
-        let (radius, muted, muted_fg, border, accent, accent_fg, background) = {
-            let theme = cx.theme();
-            (
-                theme.radius,
-                theme.muted,
-                theme.muted_foreground,
-                theme.border,
-                theme.sidebar_accent,
-                theme.sidebar_accent_foreground,
-                theme.background,
-            )
-        };
+        let chrome = PickerChrome::new(cx.theme());
+        let open = self.open_picker == Some(PickerAxis::Reasoning);
 
         // A brain glyph leads the chip, the way the model chip leads with the
         // agent's logo; the effort name is the rest of the affordance.
-        let chip = ChipTrigger {
-            element: h_flex()
-                .id("reasoning-picker-chip")
-                .h(px(24.))
-                .px_1p5()
-                .gap_1p5()
-                .rounded(radius)
-                .cursor_pointer()
-                .text_color(muted_fg)
-                .when(open, |el| el.bg(muted.opacity(0.6)))
-                .when(!open, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
-                .child(
-                    Icon::empty()
-                        .path("icons/brain.svg")
-                        .with_size(px(13.))
-                        .text_color(muted_fg),
-                )
-                .child(div().max_w(px(160.)).text_xs().truncate().child(label)),
-        };
+        let chip = picker_chip(
+            "reasoning-picker-chip",
+            &chrome,
+            label,
+            Some(
+                Icon::empty()
+                    .path("icons/brain.svg")
+                    .with_size(px(13.))
+                    .text_color(chrome.muted_fg)
+                    .into_any_element(),
+            ),
+            open,
+        );
 
         Some(
             Popover::new("reasoning-picker")
@@ -144,14 +111,14 @@ impl KumuApp {
                     move |open, _window, cx| {
                         let open = *open;
                         let _ = weak.update(cx, |app, cx| {
-                            app.reasoning_picker_open = open;
+                            app.set_picker_open(PickerAxis::Reasoning, open);
                             cx.notify();
                         });
                     }
                 })
                 .trigger(chip)
                 .content(move |_state, _window, _cx| {
-                    let mut list = v_flex().gap_0p5().p_1p5();
+                    let mut list = picker_list();
                     for effort in &efforts {
                         let value = effort.value.clone();
                         let selected = current.as_deref() == Some(effort.value.as_str());
@@ -159,39 +126,20 @@ impl KumuApp {
                         // The agent's own name for the effort, nothing more: its
                         // description is longer than the choice is worth.
                         list = list.child(select_row(
+                            &chrome,
                             &effort.name,
                             None,
                             selected,
-                            radius,
-                            muted,
-                            muted_fg,
-                            accent,
-                            accent_fg,
                             move |_, _, cx| {
                                 let _ = weak.update(cx, |app, cx| {
                                     app.pick_reasoning(value.clone(), cx);
-                                    app.reasoning_picker_open = false;
+                                    app.open_picker = None;
                                     cx.notify();
                                 });
                             },
                         ));
                     }
-                    // Content-driven with a cap, like the mode and sandbox menus.
-                    v_flex()
-                        .max_w(px(320.))
-                        .max_h(px(320.))
-                        .rounded(radius)
-                        .border_1()
-                        .border_color(border)
-                        .bg(background)
-                        .shadow_lg()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("reasoning-picker-list")
-                                .overflow_y_scroll()
-                                .child(list),
-                        )
+                    picker_menu("reasoning-picker-list", &chrome, list)
                 })
                 .into_any_element(),
         )
@@ -204,7 +152,7 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::{effective_value, reasoning_label};
+    use super::reasoning_label;
     use crate::backend::ReasoningInfo;
     use crate::ui::SessionOptions;
     use crate::ui::widgets::inherited_label;
@@ -225,23 +173,6 @@ mod tests {
             current_reasoning: current_reasoning.map(str::to_owned),
             ..Default::default()
         }
-    }
-
-    /// The stored pick wins while the agent still offers it; once it does not
-    /// (a Codex model change, say) the agent's reported value takes over.
-    #[test]
-    fn the_stored_pick_only_stands_while_it_is_offered() {
-        let options = session_options(
-            vec![effort("low", "Low"), effort("high", "High")],
-            Some("low"),
-        );
-        assert_eq!(effective_value(&options, Some("high")), Some("high"));
-        assert_eq!(
-            effective_value(&options, Some("gone")),
-            Some("low"),
-            "a pick the agent no longer lists falls back to its report"
-        );
-        assert_eq!(effective_value(&options, None), Some("low"));
     }
 
     /// The label is the agent's own name for the effort; a pick it no longer

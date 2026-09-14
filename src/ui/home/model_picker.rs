@@ -9,12 +9,12 @@ use gpui_kit::*;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 
-use super::KumuApp;
+use super::{KumuApp, PickerAxis};
 use crate::agents::AGENTS;
 use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
-use crate::ui::widgets::{ChipTrigger, agent_logo, select_row};
+use crate::ui::widgets::{PickerChrome, agent_logo, picker_chip, picker_list, select_row};
 
 impl KumuApp {
     /// Switch a session's agent and/or model: persist the choice, drop the old
@@ -109,35 +109,17 @@ impl KumuApp {
             .iter()
             .find(|a| a.id == session.agent)
             .and_then(|a| a.logo);
-        let (radius, muted, muted_fg, border, accent, accent_fg, background) = {
-            let theme = cx.theme();
-            (
-                theme.radius,
-                theme.muted,
-                theme.muted_foreground,
-                theme.border,
-                theme.sidebar_accent,
-                theme.sidebar_accent_foreground,
-                theme.background,
-            )
-        };
+        let chrome = PickerChrome::new(cx.theme());
         let search = self.model_search.clone();
-        let open = self.model_picker_open;
+        let open = self.open_picker == Some(PickerAxis::Model);
 
-        let chip = ChipTrigger {
-            element: h_flex()
-                .id("model-picker-chip")
-                .h(px(24.))
-                .px_1p5()
-                .gap_1p5()
-                .rounded(radius)
-                .cursor_pointer()
-                .text_color(muted_fg)
-                .when(open, |el| el.bg(muted.opacity(0.6)))
-                .when(!open, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
-                .child(agent_logo(chip_logo, px(13.), muted_fg))
-                .child(div().max_w(px(220.)).text_xs().truncate().child(label)),
-        };
+        let chip = picker_chip(
+            "model-picker-chip",
+            &chrome,
+            label,
+            Some(agent_logo(chip_logo, px(13.), chrome.muted_fg)),
+            open,
+        );
 
         Popover::new("model-picker")
             .appearance(false)
@@ -149,7 +131,7 @@ impl KumuApp {
                 move |open, window, cx| {
                     let open = *open;
                     let _ = weak.update(cx, |app, cx| {
-                        app.model_picker_open = open;
+                        app.set_picker_open(PickerAxis::Model, open);
                         if open {
                             // Waku resets onto the session's agent and clears
                             // the filter each time the panel opens.
@@ -190,9 +172,9 @@ impl KumuApp {
                     .items_center()
                     .gap_1()
                     .py_2()
-                    .bg(muted.opacity(0.4))
+                    .bg(chrome.muted.opacity(0.4))
                     .border_r_1()
-                    .border_color(border);
+                    .border_color(chrome.border);
                 for a in AGENTS.iter() {
                     let selected = active_agent == a.id;
                     let tab_weak = weak.clone();
@@ -200,17 +182,21 @@ impl KumuApp {
                         div()
                             .id(format!("model-tab-{}", a.id))
                             .size(px(34.))
-                            .rounded(radius)
+                            .rounded(chrome.radius)
                             .flex()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .when(selected, |el| el.bg(accent))
-                            .when(!selected, |el| el.hover(move |s| s.bg(muted)))
+                            .when(selected, |el| el.bg(chrome.accent))
+                            .when(!selected, |el| el.hover(move |s| s.bg(chrome.muted)))
                             .child(agent_logo(
                                 a.logo,
                                 px(18.),
-                                if selected { accent_fg } else { muted_fg },
+                                if selected {
+                                    chrome.accent_fg
+                                } else {
+                                    chrome.muted_fg
+                                },
                             ))
                             .on_click(move |_, _, cx| {
                                 let _ = tab_weak.update(cx, |app, cx| {
@@ -222,7 +208,7 @@ impl KumuApp {
                 }
 
                 // ---- Right: search field + model rows. ----
-                let mut list = v_flex().gap_0p5().p_1p5();
+                let mut list = picker_list();
                 if searching {
                     let matched: Vec<(&'static str, &backend::ModelInfo)> = AGENTS
                         .iter()
@@ -243,7 +229,7 @@ impl KumuApp {
                         })
                         .collect();
                     if matched.is_empty() {
-                        list = list.child(empty_list_state("没有匹配的模型", muted_fg));
+                        list = list.child(empty_list_state("没有匹配的模型", chrome.muted_fg));
                     }
                     for (agent_id, model) in matched {
                         let agent_name = AGENTS
@@ -252,22 +238,18 @@ impl KumuApp {
                             .map(|a| a.name)
                             .unwrap_or("?");
                         list = list.child(select_row(
+                            &chrome,
                             &model.name,
                             Some(format!("{agent_name} · {}", model.provider)),
                             agent_id == cur_agent
                                 && cur_model.as_deref() == Some(model.value.as_str()),
-                            radius,
-                            muted,
-                            muted_fg,
-                            accent,
-                            accent_fg,
                             {
                                 let weak = weak.clone();
                                 let value = model.value.clone();
                                 move |_, _, cx| {
                                     let _ = weak.update(cx, |app, cx| {
                                         app.pick_model(agent_id, value.clone(), cx);
-                                        app.model_picker_open = false;
+                                        app.open_picker = None;
                                         cx.notify();
                                     });
                                 }
@@ -282,22 +264,18 @@ impl KumuApp {
                             let agent_id = list_agent.unwrap();
                             for model in catalog.models.iter() {
                                 list = list.child(select_row(
+                                    &chrome,
                                     &model.name,
                                     Some(model.provider.clone()),
                                     agent_id == cur_agent
                                         && cur_model.as_deref() == Some(model.value.as_str()),
-                                    radius,
-                                    muted,
-                                    muted_fg,
-                                    accent,
-                                    accent_fg,
                                     {
                                         let weak = weak.clone();
                                         let value = model.value.clone();
                                         move |_, _, cx| {
                                             let _ = weak.update(cx, |app, cx| {
                                                 app.pick_model(agent_id, value.clone(), cx);
-                                                app.model_picker_open = false;
+                                                app.open_picker = None;
                                                 cx.notify();
                                             });
                                         }
@@ -306,10 +284,10 @@ impl KumuApp {
                             }
                         }
                         Some(_) => {
-                            list = list.child(empty_list_state("无可用模型", muted_fg));
+                            list = list.child(empty_list_state("无可用模型", chrome.muted_fg));
                         }
                         None => {
-                            list = list.child(empty_list_state("检测模型…", muted_fg));
+                            list = list.child(empty_list_state("检测模型…", chrome.muted_fg));
                         }
                     }
                 }
@@ -317,10 +295,10 @@ impl KumuApp {
                 h_flex()
                     .w(px(460.))
                     .h(px(340.))
-                    .rounded(radius)
+                    .rounded(chrome.radius)
                     .border_1()
-                    .border_color(border)
-                    .bg(background)
+                    .border_color(chrome.border)
+                    .bg(chrome.background)
                     .shadow_lg()
                     .overflow_hidden()
                     // The rail exists only to choose an agent. Once the session
@@ -333,11 +311,15 @@ impl KumuApp {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(div().p_2().border_b_1().border_color(border).child(
-                                Input::new(&search).small().prefix(
-                                    Icon::new(IconName::Search).small().text_color(muted_fg),
+                            .child(
+                                div().p_2().border_b_1().border_color(chrome.border).child(
+                                    Input::new(&search).small().prefix(
+                                        Icon::new(IconName::Search)
+                                            .small()
+                                            .text_color(chrome.muted_fg),
+                                    ),
                                 ),
-                            ))
+                            )
                             .child(
                                 div()
                                     .flex_1()

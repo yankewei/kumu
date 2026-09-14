@@ -149,19 +149,24 @@ pub struct KumuApp {
     /// Whether the conversation auto-scrolls as new content streams in.
     /// Released when the user scrolls up, re-engaged at the bottom.
     follow_tail: bool,
-    /// Model picker state: controlled open flag, which agent's rail tab is
-    /// active (None = the session's current agent), and the search field.
-    model_picker_open: bool,
+    /// Which picker's menu is open, if any. One at a time — see
+    /// [`KumuApp::set_picker_open`].
+    open_picker: Option<PickerAxis>,
+    /// Model picker state: which agent's rail tab is active (None = the
+    /// session's current agent), and the search field that no other picker has
+    /// (the other lists are short enough to read whole).
     model_picker_tab: Option<&'static str>,
     model_search: Entity<InputState>,
-    /// Mode picker open flag; the mode list is short enough to need no search.
-    mode_picker_open: bool,
-    /// Sandbox picker open flag; like the mode list, short enough for no search.
-    sandbox_picker_open: bool,
-    /// Reasoning picker open flag; its list is a handful of efforts at most.
-    reasoning_picker_open: bool,
-    /// Access picker open flag; like the mode list it needs no search.
-    access_picker_open: bool,
+}
+
+/// Which composer picker's menu is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickerAxis {
+    Model,
+    Reasoning,
+    Access,
+    Mode,
+    Sandbox,
 }
 
 impl KumuApp {
@@ -188,13 +193,9 @@ impl KumuApp {
             turns: HashMap::new(),
             conversation_scroll: ScrollHandle::new(),
             follow_tail: true,
-            model_picker_open: false,
+            open_picker: None,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
-            mode_picker_open: false,
-            sandbox_picker_open: false,
-            reasoning_picker_open: false,
-            access_picker_open: false,
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
@@ -974,6 +975,23 @@ impl KumuApp {
                 .ok();
             self.settings_window = Some(handle);
         }
+    }
+
+    /// Record a picker opening or closing.
+    ///
+    /// Only one is open at a time: the chips sit in a row and their menus
+    /// overlap. A close only clears the flag when it is *that* picker closing —
+    /// opening a second chip dismisses the first, and the two reports can arrive
+    /// in either order, so clearing unconditionally would drop the menu the user
+    /// just opened.
+    fn set_picker_open(&mut self, axis: PickerAxis, open: bool) {
+        self.open_picker = if open {
+            Some(axis)
+        } else if self.open_picker == Some(axis) {
+            None
+        } else {
+            self.open_picker
+        };
     }
 
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {

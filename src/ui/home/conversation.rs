@@ -151,13 +151,7 @@ impl KumuApp {
                                             .text_color(muted_fg),
                                     )
                                     .child(div().text_xs().text_color(muted_fg).child("已思考"))
-                                    .child(
-                                        Icon::new(IconName::ChevronDown)
-                                            .xsmall()
-                                            .flex_none()
-                                            .text_color(muted_fg)
-                                            .rotate(percentage(if open { 0.5 } else { 0. })),
-                                    )
+                                    .child(disclosure_caret(open, muted_fg))
                                     .on_click(row_toggle_click(
                                         cx,
                                         session_id,
@@ -250,13 +244,7 @@ impl KumuApp {
                                                 if active { "思考中…" } else { "已思考" },
                                             ),
                                         )
-                                        .child(
-                                            Icon::new(IconName::ChevronDown)
-                                                .xsmall()
-                                                .flex_none()
-                                                .text_color(muted_fg)
-                                                .rotate(percentage(if open { 0.5 } else { 0. })),
-                                        )
+                                        .child(disclosure_caret(open, muted_fg))
                                         .on_click(row_toggle_click(
                                             cx,
                                             session_id,
@@ -466,13 +454,7 @@ impl KumuApp {
                     .hover(move |s| s.bg(muted))
                     .child(status)
                     .child(div().text_xs().text_color(muted_fg).child(label))
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .xsmall()
-                            .flex_none()
-                            .text_color(muted_fg)
-                            .rotate(percentage(if open { 0.5 } else { 0. })),
-                    )
+                    .child(disclosure_caret(open, muted_fg))
                     .on_click(row_toggle_click(cx, session_id, RowToggle::Key(id))),
             )
             .content(
@@ -528,13 +510,7 @@ impl KumuApp {
                         .cursor_pointer()
                         .rounded(radius)
                         .hover(move |s| s.bg(muted))
-                        .child(
-                            Icon::new(IconName::ChevronDown)
-                                .xsmall()
-                                .flex_none()
-                                .text_color(muted_fg)
-                                .rotate(percentage(if open { 0.5 } else { 0. })),
-                        )
+                        .child(disclosure_caret(open, muted_fg))
                         .on_click(row_toggle_click(cx, session_id, row.toggle)),
                 )
                 .content(collapsed_body(body_id, row.content, muted_fg))
@@ -548,6 +524,16 @@ impl KumuApp {
         }
         container.into_any_element()
     }
+}
+
+/// The caret a foldable row turns: pointing down while the row is closed, half
+/// a turn once it is open.
+fn disclosure_caret(open: bool, muted_fg: gpui::Hsla) -> impl IntoElement {
+    Icon::new(IconName::ChevronDown)
+        .xsmall()
+        .flex_none()
+        .text_color(muted_fg)
+        .rotate(percentage(if open { 0.5 } else { 0. }))
 }
 
 /// Collapsible row body: the captured text, capped in height with its own
