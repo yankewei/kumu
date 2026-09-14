@@ -44,6 +44,8 @@ mod tests {
         assert!(KumuAssetSource.load("omp.png").unwrap().is_some());
         assert!(KumuAssetSource.load("opencode.png").unwrap().is_some());
         assert!(KumuAssetSource.load("codex.svg").unwrap().is_some());
+        assert!(KumuAssetSource.load("pi.png").unwrap().is_some());
+        assert!(KumuAssetSource.load("claude.png").unwrap().is_some());
         // kumu's own icons layer on top of gpui-kit's bundled set (the reason
         // chip's brain glyph, and the composer's stop glyph while a turn runs,
         // neither of which the bundled set ships).

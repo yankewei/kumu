@@ -39,20 +39,18 @@ pub const AGENTS: [AgentDef; 5] = [
         logo: Some("codex.svg"),
         drives_sessions: true,
     },
-    // No logo asset yet, so the generic Bot icon stands in.
     AgentDef {
         id: "claude",
         name: "Claude Code",
         desc: "claude -p · stream-json",
-        logo: None,
+        logo: Some("claude.png"),
         drives_sessions: true,
     },
-    // No logo asset yet either.
     AgentDef {
         id: "pi",
         name: "Pi",
         desc: "pi --mode rpc",
-        logo: None,
+        logo: Some("pi.png"),
         drives_sessions: true,
     },
 ];
