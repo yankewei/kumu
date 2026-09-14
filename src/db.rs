@@ -31,6 +31,10 @@ pub struct Session {
     /// Selected reasoning effort (value); None = the model's own default. Only
     /// agents whose models advertise efforts keep anything here.
     pub reasoning: Option<String>,
+    /// Whether the title is the user's own, set by renaming the session. A name
+    /// the user typed outranks one generated for them, so this is what stops a
+    /// generated title (kumu's fallback or the agent's own) from replacing it.
+    pub title_manual: bool,
     /// Whether the conversation has begun, which is what fixes the session's
     /// agent: a switched agent would be handed a transcript it never wrote, so
     /// switching is only offered while this is false.
@@ -83,6 +87,7 @@ impl Store {
                 mode TEXT,
                 sandbox TEXT,
                 reasoning TEXT,
+                title_manual INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -103,9 +108,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_messages_session_id
                 ON messages(session_id);",
         )?;
-        // Migrations for dbs created before model/mode/sandbox/reasoning were
-        // part of CREATE TABLE (duplicate-column errors on fresh dbs are
-        // expected and ignored).
+        // Migrations for dbs created before model/mode/sandbox/reasoning/
+        // title_manual were part of CREATE TABLE (duplicate-column errors on
+        // fresh dbs are expected and ignored).
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
             .ok();
@@ -117,6 +122,12 @@ impl Store {
             .ok();
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN reasoning TEXT", [])
+            .ok();
+        self.conn
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
             .ok();
         Ok(())
     }
@@ -151,6 +162,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning,
+                        title_manual,
                         EXISTS(
                             SELECT 1 FROM messages
                             WHERE messages.session_id = sessions.id AND messages.role <> 'system'
@@ -169,7 +181,8 @@ impl Store {
                 mode: row.get(6)?,
                 sandbox: row.get(7)?,
                 reasoning: row.get(8)?,
-                has_conversation: row.get(9)?,
+                title_manual: row.get(9)?,
+                has_conversation: row.get(10)?,
             })
         })
         .unwrap()
@@ -248,9 +261,28 @@ impl Store {
         Ok(())
     }
 
-    pub fn update_session_title(&self, id: i64, title: &str) -> Result<()> {
+    /// Store a generated title — kumu's fallback from the first message, or the
+    /// agent's own — and report whether it was applied.
+    ///
+    /// A session the user has renamed refuses it: [`Store::rename_session`] makes
+    /// the title the user's, and a generated one must not overwrite a name they
+    /// typed out. Callers mirror this verdict rather than deciding for
+    /// themselves, so the rule has one home.
+    pub fn update_session_title(&self, id: i64, title: &str) -> Result<bool> {
+        let applied = self.conn.execute(
+            "UPDATE sessions SET title = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND title_manual = 0",
+            params![title, id],
+        )?;
+        Ok(applied > 0)
+    }
+
+    /// Rename a session to a name the user chose. From here on the name is the
+    /// session's own: generated titles no longer replace it.
+    pub fn rename_session(&self, id: i64, title: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE sessions SET title = ?1, title_manual = 1, updated_at = datetime('now')
+             WHERE id = ?2",
             params![title, id],
         )?;
         Ok(())
@@ -370,6 +402,38 @@ mod tests {
         let store = store();
         store.delete_session(404).unwrap();
         assert!(store.sessions().is_empty());
+    }
+
+    /// A name the user typed outranks one generated for them: renaming marks the
+    /// title as the user's, and every later generated title — kumu's fallback
+    /// from the first message and the agent's own both come through here — is
+    /// refused, leaving the session as the user named it.
+    #[test]
+    fn a_renamed_session_keeps_the_users_title() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+
+        assert!(
+            store.update_session_title(session, "首条消息").unwrap(),
+            "a session with no name of its own takes a generated title"
+        );
+        assert_eq!(store.sessions()[0].title, "首条消息");
+        assert!(!store.sessions()[0].title_manual);
+
+        store.rename_session(session, "重构 backend").unwrap();
+        assert_eq!(store.sessions()[0].title, "重构 backend");
+        assert!(store.sessions()[0].title_manual);
+
+        assert!(
+            !store
+                .update_session_title(session, "agent 起的名字")
+                .unwrap(),
+            "a generated title is refused once the user has renamed the session"
+        );
+        assert_eq!(store.sessions()[0].title, "重构 backend");
     }
 
     /// The chosen mode is remembered across reads, and clearing it is how a

@@ -141,14 +141,23 @@ impl KumuApp {
                             .context_menu({
                                 let weak = weak.clone();
                                 move |menu, _, _| {
-                                    let weak = weak.clone();
-                                    menu.item(PopupMenuItem::new("删除").on_click(
+                                    let rename = PopupMenuItem::new("重命名").on_click({
+                                        let weak = weak.clone();
+                                        move |_, window, cx| {
+                                            let _ = weak.update(cx, move |app, cx| {
+                                                app.prompt_rename_session(sid, window, cx)
+                                            });
+                                        }
+                                    });
+                                    let delete = PopupMenuItem::new("删除").on_click({
+                                        let weak = weak.clone();
                                         move |_, window, cx| {
                                             let _ = weak.update(cx, move |app, cx| {
                                                 app.confirm_delete_session(sid, window, cx)
                                             });
-                                        },
-                                    ))
+                                        }
+                                    });
+                                    menu.item(rename).item(delete)
                                 }
                             })
                             .into_any_element(),

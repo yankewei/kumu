@@ -27,7 +27,7 @@ use crate::db::{Message, Project, Session, Store, db_path};
 use crate::ui::layers;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -345,6 +345,81 @@ impl KumuApp {
         });
     }
 
+    /// Rename a session: the dialog's field starts on the current name, so the
+    /// name can be replaced in one go.
+    fn prompt_rename_session(&self, session_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        // The dialog outlives this call, so it reaches the view weakly.
+        let weak = cx.weak_entity();
+        let dialog_input = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("重命名会话")
+                .child(Input::new(&dialog_input).small())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("保存")
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok({
+                    let weak = weak.clone();
+                    let input = dialog_input.clone();
+                    move |_, _, cx| {
+                        let name = input.read(cx).value().trim().to_string();
+                        if !name.is_empty() {
+                            let _ = weak.update(cx, move |app, cx| {
+                                app.rename_session(session_id, name, cx)
+                            });
+                        }
+                        true
+                    }
+                })
+        });
+        // Focusing after opening leaves the input the last handle the window
+        // focused; the dialog only traps Tab, so nothing steals it back.
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+    }
+
+    /// Apply the name the user chose. It is marked as theirs, which is what
+    /// keeps a title generated later from replacing it.
+    fn rename_session(&mut self, session_id: i64, title: String, cx: &mut Context<Self>) {
+        self.store.rename_session(session_id, &title).ok();
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.title = title;
+            session.title_manual = true;
+        }
+        cx.notify();
+    }
+
+    /// Take a title generated for the session — kumu's fallback from the first
+    /// message, or the agent's own.
+    ///
+    /// The store decides whether it may replace the current name, and a name the
+    /// user chose wins; the in-memory list follows that verdict rather than
+    /// deciding for itself, so the two cannot drift apart.
+    fn apply_generated_title(&mut self, session_id: i64, title: &str) {
+        if !self
+            .store
+            .update_session_title(session_id, title)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.title = title.to_string();
+        }
+    }
+
     /// Delete a session: settle anything it was waiting on, drop its live
     /// connection (which tears down the agent subprocess), forget its turn
     /// state, then remove the row and its history.
@@ -390,10 +465,7 @@ impl KumuApp {
                 if line.chars().count() > 24 {
                     title.push('…');
                 }
-                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    s.title = title.clone();
-                }
-                self.store.update_session_title(session_id, &title).ok();
+                self.apply_generated_title(session_id, &title);
             }
         }
         self.store.insert_message(session_id, "user", &text).ok();
@@ -748,10 +820,7 @@ impl KumuApp {
                 }
             }
             backend::Event::SessionTitle { title } => {
-                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    session.title = title.clone();
-                }
-                self.store.update_session_title(session_id, &title).ok();
+                self.apply_generated_title(session_id, &title);
                 cx.notify();
             }
             backend::Event::Done(_) => {
@@ -990,6 +1059,7 @@ mod tests {
             mode: None,
             sandbox: None,
             reasoning: None,
+            title_manual: false,
             has_conversation: false,
         }
     }
