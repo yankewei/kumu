@@ -160,7 +160,7 @@ impl KumuApp {
 
     /// The one-line echo of a decision, kept under the tool row so the history
     /// shows how the call was authorized.
-    pub(super) fn render_permission_decision(&self, decision: &str, cx: &Context<Self>) -> Div {
+    pub(super) fn render_permission_decision(&self, decision: &str, cx: &App) -> Div {
         div()
             .ml_8()
             .px_1()

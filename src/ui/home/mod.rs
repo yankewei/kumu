@@ -16,6 +16,10 @@ mod sidebar;
 const CONTENT_MAX_REM: f32 = 44.;
 const CONTENT_MIN_REM: f32 = 24.;
 
+/// How far above and below the viewport a conversation keeps rows laid out, so
+/// a fast scroll meets rows that already have a height.
+const CONVERSATION_OVERDRAW: Pixels = px(400.);
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -167,12 +171,11 @@ pub struct KumuApp {
     /// Live turn state keyed by session id: streaming thinking, tool calls,
     /// and the answer being built. Dropped when the turn ends.
     turns: HashMap<i64, TurnState>,
-    /// Scroll position of the conversation list; pinned to the bottom every
-    /// frame while [`Self::follow_tail`] is on.
-    conversation_scroll: ScrollHandle,
-    /// Whether the conversation auto-scrolls as new content streams in.
-    /// Released when the user scrolls up, re-engaged at the bottom.
-    follow_tail: bool,
+    /// The conversation's virtual list. Only the rows in view are built into
+    /// elements and laid out, so a long transcript costs what a short one
+    /// does. Its tail mode keeps the reply in sight while it streams, lets go
+    /// when the reader scrolls up, and takes hold again at the bottom.
+    conversation_list: ListState,
     /// Which picker's menu is open, if any. One at a time — see
     /// [`KumuApp::set_picker_open`].
     open_picker: Option<PickerAxis>,
@@ -215,8 +218,11 @@ impl KumuApp {
             }),
             conns: HashMap::new(),
             turns: HashMap::new(),
-            conversation_scroll: ScrollHandle::new(),
-            follow_tail: true,
+            conversation_list: {
+                let list = ListState::new(0, ListAlignment::Top, CONVERSATION_OVERDRAW);
+                list.set_follow_mode(FollowMode::Tail);
+                list
+            },
             open_picker: None,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
@@ -310,7 +316,9 @@ impl KumuApp {
     fn select_session(&mut self, id: i64) {
         self.selected = Some(id);
         self.messages = self.store.messages(id);
-        self.follow_tail = true;
+        // A session opens on its latest message, whichever one the reader was
+        // scrolled to in the session they came from.
+        self.conversation_list.set_follow_mode(FollowMode::Tail);
     }
 
     fn new_session(&mut self) {
@@ -533,7 +541,9 @@ impl KumuApp {
             self.complete_command(&name, window, cx);
             return;
         }
-        self.follow_tail = true;
+        // Sending is a request to see the reply, so the column returns to its
+        // tail even if the reader had wandered up.
+        self.conversation_list.set_follow_mode(FollowMode::Tail);
         // Until the agent reports a real title (session/info), fall back to
         // the first line of the first user message.
         if session.title.starts_with("会话 ") {
