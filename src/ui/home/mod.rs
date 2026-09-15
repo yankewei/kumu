@@ -22,10 +22,11 @@ use std::path::PathBuf;
 use futures::StreamExt;
 
 use self::command_menu::matching_commands;
+use self::conversation::{ConversationView, ToolRun, TurnBlock};
 use super::{AgentCommands, AgentSessionOptions, SessionOptions, SettingsWindow};
 use crate::agents::AGENTS;
 use crate::backend;
-use crate::db::{Message, Project, Session, Store, db_path};
+use crate::db::{Project, Session, Store, db_path};
 use crate::ui::layers;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -37,6 +38,7 @@ use gpui_kit::*;
 
 /// A permission request waiting for the user, shown above the composer while
 /// its tool call is still parked on the agent's side.
+#[derive(Clone)]
 struct PendingPermission {
     request_id: String,
     title: String,
@@ -102,52 +104,6 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
     ProjectPick::New { name }
 }
 
-/// One tool call observed during the live turn, in first-seen order.
-struct ToolRun {
-    id: String,
-    title: String,
-    /// pending / running / done / failed
-    status: &'static str,
-    /// Flattened text output from the agent, expandable in the UI.
-    content: String,
-    /// Whether the content is expanded.
-    open: bool,
-    /// Authorization the agent is still waiting on for this call.
-    pending_permission: Option<PendingPermission>,
-    /// The choice the user made (the agent's own option label), kept on the row
-    /// so the conversation shows how the call was authorized.
-    decision: Option<String>,
-}
-
-/// Blocks stay in arrival order; tool updates mutate their original block.
-enum TurnBlock {
-    Thinking {
-        text: String,
-        open: bool,
-    },
-    Tool(ToolRun),
-    Answer {
-        text: String,
-        view: Entity<TextViewState>,
-    },
-}
-
-struct TurnState {
-    started_at: std::time::Instant,
-    blocks: Vec<TurnBlock>,
-    active_thinking: Option<usize>,
-}
-
-impl TurnState {
-    fn new() -> Self {
-        Self {
-            started_at: std::time::Instant::now(),
-            blocks: Vec::new(),
-            active_thinking: None,
-        }
-    }
-}
-
 pub struct KumuApp {
     store: Store,
     settings_window: Option<WindowHandle<Root>>,
@@ -156,23 +112,12 @@ pub struct KumuApp {
     selected: Option<i64>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
-    /// Expanded rows in the conversation, keyed by the row's element id: a
-    /// history row's list index, or a tool run's first call. Live turn blocks
-    /// carry an `open` flag of their own instead.
-    expanded_rows: HashSet<String>,
-    messages: Vec<Message>,
+    /// The selected session's history and every session's live turn. Its own
+    /// entity so streaming and animation repaint that column alone.
+    conversation: Entity<ConversationView>,
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
     conns: HashMap<i64, backend::Connection>,
-    /// Live turn state keyed by session id: streaming thinking, tool calls,
-    /// and the answer being built. Dropped when the turn ends.
-    turns: HashMap<i64, TurnState>,
-    /// Scroll position of the conversation list; pinned to the bottom every
-    /// frame while [`Self::follow_tail`] is on.
-    conversation_scroll: ScrollHandle,
-    /// Whether the conversation auto-scrolls as new content streams in.
-    /// Released when the user scrolls up, re-engaged at the bottom.
-    follow_tail: bool,
     /// Which picker's menu is open, if any. One at a time — see
     /// [`KumuApp::set_picker_open`].
     open_picker: Option<PickerAxis>,
@@ -203,8 +148,7 @@ impl KumuApp {
             sessions: Vec::new(),
             selected: None,
             collapsed_projects: HashSet::new(),
-            expanded_rows: HashSet::new(),
-            messages: Vec::new(),
+            conversation: cx.new(ConversationView::new),
             input_state: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .auto_grow(1, 6)
@@ -214,9 +158,6 @@ impl KumuApp {
                     .submit_on_enter(true)
             }),
             conns: HashMap::new(),
-            turns: HashMap::new(),
-            conversation_scroll: ScrollHandle::new(),
-            follow_tail: true,
             open_picker: None,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
@@ -230,7 +171,7 @@ impl KumuApp {
             }
         })
         .detach();
-        app.bootstrap();
+        app.bootstrap(cx);
         app.probe_models(cx);
         app
     }
@@ -279,7 +220,7 @@ impl KumuApp {
         .detach();
     }
 
-    fn bootstrap(&mut self) {
+    fn bootstrap(&mut self, cx: &mut Context<Self>) {
         if self.store.projects().is_empty() {
             let cwd = std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/"))
@@ -297,7 +238,7 @@ impl KumuApp {
         }
         if self.selected.is_none() {
             if let Some(s) = self.sessions.first().cloned() {
-                self.select_session(s.id);
+                self.select_session(s.id, cx);
             }
         }
     }
@@ -307,19 +248,33 @@ impl KumuApp {
         self.sessions = self.store.sessions();
     }
 
-    fn select_session(&mut self, id: i64) {
+    fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
         self.selected = Some(id);
-        self.messages = self.store.messages(id);
-        self.follow_tail = true;
+        let messages = self.store.messages(id);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.show(Some(id), &messages, cx)
+        });
     }
 
-    fn new_session(&mut self) {
+    /// Re-read a session's persisted messages into the conversation, which
+    /// ignores them unless that session is on screen.
+    fn reload_messages(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        if self.selected != Some(session_id) {
+            return;
+        }
+        let messages = self.store.messages(session_id);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.reload_history(session_id, &messages, cx)
+        });
+    }
+
+    fn new_session(&mut self, cx: &mut Context<Self>) {
         let project_id = self.projects.first().map(|p| p.id).unwrap_or_else(|| {
             self.store
                 .insert_project("kumu", "cwd-not-set")
                 .unwrap_or(1)
         });
-        self.new_session_in(project_id);
+        self.new_session_in(project_id, cx);
     }
 
     /// Add a project from a native folder picker; the picked folder's own
@@ -361,7 +316,7 @@ impl KumuApp {
         }
     }
 
-    fn new_session_in(&mut self, project_id: i64) {
+    fn new_session_in(&mut self, project_id: i64, cx: &mut Context<Self>) {
         let cwd = self
             .projects
             .iter()
@@ -374,7 +329,7 @@ impl KumuApp {
             .insert_session(project_id, "omp", &format!("会话 {n}"), &cwd)
         {
             self.refresh();
-            self.select_session(id);
+            self.select_session(id, cx);
         }
     }
 
@@ -490,18 +445,21 @@ impl KumuApp {
     fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
         // Pick the fallback while the doomed row is still in the list.
         let next = neighbor_session(&self.sessions, session_id);
-        self.cancel_pending_permissions(session_id);
+        self.cancel_pending_permissions(session_id, cx);
         self.conns.remove(&session_id);
-        self.turns.remove(&session_id);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.take_turn(session_id, cx)
+        });
         self.store.delete_session(session_id).ok();
         self.refresh();
 
         if self.selected == Some(session_id) {
             match next.filter(|next| self.sessions.iter().any(|s| s.id == *next)) {
-                Some(next) => self.select_session(next),
+                Some(next) => self.select_session(next, cx),
                 None => {
                     self.selected = None;
-                    self.messages.clear();
+                    self.conversation
+                        .update(cx, |conversation, cx| conversation.show(None, &[], cx));
                 }
             }
         }
@@ -517,7 +475,7 @@ impl KumuApp {
         // would have the next Enter complete the same command again.
         let typed = self.input_state.read(cx).value();
         let text = typed.trim().to_string();
-        if text.is_empty() || self.turns.contains_key(&session_id) {
+        if text.is_empty() || self.conversation.read(cx).has_turn(session_id) {
             return;
         }
         let Some(session) = self.selected_session().cloned() else {
@@ -533,7 +491,8 @@ impl KumuApp {
             self.complete_command(&name, window, cx);
             return;
         }
-        self.follow_tail = true;
+        self.conversation
+            .update(cx, |conversation, cx| conversation.scroll_to_end(cx));
         // Until the agent reports a real title (session/info), fall back to
         // the first line of the first user message.
         if session.title.starts_with("会话 ") {
@@ -551,7 +510,7 @@ impl KumuApp {
         // re-read here rather than letting the flag lag a turn behind the
         // picker that reads it.
         self.refresh();
-        self.messages = self.store.messages(session_id);
+        self.reload_messages(session_id, cx);
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
 
@@ -568,7 +527,9 @@ impl KumuApp {
         // spawning the subprocess and streaming the first token can take a
         // while, and until then the conversation would show no sign that the
         // prompt was accepted.
-        self.turn_entry(session_id, cx);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.update_turn(session_id, cx, |_, _| ())
+        });
         conn.send(backend::Cmd::Prompt(text));
         cx.notify();
     }
@@ -597,7 +558,7 @@ impl KumuApp {
         }
         let agent_id = AGENTS.iter().find(|a| a.id == session.agent).map(|a| a.id);
         let Some(agent_id) = agent_id else {
-            self.system_message(session.id, format!("未支持的 agent：{}", session.agent));
+            self.system_message(session.id, format!("未支持的 agent：{}", session.agent), cx);
             return;
         };
         let Some(cfg) = backend::Config::for_agent(agent_id) else {
@@ -689,14 +650,16 @@ impl KumuApp {
         }
         // Settle the prompts before dropping the handle, so the agent gets an
         // answer rather than a silent disconnect.
-        self.cancel_pending_permissions(session_id);
+        self.cancel_pending_permissions(session_id, cx);
         // Drop the in-flight turn with the connection: nothing can deliver its
         // answer now, so the working indicator must not keep counting. The
         // normal paths have already dropped it (a turn ends with `Done`, and a
         // failure reports `Error` first); this covers a connection that died
         // without either, which would otherwise leave the turn — and the
         // composer, which refuses to send while one exists — stuck for good.
-        self.turns.remove(&session_id);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.take_turn(session_id, cx)
+        });
         self.conns.remove(&session_id);
         cx.notify();
     }
@@ -705,21 +668,22 @@ impl KumuApp {
     /// protocol's `Cancelled` outcome and drop it from the rows. Used when the
     /// turn ends or the connection goes away, so the agent is never left
     /// waiting on a prompt that no longer exists in the UI.
-    fn cancel_pending_permissions(&mut self, session_id: i64) {
+    fn cancel_pending_permissions(&mut self, session_id: i64, cx: &mut Context<Self>) {
         let request_ids: Vec<String> = self
-            .turns
-            .get(&session_id)
-            .map(|turn| {
-                turn.blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        TurnBlock::Tool(run) => run
-                            .pending_permission
-                            .as_ref()
-                            .map(|pending| pending.request_id.clone()),
-                        _ => None,
-                    })
-                    .collect()
+            .conversation
+            .update(cx, |conversation, cx| {
+                conversation.with_turn(session_id, cx, |turn| {
+                    turn.blocks
+                        .iter_mut()
+                        .filter_map(|block| match block {
+                            TurnBlock::Tool(run) => run
+                                .pending_permission
+                                .take()
+                                .map(|pending| pending.request_id),
+                            _ => None,
+                        })
+                        .collect()
+                })
             })
             .unwrap_or_default();
 
@@ -728,32 +692,25 @@ impl KumuApp {
                 conn.resolve_permission(request_id, None);
             }
         }
-
-        if let Some(turn) = self.turns.get_mut(&session_id) {
-            for block in &mut turn.blocks {
-                if let TurnBlock::Tool(run) = block {
-                    run.pending_permission = None;
-                }
-            }
-        }
     }
 
     /// Whether any tool call in this session is still waiting on the user.
-    fn has_pending_permission(&self, session_id: i64) -> bool {
-        self.pending_permission_for(session_id).is_some()
+    fn has_pending_permission(&self, session_id: i64, cx: &App) -> bool {
+        self.pending_permission_for(session_id, cx).is_some()
     }
 
     /// The oldest outstanding permission prompt for a session, if any.
     ///
     /// Only one is shown at a time: the agent is blocked on the earliest request
     /// anyway, and a single card keeps the input area from growing unbounded.
-    fn pending_permission_for(&self, session_id: i64) -> Option<&PendingPermission> {
-        self.turns
-            .get(&session_id)?
+    fn pending_permission_for(&self, session_id: i64, cx: &App) -> Option<PendingPermission> {
+        self.conversation
+            .read(cx)
+            .turn(session_id)?
             .blocks
             .iter()
             .find_map(|block| match block {
-                TurnBlock::Tool(run) => run.pending_permission.as_ref(),
+                TurnBlock::Tool(run) => run.pending_permission.clone(),
                 _ => None,
             })
     }
@@ -771,55 +728,71 @@ impl KumuApp {
         if let Some(conn) = self.conns.get(&session_id) {
             conn.resolve_permission(request_id, option_id);
         }
-        if let Some(turn) = self.turns.get_mut(&session_id) {
-            for block in &mut turn.blocks {
-                let TurnBlock::Tool(run) = block else {
-                    continue;
-                };
-                let matches_request = run
-                    .pending_permission
-                    .as_ref()
-                    .is_some_and(|p| p.request_id == request_id);
-                if matches_request {
-                    run.pending_permission = None;
-                    run.decision = Some(label);
-                    break;
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.with_turn(session_id, cx, |turn| {
+                for block in &mut turn.blocks {
+                    let TurnBlock::Tool(run) = block else {
+                        continue;
+                    };
+                    let matches_request = run
+                        .pending_permission
+                        .as_ref()
+                        .is_some_and(|p| p.request_id == request_id);
+                    if matches_request {
+                        run.pending_permission = None;
+                        run.decision = Some(label);
+                        break;
+                    }
                 }
-            }
-        }
+            })
+        });
         cx.notify();
     }
 
     fn on_acp_event(&mut self, session_id: i64, ev: backend::Event, cx: &mut Context<Self>) {
+        // A turn opening or closing changes the composer (send ↔ stop) and the
+        // command menu, which this view draws; a chunk streaming into a turn
+        // that is already open only changes the conversation, which repaints
+        // itself.
+        let had_turn = self.conversation.read(cx).has_turn(session_id);
         match ev {
             backend::Event::Agent(chunk) => {
                 // Feed the chunk straight into the session's markdown view:
                 // `push_str` appends incrementally instead of re-parsing the
                 // whole document on every chunk.
-                let turn = self.turn_entry(session_id, cx);
-                turn.active_thinking = None;
-                if let Some(TurnBlock::Answer { text, view }) = turn.blocks.last_mut() {
-                    view.update(cx, |state, cx| state.push_str(&chunk, cx));
-                    text.push_str(&chunk);
-                } else {
-                    let view = cx.new(|cx| TextViewState::markdown(&chunk, cx));
-                    turn.blocks.push(TurnBlock::Answer { text: chunk, view });
-                }
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.update_turn(session_id, cx, |turn, cx| {
+                        turn.active_thinking = None;
+                        if let Some(TurnBlock::Answer { text, view }) = turn.blocks.last_mut() {
+                            view.update(cx, |state, cx| state.push_str(&chunk, cx));
+                            text.push_str(&chunk);
+                        } else {
+                            let view = cx.new(|cx| TextViewState::markdown(&chunk, cx));
+                            // The appended text parses in the background; repaint
+                            // the conversation when it lands.
+                            cx.observe(&view, |_, _, cx| cx.notify()).detach();
+                            turn.blocks.push(TurnBlock::Answer { text: chunk, view });
+                        }
+                    })
+                });
             }
             backend::Event::Thought(chunk) => {
-                let turn = self.turn_entry(session_id, cx);
-                if let Some(TurnBlock::Thinking { text, .. }) = turn
-                    .active_thinking
-                    .and_then(|index| turn.blocks.get_mut(index))
-                {
-                    text.push_str(&chunk);
-                } else {
-                    turn.active_thinking = Some(turn.blocks.len());
-                    turn.blocks.push(TurnBlock::Thinking {
-                        text: chunk,
-                        open: false,
-                    });
-                }
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.update_turn(session_id, cx, |turn, _| {
+                        if let Some(TurnBlock::Thinking { text, .. }) = turn
+                            .active_thinking
+                            .and_then(|index| turn.blocks.get_mut(index))
+                        {
+                            text.push_str(&chunk);
+                        } else {
+                            turn.active_thinking = Some(turn.blocks.len());
+                            turn.blocks.push(TurnBlock::Thinking {
+                                text: chunk,
+                                open: false,
+                            });
+                        }
+                    })
+                });
             }
             backend::Event::ToolCall {
                 id,
@@ -827,32 +800,35 @@ impl KumuApp {
                 status,
                 content,
             } => {
-                let turn = self.turn_entry(session_id, cx);
-                turn.active_thinking = None;
-                if let Some(run) = turn.blocks.iter_mut().find_map(|block| match block {
-                    TurnBlock::Tool(run) if run.id == id => Some(run),
-                    _ => None,
-                }) {
-                    if !status.is_empty() {
-                        run.status = status;
-                    }
-                    if !title.is_empty() {
-                        run.title = title;
-                    }
-                    if !content.is_empty() {
-                        run.content = content;
-                    }
-                } else {
-                    turn.blocks.push(TurnBlock::Tool(ToolRun {
-                        id,
-                        title,
-                        status: if status.is_empty() { "running" } else { status },
-                        content,
-                        open: false,
-                        pending_permission: None,
-                        decision: None,
-                    }));
-                }
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.update_turn(session_id, cx, |turn, _| {
+                        turn.active_thinking = None;
+                        if let Some(run) = turn.blocks.iter_mut().find_map(|block| match block {
+                            TurnBlock::Tool(run) if run.id == id => Some(run),
+                            _ => None,
+                        }) {
+                            if !status.is_empty() {
+                                run.status = status;
+                            }
+                            if !title.is_empty() {
+                                run.title = title;
+                            }
+                            if !content.is_empty() {
+                                run.content = content;
+                            }
+                        } else {
+                            turn.blocks.push(TurnBlock::Tool(ToolRun {
+                                id,
+                                title,
+                                status: if status.is_empty() { "running" } else { status },
+                                content,
+                                open: false,
+                                pending_permission: None,
+                                decision: None,
+                            }));
+                        }
+                    })
+                });
             }
             backend::Event::PermissionRequest {
                 tool_call_id,
@@ -861,41 +837,48 @@ impl KumuApp {
                 detail,
                 options,
             } => {
-                let conn = self.conns.get(&session_id).cloned();
-                let turn = self.turn_entry(session_id, cx);
-                turn.active_thinking = None;
-                let index = match turn.blocks.iter().position(
-                    |block| matches!(block, TurnBlock::Tool(run) if run.id == tool_call_id),
-                ) {
-                    Some(index) => index,
-                    None => {
-                        // The request can arrive before the tool call it refers
-                        // to; seed the row from what the request itself carries
-                        // so the prompt is never dropped.
-                        turn.blocks.push(TurnBlock::Tool(ToolRun {
-                            id: tool_call_id,
-                            title: title.clone(),
-                            status: "pending",
-                            content: String::new(),
-                            open: false,
-                            pending_permission: None,
-                            decision: None,
-                        }));
-                        turn.blocks.len() - 1
-                    }
-                };
-                if let Some(TurnBlock::Tool(run)) = turn.blocks.get_mut(index) {
-                    // One prompt per row: settle any earlier one as cancelled.
-                    if let (Some(previous), Some(conn)) = (run.pending_permission.take(), conn) {
-                        conn.resolve_permission(&previous.request_id, None);
-                    }
-                    run.pending_permission = Some(PendingPermission {
-                        request_id,
-                        title,
-                        detail,
-                        options,
-                    });
+                let previous = self.conversation.update(cx, |conversation, cx| {
+                    conversation.update_turn(session_id, cx, |turn, _| {
+                        turn.active_thinking = None;
+                        let index = match turn.blocks.iter().position(
+                            |block| matches!(block, TurnBlock::Tool(run) if run.id == tool_call_id),
+                        ) {
+                            Some(index) => index,
+                            None => {
+                                // The request can arrive before the tool call it
+                                // refers to; seed the row from what the request
+                                // itself carries so the prompt is never dropped.
+                                turn.blocks.push(TurnBlock::Tool(ToolRun {
+                                    id: tool_call_id,
+                                    title: title.clone(),
+                                    status: "pending",
+                                    content: String::new(),
+                                    open: false,
+                                    pending_permission: None,
+                                    decision: None,
+                                }));
+                                turn.blocks.len() - 1
+                            }
+                        };
+                        let TurnBlock::Tool(run) = &mut turn.blocks[index] else {
+                            return None;
+                        };
+                        run.pending_permission
+                            .replace(PendingPermission {
+                                request_id,
+                                title,
+                                detail,
+                                options,
+                            })
+                            .map(|previous| previous.request_id)
+                    })
+                });
+                // One prompt per row: settle any earlier one as cancelled.
+                if let (Some(previous), Some(conn)) = (previous, self.conns.get(&session_id)) {
+                    conn.resolve_permission(&previous, None);
                 }
+                // The card above the composer and the sidebar's marker.
+                cx.notify();
             }
             backend::Event::SessionTitle { title } => {
                 self.apply_generated_title(session_id, &title);
@@ -903,8 +886,11 @@ impl KumuApp {
             }
             backend::Event::Done(_) => {
                 // The turn is over, so nothing can still be authorized.
-                self.cancel_pending_permissions(session_id);
-                if let Some(turn) = self.turns.remove(&session_id) {
+                self.cancel_pending_permissions(session_id, cx);
+                let turn = self.conversation.update(cx, |conversation, cx| {
+                    conversation.take_turn(session_id, cx)
+                });
+                if let Some(turn) = turn {
                     for block in turn.blocks {
                         let (role, text) = match block {
                             TurnBlock::Thinking { text, .. } => ("thinking", text),
@@ -924,21 +910,24 @@ impl KumuApp {
                             self.store.insert_message(session_id, role, &text).ok();
                         }
                     }
-                    if self.selected == Some(session_id) {
-                        self.messages = self.store.messages(session_id);
-                    }
                 }
+                self.reload_messages(session_id, cx);
+                cx.notify();
             }
             backend::Event::Error(err) => {
-                self.cancel_pending_permissions(session_id);
-                self.turns.remove(&session_id);
-                self.system_message(session_id, err);
+                self.cancel_pending_permissions(session_id, cx);
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.take_turn(session_id, cx)
+                });
+                self.system_message(session_id, err, cx);
+                cx.notify();
             }
             backend::Event::Commands { agent, commands } => {
                 if !cx.has_global::<AgentCommands>() {
                     cx.set_global(AgentCommands::default());
                 }
                 cx.global_mut::<AgentCommands>().0.insert(agent, commands);
+                cx.notify();
             }
             // The axes are independent — an agent may offer any subset of them —
             // so an entirely empty report is not worth caching.
@@ -977,49 +966,19 @@ impl KumuApp {
                         current_reasoning,
                     },
                 );
+                cx.notify();
             }
             _ => {}
         }
-        cx.notify();
-    }
-
-    /// Get (or lazily create) the live turn state for a session. Creating one
-    /// also starts a 500ms notify ticker so the working-time label keeps
-    /// counting even when no ACP chunks arrive.
-    fn turn_entry(&mut self, session_id: i64, cx: &mut Context<Self>) -> &mut TurnState {
-        if !self.turns.contains_key(&session_id) {
-            self.turns.insert(session_id, TurnState::new());
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(500))
-                        .await;
-                    let alive = this
-                        .update(cx, |app, cx| {
-                            if app.turns.contains_key(&session_id) {
-                                cx.notify();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if !alive {
-                        break;
-                    }
-                }
-            })
-            .detach();
+        if had_turn != self.conversation.read(cx).has_turn(session_id) {
+            cx.notify();
         }
-        self.turns.get_mut(&session_id).unwrap()
     }
 
     /// Persist and show a system notice (unsupported agent, ACP error…).
-    fn system_message(&mut self, session_id: i64, text: String) {
+    fn system_message(&mut self, session_id: i64, text: String, cx: &mut Context<Self>) {
         self.store.insert_message(session_id, "system", &text).ok();
-        if self.selected == Some(session_id) {
-            self.messages = self.store.messages(session_id);
-        }
+        self.reload_messages(session_id, cx);
     }
 
     fn selected_session(&self) -> Option<&Session> {
@@ -1086,13 +1045,30 @@ impl KumuApp {
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .child(self.render_conversation(session, cx))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .px_4()
+                            .py_2()
+                            .child(div().text_sm().font_medium().child(session.title.clone())),
+                    )
+                    // Cached: this frame reuses the conversation's last paint
+                    // unless the conversation itself was notified.
+                    .child(
+                        self.conversation.clone().cached(
+                            StyleRefinement::default()
+                                .flex_1()
+                                .min_h_0()
+                                .min_w_0()
+                                .w_full(),
+                        ),
+                    )
                     .child(div().h_px().w_full().bg(theme.border))
                     // A pending authorization sits directly above the input, so
                     // the decision is always in reach.
                     .children(
-                        self.pending_permission_for(session.id)
-                            .map(|pending| self.render_permission_card(session.id, pending, cx)),
+                        self.pending_permission_for(session.id, cx)
+                            .map(|pending| self.render_permission_card(session.id, &pending, cx)),
                     )
                     // The command menu goes closest to the input: it is about
                     // what is being typed, and it is gone the moment the message
@@ -1109,7 +1085,7 @@ impl KumuApp {
                     .child(div().text_sm().child("还没有会话"))
                     .child(Button::new("empty-new").ghost().label("新建会话").on_click(
                         cx.listener(|this, _, _, cx| {
-                            this.new_session();
+                            this.new_session(cx);
                             cx.notify();
                         }),
                     )),

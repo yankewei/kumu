@@ -87,7 +87,7 @@ impl KumuApp {
     /// command matches it, or a turn is in flight (the composer refuses to send
     /// then, so there is nothing to complete into).
     pub(super) fn command_menu(&self, session: &Session, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.turns.contains_key(&session.id) {
+        if self.conversation.read(cx).has_turn(session.id) {
             return None;
         }
         let commands = self.session_commands(session, cx);

@@ -70,7 +70,7 @@ impl KumuApp {
                             .child(self.model_picker(session, cx))
                             .children(axes)
                             .child(div().flex_1())
-                            .child(if self.turns.contains_key(&session.id) {
+                            .child(if self.conversation.read(cx).has_turn(session.id) {
                                 // A turn is in flight, so sending is refused (see
                                 // `KumuApp::send`) and the slot offers the one
                                 // action that is available: stopping the turn

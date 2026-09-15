@@ -157,16 +157,16 @@ impl KumuApp {
                     .child(card.child(actions)),
             )
     }
+}
 
-    /// The one-line echo of a decision, kept under the tool row so the history
-    /// shows how the call was authorized.
-    pub(super) fn render_permission_decision(&self, decision: &str, cx: &Context<Self>) -> Div {
-        div()
-            .ml_8()
-            .px_1()
-            .py_0p5()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(format!("权限 · {decision}"))
-    }
+/// The one-line echo of a decision, kept under the tool row so the history
+/// shows how the call was authorized.
+pub(super) fn render_permission_decision(decision: &str, muted_fg: Hsla) -> Div {
+    div()
+        .ml_8()
+        .px_1()
+        .py_0p5()
+        .text_xs()
+        .text_color(muted_fg)
+        .child(format!("权限 · {decision}"))
 }

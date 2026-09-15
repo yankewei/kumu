@@ -77,7 +77,7 @@ impl KumuApp {
                             .group_hover(group, |style| style.opacity(1.))
                             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.new_session_in(project_id);
+                                this.new_session_in(project_id, cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
@@ -104,7 +104,7 @@ impl KumuApp {
                     let agent = AGENTS.iter().find(|a| a.id == s.agent).and_then(|a| a.logo);
                     // A prompt can be waiting on a session the user is not
                     // looking at, so mark the row that needs an answer.
-                    let waiting = self.has_pending_permission(sid);
+                    let waiting = self.has_pending_permission(sid, cx);
                     tree.push(
                         div()
                             .id(format!("session-{sid}"))
@@ -117,7 +117,7 @@ impl KumuApp {
                                 this.hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_session(sid);
+                                this.select_session(sid, cx);
                                 cx.notify();
                             }))
                             .child(

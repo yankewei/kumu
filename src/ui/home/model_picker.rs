@@ -84,9 +84,11 @@ impl KumuApp {
             // connection below re-applies the stored model on session/new.
             // Any prompt still waiting on the old connection is settled first,
             // and the in-flight reply (if any) is abandoned with it.
-            self.cancel_pending_permissions(session_id);
+            self.cancel_pending_permissions(session_id, cx);
             self.conns.remove(&session_id);
-            self.turns.remove(&session_id);
+            self.conversation.update(cx, |conversation, cx| {
+                conversation.take_turn(session_id, cx)
+            });
         }
         self.refresh();
         // Opening a connection here just to deliver the value would start an
