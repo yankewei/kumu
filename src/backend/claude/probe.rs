@@ -126,9 +126,11 @@ mod tests {
     use super::probe;
 
     /// End-to-end: probe a real `claude` and expect the fixed vocabulary.
-    /// Skipped when the binary is absent, so the suite still passes on machines
-    /// without a local agent.
+    /// Ignored by default, so a plain `cargo test` never drives a real agent;
+    /// `cargo test -- --ignored` runs it, and it skips itself when the binary is
+    /// absent.
     #[test]
+    #[ignore = "drives the real claude binary"]
     fn probe_reports_claude_options() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config::for_agent("claude").expect("claude is a registered agent");

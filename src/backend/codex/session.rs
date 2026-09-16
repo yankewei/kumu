@@ -959,15 +959,17 @@ mod tests {
 
     /// End-to-end: spawn a real Codex session, send one prompt, and expect
     /// streamed agent text followed by `Done` — the same path the home window
-    /// takes. Skipped when the binary is absent; a Codex that is not signed in
-    /// makes the session say so, and being signed in is a property of the
-    /// machine rather than of this code, so that is skipped too.
+    /// takes. Ignored by default, so a plain `cargo test` never drives a real
+    /// agent; `cargo test -- --ignored` runs it. Two properties of the machine
+    /// then count as skips rather than failures: the binary may be absent, and a
+    /// Codex that is not signed in says so.
     ///
     /// This is also the proof that a sandbox pick reaches Codex: the session is
     /// told to use `read-only` and then has to report that back, which only the
     /// agent can confirm. A reasoning pick is sent with it and rides on the
     /// turn, so a turn that completes is the agent accepting the effort.
     #[test]
+    #[ignore = "drives the real codex binary"]
     fn session_prompts_codex_end_to_end() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = Config::for_agent("codex").expect("codex is a registered agent");

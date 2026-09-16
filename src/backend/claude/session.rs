@@ -1081,12 +1081,16 @@ mod tests {
     /// binary may be absent, and a CLI with no credentials says so instead of
     /// answering.
     ///
+    /// Ignored by default, so a plain `cargo test` never drives a real agent;
+    /// `cargo test -- --ignored` runs it.
+    ///
     /// The run is given a scratch `HOME` and `CLAUDE_CONFIG_DIR`, so its
     /// transcript lands there and none of the user's own Claude Code settings or
     /// history are involved. Authentication comes from the environment
     /// (`ANTHROPIC_AUTH_TOKEN` here) or the system keychain, neither of which the
     /// scratch home hides — checked by running this against an empty home.
     #[test]
+    #[ignore = "drives the real claude binary"]
     fn session_prompts_claude_end_to_end() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = Config::for_agent("claude").expect("claude is a registered agent");

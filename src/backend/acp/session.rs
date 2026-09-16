@@ -542,8 +542,11 @@ mod tests {
 
     /// End-to-end: spawn a real agent (KUMU_AGENT, default omp), send one
     /// prompt, and expect streamed Agent chunks followed by Done — the same
-    /// path the home window uses. Skipped when the binary is missing.
+    /// path the home window uses. Ignored by default, so a plain `cargo test`
+    /// never drives a real agent; `cargo test -- --ignored` runs it, and it
+    /// skips itself when the binary is absent.
     #[test]
+    #[ignore = "drives a real agent binary (KUMU_AGENT)"]
     fn session_prompts_agent_end_to_end() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {

@@ -976,9 +976,11 @@ mod tests {
     /// composer refusing to send for good. Two prompts in a row is what proves
     /// the loop re-arms.
     ///
-    /// Skipped when the binary is absent, so the suite still passes on machines
-    /// without a local agent.
+    /// Ignored by default, so a plain `cargo test` never drives a real agent;
+    /// `cargo test -- --ignored` runs it, and it skips itself when the binary is
+    /// absent.
     #[test]
+    #[ignore = "drives the real pi binary"]
     fn session_prompts_pi_end_to_end_twice() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config::for_agent("pi").expect("pi is a registered agent");

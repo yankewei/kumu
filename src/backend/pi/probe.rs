@@ -118,9 +118,11 @@ mod tests {
     use crate::backend::{Config, Event};
 
     /// End-to-end: probe a real `pi` and expect the catalogue it reports.
-    /// Skipped when the binary is absent, so the suite still passes on machines
-    /// without a local agent.
+    /// Ignored by default, so a plain `cargo test` never drives a real agent;
+    /// `cargo test -- --ignored` runs it, and it skips itself when the binary is
+    /// absent.
     #[test]
+    #[ignore = "drives the real pi binary"]
     fn probe_reports_pi_options() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config::for_agent("pi").expect("pi is a registered agent");
