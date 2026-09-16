@@ -14,7 +14,21 @@ pub enum Event {
     /// A chunk of agent reply text; append to the current agent row.
     Agent(String),
     /// A chunk of the agent's internal reasoning; transient (not persisted).
-    Thought(String),
+    ///
+    /// `message` is the agent's own label for the piece of reasoning the chunk
+    /// belongs to, when it gives one: chunks that share a label are one piece,
+    /// and a chunk labelled differently starts another. The UI groups its rows
+    /// by it rather than by what came before, because what comes between two
+    /// chunks of one piece is not always reasoning — an agent working a
+    /// background task reports its progress while it goes on thinking, and
+    /// those reports arrive on this same channel.
+    ///
+    /// An agent that labels nothing (Pi sends no id on a streamed message)
+    /// leaves it `None`, and then consecutive chunks simply run together.
+    Thought {
+        text: String,
+        message: Option<String>,
+    },
     /// A tool call started or changed. `title`/`status` are empty when the
     /// update didn't touch them; `status` is one of pending/running/done/failed.
     /// `content` is the flattened text output (empty when none).
@@ -225,7 +239,7 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
     if std::env::var("KUMU_DEBUG").is_ok() {
         match &ev {
             Event::Agent(t) => eprintln!("[agent] agent: {t}"),
-            Event::Thought(t) => eprintln!("[agent] thought: {t}"),
+            Event::Thought { text, .. } => eprintln!("[agent] thought: {text}"),
             Event::ToolCall {
                 id,
                 title,

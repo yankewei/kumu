@@ -518,10 +518,18 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             }
         }
         // Both the readable summary and raw reasoning become thinking text;
-        // which one the model supports is not kumu's business.
+        // which one the model supports is not kumu's business. The item is what
+        // the deltas belong to, so its id is what keeps one piece of reasoning
+        // in one row.
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             if let Ok(delta) = serde_json::from_value::<DeltaNotification>(params) {
-                emit(&shared.ev_tx, Event::Thought(delta.delta));
+                emit(
+                    &shared.ev_tx,
+                    Event::Thought {
+                        text: delta.delta,
+                        message: Some(delta.item_id),
+                    },
+                );
             }
         }
         "item/commandExecution/outputDelta" => {
@@ -800,7 +808,7 @@ mod tests {
             .map(|e| match e {
                 Event::Log(_) => "log",
                 Event::Agent(_) => "agent",
-                Event::Thought(_) => "thought",
+                Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
                 Event::Done(_) => "done",

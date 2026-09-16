@@ -521,7 +521,16 @@ fn handle_frame(frame: Value, stream: &mut PiStream, ev_tx: &Sender<Event>) -> R
                 Some("thinking_delta") => {
                     if let Some(delta) = non_empty(update.get("delta")) {
                         stream.saw_reasoning = true;
-                        emit(ev_tx, Event::Thought(delta));
+                        // Pi stamps no id on a streamed message, so its
+                        // reasoning arrives unlabelled and the UI runs the
+                        // chunks together by adjacency.
+                        emit(
+                            ev_tx,
+                            Event::Thought {
+                                text: delta,
+                                message: None,
+                            },
+                        );
                     }
                 }
                 // `toolcall_start`/`_delta`/`_end` are deliberately not turned
@@ -546,7 +555,13 @@ fn handle_frame(frame: Value, stream: &mut PiStream, ev_tx: &Sender<Event>) -> R
                 && let Some(thinking) = convert::message_thinking(&message)
             {
                 stream.saw_reasoning = true;
-                emit(ev_tx, Event::Thought(thinking));
+                emit(
+                    ev_tx,
+                    Event::Thought {
+                        text: thinking,
+                        message: None,
+                    },
+                );
             }
             note_failure(stream, convert::failure(&message), ev_tx);
         }
@@ -698,7 +713,7 @@ mod tests {
             .map(|event| match event {
                 Event::Log(_) => "log",
                 Event::Agent(_) => "agent",
-                Event::Thought(_) => "thought",
+                Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
                 Event::Done(_) => "done",

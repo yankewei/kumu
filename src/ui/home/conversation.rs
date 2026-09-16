@@ -1,11 +1,10 @@
 //! Upper right: the selected session's message history and live reply.
 //!
 //! The conversation is its own entity, embedded as a cached view, so the things
-//! that change it many times a second — streamed chunks, the working spinner,
-//! the elapsed-time ticker — repaint this column alone, and a keystroke in the
-//! composer or a hover in the sidebar leaves it untouched. Rows go through a
-//! virtual list, so a frame only builds the rows on screen however long the
-//! session has grown.
+//! that change it many times a second — streamed chunks and the working spinner
+//! — repaint this column alone, and a keystroke in the composer or a hover in
+//! the sidebar leaves it untouched. Rows go through a virtual list, so a frame
+//! only builds the rows on screen however long the session has grown.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +12,6 @@ use std::ops::Range;
 
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -22,6 +20,7 @@ use gpui_kit::*;
 use super::permission::render_permission_decision;
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, PendingPermission};
 use crate::db::Message;
+use crate::ui::widgets::loader;
 
 /// One tool call observed during the live turn, in first-seen order.
 pub(super) struct ToolRun {
@@ -45,6 +44,14 @@ pub(super) enum TurnBlock {
     Thinking {
         text: String,
         open: bool,
+        /// The agent's own label for the message this reasoning belongs to.
+        ///
+        /// The row is held open by it rather than by what came last: an agent
+        /// with a background task running reports that task's progress between
+        /// two chunks of one message, and grouping by adjacency broke one
+        /// sentence into a row per chunk. `None` is an agent that labels
+        /// nothing, and then adjacency is all there is to go on.
+        message: Option<String>,
     },
     Tool(ToolRun),
     Answer {
@@ -66,6 +73,52 @@ impl TurnState {
             blocks: Vec::new(),
             active_thinking: None,
         }
+    }
+
+    /// How long the turn has been running. Read as it closes, so the total can
+    /// be recorded against the message that ends it.
+    pub(super) fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Append a reasoning chunk to the row it belongs to, opening one when the
+    /// chunk starts a piece of reasoning of its own. Returns that row's index,
+    /// which is the row still being written.
+    ///
+    /// Which row that is comes from the agent's own label for the message, not
+    /// from what arrived last: a background task reports its progress between
+    /// two chunks of one message, and those reports used to cut the message's
+    /// reasoning into a row per chunk.
+    pub(super) fn push_thinking(&mut self, text: String, message: Option<String>) -> usize {
+        if let Some(TurnBlock::Thinking {
+            text: current,
+            message: held,
+            ..
+        }) = self.blocks.last_mut()
+            && continues_reasoning(held.as_deref(), message.as_deref())
+        {
+            current.push_str(&text);
+        } else {
+            self.blocks.push(TurnBlock::Thinking {
+                text,
+                open: false,
+                message,
+            });
+        }
+        self.blocks.len() - 1
+    }
+}
+
+/// Whether a reasoning chunk belongs to the piece of reasoning a row holds.
+///
+/// With both labelled the label decides, so one message's chunks stay one row
+/// whatever lands between them. With either unlabelled nothing contradicts the
+/// row: an agent that labels nothing (Pi sends no id on a streamed message) is
+/// one the UI only has adjacency for.
+fn continues_reasoning(held: Option<&str>, chunk: Option<&str>) -> bool {
+    match (held, chunk) {
+        (Some(held), Some(chunk)) => held == chunk,
+        _ => true,
     }
 }
 
@@ -145,6 +198,12 @@ enum Row {
     Placeholder,
     /// The working-time label under a reply in flight.
     Working,
+    /// The same label once its turn is over, holding the total. `index` is the
+    /// history row it sits under — the message that closed the turn.
+    Worked {
+        index: usize,
+        duration_ms: u64,
+    },
 }
 
 impl Row {
@@ -158,12 +217,16 @@ impl Row {
             Row::LiveTools(range) => (3, range.start),
             Row::Placeholder => (4, 0),
             Row::Working => (5, 0),
+            Row::Worked { index, .. } => (6, *index),
         }
     }
 
     /// Whether the row's content can change while its slot stays the same.
     fn is_live(&self) -> bool {
-        !matches!(self, Row::History(_) | Row::HistoryTools(_))
+        !matches!(
+            self,
+            Row::History(_) | Row::HistoryTools(_) | Row::Worked { .. }
+        )
     }
 }
 
@@ -195,6 +258,55 @@ fn fold_rows(
         rows.push(run(start..len));
     }
     rows
+}
+
+/// A turn's elapsed time as its label shows it. Hours get their own step so a
+/// turn that ran past one does not read as `60m00s`.
+fn elapsed_label(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// Put each finished turn's total directly under the row its closing message
+/// ended up in — a row of its own, or folded in with the run of calls it was
+/// part of.
+///
+/// A run holds at most one closing message: turns are separated by the prompt
+/// that opened the next one, and a prompt is not a tool call, so it breaks the
+/// run. That is why the first match in a run is the only one there is.
+fn rows_with_totals(folded: Vec<Row>, settled: &HashMap<usize, u64>) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(folded.len());
+    for row in folded {
+        let closed = match &row {
+            Row::History(index) => Some(*index),
+            Row::HistoryTools(range) => range.clone().find(|index| settled.contains_key(index)),
+            _ => None,
+        };
+        rows.push(row);
+        if let Some(index) = closed
+            && let Some(&duration_ms) = settled.get(&index)
+        {
+            rows.push(Row::Worked { index, duration_ms });
+        }
+    }
+    rows
+}
+
+/// The totals the history carries, keyed by the index of the message that closed
+/// each turn. A zero is dropped rather than shown: a turn that recorded no time
+/// reads the same as one that never ended, and neither has a total to show.
+fn settled_totals(messages: &[Message]) -> HashMap<usize, u64> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let duration_ms = u64::try_from(message.duration_ms?).ok()?;
+            (duration_ms > 0).then_some((index, duration_ms))
+        })
+        .collect()
 }
 
 /// How an existing list must change to show new rows in place of old ones.
@@ -251,6 +363,9 @@ pub(super) struct ConversationView {
     /// The session on screen, if any.
     session_id: Option<i64>,
     history: Vec<HistoryEntry>,
+    /// The total each finished turn took, keyed by the history index of the
+    /// message that closed it — where its settled label belongs in the list.
+    settled: HashMap<usize, u64>,
     /// The history folded into rows; unchanged by the live turn.
     history_rows: Vec<Row>,
     /// Every row the list currently knows about, history then live.
@@ -274,6 +389,7 @@ impl ConversationView {
         Self {
             session_id: None,
             history: Vec::new(),
+            settled: HashMap::new(),
             history_rows: Vec::new(),
             rows: Vec::new(),
             turns: HashMap::new(),
@@ -291,6 +407,7 @@ impl ConversationView {
     ) {
         self.session_id = session_id;
         self.history = messages.iter().map(HistoryEntry::decode).collect();
+        self.settled = settled_totals(messages);
         self.history_rows = self.fold_history();
         self.rows = self.current_rows();
         let count = self.rows.len();
@@ -330,6 +447,7 @@ impl ConversationView {
                 entry
             })
             .collect();
+        self.settled = settled_totals(messages);
         self.history_rows = self.fold_history();
         self.sync_rows(cx);
     }
@@ -358,10 +476,7 @@ impl ConversationView {
     ) -> R {
         let turn = match self.turns.entry(session_id) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                Self::start_ticker(session_id, cx);
-                entry.insert(TurnState::new())
-            }
+            Entry::Vacant(entry) => entry.insert(TurnState::new()),
         };
         let result = f(turn, cx);
         self.sync_turn(session_id, cx);
@@ -393,31 +508,6 @@ impl ConversationView {
         turn
     }
 
-    /// Keep the working-time label counting even when no chunks arrive. The
-    /// ticker stops by itself once the turn is gone.
-    fn start_ticker(session_id: i64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
-                    .await;
-                let alive = this
-                    .update(cx, |view, cx| {
-                        let alive = view.turns.contains_key(&session_id);
-                        if alive && view.session_id == Some(session_id) {
-                            cx.notify();
-                        }
-                        alive
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
     fn sync_turn(&mut self, session_id: i64, cx: &mut Context<Self>) {
         if self.session_id == Some(session_id) {
             self.sync_rows(cx);
@@ -425,10 +515,13 @@ impl ConversationView {
     }
 
     fn fold_history(&self) -> Vec<Row> {
-        fold_rows(
-            self.history.iter().map(HistoryEntry::is_tool),
-            Row::History,
-            Row::HistoryTools,
+        rows_with_totals(
+            fold_rows(
+                self.history.iter().map(HistoryEntry::is_tool),
+                Row::History,
+                Row::HistoryTools,
+            ),
+            &self.settled,
         )
     }
 
@@ -528,6 +621,7 @@ impl ConversationView {
                 .child("…")
                 .into_any_element(),
             Row::Working => self.render_working(session_id, cx),
+            Row::Worked { duration_ms, .. } => self.render_worked(duration_ms, cx),
         };
         div()
             .w_full()
@@ -657,7 +751,7 @@ impl ConversationView {
             return div().into_any_element();
         };
         match turn.blocks.get(index) {
-            Some(TurnBlock::Thinking { text, open }) => self.render_thinking(
+            Some(TurnBlock::Thinking { text, open, .. }) => self.render_thinking(
                 format!("thinking-{index}"),
                 *open,
                 turn.active_thinking == Some(index),
@@ -703,11 +797,7 @@ impl ConversationView {
                     .rounded(radius)
                     .hover(move |s| s.bg(muted))
                     .child(if active {
-                        Spinner::new()
-                            .icon(Icon::new(IconName::LoaderCircle))
-                            .small()
-                            .color(muted_fg)
-                            .into_any_element()
+                        loader(muted_fg)
                     } else {
                         Icon::new(IconName::CircleCheck)
                             .small()
@@ -729,27 +819,39 @@ impl ConversationView {
     }
 
     /// Working-time label at the bottom-left of the reply.
+    ///
+    /// The label has no timer of its own: the loader beside it re-renders this
+    /// view while it turns (see [`loader`]), so the elapsed time is re-read
+    /// there. A ticker would only duplicate what the loader already forces.
     fn render_working(&self, session_id: i64, cx: &Context<Self>) -> AnyElement {
         let Some(turn) = self.turns.get(&session_id) else {
             return div().into_any_element();
         };
         let muted_fg = cx.theme().muted_foreground;
-        let secs = turn.started_at.elapsed().as_secs();
-        let label = if secs >= 60 {
-            format!("{}m{:02}s", secs / 60, secs % 60)
-        } else {
-            format!("{secs}s")
-        };
         h_flex()
             .items_center()
             .gap_1p5()
+            .child(loader(muted_fg))
             .child(
-                Spinner::new()
-                    .icon(Icon::new(IconName::LoaderCircle))
-                    .small()
-                    .color(muted_fg),
+                div()
+                    .text_xs()
+                    .text_color(muted_fg)
+                    .child(elapsed_label(turn.elapsed().as_secs())),
             )
-            .child(div().text_xs().text_color(muted_fg).child(label))
+            .into_any_element()
+    }
+
+    /// The same label once its turn is over, under the message that closed it:
+    /// no longer counting, and now saying what the number is, since the spinner
+    /// that used to explain it is gone with the turn.
+    fn render_worked(&self, duration_ms: u64, cx: &Context<Self>) -> AnyElement {
+        div()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(format!(
+                "用时 {}",
+                elapsed_label((duration_ms / 1000).max(1))
+            ))
             .into_any_element()
     }
 
@@ -783,11 +885,7 @@ impl ConversationView {
                 .small()
                 .text_color(danger)
                 .into_any_element(),
-            RunStatus::Running => Spinner::new()
-                .icon(Icon::new(IconName::LoaderCircle))
-                .small()
-                .color(muted_fg)
-                .into_any_element(),
+            RunStatus::Running => loader(muted_fg),
             RunStatus::Done => Icon::new(IconName::Check)
                 .small()
                 .text_color(success)
@@ -975,9 +1073,14 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
+    use std::collections::HashMap;
+
     use super::{
-        Row, RowChange, RowToggle, RunStatus, ToolRow, diff_rows, fold_rows, fold_summary,
+        Row, RowChange, RowToggle, RunStatus, ToolRow, ToolRun, TurnBlock, TurnState,
+        continues_reasoning, diff_rows, elapsed_label, fold_rows, fold_summary, rows_with_totals,
+        settled_totals,
     };
+    use crate::db::Message;
 
     fn tool_row(status: &str) -> ToolRow {
         ToolRow {
@@ -988,6 +1091,26 @@ mod tests {
             decision: None,
             open: false,
             toggle: RowToggle::Key("t".into()),
+        }
+    }
+
+    fn tool_block(id: &str) -> TurnBlock {
+        TurnBlock::Tool(ToolRun {
+            id: id.into(),
+            title: "工具".to_string(),
+            status: "done",
+            content: String::new(),
+            open: false,
+            pending_permission: None,
+            decision: None,
+        })
+    }
+
+    /// The text of the turn's `index`-th row, which has to be a thinking one.
+    fn thinking_text(turn: &TurnState, index: usize) -> String {
+        match &turn.blocks[index] {
+            TurnBlock::Thinking { text, .. } => text.clone(),
+            _ => panic!("row {index} is not a thinking row"),
         }
     }
 
@@ -1092,5 +1215,150 @@ mod tests {
         let RowChange { remeasure, splice } = diff_rows(&old, &new);
         assert_eq!(remeasure, None);
         assert_eq!(splice, Some((1..3, 1)));
+    }
+
+    /// Whether a chunk continues the row before it, over every combination of
+    /// labels: equal labels stay together, and a side that labelled nothing
+    /// cannot contradict the row, so it joins it.
+    #[test]
+    fn a_chunk_continues_a_row_unless_the_labels_disagree() {
+        assert!(continues_reasoning(Some("m1"), Some("m1")));
+        assert!(continues_reasoning(None, None));
+        assert!(
+            continues_reasoning(None, Some("m1")),
+            "an agent that starts labelling mid-stream still lands in the row it was in"
+        );
+        assert!(
+            continues_reasoning(Some("m1"), None),
+            "a chunk that labels nothing has nothing to say about which message it is"
+        );
+        assert!(
+            !continues_reasoning(Some("m1"), Some("m2")),
+            "another message is another row"
+        );
+    }
+
+    /// One message's reasoning is one row however the stream is interrupted.
+    /// This is the shape omp sends while a background task runs: that task's
+    /// progress reports arrive between two chunks of one message, and they hold
+    /// no row of their own — which is exactly why the row is keyed on the
+    /// message and not, as it was, on what arrived last. The flag that used to
+    /// decide it is cleared between the chunks here to stand for such an
+    /// interruption, and the chunks still have to end up as one row.
+    #[test]
+    fn one_messages_reasoning_is_one_row_however_the_stream_is_interrupted() {
+        let mut turn = TurnState::new();
+        turn.push_thinking("Still running. ".into(), Some("m1".into()));
+        turn.active_thinking = None;
+        let row = turn.push_thinking(
+            "Let me continue reading useful files".into(),
+            Some("m1".into()),
+        );
+
+        assert_eq!(row, 0, "the chunk lands back in the message's own row");
+        assert_eq!(turn.blocks.len(), 1);
+        assert_eq!(
+            thinking_text(&turn, 0),
+            "Still running. Let me continue reading useful files"
+        );
+    }
+
+    /// Another message's reasoning opens a row of its own, which is what keeps
+    /// two replies' thinking apart.
+    #[test]
+    fn another_messages_reasoning_opens_its_own_row() {
+        let mut turn = TurnState::new();
+        turn.push_thinking("first".into(), Some("m1".into()));
+        let row = turn.push_thinking("second".into(), Some("m2".into()));
+
+        assert_eq!(row, 1);
+        assert_eq!(turn.blocks.len(), 2);
+        assert_eq!(thinking_text(&turn, 1), "second");
+    }
+
+    /// An agent that labels nothing — Pi sends no id on a streamed message —
+    /// leaves adjacency as the only thing to go on, so its chunks run together
+    /// the way they always have.
+    #[test]
+    fn unlabelled_reasoning_runs_together() {
+        let mut turn = TurnState::new();
+        turn.push_thinking("weigh".into(), None);
+        turn.push_thinking("ing it".into(), None);
+
+        assert_eq!(turn.blocks.len(), 1);
+        assert_eq!(thinking_text(&turn, 0), "weighing it");
+    }
+
+    /// A row that is no longer the last one is not reopened. Something arriving
+    /// between two chunks of one message is shown where it came, rather than an
+    /// earlier row reaching back over it and losing the order the agent sent.
+    #[test]
+    fn a_row_is_never_reopened_across_what_came_after_it() {
+        let mut turn = TurnState::new();
+        turn.push_thinking("before".into(), Some("m1".into()));
+        turn.blocks.push(tool_block("t1"));
+        let row = turn.push_thinking("after".into(), Some("m1".into()));
+
+        assert_eq!(row, 2, "the later chunk gets a row of its own");
+        assert_eq!(thinking_text(&turn, 0), "before");
+        assert_eq!(thinking_text(&turn, 2), "after");
+    }
+
+    /// Only a recorded total becomes a row: a message with no duration and one
+    /// recording a zero both leave the list exactly as it was.
+    #[test]
+    fn only_a_recorded_total_becomes_a_row() {
+        let message = |duration_ms| Message {
+            role: "agent".into(),
+            content: "在".into(),
+            duration_ms,
+        };
+        let totals = settled_totals(&[message(None), message(Some(0)), message(Some(1_500))]);
+
+        assert_eq!(totals, HashMap::from([(2, 1_500)]));
+    }
+
+    /// A finished turn's total lands under the row that closed it, which is not
+    /// always a row of its own: a turn that ended on a tool call left its last
+    /// message inside the run, and the total still has to follow the run rather
+    /// than sit ahead of it.
+    #[test]
+    fn a_turns_total_follows_the_row_that_closed_it() {
+        let settled = HashMap::from([(1, 65_000), (2, 2_000)]);
+        let rows = rows_with_totals(
+            fold_rows([true, true, false, true], Row::History, Row::HistoryTools),
+            &settled,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                Row::HistoryTools(0..2),
+                Row::Worked {
+                    index: 1,
+                    duration_ms: 65_000
+                },
+                Row::History(2),
+                Row::Worked {
+                    index: 2,
+                    duration_ms: 2_000
+                },
+                Row::HistoryTools(3..4),
+            ],
+            "each total follows its own row, and the run keeps its slot"
+        );
+    }
+
+    /// The label's steps, including the hour step that keeps a turn which ran
+    /// past one from reading as `60m00s`.
+    #[test]
+    fn elapsed_labels_step_up_to_hours() {
+        assert_eq!(elapsed_label(0), "0s");
+        assert_eq!(elapsed_label(59), "59s");
+        assert_eq!(elapsed_label(60), "1m00s");
+        assert_eq!(elapsed_label(65), "1m05s");
+        assert_eq!(elapsed_label(3599), "59m59s");
+        assert_eq!(elapsed_label(3600), "1h00m");
+        assert_eq!(elapsed_label(3720), "1h02m");
     }
 }

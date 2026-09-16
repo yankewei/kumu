@@ -506,9 +506,15 @@ fn on_assistant(shared: &Shared, message: &protocol::AssistantMessage) {
             ContentBlock::Text { text } if !streamed("text") => {
                 emit(&shared.ev_tx, Event::Agent(text.clone()))
             }
-            ContentBlock::Thinking { thinking } if !streamed("thinking") => {
-                emit(&shared.ev_tx, Event::Thought(thinking.clone()))
-            }
+            ContentBlock::Thinking { thinking } if !streamed("thinking") => emit(
+                &shared.ev_tx,
+                Event::Thought {
+                    text: thinking.clone(),
+                    // A message the CLI named nothing is one the UI can only
+                    // group by adjacency.
+                    message: (!id.is_empty()).then(|| id.to_string()),
+                },
+            ),
             _ => {}
         }
     }
@@ -572,7 +578,15 @@ fn on_stream_event(shared: &Shared, event: &protocol::StreamEvent) {
                         .unwrap()
                         .insert(format!("{id}:thinking"));
                 }
-                emit(&shared.ev_tx, Event::Thought(thinking.clone()));
+                // The message the delta belongs to is the label the UI groups
+                // reasoning rows by, so it travels up with the text.
+                emit(
+                    &shared.ev_tx,
+                    Event::Thought {
+                        text: thinking.clone(),
+                        message: id,
+                    },
+                );
             }
         }
         // Tool input and signatures are not rendered: the complete block comes
@@ -760,7 +774,7 @@ mod tests {
             .map(|e| match e {
                 Event::Log(_) => "log",
                 Event::Agent(_) => "agent",
-                Event::Thought(_) => "thought",
+                Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
                 Event::Done(_) => "done",
@@ -865,7 +879,7 @@ mod tests {
         let thoughts: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                Event::Thought(t) => Some(t.as_str()),
+                Event::Thought { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

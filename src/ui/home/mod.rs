@@ -780,21 +780,13 @@ impl KumuApp {
                     })
                 });
             }
-            backend::Event::Thought(chunk) => {
+            backend::Event::Thought { text, message } => {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.update_turn(session_id, cx, |turn, _| {
-                        if let Some(TurnBlock::Thinking { text, .. }) = turn
-                            .active_thinking
-                            .and_then(|index| turn.blocks.get_mut(index))
-                        {
-                            text.push_str(&chunk);
-                        } else {
-                            turn.active_thinking = Some(turn.blocks.len());
-                            turn.blocks.push(TurnBlock::Thinking {
-                                text: chunk,
-                                open: false,
-                            });
-                        }
+                        // The row that took the chunk is the row still being
+                        // written, so the spinner follows it there.
+                        let row = turn.push_thinking(text, message);
+                        turn.active_thinking = Some(row);
                     })
                 });
             }
@@ -806,7 +798,6 @@ impl KumuApp {
             } => {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.update_turn(session_id, cx, |turn, _| {
-                        turn.active_thinking = None;
                         if let Some(run) = turn.blocks.iter_mut().find_map(|block| match block {
                             TurnBlock::Tool(run) if run.id == id => Some(run),
                             _ => None,
@@ -821,6 +812,11 @@ impl KumuApp {
                                 run.content = content;
                             }
                         } else {
+                            // Opening a row ends the reasoning above it. An update
+                            // to a row already there does not: an agent reporting
+                            // a background task's progress would otherwise close
+                            // the reasoning it interrupts, once per report.
+                            turn.active_thinking = None;
                             turn.blocks.push(TurnBlock::Tool(ToolRun {
                                 id,
                                 title,
@@ -843,7 +839,6 @@ impl KumuApp {
             } => {
                 let previous = self.conversation.update(cx, |conversation, cx| {
                     conversation.update_turn(session_id, cx, |turn, _| {
-                        turn.active_thinking = None;
                         let index = match turn.blocks.iter().position(
                             |block| matches!(block, TurnBlock::Tool(run) if run.id == tool_call_id),
                         ) {
@@ -852,6 +847,9 @@ impl KumuApp {
                                 // The request can arrive before the tool call it
                                 // refers to; seed the row from what the request
                                 // itself carries so the prompt is never dropped.
+                                // Seeding a row ends the reasoning above it, the
+                                // same as any other call opening one.
+                                turn.active_thinking = None;
                                 turn.blocks.push(TurnBlock::Tool(ToolRun {
                                     id: tool_call_id,
                                     title: title.clone(),
@@ -895,6 +893,11 @@ impl KumuApp {
                     conversation.take_turn(session_id, cx)
                 });
                 if let Some(turn) = turn {
+                    let elapsed = turn.elapsed();
+                    // The message the turn finished on, which is where its total
+                    // is recorded — and so where the settled label is rebuilt
+                    // from when the history is read back.
+                    let mut closed = None;
                     for block in turn.blocks {
                         let (role, text) = match block {
                             TurnBlock::Thinking { text, .. } => ("thinking", text),
@@ -911,8 +914,13 @@ impl KumuApp {
                             ),
                         };
                         if !text.trim().is_empty() {
-                            self.store.insert_message(session_id, role, &text).ok();
+                            closed = self.store.insert_message(session_id, role, &text).ok();
                         }
+                    }
+                    if let Some(id) = closed {
+                        self.store
+                            .set_message_duration(id, elapsed.as_millis() as i64)
+                            .ok();
                     }
                 }
                 self.reload_messages(session_id, cx);

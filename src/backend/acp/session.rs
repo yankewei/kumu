@@ -51,10 +51,20 @@ fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<E
             ContentBlock::Text(t) => Some(Event::Agent(t.text)),
             _ => None,
         },
-        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
-            ContentBlock::Text(t) => Some(Event::Thought(t.text)),
-            _ => None,
-        },
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            // The chunk's message id is what keeps one piece of reasoning in
+            // one row: an agent working a background task reports its progress
+            // between two chunks of the same message, and without the label
+            // those reports would split the thinking row in two.
+            let message = chunk.message_id.map(|id| id.0.to_string());
+            match chunk.content {
+                ContentBlock::Text(t) => Some(Event::Thought {
+                    text: t.text,
+                    message,
+                }),
+                _ => None,
+            }
+        }
         SessionUpdate::ToolCall(call) => {
             let content = tool_call_content(&call.content, &call.raw_output);
             Some(Event::ToolCall {
@@ -426,14 +436,38 @@ mod tests {
     }
 
     /// The reasoning chunk is the same shape as the reply, but becomes a
-    /// `Thought` rather than `Agent` — the two must not be confused.
+    /// `Thought` rather than `Agent` — the two must not be confused — and it
+    /// carries the message it belongs to, which is what groups reasoning rows.
     #[test]
-    fn agent_thought_text_streams_as_thought() {
+    fn agent_thought_text_streams_as_thought_under_its_message() {
+        let event = notification_event(
+            "omp",
+            SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(text("considering...")).message_id("m1"),
+            ),
+        );
+        assert!(
+            matches!(
+                event,
+                Some(Event::Thought { text, message: Some(message) })
+                    if text == "considering..." && message == "m1"
+            ),
+            "the chunk's own message id has to survive the crossing"
+        );
+    }
+
+    /// An agent that stamps no message id on its reasoning still streams it:
+    /// the label is what the UI groups rows by, not something it renders.
+    #[test]
+    fn a_thought_chunk_without_a_message_id_still_streams() {
         let event = notification_event(
             "omp",
             SessionUpdate::AgentThoughtChunk(ContentChunk::new(text("considering..."))),
         );
-        assert!(matches!(event, Some(Event::Thought(t)) if t == "considering..."));
+        assert!(matches!(
+            event,
+            Some(Event::Thought { text, message: None }) if text == "considering..."
+        ));
     }
 
     /// A new tool call starts running under its own id and title, in the
