@@ -7,6 +7,7 @@ use gpui_kit::*;
 
 use super::KumuApp;
 use crate::agents::AGENTS;
+use crate::ui::tooltip::HoverLabel as _;
 use crate::ui::widgets::agent_logo;
 
 impl KumuApp {
@@ -59,11 +60,15 @@ impl KumuApp {
                     )
                     .child(
                         div()
+                            .id(format!("project-name-{project_id}"))
                             .flex_1()
                             .min_w_0()
                             .text_sm()
                             .font_medium()
                             .text_color(sidebar_fg)
+                            // The tree shows the name alone; where the project
+                            // actually lives is a hover label above it.
+                            .hover_label(&self.tooltips, project.path.clone())
                             .child(project_name),
                     )
                     .child(

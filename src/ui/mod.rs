@@ -3,6 +3,7 @@
 mod home;
 mod layers;
 mod settings;
+mod tooltip;
 pub mod widgets;
 
 use std::collections::HashMap;

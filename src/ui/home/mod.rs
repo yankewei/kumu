@@ -28,6 +28,7 @@ use crate::agents::AGENTS;
 use crate::backend;
 use crate::db::{Project, Session, Store, db_path};
 use crate::ui::layers;
+use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
@@ -126,6 +127,8 @@ pub struct KumuApp {
     /// (the other lists are short enough to read whole).
     model_picker_tab: Option<&'static str>,
     model_search: Entity<InputState>,
+    /// Hover labels for the sidebar tree (see [`Tooltips`]).
+    tooltips: Entity<Tooltips>,
 }
 
 /// Which composer picker's menu is open.
@@ -161,6 +164,7 @@ impl KumuApp {
             open_picker: None,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
+            tooltips: cx.new(|cx| Tooltips::new(cx)),
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
@@ -1037,7 +1041,7 @@ impl KumuApp {
     }
 
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(window, cx);
+        let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
         let right =
             match self.selected_session() {

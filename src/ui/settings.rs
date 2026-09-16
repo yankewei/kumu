@@ -12,6 +12,7 @@ use crate::backend;
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
+use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -79,6 +80,8 @@ pub struct SettingsWindow {
     session_options: HashMap<&'static str, SessionOptions>,
     /// Agents whose probe is still running.
     probing: HashSet<&'static str>,
+    /// The window's overlay for hover labels; mounted by `window_layers`.
+    tooltips: Entity<Tooltips>,
 }
 
 /// The registry agents this process has no cached options for, in registry order.
@@ -149,6 +152,7 @@ impl SettingsWindow {
             font_size_select,
             session_options,
             probing: HashSet::new(),
+            tooltips: cx.new(|cx| Tooltips::new(cx)),
         };
         settings.probe(missing, cx);
         settings
@@ -265,7 +269,7 @@ impl SettingsWindow {
     }
 
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(window, cx);
+        let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
         let (foreground, muted_fg, border, radius) = (
