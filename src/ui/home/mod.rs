@@ -5,6 +5,8 @@ mod access_picker;
 mod command_menu;
 mod composer;
 mod conversation;
+mod markdown_mermaid;
+mod mermaid_viewer;
 mod mode_picker;
 mod model_picker;
 mod permission;
