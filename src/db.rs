@@ -52,6 +52,13 @@ pub struct Session {
 pub struct Message {
     pub role: String, // "user" | "agent" | "system" | "thinking" | "tool"
     pub content: String,
+    /// How long the turn this message closed ran, when it closed one.
+    ///
+    /// The total belongs to the turn, not to the message, and the schema has no
+    /// turn of its own — but the message that ended one is exactly where the
+    /// settled total is anchored, so it is recorded here rather than in a table
+    /// nothing else would read.
+    pub duration_ms: Option<i64>,
 }
 
 pub struct Store {
@@ -96,6 +103,7 @@ impl Store {
                 session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                duration_ms INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS settings (
@@ -109,8 +117,8 @@ impl Store {
                 ON messages(session_id);",
         )?;
         // Migrations for dbs created before model/mode/sandbox/reasoning/
-        // title_manual were part of CREATE TABLE (duplicate-column errors on
-        // fresh dbs are expected and ignored).
+        // title_manual/duration_ms were part of CREATE TABLE (duplicate-column
+        // errors on fresh dbs are expected and ignored).
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
             .ok();
@@ -128,6 +136,9 @@ impl Store {
                 "ALTER TABLE sessions ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0",
                 [],
             )
+            .ok();
+        self.conn
+            .execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER", [])
             .ok();
         Ok(())
     }
@@ -291,12 +302,15 @@ impl Store {
     pub fn messages(&self, session_id: i64) -> Vec<Message> {
         let mut stmt = self
             .conn
-            .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id")
+            .prepare(
+                "SELECT role, content, duration_ms FROM messages WHERE session_id = ?1 ORDER BY id",
+            )
             .unwrap();
         stmt.query_map(params![session_id], |row| {
             Ok(Message {
                 role: row.get(0)?,
                 content: row.get(1)?,
+                duration_ms: row.get(2)?,
             })
         })
         .unwrap()
@@ -314,6 +328,19 @@ impl Store {
             params![session_id],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record how long the turn this message closed ran.
+    ///
+    /// Apart from [`Store::insert_message`] because only the caller knows which
+    /// message ended the turn, and the total belongs to that row rather than to
+    /// whichever role the turn happened to finish on.
+    pub fn set_message_duration(&self, id: i64, duration_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET duration_ms = ?1 WHERE id = ?2",
+            params![duration_ms, id],
+        )?;
+        Ok(())
     }
 }
 
@@ -568,5 +595,58 @@ mod tests {
             count, 1,
             "exactly one session_id index, however often init runs"
         );
+    }
+
+    /// A turn's total is recorded on the message that closed it and comes back
+    /// with the history, which is what lets a settled row be rebuilt after a
+    /// restart. Every other message reads `None` rather than a zero, so "no
+    /// turn closed here" stays distinguishable from "a turn took no time".
+    #[test]
+    fn a_closing_message_round_trips_its_turn_duration() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+        store.insert_message(session, "user", "你好").unwrap();
+        let closing = store.insert_message(session, "agent", "在").unwrap();
+        store.set_message_duration(closing, 65_000).unwrap();
+
+        let messages = store.messages(session);
+        assert_eq!(
+            messages[0].duration_ms, None,
+            "the prompt carries no total of its own"
+        );
+        assert_eq!(messages[1].duration_ms, Some(65_000));
+    }
+
+    /// A database written before the column existed gains it on open: the
+    /// upgrade path is the same `init` every open runs, so an in-place upgrade
+    /// must not be the case that quietly loses the total.
+    #[test]
+    fn an_older_messages_table_gains_the_duration_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        let store = Store { conn };
+        store.init().unwrap();
+
+        let columns: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('messages') WHERE name = 'duration_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "the migration adds the column");
     }
 }
