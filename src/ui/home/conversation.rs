@@ -17,6 +17,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::markdown_mermaid::MermaidMarkdownPlugin;
 use super::permission::render_permission_decision;
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, PendingPermission};
 use crate::db::Message;
@@ -686,7 +687,12 @@ impl ConversationView {
                     }
                 };
                 div()
-                    .child(TextView::new(&view).text_sm().line_height(relative(1.75)))
+                    .child(
+                        TextView::new(&view)
+                            .plugin(MermaidMarkdownPlugin)
+                            .text_sm()
+                            .line_height(relative(1.75)),
+                    )
                     .into_any_element()
             }
             // Tool entries are always drawn through their run row.
@@ -758,7 +764,12 @@ impl ConversationView {
                 cx,
             ),
             Some(TurnBlock::Answer { view, .. }) => div()
-                .child(TextView::new(view).text_sm().line_height(relative(1.75)))
+                .child(
+                    TextView::new(view)
+                        .plugin(MermaidMarkdownPlugin)
+                        .text_sm()
+                        .line_height(relative(1.75)),
+                )
                 .into_any_element(),
             // Tool blocks are always drawn through their run row.
             Some(TurnBlock::Tool(_)) | None => div().into_any_element(),
