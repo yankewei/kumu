@@ -250,6 +250,15 @@ pub(super) struct FileChangeApprovalParams {
     pub grant_root: Option<String>,
 }
 
+/// Codex's best-effort description of what a shell command will do. A single
+/// command can contain more than one action, such as reading a file and then
+/// searching its output.
+#[derive(Debug, Deserialize)]
+pub(super) struct CommandAction {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
 /// One unit of work inside a turn. Only the variants kumu renders are modelled;
 /// the tag decides which, and anything else becomes [`ThreadItem::Unknown`].
 #[derive(Debug, Deserialize)]
@@ -274,6 +283,9 @@ pub(super) enum ThreadItem {
         /// `outputDelta` notifications carry the same text in pieces.
         #[serde(rename = "aggregatedOutput", default)]
         aggregated_output: Option<String>,
+        /// Best-effort action names for friendly display.
+        #[serde(rename = "commandActions", default)]
+        command_actions: Vec<CommandAction>,
     },
     FileChange {
         #[serde(default)]

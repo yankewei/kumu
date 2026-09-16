@@ -28,7 +28,7 @@ use crate::backend::session::{
 use super::convert;
 use super::protocol::{
     AccountResult, CommandApprovalParams, DeltaNotification, ErrorNotification,
-    FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult,
+    FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult, ThreadItem,
     ThreadNameUpdatedNotification, ThreadStartResult, Turn, TurnCompletedNotification,
     TurnStartResult,
 };
@@ -46,9 +46,10 @@ struct Shared {
     /// the command loop can stay serial exactly like the ACP backend's
     /// prompt-and-wait.
     turn_done: Mutex<Option<oneshot::Sender<Turn>>>,
-    /// Command output accumulated per item. The UI *replaces* a row's content
-    /// rather than appending, so deltas have to be summed before being sent up.
-    output: Mutex<HashMap<String, String>>,
+    /// Command rows still running, per item. The UI *replaces* a row's content
+    /// rather than appending, so deltas have to be summed — and rendered with
+    /// their command — before being sent up.
+    commands: Mutex<HashMap<String, CommandRow>>,
     /// Rendered content per item, so an approval prompt can show the diff it
     /// refers to — the request itself carries only the item id.
     details: Mutex<HashMap<String, String>>,
@@ -153,7 +154,7 @@ pub(in crate::backend) async fn run(
         permissions,
         next_request_id: AtomicU64::new(1),
         turn_done: Mutex::new(None),
-        output: Mutex::new(HashMap::new()),
+        commands: Mutex::new(HashMap::new()),
         details: Mutex::new(HashMap::new()),
     });
     // Notifications and approvals are handled on their own task, so the command
@@ -538,10 +539,10 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             // The row's content is replaced, not appended to, so the whole
             // accumulated output is what has to be sent.
             let content = {
-                let mut output = shared.output.lock().unwrap();
-                let accumulated = output.entry(delta.item_id.clone()).or_default();
-                accumulated.push_str(&delta.delta);
-                accumulated.clone()
+                let mut commands = shared.commands.lock().unwrap();
+                let row = commands.entry(delta.item_id.clone()).or_default();
+                row.output.push_str(&delta.delta);
+                convert::command_content(&row.command, Some(&row.output))
             };
             emit(
                 &shared.ev_tx,
@@ -558,20 +559,35 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
                 return;
             };
             let item = notification.item;
-            let detail = convert::item_content(&item);
+            let detail = {
+                let mut commands = shared.commands.lock().unwrap();
+                let finished = if method == "item/completed" {
+                    // The deltas are dropped rather than left to outlive the
+                    // item, but still render it if it carries no output itself.
+                    commands.remove(item.id())
+                } else {
+                    // Output can stream before the item starts; the row keeps
+                    // it and learns the command it belongs to.
+                    if let ThreadItem::CommandExecution { command, .. } = &item {
+                        commands.entry(item.id().to_string()).or_default().command =
+                            command.clone();
+                    }
+                    None
+                };
+                let streamed = finished
+                    .as_ref()
+                    .or_else(|| commands.get(item.id()))
+                    .map(|row| row.output.as_str());
+                convert::item_content(&item, streamed)
+            };
             if !detail.is_empty() {
                 shared
                     .details
                     .lock()
                     .unwrap()
-                    .insert(item.id().to_string(), detail);
+                    .insert(item.id().to_string(), detail.clone());
             }
-            if method == "item/completed" {
-                // The completed item carries its own aggregated output, so the
-                // deltas are dropped rather than left to outlive it.
-                shared.output.lock().unwrap().remove(item.id());
-            }
-            if let Some(event) = convert::tool_event(&item) {
+            if let Some(event) = convert::tool_event_with_content(&item, detail) {
                 emit(&shared.ev_tx, event);
             }
         }
@@ -592,7 +608,7 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             else {
                 return;
             };
-            shared.output.lock().unwrap().clear();
+            shared.commands.lock().unwrap().clear();
             if let Some(done) = shared.turn_done.lock().unwrap().take() {
                 let _ = done.send(notification.turn);
             }
@@ -633,6 +649,13 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
         | "account/rateLimits/updated" => {}
         other => emit(&shared.ev_tx, Event::Log(format!("update: {other}"))),
     }
+}
+
+/// A command row's state between its output deltas and its completion.
+#[derive(Default)]
+struct CommandRow {
+    command: String,
+    output: String,
 }
 
 /// Answer a server-initiated request.
@@ -793,7 +816,7 @@ mod tests {
             permissions: Weak::new(),
             next_request_id: AtomicU64::new(1),
             turn_done: Mutex::new(None),
-            output: Mutex::new(HashMap::new()),
+            commands: Mutex::new(HashMap::new()),
             details: Mutex::new(HashMap::new()),
         };
         (shared, rx)
@@ -861,7 +884,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(contents, vec!["a", "ab"]);
+        assert_eq!(contents, vec!["输出：\na", "输出：\nab"]);
     }
 
     /// An item starting then completing reports the same call twice: running,
@@ -901,9 +924,38 @@ mod tests {
             .collect();
         assert_eq!(statuses, vec!["", "running", "done"]);
         assert!(
-            shared.output.lock().unwrap().get("cmd1").is_none(),
+            shared.commands.lock().unwrap().get("cmd1").is_none(),
             "the completed item's own output supersedes the accumulated deltas"
         );
+    }
+
+    /// `aggregatedOutput` is nullable, so a completed item without it keeps the
+    /// output its deltas streamed rather than shrinking to just the command.
+    #[test]
+    fn a_completed_command_without_output_keeps_its_streamed_output() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/commandExecution/outputDelta",
+            json!({"itemId": "cmd1", "delta": "streamed"}),
+        );
+        handle_notification(
+            &shared,
+            "item/completed",
+            json!({"item": {
+                "type": "commandExecution", "id": "cmd1", "command": "ls",
+                "status": "completed", "aggregatedOutput": null,
+            }}),
+        );
+        let last = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::ToolCall { content, .. } => Some(content),
+                _ => None,
+            })
+            .last();
+        assert_eq!(last.as_deref(), Some("命令：\nls\n\n输出：\nstreamed"));
+        assert!(shared.commands.lock().unwrap().is_empty());
     }
 
     /// The agent's own title for the thread replaces kumu's; a cleared name
@@ -945,7 +997,7 @@ mod tests {
         );
         let turn = done_rx.try_recv().expect("turn/completed should wake it");
         assert_eq!(turn.status, "completed");
-        assert!(shared.output.lock().unwrap().is_empty());
+        assert!(shared.commands.lock().unwrap().is_empty());
         drop(rx);
     }
 

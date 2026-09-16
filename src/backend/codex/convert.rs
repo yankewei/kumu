@@ -15,8 +15,8 @@ use crate::backend::event::{
 };
 
 use super::protocol::{
-    FileUpdateChange, McpToolCallError, McpToolCallResult, ModelListResult, SandboxPolicy,
-    ThreadItem,
+    CommandAction, FileUpdateChange, McpToolCallError, McpToolCallResult, ModelListResult,
+    SandboxPolicy, ThreadItem,
 };
 
 /// The provider label Codex models are filed under.
@@ -38,10 +38,14 @@ pub(super) fn status_name(status: &str) -> &'static str {
     }
 }
 
+const COMMAND_EXECUTION_LABEL: &str = "命令执行";
+
 /// The label a tool row shows for an item.
 fn tool_title(item: &ThreadItem) -> String {
     match item {
-        ThreadItem::CommandExecution { command, .. } => command.clone(),
+        ThreadItem::CommandExecution {
+            command_actions, ..
+        } => command_action_title(command_actions),
         ThreadItem::FileChange { changes, .. } => {
             let paths = changes
                 .iter()
@@ -60,18 +64,70 @@ fn tool_title(item: &ThreadItem) -> String {
     }
 }
 
-/// The body a tool row shows: a diff for file changes, output for commands.
-pub(super) fn item_content(item: &ThreadItem) -> String {
+/// Prefer Codex's parsed action name over the generic command-execution label.
+/// A shell command may contain several actions, so keep each distinct action
+/// visible in the compact title and leave the raw command in the expander.
+fn command_action_title(actions: &[CommandAction]) -> String {
+    let mut labels = Vec::new();
+    for action in actions {
+        let label = match action.kind.as_str() {
+            "read" => "读取文件",
+            "listFiles" => "列出文件",
+            "search" => "搜索",
+            _ => COMMAND_EXECUTION_LABEL,
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        COMMAND_EXECUTION_LABEL.to_string()
+    } else {
+        labels.join(" · ")
+    }
+}
+
+/// The body a tool row shows: the command and output for command executions, or
+/// the detail returned by other tool types. `streamed` is command output already
+/// summed from deltas, the fallback when the item carries none of its own —
+/// `aggregatedOutput` is nullable, and a body without it would replace the
+/// output the row shows.
+pub(super) fn item_content(item: &ThreadItem, streamed: Option<&str>) -> String {
     match item {
         ThreadItem::CommandExecution {
-            aggregated_output, ..
-        } => aggregated_output.clone().unwrap_or_default(),
+            command,
+            aggregated_output,
+            ..
+        } => {
+            let own = aggregated_output
+                .as_deref()
+                .filter(|output| !output.is_empty());
+            command_content(command, own.or(streamed))
+        }
         ThreadItem::FileChange { changes, .. } => render_changes(changes),
         ThreadItem::McpToolCall { error, result, .. } => {
             mcp_content(error.as_ref(), result.as_ref())
         }
         _ => String::new(),
     }
+}
+
+/// The command text that belongs in a command-execution row's expandable body.
+pub(super) fn command_content(command: &str, output: Option<&str>) -> String {
+    let output = output.filter(|output| !output.is_empty());
+    let mut content = String::with_capacity(command.len() + output.map_or(0, str::len) + 32);
+    if !command.is_empty() {
+        content.push_str("命令：\n");
+        content.push_str(command);
+    }
+    if let Some(output) = output {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str("输出：\n");
+        content.push_str(output);
+    }
+    content
 }
 
 /// Render proposed file changes: each path followed by its diff. Codex already
@@ -112,9 +168,9 @@ fn mcp_content(error: Option<&McpToolCallError>, result: Option<&McpToolCallResu
         .join("\n")
 }
 
-/// The tool row an item produces, or `None` for items kumu does not render —
-/// messages and reasoning arrive as streamed text instead.
-pub(super) fn tool_event(item: &ThreadItem) -> Option<Event> {
+/// Build a tool event with content that may include output accumulated outside
+/// the item notification, as happens for Codex's streaming command output.
+pub(super) fn tool_event_with_content(item: &ThreadItem, content: String) -> Option<Event> {
     let (id, status) = match item {
         ThreadItem::CommandExecution { id, status, .. }
         | ThreadItem::FileChange { id, status, .. }
@@ -130,7 +186,7 @@ pub(super) fn tool_event(item: &ThreadItem) -> Option<Event> {
         id: id.clone(),
         title: tool_title(item),
         status: status_name(status),
-        content: item_content(item),
+        content,
     })
 }
 
@@ -378,14 +434,49 @@ mod tests {
             title,
             status,
             content,
-        } = tool_event(&item).expect("a tool row")
+        } = tool_event_with_content(&item, item_content(&item, None)).expect("a tool row")
         else {
             panic!("expected a tool call");
         };
         assert_eq!(id, "c1");
-        assert_eq!(title, "cargo test");
+        assert_eq!(title, "命令执行");
         assert_eq!(status, "running");
-        assert_eq!(content, "running...");
+        assert_eq!(content, "命令：\ncargo test\n\n输出：\nrunning...");
+    }
+
+    #[test]
+    fn a_command_item_keeps_its_command_when_it_has_no_output() {
+        let item: ThreadItem = serde_json::from_value(json!({
+            "type": "commandExecution",
+            "id": "c1",
+            "command": "/bin/zsh -lc \"pwd\"",
+            "status": "completed",
+        }))
+        .unwrap();
+
+        assert_eq!(item_content(&item, None), "命令：\n/bin/zsh -lc \"pwd\"");
+    }
+
+    #[test]
+    fn command_actions_name_command_rows_by_their_actions() {
+        let item: ThreadItem = serde_json::from_value(json!({
+            "type": "commandExecution",
+            "id": "c1",
+            "command": "sed -n '1,20p' README.md | rg tool",
+            "status": "completed",
+            "commandActions": [
+                {"type": "read", "command": "sed", "name": "sed", "path": "README.md"},
+                {"type": "search", "command": "rg", "query": "tool"}
+            ]
+        }))
+        .unwrap();
+
+        let Event::ToolCall { title, .. } =
+            tool_event_with_content(&item, item_content(&item, None)).expect("a tool row")
+        else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(title, "读取文件 · 搜索");
     }
 
     #[test]
@@ -399,10 +490,12 @@ mod tests {
             ],
         }))
         .unwrap();
-        let content = item_content(&item);
+        let content = item_content(&item, None);
         assert!(content.contains("src/main.rs"), "missing path: {content}");
         assert!(content.contains("+new"), "missing diff: {content}");
-        let Event::ToolCall { title, status, .. } = tool_event(&item).expect("a tool row") else {
+        let Event::ToolCall { title, status, .. } =
+            tool_event_with_content(&item, item_content(&item, None)).expect("a tool row")
+        else {
             panic!("expected a tool call");
         };
         assert_eq!(title, "src/main.rs");
@@ -419,7 +512,10 @@ mod tests {
             json!({"type": "somethingNew", "id": "x1"}),
         ] {
             let item: ThreadItem = serde_json::from_value(raw).unwrap();
-            assert!(tool_event(&item).is_none(), "unexpected row for {item:?}");
+            assert!(
+                tool_event_with_content(&item, item_content(&item, None)).is_none(),
+                "unexpected row for {item:?}"
+            );
         }
     }
 
