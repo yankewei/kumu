@@ -766,7 +766,6 @@ impl KumuApp {
                 // whole document on every chunk.
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.update_turn(session_id, cx, |turn, cx| {
-                        turn.active_thinking = None;
                         if let Some(TurnBlock::Answer { text, view }) = turn.blocks.last_mut() {
                             view.update(cx, |state, cx| state.push_str(&chunk, cx));
                             text.push_str(&chunk);
@@ -782,12 +781,8 @@ impl KumuApp {
             }
             backend::Event::Thought { text, message } => {
                 self.conversation.update(cx, |conversation, cx| {
-                    conversation.update_turn(session_id, cx, |turn, _| {
-                        // The row that took the chunk is the row still being
-                        // written, so the spinner follows it there.
-                        let row = turn.push_thinking(text, message);
-                        turn.active_thinking = Some(row);
-                    })
+                    conversation
+                        .update_turn(session_id, cx, |turn, _| turn.push_thinking(text, message))
                 });
             }
             backend::Event::ToolCall {
@@ -812,11 +807,6 @@ impl KumuApp {
                                 run.content = content;
                             }
                         } else {
-                            // Opening a row ends the reasoning above it. An update
-                            // to a row already there does not: an agent reporting
-                            // a background task's progress would otherwise close
-                            // the reasoning it interrupts, once per report.
-                            turn.active_thinking = None;
                             turn.blocks.push(TurnBlock::Tool(ToolRun {
                                 id,
                                 title,
@@ -847,9 +837,6 @@ impl KumuApp {
                                 // The request can arrive before the tool call it
                                 // refers to; seed the row from what the request
                                 // itself carries so the prompt is never dropped.
-                                // Seeding a row ends the reasoning above it, the
-                                // same as any other call opening one.
-                                turn.active_thinking = None;
                                 turn.blocks.push(TurnBlock::Tool(ToolRun {
                                     id: tool_call_id,
                                     title: title.clone(),

@@ -52,10 +52,7 @@ fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<E
             _ => None,
         },
         SessionUpdate::AgentThoughtChunk(chunk) => {
-            // The chunk's message id is what keeps one piece of reasoning in
-            // one row: an agent working a background task reports its progress
-            // between two chunks of the same message, and without the label
-            // those reports would split the thinking row in two.
+            // The label reasoning rows are grouped by; see `Event::Thought`.
             let message = chunk.message_id.map(|id| id.0.to_string());
             match chunk.content {
                 ContentBlock::Text(t) => Some(Event::Thought {

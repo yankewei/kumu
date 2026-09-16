@@ -63,7 +63,6 @@ pub(super) enum TurnBlock {
 pub(super) struct TurnState {
     started_at: std::time::Instant,
     pub(super) blocks: Vec<TurnBlock>,
-    pub(super) active_thinking: Option<usize>,
 }
 
 impl TurnState {
@@ -71,7 +70,6 @@ impl TurnState {
         Self {
             started_at: std::time::Instant::now(),
             blocks: Vec::new(),
-            active_thinking: None,
         }
     }
 
@@ -82,14 +80,13 @@ impl TurnState {
     }
 
     /// Append a reasoning chunk to the row it belongs to, opening one when the
-    /// chunk starts a piece of reasoning of its own. Returns that row's index,
-    /// which is the row still being written.
+    /// chunk starts a piece of reasoning of its own.
     ///
     /// Which row that is comes from the agent's own label for the message, not
     /// from what arrived last: a background task reports its progress between
     /// two chunks of one message, and those reports used to cut the message's
     /// reasoning into a row per chunk.
-    pub(super) fn push_thinking(&mut self, text: String, message: Option<String>) -> usize {
+    pub(super) fn push_thinking(&mut self, text: String, message: Option<String>) {
         if let Some(TurnBlock::Thinking {
             text: current,
             message: held,
@@ -105,7 +102,12 @@ impl TurnState {
                 message,
             });
         }
-        self.blocks.len() - 1
+    }
+
+    /// Whether the row at `index` is reasoning still being written: only the
+    /// last row can be, and anything pushed after it ends it.
+    fn is_thinking(&self, index: usize) -> bool {
+        index + 1 == self.blocks.len() && matches!(self.blocks[index], TurnBlock::Thinking { .. })
     }
 }
 
@@ -280,15 +282,14 @@ fn elapsed_label(secs: u64) -> String {
 fn rows_with_totals(folded: Vec<Row>, settled: &HashMap<usize, u64>) -> Vec<Row> {
     let mut rows = Vec::with_capacity(folded.len());
     for row in folded {
+        let total = |index: usize| settled.get(&index).map(|&ms| (index, ms));
         let closed = match &row {
-            Row::History(index) => Some(*index),
-            Row::HistoryTools(range) => range.clone().find(|index| settled.contains_key(index)),
+            Row::History(index) => total(*index),
+            Row::HistoryTools(range) => range.clone().find_map(total),
             _ => None,
         };
         rows.push(row);
-        if let Some(index) = closed
-            && let Some(&duration_ms) = settled.get(&index)
-        {
+        if let Some((index, duration_ms)) = closed {
             rows.push(Row::Worked { index, duration_ms });
         }
     }
@@ -363,9 +364,6 @@ pub(super) struct ConversationView {
     /// The session on screen, if any.
     session_id: Option<i64>,
     history: Vec<HistoryEntry>,
-    /// The total each finished turn took, keyed by the history index of the
-    /// message that closed it — where its settled label belongs in the list.
-    settled: HashMap<usize, u64>,
     /// The history folded into rows; unchanged by the live turn.
     history_rows: Vec<Row>,
     /// Every row the list currently knows about, history then live.
@@ -389,7 +387,6 @@ impl ConversationView {
         Self {
             session_id: None,
             history: Vec::new(),
-            settled: HashMap::new(),
             history_rows: Vec::new(),
             rows: Vec::new(),
             turns: HashMap::new(),
@@ -407,8 +404,7 @@ impl ConversationView {
     ) {
         self.session_id = session_id;
         self.history = messages.iter().map(HistoryEntry::decode).collect();
-        self.settled = settled_totals(messages);
-        self.history_rows = self.fold_history();
+        self.history_rows = self.fold_history(messages);
         self.rows = self.current_rows();
         let count = self.rows.len();
         self.scroller
@@ -447,8 +443,7 @@ impl ConversationView {
                 entry
             })
             .collect();
-        self.settled = settled_totals(messages);
-        self.history_rows = self.fold_history();
+        self.history_rows = self.fold_history(messages);
         self.sync_rows(cx);
     }
 
@@ -514,14 +509,16 @@ impl ConversationView {
         }
     }
 
-    fn fold_history(&self) -> Vec<Row> {
+    /// Fold the history into rows, with each finished turn's total placed under
+    /// the row of the message that closed it.
+    fn fold_history(&self, messages: &[Message]) -> Vec<Row> {
         rows_with_totals(
             fold_rows(
                 self.history.iter().map(HistoryEntry::is_tool),
                 Row::History,
                 Row::HistoryTools,
             ),
-            &self.settled,
+            &settled_totals(messages),
         )
     }
 
@@ -754,7 +751,7 @@ impl ConversationView {
             Some(TurnBlock::Thinking { text, open, .. }) => self.render_thinking(
                 format!("thinking-{index}"),
                 *open,
-                turn.active_thinking == Some(index),
+                turn.is_thinking(index),
                 text.clone().into(),
                 RowToggle::Block(index),
                 session_id,
@@ -1242,21 +1239,21 @@ mod tests {
     /// This is the shape omp sends while a background task runs: that task's
     /// progress reports arrive between two chunks of one message, and they hold
     /// no row of their own — which is exactly why the row is keyed on the
-    /// message and not, as it was, on what arrived last. The flag that used to
-    /// decide it is cleared between the chunks here to stand for such an
-    /// interruption, and the chunks still have to end up as one row.
+    /// message and not, as it was, on what arrived last.
     #[test]
     fn one_messages_reasoning_is_one_row_however_the_stream_is_interrupted() {
         let mut turn = TurnState::new();
         turn.push_thinking("Still running. ".into(), Some("m1".into()));
-        turn.active_thinking = None;
-        let row = turn.push_thinking(
+        turn.push_thinking(
             "Let me continue reading useful files".into(),
             Some("m1".into()),
         );
 
-        assert_eq!(row, 0, "the chunk lands back in the message's own row");
-        assert_eq!(turn.blocks.len(), 1);
+        assert_eq!(
+            turn.blocks.len(),
+            1,
+            "the chunk lands back in the message's own row"
+        );
         assert_eq!(
             thinking_text(&turn, 0),
             "Still running. Let me continue reading useful files"
@@ -1269,9 +1266,8 @@ mod tests {
     fn another_messages_reasoning_opens_its_own_row() {
         let mut turn = TurnState::new();
         turn.push_thinking("first".into(), Some("m1".into()));
-        let row = turn.push_thinking("second".into(), Some("m2".into()));
+        turn.push_thinking("second".into(), Some("m2".into()));
 
-        assert_eq!(row, 1);
         assert_eq!(turn.blocks.len(), 2);
         assert_eq!(thinking_text(&turn, 1), "second");
     }
@@ -1297,9 +1293,13 @@ mod tests {
         let mut turn = TurnState::new();
         turn.push_thinking("before".into(), Some("m1".into()));
         turn.blocks.push(tool_block("t1"));
-        let row = turn.push_thinking("after".into(), Some("m1".into()));
+        turn.push_thinking("after".into(), Some("m1".into()));
 
-        assert_eq!(row, 2, "the later chunk gets a row of its own");
+        assert_eq!(
+            turn.blocks.len(),
+            3,
+            "the later chunk gets a row of its own"
+        );
         assert_eq!(thinking_text(&turn, 0), "before");
         assert_eq!(thinking_text(&turn, 2), "after");
     }

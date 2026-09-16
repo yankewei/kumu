@@ -521,9 +521,7 @@ fn handle_frame(frame: Value, stream: &mut PiStream, ev_tx: &Sender<Event>) -> R
                 Some("thinking_delta") => {
                     if let Some(delta) = non_empty(update.get("delta")) {
                         stream.saw_reasoning = true;
-                        // Pi stamps no id on a streamed message, so its
-                        // reasoning arrives unlabelled and the UI runs the
-                        // chunks together by adjacency.
+                        // Pi stamps no id on a streamed message.
                         emit(
                             ev_tx,
                             Event::Thought {
