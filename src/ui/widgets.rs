@@ -103,6 +103,28 @@ pub fn picker_list() -> Div {
 /// width, so a list of bare labels reserves no room for a description it has
 /// none of. (Waku caps its menu cards at the same 320.)
 pub fn picker_menu(id: impl Into<ElementId>, chrome: &PickerChrome, list: Div) -> Div {
+    picker_card(chrome).child(div().id(id).overflow_y_scroll().child(list))
+}
+
+/// A picker menu whose rows are driven from the keyboard: the rows are the
+/// scroll container's own children, so `scroll.scroll_to_item(ix)` brings row
+/// `ix` into view.
+pub fn tracked_picker_menu(
+    id: impl Into<ElementId>,
+    chrome: &PickerChrome,
+    scroll: &ScrollHandle,
+    rows: impl IntoIterator<Item = impl IntoElement>,
+) -> Div {
+    picker_card(chrome).child(
+        picker_list()
+            .id(id)
+            .overflow_y_scroll()
+            .track_scroll(scroll)
+            .children(rows),
+    )
+}
+
+fn picker_card(chrome: &PickerChrome) -> Div {
     v_flex()
         .max_w(px(PICKER_MENU_MAX))
         .max_h(px(PICKER_MENU_MAX))
@@ -112,7 +134,6 @@ pub fn picker_menu(id: impl Into<ElementId>, chrome: &PickerChrome, list: Div) -
         .bg(chrome.background)
         .shadow_lg()
         .overflow_hidden()
-        .child(div().id(id).overflow_y_scroll().child(list))
 }
 
 /// A small status pill (accent = link-tinted, neutral = muted), Zed-badge style.

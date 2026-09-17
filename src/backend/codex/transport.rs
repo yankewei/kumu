@@ -208,7 +208,7 @@ pub(super) fn spawn(
 
 /// Echo the wire traffic to stderr when KUMU_DEBUG is set, for headless
 /// verification (mirrors the shared `emit` convention).
-fn debug_log(message: &str) {
+pub(super) fn debug_log(message: &str) {
     if std::env::var("KUMU_DEBUG").is_ok() {
         eprintln!("[codex] <- {message}");
     }

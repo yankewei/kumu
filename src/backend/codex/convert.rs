@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use crate::backend::event::{
-    Event, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo, SandboxInfo,
+    CommandInfo, Event, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo, SandboxInfo,
 };
 
 use super::protocol::{
     CommandAction, FileUpdateChange, McpToolCallError, McpToolCallResult, ModelListResult,
-    SandboxPolicy, ThreadItem,
+    SandboxPolicy, Skill, SkillsListResult, ThreadItem,
 };
 
 /// The provider label Codex models are filed under.
@@ -188,6 +188,145 @@ pub(super) fn tool_event_with_content(item: &ThreadItem, content: String) -> Opt
         status: status_name(status),
         content,
     })
+}
+
+/// The skills a session can invoke, from `skills/list`: the enabled ones, in
+/// Codex's own order (repo, then user, then system), each name once.
+///
+/// A name repeated across scopes keeps its first — the most local — entry,
+/// which is the one a composer row can mean.
+pub(super) fn skill_catalog(listed: SkillsListResult) -> Vec<Skill> {
+    let mut skills: Vec<Skill> = Vec::new();
+    for skill in listed.data.into_iter().flat_map(|entry| entry.skills) {
+        if skill.enabled
+            && !skill.name.trim().is_empty()
+            && !skills.iter().any(|seen| seen.name == skill.name)
+        {
+            skills.push(skill);
+        }
+    }
+    skills
+}
+
+/// The slash commands this backend runs itself, with the hint each takes.
+///
+/// app-server has no slash commands — they live in Codex's TUI, which calls a
+/// method for each — so these are kumu's own, a subset of the TUI's chosen for
+/// mapping onto one app-server method (or, for `init`, the TUI's own prompt)
+/// with nothing to show beyond what a turn already shows. See [`builtin_command`].
+const BUILTIN_COMMANDS: &[(&str, Option<&str>)] = &[
+    ("compact", None),
+    ("review", Some("[审查说明]")),
+    ("review-branch", Some("<分支>")),
+    ("review-commit", Some("<commit sha>")),
+    ("rename", Some("<名称>")),
+    ("init", None),
+];
+
+/// The prompt Codex's TUI sends for `/init`, vendored from codex-cli 0.154.0
+/// (`codex-rs/tui/assets/prompt_for_init_command.md`, Apache-2.0).
+pub(super) const INIT_PROMPT: &str = include_str!("init_prompt.md");
+
+/// A built-in command as typed.
+#[derive(Debug, PartialEq)]
+pub(super) enum BuiltinCommand {
+    /// `thread/compact/start`.
+    Compact,
+    /// `review/start` with this target.
+    Review(Value),
+    /// `thread/name/set`.
+    Rename(String),
+    /// A turn carrying [`INIT_PROMPT`].
+    Init,
+    /// Typed without the argument it needs; the text says which.
+    Usage(String),
+}
+
+/// The built-in command a prompt invokes, if it opens with one.
+///
+/// Built-ins win over a skill of the same name, which the catalogue drops.
+pub(super) fn builtin_command(text: &str) -> Option<BuiltinCommand> {
+    let invocation = text.trim().strip_prefix('/')?;
+    let (name, args) = invocation
+        .split_once(char::is_whitespace)
+        .map_or((invocation, ""), |(name, args)| (name, args.trim()));
+    let usage = |what: &str| Some(BuiltinCommand::Usage(format!("/{name} 需要{what}")));
+    match name {
+        "compact" => Some(BuiltinCommand::Compact),
+        "review" if args.is_empty() => Some(BuiltinCommand::Review(
+            json!({ "type": "uncommittedChanges" }),
+        )),
+        "review" => Some(BuiltinCommand::Review(
+            json!({ "type": "custom", "instructions": args }),
+        )),
+        "review-branch" if args.is_empty() => usage("分支名"),
+        "review-branch" => Some(BuiltinCommand::Review(
+            json!({ "type": "baseBranch", "branch": args }),
+        )),
+        "review-commit" if args.is_empty() => usage(" commit sha"),
+        "review-commit" => Some(BuiltinCommand::Review(
+            json!({ "type": "commit", "sha": args }),
+        )),
+        "rename" if args.is_empty() => usage("新名称"),
+        "rename" => Some(BuiltinCommand::Rename(args.to_string())),
+        "init" => Some(BuiltinCommand::Init),
+        _ => None,
+    }
+}
+
+/// The composer's slash commands: the built-ins, then the skills.
+///
+/// A skill takes the rest of the line as free text, with nothing said about
+/// what it should be. One named like a built-in is left out, since typing it
+/// runs the built-in.
+pub(super) fn command_catalog(skills: &[Skill]) -> Vec<CommandInfo> {
+    let builtins = BUILTIN_COMMANDS.iter().map(|(name, hint)| CommandInfo {
+        name: name.to_string(),
+        hint: hint.map(str::to_string),
+    });
+    let skills = skills
+        .iter()
+        .filter(|skill| !BUILTIN_COMMANDS.iter().any(|(name, _)| *name == skill.name))
+        .map(|skill| CommandInfo {
+            name: skill.name.clone(),
+            hint: None,
+        });
+    builtins.chain(skills).collect()
+}
+
+/// The row a compaction shows as: running while Codex summarises, done after.
+pub(super) fn compaction_event(item: &ThreadItem, done: bool) -> Option<Event> {
+    let ThreadItem::ContextCompaction { id } = item else {
+        return None;
+    };
+    (!id.is_empty()).then(|| Event::ToolCall {
+        id: id.clone(),
+        title: "压缩上下文".to_string(),
+        status: if done { "done" } else { "running" },
+        content: String::new(),
+    })
+}
+
+/// A prompt as `turn/start` input.
+///
+/// A prompt that opens with `/name`, where `name` is a skill, is how the
+/// composer invokes one, but app-server does not parse slashes. It becomes what
+/// Codex's own TUI sends instead: the text with the skill spelled `$name`, plus
+/// a structured `skill` item naming it by path, which Codex prefers over the
+/// text mention and so resolves unambiguously. Anything else is plain text.
+pub(super) fn turn_input(text: &str, skills: &[Skill]) -> Value {
+    let invoked = text.strip_prefix('/').and_then(|rest| {
+        let name = rest.split(char::is_whitespace).next()?;
+        let skill = skills.iter().find(|skill| skill.name == name)?;
+        Some((skill, &rest[name.len()..]))
+    });
+    match invoked {
+        Some((skill, args)) => json!([
+            { "type": "text", "text": format!("${}{args}", skill.name) },
+            { "type": "skill", "name": skill.name, "path": skill.path },
+        ]),
+        None => json!([{ "type": "text", "text": text }]),
+    }
 }
 
 /// Build the picker catalog from `model/list`: its visible models, and the one
@@ -712,5 +851,132 @@ mod tests {
         assert_eq!(decision(Some("cancel")), "cancel");
         assert_eq!(decision(None), "cancel");
         assert_eq!(decision(Some("somethingNew")), "cancel");
+    }
+
+    /// Shaped like a real `skills/list` reply: a disabled skill is not offered,
+    /// and a name shadowed by a more local scope is offered once, as that scope's.
+    #[test]
+    fn the_skill_catalogue_is_the_enabled_skills_each_name_once() {
+        let listed: SkillsListResult = serde_json::from_value(json!({
+            "data": [{
+                "cwd": "/repo",
+                "errors": [],
+                "skills": [
+                    {"name": "code-simplifier", "path": "/repo/.agents/skills/code-simplifier/SKILL.md", "enabled": true, "scope": "repo"},
+                    {"name": "pdf:pdf", "path": "/home/.codex/plugins/pdf/SKILL.md", "enabled": true, "scope": "user"},
+                    {"name": "code-simplifier", "path": "/home/.agents/skills/code-simplifier/SKILL.md", "enabled": true, "scope": "user"},
+                    {"name": "imagegen", "path": "/home/.codex/skills/.system/imagegen/SKILL.md", "enabled": false, "scope": "system"},
+                ],
+            }],
+        }))
+        .unwrap();
+        let skills = skill_catalog(listed);
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, ["code-simplifier", "pdf:pdf"]);
+        assert_eq!(
+            skills[0].path,
+            "/repo/.agents/skills/code-simplifier/SKILL.md"
+        );
+    }
+
+    /// The built-ins come first, and a skill named like one is not offered twice.
+    #[test]
+    fn the_command_catalogue_is_the_builtins_then_the_skills() {
+        let skill = |name: &str| Skill {
+            name: name.into(),
+            path: format!("/skills/{name}/SKILL.md"),
+            enabled: true,
+            scope: "user".into(),
+        };
+        let names: Vec<String> = command_catalog(&[skill("pdf:pdf"), skill("review")])
+            .into_iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "compact",
+                "review",
+                "review-branch",
+                "review-commit",
+                "rename",
+                "init",
+                "pdf:pdf"
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_commands_parse_into_their_requests() {
+        assert_eq!(builtin_command("/compact"), Some(BuiltinCommand::Compact));
+        assert_eq!(
+            builtin_command("/review"),
+            Some(BuiltinCommand::Review(
+                json!({"type": "uncommittedChanges"})
+            ))
+        );
+        assert_eq!(
+            builtin_command("/review 重点看错误处理"),
+            Some(BuiltinCommand::Review(
+                json!({"type": "custom", "instructions": "重点看错误处理"})
+            ))
+        );
+        assert_eq!(
+            builtin_command("/review-branch main"),
+            Some(BuiltinCommand::Review(
+                json!({"type": "baseBranch", "branch": "main"})
+            ))
+        );
+        assert_eq!(
+            builtin_command("/review-commit abc123"),
+            Some(BuiltinCommand::Review(
+                json!({"type": "commit", "sha": "abc123"})
+            ))
+        );
+        assert_eq!(
+            builtin_command("/rename 修登录"),
+            Some(BuiltinCommand::Rename("修登录".into()))
+        );
+        assert_eq!(builtin_command("/init"), Some(BuiltinCommand::Init));
+        assert!(matches!(
+            builtin_command("/review-branch"),
+            Some(BuiltinCommand::Usage(_))
+        ));
+        for text in ["compact", "/compaction", "/pdf:pdf 读一下", "请 /compact"] {
+            assert_eq!(builtin_command(text), None, "{text:?} is no built-in");
+        }
+    }
+
+    /// `/skill args` goes out the way Codex's TUI sends it; anything that does
+    /// not name a skill is left as the text it is.
+    #[test]
+    fn a_slash_skill_becomes_a_skill_input() {
+        let skills = vec![Skill {
+            name: "pdf:pdf".into(),
+            path: "/skills/pdf/SKILL.md".into(),
+            enabled: true,
+            scope: "user".into(),
+        }];
+        assert_eq!(
+            turn_input("/pdf:pdf 读一下 report.pdf", &skills),
+            json!([
+                {"type": "text", "text": "$pdf:pdf 读一下 report.pdf"},
+                {"type": "skill", "name": "pdf:pdf", "path": "/skills/pdf/SKILL.md"},
+            ])
+        );
+        assert_eq!(
+            turn_input("/pdf:pdf", &skills),
+            json!([
+                {"type": "text", "text": "$pdf:pdf"},
+                {"type": "skill", "name": "pdf:pdf", "path": "/skills/pdf/SKILL.md"},
+            ])
+        );
+        for text in ["/pdf 读一下", "/usr/bin/env", "请用 /pdf:pdf"] {
+            assert_eq!(
+                turn_input(text, &skills),
+                json!([{"type": "text", "text": text}]),
+                "{text:?} names no skill"
+            );
+        }
     }
 }

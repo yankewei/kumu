@@ -102,9 +102,11 @@ pub enum Event {
     /// a command set has no value in force, and it arrives on its own schedule
     /// — at the handshake, and again whenever the agent changes it.
     ///
-    /// An empty list is the honest report for an agent that has none (Codex's
-    /// app-server exposes no such catalogue), which is what keeps the menu off
-    /// the composer there rather than offering commands that could not run.
+    /// An empty list is the honest report for an agent that has none, which is
+    /// what keeps the menu off the composer there rather than offering commands
+    /// that could not run. Codex's app-server has no slash commands of its own
+    /// (they live in its TUI), so its backend reports the few built-ins it runs
+    /// itself, then the session's skills.
     Commands {
         agent: &'static str,
         commands: Vec<CommandInfo>,

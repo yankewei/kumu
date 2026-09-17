@@ -39,3 +39,18 @@ does not accept one — and `thread/start`'s response echoes the effective value
 back. `model/list` advertises `defaultReasoningEffort` and
 `supportedReasoningEfforts` per model. These are the shapes `protocol.rs` and
 `convert.rs` rely on.
+
+app-server has no slash commands: those are Codex's TUI's own (`SlashCommand`
+in `codex-rs/tui`), which calls methods such as `thread/compact/start` itself.
+What the composer offers for Codex is therefore a few built-ins the backend
+maps itself — `/compact` → `thread/compact/start` (an acknowledgement only; the
+turn announces itself with `turn/started` and shows as a `contextCompaction`
+item), `/review*` → `review/start` with `delivery: "inline"` (the findings
+arrive as a completed `agentMessage` that never streamed), `/rename` →
+`thread/name/set`, `/init` → the TUI's own prompt — followed by `skills/list` — per entry,
+`skills[].name`/`path`/`enabled` — refreshed on `skills/changed`. A skill is
+invoked the way the TUI does it: the text spells it `$name`, and a
+`{"type":"skill","name","path"}` input item beside it names it exactly (Codex
+prefers the structured item over the text mention). Checked against a live
+`skills/list` from codex-cli 0.154.0; the turn-side shape is the schema's
+`SkillUserInput`, not a captured frame.
