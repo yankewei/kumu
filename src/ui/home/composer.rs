@@ -5,7 +5,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::Textarea;
+use gpui_kit::component::input::{MoveDown, MoveUp, Textarea};
 
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
 use crate::agents::AGENTS;
@@ -51,12 +51,28 @@ impl KumuApp {
                     .bg(theme.background)
                     .overflow_hidden()
                     .child(
-                        div().p_2().child(
-                            Textarea::new(&self.input_state)
-                                .appearance(false)
-                                .bordered(false)
-                                .w_full(),
-                        ),
+                        div()
+                            .p_2()
+                            // While the slash-command menu is open, Up/Down move
+                            // its highlight. Caught on the way down to the
+                            // textarea, which would otherwise take them as caret
+                            // moves; with the menu closed they pass through.
+                            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                                if this.move_command_cursor(false, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                                if this.move_command_cursor(true, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .child(
+                                Textarea::new(&self.input_state)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .w_full(),
+                            ),
                     )
                     .child(
                         // Toolbar: model picker on the left,

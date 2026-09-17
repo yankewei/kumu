@@ -185,6 +185,41 @@ pub(super) struct ItemNotification {
     pub item: ThreadItem,
 }
 
+/// Result of `skills/list`: the skills in reach of each working directory asked
+/// about, one entry per directory.
+#[derive(Debug, Deserialize)]
+pub(super) struct SkillsListResult {
+    #[serde(default)]
+    pub data: Vec<SkillsListEntry>,
+}
+
+/// One working directory's skills. Its `cwd` and load `errors` are on the wire
+/// and not modelled: kumu asks about one directory at a time, and a skill that
+/// failed to load is simply not offered.
+#[derive(Debug, Deserialize)]
+pub(super) struct SkillsListEntry {
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+}
+
+/// One skill. `path` is what a structured `skill` input names it by, so an
+/// invocation cannot be mistaken for a same-named skill in another scope.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(super) struct Skill {
+    pub name: String,
+    pub path: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    /// `repo`, `user`, `system` or `admin`: whether the skill belongs to the
+    /// working directory it was listed for or goes wherever Codex does.
+    #[serde(default)]
+    pub scope: String,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
 /// Params of the streaming notifications, which all carry a chunk plus the item
 /// it belongs to.
 #[derive(Debug, Deserialize)]
@@ -267,6 +302,10 @@ pub(super) enum ThreadItem {
     AgentMessage {
         #[serde(default)]
         id: String,
+        /// The whole message. Normally it has already streamed as deltas; a
+        /// review's findings arrive only here.
+        #[serde(default)]
+        text: String,
     },
     Reasoning {
         #[serde(default)]
@@ -319,6 +358,12 @@ pub(super) enum ThreadItem {
         #[serde(default)]
         id: String,
     },
+    /// The conversation history being summarised, from `thread/compact/start`
+    /// or Codex's own automatic compaction.
+    ContextCompaction {
+        #[serde(default)]
+        id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -327,13 +372,14 @@ impl ThreadItem {
     /// The item's id; empty for a kind this build does not model.
     pub(super) fn id(&self) -> &str {
         match self {
-            Self::AgentMessage { id }
+            Self::AgentMessage { id, .. }
             | Self::Reasoning { id }
             | Self::CommandExecution { id, .. }
             | Self::FileChange { id, .. }
             | Self::McpToolCall { id, .. }
             | Self::WebSearch { id, .. }
-            | Self::Plan { id } => id,
+            | Self::Plan { id }
+            | Self::ContextCompaction { id } => id,
             Self::Unknown => "",
         }
     }

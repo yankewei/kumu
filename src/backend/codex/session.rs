@@ -8,11 +8,12 @@
 //! process, but kumu still runs one process per session. That is what keeps
 //! "dropping the last `Connection` reclaims the agent" true.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -25,12 +26,12 @@ use crate::backend::session::{
     forget_stale_cancels, release_pending_permissions, settle,
 };
 
-use super::convert;
+use super::convert::{self, BuiltinCommand};
 use super::protocol::{
     AccountResult, CommandApprovalParams, DeltaNotification, ErrorNotification,
-    FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult, ThreadItem,
-    ThreadNameUpdatedNotification, ThreadStartResult, Turn, TurnCompletedNotification,
-    TurnStartResult,
+    FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult, Skill,
+    SkillsListResult, ThreadItem, ThreadNameUpdatedNotification, ThreadStartResult, Turn,
+    TurnCompletedNotification, TurnStartResult,
 };
 use super::transport::{Message, Transport};
 
@@ -39,7 +40,13 @@ struct Shared {
     /// The wire, so a server request can be answered from either task.
     transport: Arc<Transport>,
     ev_tx: Sender<Event>,
+    agent: &'static str,
+    /// The session's working directory: which repo skills are in reach.
+    cwd: PathBuf,
     permissions: WeakPermissions,
+    /// The skills a prompt can invoke as `/name`, as last listed. Refreshed when
+    /// Codex says the skill files changed.
+    skills: Mutex<Vec<Skill>>,
     /// Names our permission prompts; the wire's request id belongs to the agent.
     next_request_id: AtomicU64,
     /// Fires when the in-flight turn ends, carrying the turn's final state, so
@@ -53,6 +60,12 @@ struct Shared {
     /// Rendered content per item, so an approval prompt can show the diff it
     /// refers to — the request itself carries only the item id.
     details: Mutex<HashMap<String, String>>,
+    /// The running turn's id, as `turn/started` reports it. An interrupt needs
+    /// it, and a compaction's start response does not carry one.
+    turn_id: Mutex<Option<String>>,
+    /// Agent messages that streamed as deltas this turn. One that completes
+    /// without having streamed — a review's findings — is shown whole instead.
+    streamed: Mutex<HashSet<String>>,
 }
 
 /// The prompt an approval request turns into.
@@ -69,6 +82,16 @@ struct TurnOverrides<'a> {
     model: Option<&'a str>,
     sandbox: Option<&'a str>,
     reasoning: Option<&'a str>,
+}
+
+/// What starts a turn. A prompt carries the session's picks; the built-ins that
+/// run as turns are methods of their own, which take none of them.
+#[derive(Clone, Copy)]
+enum TurnRequest<'a> {
+    Prompt(&'a str),
+    Compact,
+    /// `review/start`'s target.
+    Review(&'a Value),
 }
 
 /// The session's catalogue and picks, so the options event can be rebuilt
@@ -151,11 +174,16 @@ pub(in crate::backend) async fn run(
     let shared = Arc::new(Shared {
         transport: transport.clone(),
         ev_tx: ev_tx.clone(),
+        agent: cfg.agent,
+        cwd: cwd.clone(),
         permissions,
+        skills: Mutex::new(Vec::new()),
         next_request_id: AtomicU64::new(1),
         turn_done: Mutex::new(None),
         commands: Mutex::new(HashMap::new()),
         details: Mutex::new(HashMap::new()),
+        turn_id: Mutex::new(None),
+        streamed: Mutex::new(HashSet::new()),
     });
     // Notifications and approvals are handled on their own task, so the command
     // loop below is never blocked by them.
@@ -300,12 +328,13 @@ pub(in crate::backend) async fn run(
         .or_else(|| started.reasoning_effort.clone());
     state.reasoning = state.reconcile(wanted.as_deref());
     state.emit(cfg.agent, &ev_tx);
+    refresh_skills(&shared, false).await;
 
     // Headless convenience, matching the ACP backend: send one prompt before
     // the UI loop starts.
     if let Some(auto) = cfg.auto_prompt.clone() {
         emit(&ev_tx, Event::Log(format!("auto prompt: {auto}")));
-        run_turn(
+        run_prompt(
             &transport,
             &shared,
             &ev_tx,
@@ -331,7 +360,7 @@ pub(in crate::backend) async fn run(
         };
         match cmd {
             Cmd::Prompt(text) => {
-                run_turn(
+                run_prompt(
                     &transport,
                     &shared,
                     &ev_tx,
@@ -394,6 +423,60 @@ async fn request<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|err| format!("{method}: unexpected response: {err}"))
 }
 
+/// Handle one prompt: a built-in command, or a turn.
+///
+/// app-server parses no slashes, so the built-ins are recognised here and sent
+/// as the methods Codex's TUI calls for them (see [`convert::builtin_command`]).
+/// Whatever they do, the UI opened a turn for the prompt, so each one settles.
+async fn run_prompt(
+    transport: &Transport,
+    shared: &Shared,
+    ev_tx: &Sender<Event>,
+    thread_id: &str,
+    overrides: TurnOverrides<'_>,
+    text: &str,
+    cancels: &mut CancelRequests,
+) {
+    let request = match convert::builtin_command(text) {
+        None => TurnRequest::Prompt(text),
+        Some(BuiltinCommand::Init) => TurnRequest::Prompt(convert::INIT_PROMPT),
+        Some(BuiltinCommand::Compact) => TurnRequest::Compact,
+        Some(BuiltinCommand::Review(target)) => {
+            let request = TurnRequest::Review(&target);
+            return run_turn(
+                transport, shared, ev_tx, thread_id, overrides, request, cancels,
+            )
+            .await;
+        }
+        Some(BuiltinCommand::Rename(name)) => {
+            let params = json!({ "threadId": thread_id, "name": name });
+            let failure = match transport.request("thread/name/set", params).await {
+                // The agent also says so as `thread/name/updated`; reporting it
+                // here does not depend on that echo reaching this connection.
+                Ok(_) => {
+                    emit(ev_tx, Event::SessionTitle { title: name });
+                    None
+                }
+                Err(err) => Some(format!("重命名失败：{err}")),
+            };
+            for event in settle("completed", failure) {
+                emit(ev_tx, event);
+            }
+            return;
+        }
+        Some(BuiltinCommand::Usage(usage)) => {
+            for event in settle("completed", Some(usage)) {
+                emit(ev_tx, event);
+            }
+            return;
+        }
+    };
+    run_turn(
+        transport, shared, ev_tx, thread_id, overrides, request, cancels,
+    )
+    .await;
+}
+
 /// Run one turn and wait for it to end.
 ///
 /// The turn's output — messages, thinking, tool rows, approvals — streams in on
@@ -405,7 +488,7 @@ async fn run_turn(
     ev_tx: &Sender<Event>,
     thread_id: &str,
     overrides: TurnOverrides<'_>,
-    text: &str,
+    turn: TurnRequest<'_>,
     cancels: &mut CancelRequests,
 ) {
     forget_stale_cancels(cancels);
@@ -413,38 +496,63 @@ async fn run_turn(
     // anyone is listening for it.
     let (done_tx, done_rx) = oneshot::channel();
     *shared.turn_done.lock().unwrap() = Some(done_tx);
-    let mut params = json!({
-        "threadId": thread_id,
-        "input": [{ "type": "text", "text": text }],
-    });
-    if let Some(model) = overrides.model {
-        params["model"] = json!(model);
-    }
-    // Repeated on every turn, not just on the thread, so a pick made
-    // mid-session takes effect on the next turn without reopening anything —
-    // the protocol makes a turn-level override the thread's default from then
-    // on. An unrecognised value yields nothing, leaving the current policy be.
-    if let Some(policy) = overrides.sandbox.and_then(convert::sandbox_policy) {
-        params["sandboxPolicy"] = policy;
-    }
-    // Per turn, and only per turn: `thread/start` takes no effort, so this is
-    // the one place a reasoning pick can take effect. The value is an open
-    // string advertised by the model, so it is passed through rather than
-    // validated — an unknown one is the agent's to reject, not kumu's to guess.
-    if let Some(effort) = overrides.reasoning {
-        params["effort"] = json!(effort);
-    }
-    emit(ev_tx, Event::Log("prompt sent".into()));
-    // The turn's id is what an interrupt addresses, and `turn/start` is where it
-    // is handed over — earlier than the `turn/started` notification, which this
-    // backend only logs.
-    let turn_id = match request::<TurnStartResult>(transport, "turn/start", params).await {
-        Ok(started) => {
-            emit(
-                ev_tx,
-                Event::Log(format!("turn started: {}", started.turn.id)),
-            );
-            started.turn.id
+    *shared.turn_id.lock().unwrap() = None;
+    let started = match turn {
+        TurnRequest::Prompt(text) => {
+            let input = convert::turn_input(text, &shared.skills.lock().unwrap());
+            let mut params = json!({
+                "threadId": thread_id,
+                "input": input,
+            });
+            if let Some(model) = overrides.model {
+                params["model"] = json!(model);
+            }
+            // Repeated on every turn, not just on the thread, so a pick made
+            // mid-session takes effect on the next turn without reopening
+            // anything — the protocol makes a turn-level override the thread's
+            // default from then on. An unrecognised value yields nothing,
+            // leaving the current policy be.
+            if let Some(policy) = overrides.sandbox.and_then(convert::sandbox_policy) {
+                params["sandboxPolicy"] = policy;
+            }
+            // Per turn, and only per turn: `thread/start` takes no effort, so
+            // this is the one place a reasoning pick can take effect. The value
+            // is an open string advertised by the model, so it is passed through
+            // rather than validated — an unknown one is the agent's to reject,
+            // not kumu's to guess.
+            if let Some(effort) = overrides.reasoning {
+                params["effort"] = json!(effort);
+            }
+            emit(ev_tx, Event::Log("prompt sent".into()));
+            request::<TurnStartResult>(transport, "turn/start", params)
+                .await
+                .map(|started| Some(started.turn.id))
+        }
+        // The start response is only an acknowledgement; the turn it runs as
+        // announces itself with `turn/started`.
+        TurnRequest::Compact => {
+            let params = json!({ "threadId": thread_id });
+            request::<Value>(transport, "thread/compact/start", params)
+                .await
+                .map(|_| None)
+        }
+        // Inline, on this thread: a detached review would run on a thread this
+        // session does not follow.
+        TurnRequest::Review(target) => {
+            let params = json!({ "threadId": thread_id, "target": target, "delivery": "inline" });
+            request::<TurnStartResult>(transport, "review/start", params)
+                .await
+                .map(|started| Some(started.turn.id))
+        }
+    };
+    // The turn's id is what an interrupt addresses. A start response that hands
+    // one over is the earliest place to learn it; otherwise `turn/started` is.
+    let turn_id = match started {
+        Ok(turn_id) => {
+            if let Some(turn_id) = &turn_id {
+                emit(ev_tx, Event::Log(format!("turn started: {turn_id}")));
+            }
+            turn_id
         }
         Err(err) => {
             // Nothing will complete, so drop the waiter rather than leave the
@@ -459,18 +567,29 @@ async fn run_turn(
     // watched for here rather than on the command channel: the loop is parked on
     // this very await.
     tokio::pin!(done_rx);
-    let mut asked = false;
+    let (mut cancel_wanted, mut interrupted) = (false, false);
     let outcome = loop {
-        tokio::select! {
-            outcome = &mut done_rx => break outcome,
-            _ = cancels.recv(), if !asked => {
-                asked = true;
-                emit(ev_tx, Event::Log("cancel requested".into()));
-                let params = json!({"threadId": thread_id, "turnId": turn_id.as_str()});
+        if cancel_wanted && !interrupted {
+            let known = turn_id
+                .clone()
+                .or_else(|| shared.turn_id.lock().unwrap().clone());
+            if let Some(turn_id) = known {
+                interrupted = true;
+                let params = json!({"threadId": thread_id, "turnId": turn_id});
                 if let Err(err) = transport.request("turn/interrupt", params).await {
                     emit(ev_tx, Event::Log(format!("turn/interrupt failed: {err}")));
                 }
             }
+        }
+        tokio::select! {
+            outcome = &mut done_rx => break outcome,
+            _ = cancels.recv(), if !cancel_wanted => {
+                cancel_wanted = true;
+                emit(ev_tx, Event::Log("cancel requested".into()));
+            }
+            // A compaction learns its id from `turn/started`, which can trail
+            // the request to cancel it; look again shortly rather than drop it.
+            _ = tokio::time::sleep(Duration::from_millis(50)), if cancel_wanted && !interrupted => {}
         }
     };
 
@@ -498,10 +617,45 @@ async fn run_turn(
     }
 }
 
+/// List the session's skills and report them as its commands.
+///
+/// Best effort: a failure costs the composer its menu, not the session, so it
+/// only reaches the log. `force_reload` bypasses Codex's cache, for when it has
+/// said the files changed.
+async fn refresh_skills(shared: &Shared, force_reload: bool) {
+    let params = json!({ "cwds": [shared.cwd], "forceReload": force_reload });
+    let listed = match request::<SkillsListResult>(&shared.transport, "skills/list", params).await {
+        Ok(listed) => listed,
+        Err(err) => {
+            emit(
+                &shared.ev_tx,
+                Event::Log(format!("skills/list failed: {err}")),
+            );
+            return;
+        }
+    };
+    let skills = convert::skill_catalog(listed);
+    let commands = convert::command_catalog(&skills);
+    *shared.skills.lock().unwrap() = skills;
+    emit(
+        &shared.ev_tx,
+        Event::Commands {
+            agent: shared.agent,
+            commands,
+        },
+    );
+}
+
 /// Fold server messages into events until the connection ends.
 async fn handle_messages(shared: Arc<Shared>, mut messages: mpsc::UnboundedReceiver<Message>) {
     while let Some(message) = messages.recv().await {
         match message {
+            // Its own task: the reply arrives on this very loop, so awaiting it
+            // here would wait on itself.
+            Message::Notification { method, .. } if method == "skills/changed" => {
+                let shared = shared.clone();
+                tokio::spawn(async move { refresh_skills(&shared, true).await });
+            }
             Message::Notification { method, params } => {
                 handle_notification(&shared, &method, params)
             }
@@ -515,6 +669,7 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
     match method {
         "item/agentMessage/delta" => {
             if let Ok(delta) = serde_json::from_value::<DeltaNotification>(params) {
+                shared.streamed.lock().unwrap().insert(delta.item_id);
                 emit(&shared.ev_tx, Event::Agent(delta.delta));
             }
         }
@@ -559,6 +714,19 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
                 return;
             };
             let item = notification.item;
+            let done = method == "item/completed";
+            if let Some(event) = convert::compaction_event(&item, done) {
+                emit(&shared.ev_tx, event);
+                return;
+            }
+            // A message that never streamed is shown whole; one that did has
+            // already been shown chunk by chunk.
+            if let ThreadItem::AgentMessage { id, text } = &item {
+                if done && !text.is_empty() && !shared.streamed.lock().unwrap().contains(id) {
+                    emit(&shared.ev_tx, Event::Agent(text.clone()));
+                }
+                return;
+            }
             let detail = {
                 let mut commands = shared.commands.lock().unwrap();
                 let finished = if method == "item/completed" {
@@ -609,6 +777,7 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
                 return;
             };
             shared.commands.lock().unwrap().clear();
+            shared.streamed.lock().unwrap().clear();
             if let Some(done) = shared.turn_done.lock().unwrap().take() {
                 let _ = done.send(notification.turn);
             }
@@ -637,7 +806,16 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
         // rather than pattern-matched so that a method this build has never
         // seen still falls through to the log below and announces itself —
         // which is the canary for app-server growing a new notification.
-        "turn/started"
+        // The id an interrupt addresses, for a turn whose start response did not
+        // hand it over.
+        "turn/started" => {
+            if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
+                *shared.turn_id.lock().unwrap() = Some(id.to_string());
+            }
+        }
+        // A compaction's progress is its `contextCompaction` item; this is the
+        // deprecated notification Codex still sends alongside it.
+        "thread/compacted"
         | "thread/started"
         | "thread/status/changed"
         | "serverRequest/resolved"
@@ -798,7 +976,7 @@ mod tests {
 
     use super::{Shared, Transport, handle_notification};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Weak};
@@ -813,11 +991,16 @@ mod tests {
         let shared = Shared {
             transport: Arc::new(Transport::detached_for_test()),
             ev_tx: tx,
+            agent: "codex",
+            cwd: PathBuf::new(),
             permissions: Weak::new(),
+            skills: Mutex::new(Vec::new()),
             next_request_id: AtomicU64::new(1),
             turn_done: Mutex::new(None),
             commands: Mutex::new(HashMap::new()),
             details: Mutex::new(HashMap::new()),
+            turn_id: Mutex::new(None),
+            streamed: Mutex::new(HashSet::new()),
         };
         (shared, rx)
     }
@@ -858,6 +1041,34 @@ mod tests {
             "expected one Agent(\"ok\"): {:?}",
             kinds(&events)
         );
+    }
+
+    /// A review's findings arrive as a completed agent message that never
+    /// streamed, so they are shown whole; a message that did stream is not
+    /// shown twice.
+    #[test]
+    fn a_message_that_never_streamed_is_shown_on_completion() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/agentMessage/delta",
+            json!({"itemId": "streamed", "delta": "ok"}),
+        );
+        for (id, text) in [("streamed", "ok"), ("review", "未发现问题")] {
+            handle_notification(
+                &shared,
+                "item/completed",
+                json!({"item": {"type": "agentMessage", "id": id, "text": text}}),
+            );
+        }
+        let texts: Vec<String> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Agent(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["ok", "未发现问题"]);
     }
 
     /// The UI replaces a tool row's content rather than appending to it, so

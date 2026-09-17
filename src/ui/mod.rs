@@ -43,7 +43,9 @@ pub struct AgentSessionOptions(pub HashMap<&'static str, SessionOptions>);
 
 impl Global for AgentSessionOptions {}
 
-/// App-wide cache of each agent's slash commands, discovered the same way.
+/// App-wide cache of each agent's slash commands, as its probe discovered them:
+/// what a session offers until its own connection reports the commands its
+/// working directory adds.
 ///
 /// Deliberately not a field of [`SessionOptions`]: those are axes with a value in
 /// force, re-reported whole by several different events (a handshake, a config

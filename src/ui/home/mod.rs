@@ -23,7 +23,6 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 
-use self::command_menu::matching_commands;
 use self::conversation::{ConversationView, ToolRun, TurnBlock};
 use super::{AgentCommands, AgentSessionOptions, SessionOptions, SettingsWindow};
 use crate::agents::AGENTS;
@@ -129,6 +128,15 @@ pub struct KumuApp {
     /// (the other lists are short enough to read whole).
     model_picker_tab: Option<&'static str>,
     model_search: Entity<InputState>,
+    /// The slash-command menu's highlighted row, and the scroll that keeps it in
+    /// view. Back to the first match whenever the input changes.
+    command_cursor: usize,
+    command_scroll: ScrollHandle,
+    /// The commands each live session reported, with the agent that reported
+    /// them. What a session can run depends on its working directory (a
+    /// project's own commands and skills), so one session's list must not stand
+    /// in for another's; [`AgentCommands`] only fills in until a session reports.
+    live_commands: HashMap<i64, (&'static str, Vec<backend::CommandInfo>)>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
 }
@@ -166,14 +174,23 @@ impl KumuApp {
             open_picker: None,
             model_picker_tab: None,
             model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
+            command_cursor: 0,
+            command_scroll: ScrollHandle::new(),
+            live_commands: HashMap::new(),
             tooltips: cx.new(|cx| Tooltips::new(cx)),
         };
         // Enter in the composer sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
         cx.subscribe_in(&app.input_state, window, |this, _, ev, window, cx| {
-            // Shift+Enter also emits PressEnter; only plain Enter sends.
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                this.send(window, cx);
+            match ev {
+                // Shift+Enter also emits PressEnter; only plain Enter sends.
+                InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                // A new prefix is a new list, so the highlight starts over.
+                InputEvent::Change => {
+                    this.command_cursor = 0;
+                    this.command_scroll.scroll_to_item(0);
+                }
+                _ => {}
             }
         })
         .detach();
@@ -453,6 +470,7 @@ impl KumuApp {
         let next = neighbor_session(&self.sessions, session_id);
         self.cancel_pending_permissions(session_id, cx);
         self.conns.remove(&session_id);
+        self.live_commands.remove(&session_id);
         self.conversation.update(cx, |conversation, cx| {
             conversation.take_turn(session_id, cx)
         });
@@ -487,13 +505,10 @@ impl KumuApp {
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
-        // Enter completes while the input is still a bare command, and the menu's
-        // first row is what it completes to, so the effect is visible before the
-        // key is pressed. Sending takes a second Enter.
-        if let Some(command) =
-            matching_commands(&self.session_commands(&session, cx), &typed).first()
-        {
-            let name = command.name.clone();
+        // Enter completes while the input is still a bare command, to the row the
+        // menu highlights, so the effect is visible before the key is pressed.
+        // Sending takes a second Enter.
+        if let Some(name) = self.chosen_command(&session, cx) {
             self.complete_command(&name, window, cx);
             return;
         }
@@ -923,11 +938,17 @@ impl KumuApp {
                 self.system_message(session_id, err, cx);
                 cx.notify();
             }
+            // A probe (no session) speaks for the agent in general; a live
+            // session for itself alone.
             backend::Event::Commands { agent, commands } => {
-                if !cx.has_global::<AgentCommands>() {
-                    cx.set_global(AgentCommands::default());
+                if session_id < 0 {
+                    if !cx.has_global::<AgentCommands>() {
+                        cx.set_global(AgentCommands::default());
+                    }
+                    cx.global_mut::<AgentCommands>().0.insert(agent, commands);
+                } else {
+                    self.live_commands.insert(session_id, (agent, commands));
                 }
-                cx.global_mut::<AgentCommands>().0.insert(agent, commands);
                 cx.notify();
             }
             // The axes are independent — an agent may offer any subset of them —

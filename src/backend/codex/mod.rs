@@ -10,7 +10,7 @@
 //!   - `transport` — the wire: newline-delimited JSON over the child's stdio;
 //!   - `convert`   — protocol -> app translation, where protocol types stop;
 //!   - `session`   — handshake, the single thread, and the command loop;
-//!   - `probe`     — model discovery (`model/list`) for the settings window.
+//!   - `probe`     — model and skill discovery (`model/list`, `skills/list`).
 //!
 //! [`Event`]: crate::backend::Event
 //! [`Cmd`]: crate::backend::Cmd

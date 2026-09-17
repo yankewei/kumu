@@ -1,11 +1,12 @@
 //! The composer's slash-command menu: what the session's agent says it will run,
 //! filtered by what has been typed so far.
 //!
-//! It sits directly above the input and shows the row Enter would complete to,
-//! which is the whole of its behaviour: a command is an ordinary message once it
-//! is typed (`/name args` — every agent kumu drives recognizes the prefix
-//! itself), so nothing here sends anything. It exists to answer "what can I
-//! type?" before the user has to remember it.
+//! It sits directly above the input and highlights the row Enter would complete
+//! to — the first match, or whichever one Up/Down moved to. That is the whole of
+//! its behaviour: a command is an ordinary message once it is typed (`/name
+//! args` — every agent kumu drives recognizes the prefix itself), so nothing
+//! here sends anything. It exists to answer "what can I type?" before the user
+//! has to remember it.
 
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -15,7 +16,7 @@ use super::KumuApp;
 use crate::backend;
 use crate::db::Session;
 use crate::ui::AgentCommands;
-use crate::ui::widgets::{PickerChrome, picker_list, picker_menu, select_row};
+use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 
 /// The commands a partly typed `/…` could mean, in the agent's own order.
 ///
@@ -42,20 +43,68 @@ pub(super) fn matching_commands<'a>(
 }
 
 impl KumuApp {
-    /// The commands the session's agent offers, from the cache the probes and
-    /// live sessions fill (`Event::Commands`).
+    /// The commands the session can run: what its own connection reported,
+    /// else — before it has one, or after its agent changed — what the agent's
+    /// probe reported (`Event::Commands`).
     ///
-    /// Empty for an agent that reports none — Codex's app-server exposes no such
-    /// catalogue — which is what keeps the menu out of that session's composer
-    /// rather than offering commands that could not run.
+    /// Empty for an agent that has reported none (yet), which is what keeps the
+    /// menu out of that session's composer rather than offering commands that
+    /// could not run.
     pub(super) fn session_commands(
         &self,
         session: &Session,
         cx: &App,
     ) -> Vec<backend::CommandInfo> {
+        if let Some((_, commands)) = self
+            .live_commands
+            .get(&session.id)
+            .filter(|(agent, _)| *agent == session.agent)
+        {
+            return commands.clone();
+        }
         cx.try_global::<AgentCommands>()
             .and_then(|catalogs| catalogs.0.get(session.agent.as_str()).cloned())
             .unwrap_or_default()
+    }
+
+    /// The command Enter completes to: the highlighted match, if the input is a
+    /// bare command at all.
+    ///
+    /// The cursor is clamped rather than trusted, because the catalogue can be
+    /// replaced (a live session reporting its own) without the input changing.
+    pub(super) fn chosen_command(&self, session: &Session, cx: &App) -> Option<String> {
+        let commands = self.session_commands(session, cx);
+        let typed = self.input_state.read(cx).value();
+        let matches = matching_commands(&commands, &typed);
+        let last = matches.len().checked_sub(1)?;
+        Some(matches[self.command_cursor.min(last)].name.clone())
+    }
+
+    /// Move the highlight by one row, wrapping at either end. Returns whether
+    /// the menu is open to take the key — when it is not, Up/Down belong to the
+    /// textarea.
+    pub(super) fn move_command_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.selected_session() else {
+            return false;
+        };
+        if self.conversation.read(cx).has_turn(session.id) {
+            return false;
+        }
+        let commands = self.session_commands(session, cx);
+        let typed = self.input_state.read(cx).value();
+        let len = matching_commands(&commands, &typed).len();
+        if len == 0 {
+            return false;
+        }
+        let current = self.command_cursor.min(len - 1);
+        self.command_cursor = if down {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        self.command_scroll.scroll_to_item(self.command_cursor);
+        cx.notify();
+        true
     }
 
     /// Put a command into the input, ready for its arguments.
@@ -103,25 +152,23 @@ impl KumuApp {
         let theme = cx.theme();
         let chrome = PickerChrome::new(theme);
         let weak = cx.entity().downgrade();
-        let mut list = picker_list();
-        for (index, command) in matches.iter().enumerate() {
+        let cursor = self.command_cursor.min(matches.len() - 1);
+        let rows = matches.iter().enumerate().map(|(index, command)| {
             let name = command.name.clone();
             let weak = weak.clone();
-            list = list.child(select_row(
+            select_row(
                 &chrome,
                 &format!("/{name}"),
                 command.hint.clone(),
-                // The first match is what Enter completes to, so it is the row
-                // that reads as chosen — there is no separate cursor to move,
-                // and typing narrows the list instead.
-                index == 0,
+                // The highlighted row is what Enter completes to.
+                index == cursor,
                 move |_, window, cx| {
                     let _ = weak.update(cx, |app, cx| {
                         app.complete_command(&name, window, cx);
                     });
                 },
-            ));
-        }
+            )
+        });
 
         // The same backdrop recipe as the permission card above it: the two read
         // as one input region, on the composer's centered column.
@@ -137,7 +184,12 @@ impl KumuApp {
                         .max_w(rems(super::CONTENT_MAX_REM))
                         .min_w(rems(super::CONTENT_MIN_REM))
                         .mx_auto()
-                        .child(picker_menu("command-menu", &chrome, list)),
+                        .child(tracked_picker_menu(
+                            "command-menu",
+                            &chrome,
+                            &self.command_scroll,
+                            rows,
+                        )),
                 )
                 .into_any_element(),
         )
@@ -237,7 +289,7 @@ mod tests {
         );
     }
 
-    /// An agent with no catalogue (Codex) never has a match, whatever is typed.
+    /// An agent with no catalogue never has a match, whatever is typed.
     #[test]
     fn no_catalogue_means_no_menu() {
         assert!(matching_commands(&[], "/").is_empty());
