@@ -14,6 +14,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "macros"] }
 
+[dev-dependencies]
+markdown = "1.0.0"
+
 # Dependencies are optimized even in dev builds: unoptimized GPUI layout, text
 # shaping and markdown parsing make `cargo run` visibly stutter, while kumu's
 # own crate stays at opt-level 0 so incremental rebuilds stay fast.

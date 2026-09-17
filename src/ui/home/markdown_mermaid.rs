@@ -26,6 +26,12 @@ use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest
 use super::mermaid_viewer::open_viewer;
 
 const NODE_NAME: &str = "kumu-mermaid";
+const MAX_CACHED_DIAGRAMS: usize = 64;
+
+struct MermaidBlock {
+    source: SharedString,
+    offset: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct MermaidMarkdownPlugin;
@@ -44,51 +50,43 @@ impl MarkdownPlugin for MermaidMarkdownPlugin {
         node: &markdown_ast::Node,
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
-        let markdown_ast::Node::Code(code) = node else {
-            return None;
-        };
-        if !code
-            .lang
-            .as_deref()
-            .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
-        {
-            return None;
-        }
-        let fence = cx.node_source(node)?;
-        if !is_closed_fence(fence) {
-            return None;
-        }
-        Some(
-            MarkdownNode::new(NODE_NAME, SharedString::from(code.value.clone()))
-                .text(code.value.clone())
-                .markdown(fence),
-        )
+        parse_diagram(node, cx.source(), cx.offset())
     }
 
-    fn render(&self, node: &MarkdownNode, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Some(source) = node.data::<SharedString>() else {
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Some(block) = node.data::<MermaidBlock>() else {
             return div().into_any_element();
         };
+        let revision = cx.default_global::<crate::theme::ThemeRevision>().0;
+        if cx
+            .try_global::<DiagramTheme>()
+            .is_none_or(|theme| theme.revision != revision)
+        {
+            let spec = Arc::new(ThemeSpec::from_theme(cx.theme()));
+            cx.set_global(DiagramTheme { revision, spec });
+        }
         let key = DiagramKey {
-            source: source.clone(),
-            theme: ThemeSpec::from_app(cx),
+            source: block.source.clone(),
+            theme: revision,
         };
 
-        match diagram(key, cx) {
+        match diagram(key, window, cx) {
             DiagramState::Ready(diagram) => {
                 let theme = cx.theme();
-                let id = format!("{NODE_NAME}-{:p}", source.as_ptr());
-                let expand = Button::new(SharedString::from(format!("{id}-expand")))
+                let expand = Button::new(("mermaid-expand", block.offset))
                     .ghost()
                     .small()
                     .icon(IconName::Maximize)
                     .tooltip("放大查看")
                     .on_click({
                         let diagram = diagram.clone();
-                        move |_, window, cx| open_viewer(diagram.clone(), window, cx)
+                        move |_, window, cx| {
+                            cx.stop_propagation();
+                            open_viewer(diagram.clone(), window, cx);
+                        }
                     });
                 div()
-                    .id(SharedString::from(id))
+                    .id((NODE_NAME, block.offset))
                     .relative()
                     .w_full()
                     .p_3()
@@ -104,19 +102,49 @@ impl MarkdownPlugin for MermaidMarkdownPlugin {
                     .child(div().absolute().top_1().right_1().child(expand))
                     .into_any_element()
             }
-            // Laying out takes a moment; the fence reads as code meanwhile
-            // rather than as an empty box that jumps once the image lands.
+            // Keep the source readable while the diagram is rendering.
             DiagramState::Pending | DiagramState::Failed => {
-                let id = ElementId::Name(format!("{NODE_NAME}-{:p}", source.as_ptr()).into());
+                let id = ElementId::from((NODE_NAME, block.offset));
                 TextView::markdown(id, node.as_markdown().to_string()).into_any_element()
             }
         }
     }
 }
 
+fn parse_diagram(node: &markdown_ast::Node, source: &str, offset: usize) -> Option<MarkdownNode> {
+    let markdown_ast::Node::Code(code) = node else {
+        return None;
+    };
+    if !code
+        .lang
+        .as_deref()
+        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+    {
+        return None;
+    }
+    let position = node.position()?;
+    let fence = source.get(position.start.offset..position.end.offset)?;
+    let prefix = source[..position.start.offset].rsplit('\n').next()?;
+    let quote_depth = prefix.chars().filter(|c| *c == '>').count();
+    if !is_closed_fence(fence, quote_depth) {
+        return None;
+    }
+    Some(
+        MarkdownNode::new(
+            NODE_NAME,
+            MermaidBlock {
+                source: code.value.clone().into(),
+                offset: offset + position.start.offset,
+            },
+        )
+        .text(code.value.clone())
+        .markdown(fence),
+    )
+}
+
 /// A fence's source slice ends with its closing marker; one cut off mid-stream
 /// ends with the last line of the diagram instead.
-fn is_closed_fence(fence: &str) -> bool {
+fn is_closed_fence(fence: &str, quote_depth: usize) -> bool {
     let fence = fence.trim_end();
     let Some((opening, rest)) = fence.split_once('\n') else {
         return false;
@@ -127,7 +155,14 @@ fn is_closed_fence(fence: &str) -> bool {
         return false;
     };
     let width = opening.chars().take_while(|c| *c == marker).count();
-    let closing = rest.lines().last().unwrap_or_default().trim();
+    // mdast excludes the opening container prefix, but keeps it on later lines.
+    let mut closing = rest.lines().last().unwrap_or_default().trim();
+    for _ in 0..quote_depth {
+        let Some(line) = closing.strip_prefix('>') else {
+            return false;
+        };
+        closing = line.trim_start();
+    }
     closing.len() >= width && closing.chars().all(|c| c == marker)
 }
 
@@ -150,43 +185,91 @@ pub(super) struct Diagram {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DiagramKey {
     source: SharedString,
-    theme: ThemeSpec,
+    theme: u64,
 }
 
-/// Every diagram rendered so far, for the current theme. Rendering happens once
-/// per source; switching theme drops the old images and renders again.
+struct DiagramTheme {
+    revision: u64,
+    spec: Arc<ThemeSpec>,
+}
+
+impl Global for DiagramTheme {}
+
+struct CachedDiagram {
+    state: DiagramState,
+    last_used: u64,
+    request: u64,
+}
+
 #[derive(Default)]
-struct Diagrams(HashMap<DiagramKey, DiagramState>);
+struct Diagrams {
+    entries: HashMap<DiagramKey, CachedDiagram>,
+    clock: u64,
+}
 
 impl Global for Diagrams {}
 
-fn diagram(key: DiagramKey, cx: &mut App) -> DiagramState {
-    if let Some(state) = cx
-        .try_global::<Diagrams>()
-        .and_then(|diagrams| diagrams.0.get(&key))
-    {
-        return state.clone();
-    }
-
-    let mut stale = Vec::new();
-    let diagrams = cx.default_global::<Diagrams>();
-    diagrams.0.retain(|cached, state| {
-        let keep = cached.theme == key.theme;
-        if !keep && let DiagramState::Ready(diagram) = state {
-            stale.push(diagram.image.clone());
+impl Diagrams {
+    fn evict(&mut self, theme: u64) -> Vec<Arc<RenderImage>> {
+        let mut stale = Vec::new();
+        self.entries.retain(|key, entry| {
+            if key.theme == theme {
+                return true;
+            }
+            if let DiagramState::Ready(diagram) = &entry.state {
+                stale.push(diagram.image.clone());
+            }
+            false
+        });
+        while self.entries.len() >= MAX_CACHED_DIAGRAMS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            if let Some(CachedDiagram {
+                state: DiagramState::Ready(diagram),
+                ..
+            }) = self.entries.remove(&oldest)
+            {
+                stale.push(diagram.image);
+            }
         }
-        keep
-    });
-    diagrams.0.insert(key.clone(), DiagramState::Pending);
+        stale
+    }
+}
+
+fn diagram(key: DiagramKey, window: &mut Window, cx: &mut App) -> DiagramState {
+    let diagrams = cx.default_global::<Diagrams>();
+    diagrams.clock += 1;
+    let request = diagrams.clock;
+    if let Some(entry) = diagrams.entries.get_mut(&key) {
+        entry.last_used = request;
+        return entry.state.clone();
+    }
+    let stale = diagrams.evict(key.theme);
+    diagrams.entries.insert(
+        key.clone(),
+        CachedDiagram {
+            state: DiagramState::Pending,
+            last_used: request,
+            request,
+        },
+    );
     for image in stale {
-        cx.drop_image(image, None);
+        cx.drop_image(image, Some(window));
     }
 
     let svg_renderer = cx.svg_renderer();
+    let theme = cx.global::<DiagramTheme>().spec.clone();
     let job = key.clone();
     let task = cx.background_spawn(async move {
-        let svg = render_svg(&job.source, &job.theme)?;
-        let image = svg_renderer.render_single_frame(svg.as_bytes(), 1.).ok()?;
+        let svg = render_svg(&job.source, &theme)?;
+        let image = svg_renderer
+            .render_single_frame(svg.as_bytes(), 1.)
+            .map_err(|error| eprintln!("Mermaid rasterisation failed: {error}"))
+            .ok()?;
         Some(Diagram {
             svg: svg.into(),
             image,
@@ -196,9 +279,11 @@ fn diagram(key: DiagramKey, cx: &mut App) -> DiagramState {
         let diagram = task.await;
         cx.update(|cx| {
             let state = diagram.map_or(DiagramState::Failed, DiagramState::Ready);
-            // A theme switch while this was rendering already evicted the key.
-            if let Some(slot) = cx.default_global::<Diagrams>().0.get_mut(&key) {
-                *slot = state;
+            // An evicted source may have been requested again while this job ran.
+            if let Some(entry) = cx.default_global::<Diagrams>().entries.get_mut(&key)
+                && entry.request == request
+            {
+                entry.state = state;
                 cx.refresh_windows();
             } else if let DiagramState::Ready(diagram) = state {
                 cx.drop_image(diagram.image, None);
@@ -212,7 +297,10 @@ fn diagram(key: DiagramKey, cx: &mut App) -> DiagramState {
 
 fn render_svg(source: &str, theme: &ThemeSpec) -> Option<String> {
     let presentation = Presentation::new()
-        .with_theme(theme.host_theme()?)
+        .with_theme(theme.host_theme().or_else(|| {
+            eprintln!("Mermaid theme validation failed");
+            None
+        })?)
         .resolve();
     let renderer =
         Renderer::new().with_engine(presentation.materialize_engine(merman::Engine::new()));
@@ -228,13 +316,18 @@ fn render_svg(source: &str, theme: &ThemeSpec) -> Option<String> {
     };
     match renderer.render(RenderRequest::svg(source, OperationControl::new(), request)) {
         Ok(RenderOutput::Svg(Some(svg))) => Some(svg.into_parts().0),
-        _ => None,
+        Err(error) => {
+            eprintln!("Mermaid SVG rendering failed: {error}");
+            None
+        }
+        _ => {
+            eprintln!("Mermaid renderer returned no SVG");
+            None
+        }
     }
 }
 
-/// The app theme as merman's semantic roles, in CSS colours. It is also the
-/// cache key, so a diagram is rendered again only when one of these changes.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// The app theme as merman's semantic roles, rebuilt only when the theme changes.
 struct ThemeSpec {
     dark: bool,
     roles: Vec<(ThemeRole, String)>,
@@ -242,8 +335,7 @@ struct ThemeSpec {
 }
 
 impl ThemeSpec {
-    fn from_app(cx: &App) -> Self {
-        let theme = cx.theme();
+    fn from_theme(theme: &gpui_kit::component::Theme) -> Self {
         let roles = [
             (ThemeRole::Canvas, theme.background),
             (ThemeRole::Surface, theme.muted),
@@ -321,16 +413,92 @@ mod tests {
     use std::sync::Arc;
 
     use gpui_kit::SvgRenderer;
-    use merman::svg::ThemeRole;
+    use gpui_kit::component::{Theme, ThemeMode};
 
-    use super::{ThemeSpec, is_closed_fence, render_svg};
+    use super::{
+        CachedDiagram, DiagramKey, DiagramState, Diagrams, MAX_CACHED_DIAGRAMS, MermaidBlock,
+        ThemeSpec, is_closed_fence, parse_diagram, render_svg,
+    };
 
     #[test]
     fn a_fence_counts_as_closed_only_with_its_closing_marker() {
-        assert!(is_closed_fence("```mermaid\ngraph TD\nA-->B\n```"));
-        assert!(is_closed_fence("````mermaid\ngraph TD\n````\n"));
-        assert!(!is_closed_fence("```mermaid\ngraph TD\nA-->B"));
-        assert!(!is_closed_fence("````mermaid\ngraph TD\n```"));
+        assert!(is_closed_fence("```mermaid\ngraph TD\nA-->B\n```", 0));
+        assert!(is_closed_fence("````mermaid\ngraph TD\n````\n", 0));
+        assert!(!is_closed_fence("```mermaid\ngraph TD\nA-->B", 0));
+        assert!(!is_closed_fence("````mermaid\ngraph TD\n```", 0));
+    }
+
+    #[test]
+    fn parsed_fences_are_claimed_only_after_closing() {
+        for (source, claimed) in [
+            ("```mermaid\ngraph TD\nA-->B", false),
+            ("```mermaid\ngraph TD\nA-->B\n```", true),
+            ("> ```mermaid\n> graph TD\n> ```", true),
+            ("> ```mermaid\n> graph TD", false),
+            ("- ```mermaid\n  graph TD\n  ```", true),
+            ("> - > ```mermaid\n>   > graph TD\n>   > ```", true),
+            ("```mermaid\ngraph TD\n> ```", false),
+        ] {
+            let tree = markdown::to_mdast(source, &markdown::ParseOptions::gfm()).unwrap();
+            let mut node = &tree;
+            while let Some(children) = node.children() {
+                node = &children[0];
+            }
+            assert!(matches!(node, markdown::mdast::Node::Code(_)));
+            let parsed = parse_diagram(node, source, 100);
+            assert_eq!(parsed.is_some(), claimed, "{source}");
+            if let Some(parsed) = parsed {
+                let block = parsed.data::<MermaidBlock>().unwrap();
+                assert_eq!(block.offset, 100 + node.position().unwrap().start.offset);
+                assert!(!block.source.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn cache_evicts_the_least_recently_used_entry_and_old_themes() {
+        let mut cache = Diagrams::default();
+        for index in 0..MAX_CACHED_DIAGRAMS {
+            cache.entries.insert(
+                DiagramKey {
+                    source: index.to_string().into(),
+                    theme: 1,
+                },
+                CachedDiagram {
+                    state: DiagramState::Pending,
+                    last_used: index as u64,
+                    request: index as u64,
+                },
+            );
+        }
+        let first = DiagramKey {
+            source: "0".into(),
+            theme: 1,
+        };
+        cache.entries.get_mut(&first).unwrap().last_used = MAX_CACHED_DIAGRAMS as u64;
+        cache.evict(1);
+        assert_eq!(cache.entries.len(), MAX_CACHED_DIAGRAMS - 1);
+        assert!(cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&DiagramKey {
+            source: "1".into(),
+            theme: 1
+        }));
+        cache.evict(2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn all_app_theme_roles_are_accepted() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let theme = Theme {
+                mode,
+                ..Theme::default()
+            };
+            let spec = ThemeSpec::from_theme(&theme);
+            assert_eq!(spec.roles.len(), 22);
+            assert_eq!(spec.series.len(), 5);
+            assert!(spec.host_theme().is_some());
+        }
     }
 
     /// A flowchart has to survive the whole path to pixels: merman must not
@@ -338,11 +506,7 @@ mod tests {
     /// leave the reply's background showing rather than paint its own.
     #[test]
     fn a_flowchart_rasterises_on_a_transparent_background() {
-        let theme = ThemeSpec {
-            dark: true,
-            roles: vec![(ThemeRole::Text, "rgba(250, 250, 250, 1.000)".into())],
-            series: Vec::new(),
-        };
+        let theme = ThemeSpec::from_theme(&Theme::default());
         let svg = render_svg("flowchart LR\n  A[开始] --> B{判断}", &theme).expect("svg");
         let image = SvgRenderer::new(Arc::new(()))
             .render_single_frame(svg.as_bytes(), 1.)

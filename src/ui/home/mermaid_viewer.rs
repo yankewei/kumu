@@ -197,7 +197,11 @@ impl Render for DiagramViewer {
                     .px_2()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("拖动平移 · ⌘ + 滚轮缩放"),
+                    .child(if cfg!(target_os = "macos") {
+                        "拖动平移 · ⌘ / Ctrl + 滚轮缩放"
+                    } else {
+                        "拖动平移 · Ctrl + 滚轮缩放"
+                    }),
             )
             .child(
                 Button::new("mermaid-zoom-out")

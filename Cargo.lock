@@ -4042,6 +4042,7 @@ dependencies = [
  "agent-client-protocol",
  "futures",
  "gpui-kit",
+ "markdown",
  "merman",
  "rusqlite",
  "rust-embed",

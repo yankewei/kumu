@@ -7,6 +7,11 @@
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+#[derive(Default)]
+pub(crate) struct ThemeRevision(pub u64);
+
+impl Global for ThemeRevision {}
+
 pub const THEME_LIGHT: &str = include_str!("../themes/light.json");
 pub const THEME_DARK: &str = include_str!("../themes/dark.json");
 pub const THEME_LIGHT_NAME: &str = "Kumu Light";
@@ -51,6 +56,7 @@ pub fn load_kumu_themes(cx: &mut App) {
 /// re-applies what the theme JSON defines, which would drop the family.
 pub fn change_mode(mode: impl Into<ThemeMode>, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window, cx);
+    cx.default_global::<ThemeRevision>().0 += 1;
     apply_saved_font(cx);
     install_text_view_style(cx);
 }
