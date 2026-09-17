@@ -51,6 +51,9 @@ pub(super) enum Incoming {
 pub(super) struct SystemEvent {
     #[serde(default)]
     pub subtype: String,
+    /// Durable conversation id reported by `system/init`.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// The model the session resolved to, on `init`. This is the effective
     /// model, not the value kumu asked for.
     #[serde(default)]

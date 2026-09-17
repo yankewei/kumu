@@ -135,6 +135,22 @@ pub(in crate::backend) async fn run(
             .map_err(|error| format!("failed to launch {}: {error}", cfg.command))?;
     let transport = Arc::new(transport);
 
+    if let Some(path) = &cfg.session.resume_id {
+        // Pi opens a missing path as a new session, so check before switching.
+        if !std::path::Path::new(path).is_file() {
+            return Err(format!(
+                "恢复 Pi 会话失败，会话文件不存在：{path}。未开启新会话。"
+            ));
+        }
+        let response = transport
+            .request(json!({"type": "switch_session", "sessionPath": path}))
+            .await
+            .map_err(|error| format!("恢复 Pi 会话失败，未开启新会话：{error}"))?;
+        if response.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
+            return Err("恢复 Pi 会话被取消，未发送消息。".into());
+        }
+    }
+
     let shared = Arc::new(Shared {
         agent: cfg.agent,
         transport: transport.clone(),
@@ -428,6 +444,18 @@ async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
         .await
         .map_err(|error| format!("读取 pi 会话状态失败：{error}"))?;
     let data = state.get("data").cloned().unwrap_or(Value::Null);
+    if let Some(path) = data
+        .get("sessionFile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        emit(
+            &shared.ev_tx,
+            Event::SessionReady {
+                resume_id: path.to_string(),
+            },
+        );
+    }
     let models = shared
         .transport
         .request(json!({"type": "get_available_models"}))
@@ -714,6 +742,7 @@ mod tests {
                 Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
+                Event::SessionReady { .. } => "ready",
                 Event::Done(_) => "done",
                 Event::PermissionRequest { .. } => "permission",
                 Event::Error(_) => "error",

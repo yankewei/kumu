@@ -12,12 +12,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{
@@ -153,6 +153,8 @@ pub(in crate::backend) async fn run(
     let next_perm_id = Arc::new(AtomicU64::new(1));
     // The request handler and the connection closure both need the table.
     let handler_permissions = permissions.clone();
+    let loading = Arc::new(AtomicBool::new(cfg.session.resume_id.is_some()));
+    let notification_loading = loading.clone();
 
     emit(
         &log_tx,
@@ -164,6 +166,18 @@ pub(in crate::backend) async fn run(
         .name("kumu-demo")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                // Loading replays the transcript before replying. SQLite already
+                // supplies those rows; only session metadata should reach the UI.
+                if notification_loading.load(Ordering::Acquire)
+                    && matches!(notification.update,
+                        SessionUpdate::UserMessageChunk(_)
+                        | SessionUpdate::AgentMessageChunk(_)
+                        | SessionUpdate::AgentThoughtChunk(_)
+                        | SessionUpdate::ToolCall(_)
+                        | SessionUpdate::ToolCallUpdate(_))
+                {
+                    return Ok(());
+                }
                 if let Some(event) = notification_event(agent_id, notification.update) {
                     emit(&notif_tx, event);
                 }
@@ -241,22 +255,41 @@ pub(in crate::backend) async fn run(
                     )),
                 );
 
-                let new_session = connection
-                    .send_request(NewSessionRequest::new(cwd))
-                    .block_task()
-                    .await?;
-                let session_id = new_session.session_id;
+                let (session_id, config_options) = if let Some(id) = &cfg.session.resume_id {
+                    if !init.agent_capabilities.load_session {
+                        return Err(agent_client_protocol::Error::new(
+                            -32603,
+                            "当前 agent 不支持恢复会话，未开启新会话。请新建会话，或使用支持恢复的 agent 版本。",
+                        ));
+                    }
+                    let loaded = connection
+                        .send_request(LoadSessionRequest::new(id.clone(), cwd))
+                        .block_task()
+                        .await
+                        .map_err(|error| agent_client_protocol::Error::new(
+                            -32603, format!("恢复 agent 会话失败，未开启新会话：{error}"),
+                        ))?;
+                    (id.clone().into(), loaded.config_options)
+                } else {
+                    let created = connection
+                        .send_request(NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    (created.session_id, created.config_options)
+                };
+                loading.store(false, Ordering::Release);
+                emit(&log_tx, Event::SessionReady { resume_id: session_id.0.to_string() });
                 emit(&log_tx, Event::Log(format!("session ready: {session_id}")));
 
                 // Read the model, mode and reasoning config options: their ids
                 // let the UI switch any of them later; the catalogs feed the
                 // composer's pickers.
                 let (model_option_id, current_model, models) =
-                    model_catalog(&new_session.config_options);
+                    model_catalog(&config_options);
                 let (mode_option_id, current_mode, modes) =
-                    mode_catalog(&new_session.config_options);
+                    mode_catalog(&config_options);
                 let (reasoning_option_id, current_reasoning, reasoning) =
-                    reasoning_catalog(&new_session.config_options);
+                    reasoning_catalog(&config_options);
                 let options = SessionOptionsBuilder::new(agent_id)
                     .models(models, current_model)
                     .modes(modes, current_mode)
