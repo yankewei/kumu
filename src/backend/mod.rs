@@ -46,6 +46,9 @@ mod session;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(test)]
+mod resume_tests;
+
 pub use config::{Config, SessionPicks};
 pub use connection::{Connection, spawn};
 pub use event::{

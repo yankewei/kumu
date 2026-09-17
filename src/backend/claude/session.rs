@@ -404,6 +404,9 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
         // The session's own report, arriving with the first turn: the mode in
         // force and the model kumu's pick resolved to.
         "init" => {
+            if let Some(resume_id) = system.session_id.filter(|id| !id.is_empty()) {
+                emit(&shared.ev_tx, Event::SessionReady { resume_id });
+            }
             let model = system.model.filter(|model| !model.is_empty());
             {
                 let mut options = shared.options.lock().unwrap();
@@ -777,6 +780,7 @@ mod tests {
                 Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
+                Event::SessionReady { .. } => "ready",
                 Event::Done(_) => "done",
                 Event::PermissionRequest { .. } => "permission",
                 Event::Error(_) => "error",

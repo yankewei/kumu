@@ -26,8 +26,7 @@ pub enum Backend {
     Pi,
 }
 
-/// The session axes a connection is opened with: the values the user has picked
-/// on the session row.
+/// The session's saved selections and backend restore cursor.
 ///
 /// They live here as well as on the command channel because a backend may need
 /// them at launch. Claude Code takes its model, effort and permission mode on
@@ -39,6 +38,8 @@ pub struct SessionPicks {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning: Option<String>,
+    /// Backend-owned restore cursor; its format never reaches UI logic.
+    pub resume_id: Option<String>,
 }
 
 /// How to launch the local agent subprocess.
@@ -52,8 +53,8 @@ pub struct Config {
     pub env: Vec<(String, String)>,
     /// If set, send this prompt automatically once the session is ready.
     pub auto_prompt: Option<String>,
-    /// The session's stored picks, empty until [`Config::with_session`] is
-    /// called. Only the backends that take an axis at launch read this.
+    /// The session's stored selections and restore cursor, empty until
+    /// [`Config::with_session`] is called.
     pub session: SessionPicks,
 }
 
@@ -69,6 +70,9 @@ impl Config {
     pub fn with_session(mut self, session: SessionPicks) -> Self {
         if matches!(self.backend, Backend::Claude) {
             self.args.extend(super::claude::session_args(&session));
+            if let Some(id) = &session.resume_id {
+                self.args.extend(["--resume".to_string(), id.clone()]);
+            }
         }
         self.session = session;
         self

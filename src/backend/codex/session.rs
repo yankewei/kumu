@@ -270,8 +270,27 @@ pub(in crate::backend) async fn run(
         // tagged object. `convert` owns that asymmetry.
         params["sandbox"] = json!(sandbox);
     }
-    let started: ThreadStartResult = request(&transport, "thread/start", params).await?;
+    let method = if let Some(id) = &cfg.session.resume_id {
+        params["threadId"] = json!(id);
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    let started: ThreadStartResult =
+        request(&transport, method, params).await.map_err(|error| {
+            if cfg.session.resume_id.is_some() {
+                format!("恢复 Codex 会话失败，未开启新会话：{error}")
+            } else {
+                error
+            }
+        })?;
     let thread_id = started.thread.id.clone();
+    emit(
+        &ev_tx,
+        Event::SessionReady {
+            resume_id: thread_id.clone(),
+        },
+    );
     emit(
         &ev_tx,
         Event::Log(format!(
@@ -1016,6 +1035,7 @@ mod tests {
                 Event::Thought { .. } => "thought",
                 Event::ToolCall { .. } => "tool",
                 Event::SessionTitle { .. } => "title",
+                Event::SessionReady { .. } => "ready",
                 Event::Done(_) => "done",
                 Event::PermissionRequest { .. } => "permission",
                 Event::Error(_) => "error",

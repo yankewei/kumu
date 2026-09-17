@@ -129,9 +129,10 @@ the session id placeholder.
 - **Steering** (`steer`, and `streamingBehavior` on `prompt`) is not used: the UI
   refuses to send a prompt while a turn is in flight, and the backend parks its
   command loop until the turn settles, so a second prompt cannot arise.
-- **Rewind, branch and resume**: Pi's `get_fork_messages` / `fork` / `clone` and
-  its `switch_session` are all present, but kumu persists no provider session for
-  any agent, so none of them is wired.
+- **Rewind and branch**: Pi's `get_fork_messages` / `fork` / `clone` are not wired.
+  Session recovery now saves `get_state.sessionFile` and uses `switch_session`
+  before sending the next prompt. That command is documented and covered by a
+  local protocol fixture, but these original captures did not exercise it.
 - **The 1 MiB stdout ceiling** Pi's documentation mentions for oversized frames
   was not hit; the largest frame observed was the model catalogue at ~40 KB.
 

@@ -600,8 +600,16 @@ impl KumuApp {
             model: session.model.clone(),
             mode: session.mode.clone(),
             reasoning: session.reasoning.clone(),
+            resume_id: session.resume_id.clone(),
         };
         let cfg = cfg.with_session(picks);
+        if session.has_conversation && session.resume_id.is_none() {
+            self.system_message(
+                session.id,
+                "这段历史没有保存 agent 会话标识，无法恢复原来的上下文；本次将开启新的 agent 会话。".into(),
+                cx,
+            );
+        }
 
         // ACP thread -> std channel -> forwarder thread -> async channel ->
         // UI task (same bridge pattern as the settings window's probes).
@@ -777,6 +785,21 @@ impl KumuApp {
         // itself.
         let had_turn = self.conversation.read(cx).has_turn(session_id);
         match ev {
+            backend::Event::SessionReady { resume_id } => {
+                match self.store.update_session_resume_id(session_id, &resume_id) {
+                    Ok(()) => {
+                        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id)
+                        {
+                            session.resume_id = Some(resume_id);
+                        }
+                    }
+                    Err(error) => self.system_message(
+                        session_id,
+                        format!("保存 agent 会话标识失败，重启后将无法恢复上下文：{error}"),
+                        cx,
+                    ),
+                }
+            }
             backend::Event::Agent(chunk) => {
                 // Feed the chunk straight into the session's markdown view:
                 // `push_str` appends incrementally instead of re-parsing the
@@ -1159,6 +1182,7 @@ mod tests {
             agent: "omp".into(),
             title: format!("会话 {id}"),
             cwd: "/tmp".into(),
+            resume_id: None,
             model: None,
             mode: None,
             sandbox: None,

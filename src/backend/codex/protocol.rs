@@ -100,7 +100,7 @@ pub(super) struct ReasoningEffortOption {
     pub reasoning_effort: String,
 }
 
-/// Result of `thread/start`.
+/// Result of `thread/start` or `thread/resume` (the same response shape).
 #[derive(Debug, Deserialize)]
 pub(super) struct ThreadStartResult {
     pub thread: ThreadSummary,

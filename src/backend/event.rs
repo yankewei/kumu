@@ -40,6 +40,8 @@ pub enum Event {
     },
     /// The agent named the session (session/info update with a title).
     SessionTitle { title: String },
+    /// The backend opened a conversation and supplied its durable restore cursor.
+    SessionReady { resume_id: String },
     /// The prompt turn ended with this stop reason.
     Done(String),
     /// The agent is asking for authorization before running a tool call. The UI
@@ -254,6 +256,7 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 )
             }
             Event::SessionTitle { title } => eprintln!("[agent] title: {title}"),
+            Event::SessionReady { resume_id } => eprintln!("[agent] session ready: {resume_id}"),
             Event::Done(s) => eprintln!("[agent] done: {s}"),
             Event::PermissionRequest {
                 tool_call_id,

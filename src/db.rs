@@ -20,6 +20,8 @@ pub struct Session {
     pub agent: String,
     pub title: String,
     pub cwd: String,
+    /// Opaque backend cursor used to reopen the agent's persisted conversation.
+    pub resume_id: Option<String>,
     /// Selected model (config-option value); None = agent default.
     pub model: Option<String>,
     /// Selected session mode (config-option value); None = agent default.
@@ -90,6 +92,7 @@ impl Store {
                 agent TEXT NOT NULL,
                 title TEXT NOT NULL,
                 cwd TEXT NOT NULL,
+                resume_id TEXT,
                 model TEXT,
                 mode TEXT,
                 sandbox TEXT,
@@ -140,6 +143,15 @@ impl Store {
         self.conn
             .execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER", [])
             .ok();
+        let has_resume_id: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_resume_id {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN resume_id TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -173,7 +185,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning,
-                        title_manual,
+                        title_manual, resume_id,
                         EXISTS(
                             SELECT 1 FROM messages
                             WHERE messages.session_id = sessions.id AND messages.role <> 'system'
@@ -193,7 +205,8 @@ impl Store {
                 sandbox: row.get(7)?,
                 reasoning: row.get(8)?,
                 title_manual: row.get(9)?,
-                has_conversation: row.get(10)?,
+                resume_id: row.get(10)?,
+                has_conversation: row.get(11)?,
             })
         })
         .unwrap()
@@ -233,8 +246,18 @@ impl Store {
         model: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
+            "UPDATE sessions SET resume_id = CASE WHEN agent = ?1 THEN resume_id ELSE NULL END,
+             agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
             params![agent, model, id],
+        )?;
+        Ok(())
+    }
+
+    /// Keep the backend's restore cursor independently of model selections.
+    pub fn update_session_resume_id(&self, id: i64, resume_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET resume_id = ?1 WHERE id = ?2",
+            params![resume_id, id],
         )?;
         Ok(())
     }
@@ -394,6 +417,61 @@ mod tests {
         };
         store.init().unwrap();
         store
+    }
+
+    #[test]
+    fn old_sessions_gain_restore_cursors_without_losing_history() {
+        let store = Store {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL,
+                agent TEXT NOT NULL, title TEXT NOT NULL, cwd TEXT NOT NULL,
+                created_at TEXT, updated_at TEXT
+            );
+            INSERT INTO sessions VALUES (1, 1, 'omp', '旧会话', '/tmp', NULL, NULL);",
+            )
+            .unwrap();
+        store.init().unwrap();
+        store.insert_message(1, "user", "旧消息").unwrap();
+        store.init().unwrap();
+
+        let session = &store.sessions()[0];
+        assert_eq!(session.title, "旧会话");
+        assert!(session.resume_id.is_none());
+        assert!(session.has_conversation);
+        assert_eq!(store.messages(1)[0].content, "旧消息");
+
+        store
+            .update_session_resume_id(1, "backend-session")
+            .unwrap();
+        store.init().unwrap();
+        assert_eq!(
+            store.sessions()[0].resume_id.as_deref(),
+            Some("backend-session")
+        );
+    }
+
+    #[test]
+    fn model_changes_keep_restore_cursor_but_agent_changes_clear_it() {
+        let store = store();
+        let project = store.insert_project("test", "/tmp").unwrap();
+        let id = store
+            .insert_session(project, "omp", "test", "/tmp")
+            .unwrap();
+        store.update_session_resume_id(id, "omp-session").unwrap();
+        store
+            .update_session_agent_model(id, "omp", Some("another-model"))
+            .unwrap();
+        assert_eq!(
+            store.sessions()[0].resume_id.as_deref(),
+            Some("omp-session")
+        );
+        store.update_session_agent_model(id, "codex", None).unwrap();
+        assert!(store.sessions()[0].resume_id.is_none());
     }
 
     /// Deleting a session drops its history with it, and touches nothing else:
