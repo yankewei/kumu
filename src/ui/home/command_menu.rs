@@ -14,7 +14,6 @@ use gpui_kit::*;
 
 use super::KumuApp;
 use crate::agent;
-use crate::app::discovery::AgentCommands;
 use crate::db::Session;
 use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 
@@ -43,25 +42,10 @@ pub(super) fn matching_commands<'a>(
 }
 
 impl KumuApp {
-    /// The commands the session can run: what its own connection reported,
-    /// else — before it has one, or after its agent changed — what the agent's
-    /// probe reported (`Event::Commands`).
-    ///
-    /// Empty for an agent that has reported none (yet), which is what keeps the
-    /// menu out of that session's composer rather than offering commands that
-    /// could not run.
+    /// The commands the session can run (see
+    /// [`crate::app::Workspace::session_commands`]).
     pub(super) fn session_commands(&self, session: &Session, cx: &App) -> Vec<agent::CommandInfo> {
-        if let Some((_, commands)) = self
-            .workspace
-            .read(cx)
-            .live_commands(session.id)
-            .filter(|(agent, _)| *agent == session.agent)
-        {
-            return commands.to_vec();
-        }
-        cx.try_global::<AgentCommands>()
-            .and_then(|catalogs| catalogs.0.get(session.agent.as_str()).cloned())
-            .unwrap_or_default()
+        self.workspace.read(cx).session_commands(session).to_vec()
     }
 
     /// The command Enter completes to: the highlighted match, if the input is a

@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use gpui_kit::Context;
 
+use super::discovery::{self, SessionOptions};
 use super::turn::{PendingPermission, Turn};
-use super::{Workspace, WorkspaceEvent, discovery};
+use super::{Workspace, WorkspaceEvent};
 use crate::agent;
 use crate::db::Session;
 
@@ -177,6 +178,8 @@ impl Workspace {
             // in-flight reply (if any) is abandoned with it.
             self.cancel_pending_permissions(session_id);
             self.conns.remove(&session_id);
+            self.live_commands.remove(&session_id);
+            self.live_options.remove(&session_id);
             self.take_turn(session_id, cx);
         }
         self.refresh();
@@ -470,7 +473,16 @@ impl Workspace {
                 self.live_commands.insert(session_id, (agent, commands));
                 cx.emit(WorkspaceEvent::Changed);
             }
-            ev @ agent::Event::SessionOptions { .. } => self.cache_options(&ev, cx),
+            // What this session's process offers and runs with; the agent's
+            // catalog stays what its probe said.
+            ev @ agent::Event::SessionOptions { .. } => {
+                if let Some((agent, options)) = SessionOptions::from_event(&ev)
+                    && !options.is_empty()
+                {
+                    self.live_options.insert(session_id, (agent, options));
+                    cx.emit(WorkspaceEvent::Changed);
+                }
+            }
             agent::Event::Log(_) | agent::Event::ProbeFailed { .. } => {}
         }
     }

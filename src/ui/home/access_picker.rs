@@ -15,7 +15,6 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::app::discovery::AgentSessionOptions;
 use crate::app::discovery::SessionOptions;
 use crate::db::Session;
 use crate::ui::widgets::{
@@ -50,10 +49,7 @@ impl KumuApp {
         session: &Session,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let options = cx
-            .try_global::<AgentSessionOptions>()
-            .and_then(|catalogs| catalogs.0.get(session.agent.as_str()))
-            .cloned()?;
+        let options = self.workspace.read(cx).session_options(session).cloned()?;
         let label = access_label(
             Some(&options),
             session.mode.as_deref(),

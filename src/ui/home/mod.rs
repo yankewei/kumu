@@ -395,8 +395,9 @@ impl KumuApp {
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
+        let workspace = self.workspace.clone();
         if let Ok(handle) = cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| SettingsWindow::new(window, cx));
+            let view = cx.new(|cx| SettingsWindow::new(workspace, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         }) {
             handle

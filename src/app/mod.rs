@@ -24,6 +24,7 @@ use gpui_kit::{Context, EventEmitter};
 
 use crate::agent;
 use crate::db::{Message, Project, Session, Store, db_path};
+use discovery::{Discovery, SessionOptions};
 use turn::{PendingPermission, Turn};
 
 pub use session::Axis;
@@ -45,9 +46,9 @@ pub enum WorkspaceEvent {
 
 /// Projects, sessions, and each session's live connection and turn.
 ///
-/// One per app, owned by the home window. Nothing in here renders, and nothing
-/// in here names a protocol: agents are reached only through [`agent`]'s
-/// vocabulary.
+/// One per app, owned by the home window and shared with the settings window.
+/// Nothing in here renders, and nothing in here names a protocol: agents are
+/// reached only through [`agent`]'s vocabulary.
 pub struct Workspace {
     store: Store,
     projects: Vec<Project>,
@@ -60,9 +61,16 @@ pub struct Workspace {
     /// The commands each live session reported, with the agent that reported
     /// them. What a session can run depends on its working directory (a
     /// project's own commands and skills), so one session's list must not stand
-    /// in for another's; [`discovery::AgentCommands`] only fills in until a
-    /// session reports.
+    /// in for another's; the agent's probed list only fills in until a session
+    /// reports.
     live_commands: HashMap<i64, (&'static str, Vec<agent::CommandInfo>)>,
+    /// The options each live session reported, with the agent that reported
+    /// them: the models it offers, and the values in force on *its* process.
+    /// Two sessions of one agent may run different models — and a Codex model
+    /// has its own efforts — so this is per session, over the agent's catalog.
+    live_options: HashMap<i64, (&'static str, SessionOptions)>,
+    /// What each agent offers in general, as probed.
+    discovery: Discovery,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -77,6 +85,8 @@ impl Workspace {
             conns: HashMap::new(),
             turns: HashMap::new(),
             live_commands: HashMap::new(),
+            live_options: HashMap::new(),
+            discovery: Discovery::default(),
         };
         workspace.bootstrap();
         workspace.probe_missing(cx);
@@ -139,12 +149,35 @@ impl Workspace {
         self.turn(session_id)?.pending_permission()
     }
 
-    /// The commands the session's own connection reported, with the agent that
-    /// reported them.
-    pub fn live_commands(&self, session_id: i64) -> Option<(&'static str, &[agent::CommandInfo])> {
+    /// What each agent offers in general, and which probes are out.
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
+    /// The options the session's pickers offer: what its own connection
+    /// reported, else — before it has one, or after its agent changed — what
+    /// the agent's probe reported.
+    pub fn session_options(&self, session: &Session) -> Option<&SessionOptions> {
+        self.live_options
+            .get(&session.id)
+            .filter(|(agent, _)| *agent == session.agent)
+            .map(|(_, options)| options)
+            .or_else(|| self.discovery.catalog(&session.agent))
+    }
+
+    /// The commands the session can run, from the same two sources as
+    /// [`Self::session_options`].
+    ///
+    /// Empty for an agent that has reported none (yet), which is what keeps the
+    /// menu out of that session's composer rather than offering commands that
+    /// could not run.
+    pub fn session_commands(&self, session: &Session) -> &[agent::CommandInfo] {
         self.live_commands
-            .get(&session_id)
-            .map(|(agent, commands)| (*agent, commands.as_slice()))
+            .get(&session.id)
+            .filter(|(agent, _)| *agent == session.agent)
+            .map(|(_, commands)| commands.as_slice())
+            .or_else(|| self.discovery.commands(&session.agent))
+            .unwrap_or_default()
     }
 
     /// Add the folder at `path` as a project, named after the folder itself —
@@ -224,6 +257,7 @@ impl Workspace {
         self.cancel_pending_permissions(session_id);
         self.conns.remove(&session_id);
         self.live_commands.remove(&session_id);
+        self.live_options.remove(&session_id);
         self.take_turn(session_id, cx);
         self.store.delete_session(session_id).ok();
         self.refresh();
@@ -236,68 +270,56 @@ impl Workspace {
         cx.emit(WorkspaceEvent::HistoryChanged(session_id));
     }
 
-    /// Probe agents whose session options aren't cached yet, so the composer's
-    /// pickers have data before any session has connected.
-    fn probe_missing(&mut self, cx: &mut Context<Self>) {
-        if !cx.has_global::<discovery::AgentSessionOptions>() {
-            cx.set_global(discovery::AgentSessionOptions::default());
-        }
-        let cached = &cx.global::<discovery::AgentSessionOptions>().0;
-        let missing: Vec<&'static str> = agent::AGENTS
+    /// Probe the agents nothing is known about yet — never probed, or probed
+    /// and failed — so the pickers have something to offer before any session
+    /// has connected.
+    pub fn probe_missing(&mut self, cx: &mut Context<Self>) {
+        let missing = self.discovery.missing();
+        self.probe(&missing, cx);
+    }
+
+    /// Probe `agents` again, replacing what is cached as the answers arrive.
+    /// An agent whose probe is already out is left to that one.
+    ///
+    /// This is the only way to refresh a catalog mid-run: an agent that was
+    /// updated, restarted, or pointed at another account is otherwise cached
+    /// for the life of the process.
+    pub fn probe(&mut self, agents: &[&'static str], cx: &mut Context<Self>) {
+        let launchable: Vec<(&'static str, agent::Config)> = agents
             .iter()
-            .map(|a| a.id)
-            .filter(|id| !cached.contains_key(id))
+            .filter_map(|&id| Some((id, agent::Config::for_agent(id)?)))
             .collect();
-        if missing.is_empty() {
+        let ids: Vec<&'static str> = launchable.iter().map(|(id, _)| *id).collect();
+        let started = self.discovery.start(&ids);
+        if started.is_empty() {
             return;
         }
-        let mut reports = discovery::probe(&missing);
+        let mut reports = discovery::probe(
+            launchable
+                .into_iter()
+                .filter(|(id, _)| started.contains(id))
+                .collect(),
+        );
+        cx.emit(WorkspaceEvent::Changed);
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
             while let Some(ev) = reports.next().await {
-                if this
-                    .update(cx, |workspace, cx| workspace.on_probe_event(ev, cx))
-                    .is_err()
-                {
-                    break;
+                let updated = this.update(cx, |workspace, cx| {
+                    if workspace.discovery.record(ev) {
+                        cx.emit(WorkspaceEvent::Changed);
+                    }
+                });
+                if updated.is_err() {
+                    return;
                 }
             }
+            // A probe that ended without a word is over all the same.
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.discovery.finish(&started);
+                cx.emit(WorkspaceEvent::Changed);
+            });
         })
         .detach();
-    }
-
-    /// A probe speaks for the agent in general, so what it reports is what
-    /// every session of that agent starts from.
-    fn on_probe_event(&mut self, ev: agent::Event, cx: &mut Context<Self>) {
-        match ev {
-            agent::Event::Commands { agent, commands } => {
-                if !cx.has_global::<discovery::AgentCommands>() {
-                    cx.set_global(discovery::AgentCommands::default());
-                }
-                cx.global_mut::<discovery::AgentCommands>()
-                    .0
-                    .insert(agent, commands);
-                cx.emit(WorkspaceEvent::Changed);
-            }
-            ev => self.cache_options(&ev, cx),
-        }
-    }
-
-    /// Cache the options an agent reported, when it reported any.
-    fn cache_options(&mut self, ev: &agent::Event, cx: &mut Context<Self>) {
-        let Some((agent, options)) = discovery::SessionOptions::from_event(ev) else {
-            return;
-        };
-        if options.is_empty() {
-            return;
-        }
-        if !cx.has_global::<discovery::AgentSessionOptions>() {
-            cx.set_global(discovery::AgentSessionOptions::default());
-        }
-        cx.global_mut::<discovery::AgentSessionOptions>()
-            .0
-            .insert(agent, options);
-        cx.emit(WorkspaceEvent::Changed);
     }
 }
 

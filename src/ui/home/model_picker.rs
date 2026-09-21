@@ -12,7 +12,6 @@ use gpui_kit::component::popover::Popover;
 use super::{KumuApp, PickerAxis};
 use crate::agent;
 use crate::agent::AGENTS;
-use crate::app::discovery::AgentSessionOptions;
 use crate::app::discovery::SessionOptions;
 use crate::db::Session;
 use crate::ui::widgets::{PickerChrome, agent_logo, picker_chip, picker_list, select_row};
@@ -48,13 +47,30 @@ impl KumuApp {
         });
     }
 
+    /// The models each agent offers, for the picker's rail: the selected
+    /// session's own agent as that session reports it, every other agent as its
+    /// probe did.
+    fn model_catalogs(&self, cx: &App) -> HashMap<&'static str, SessionOptions> {
+        let workspace = self.workspace.read(cx);
+        let session = self.selected.and_then(|id| workspace.session(id));
+        AGENTS
+            .iter()
+            .filter_map(|a| {
+                let options = match session {
+                    Some(session) if session.agent == a.id => workspace.session_options(session),
+                    _ => workspace.discovery().catalog(a.id),
+                };
+                Some((a.id, options?.clone()))
+            })
+            .collect()
+    }
+
     /// Label for the composer's model picker chip: the selected model's name
     /// (the chip's icon already identifies the agent). Fresh sessions fall
     /// back to the model the agent reports as active, then the agent name.
     fn picker_label(&self, session: &Session, cx: &App) -> String {
-        let catalog = cx
-            .try_global::<AgentSessionOptions>()
-            .and_then(|g| g.0.get(session.agent.as_str()));
+        let workspace = self.workspace.read(cx);
+        let catalog = workspace.session_options(session);
         model_label(
             catalog,
             session.model.as_deref(),
@@ -107,11 +123,10 @@ impl KumuApp {
             })
             .trigger(chip)
             .content(move |_state, _window, cx| {
-                let cache = if cx.has_global::<AgentSessionOptions>() {
-                    cx.global::<AgentSessionOptions>().0.clone()
-                } else {
-                    HashMap::new()
-                };
+                let cache = weak
+                    .upgrade()
+                    .map(|app| app.read(cx).model_catalogs(cx))
+                    .unwrap_or_default();
                 let (cur_agent, cur_model, has_conversation) = weak
                     .upgrade()
                     .and_then(|app| app.read(cx).selected_session(cx))
