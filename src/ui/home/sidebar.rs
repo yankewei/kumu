@@ -6,7 +6,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use crate::agents::AGENTS;
+use crate::agent::AGENTS;
 use crate::ui::tooltip::HoverLabel as _;
 use crate::ui::widgets::agent_logo;
 
@@ -28,7 +28,8 @@ impl KumuApp {
 
         // ---- Left: sidebar surface with the project/session tree. ----
         let mut tree: Vec<AnyElement> = Vec::new();
-        for project in &self.projects {
+        let workspace = self.workspace.read(cx);
+        for project in workspace.projects() {
             let project_name = project.name.clone();
             let project_id = project.id;
             let collapsed = self.collapsed_projects.contains(&project_id);
@@ -82,7 +83,7 @@ impl KumuApp {
                             .group_hover(group, |style| style.opacity(1.))
                             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.new_session_in(project_id, cx);
+                                this.new_session(Some(project_id), cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
@@ -90,8 +91,8 @@ impl KumuApp {
                     )
                     .into_any_element(),
             );
-            let project_sessions = self
-                .sessions
+            let project_sessions = workspace
+                .sessions()
                 .iter()
                 .filter(|s| s.project_id == project.id)
                 .cloned()

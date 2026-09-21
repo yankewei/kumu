@@ -11,10 +11,9 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::backend;
+use crate::app::Axis;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{
     PickerChrome, axis_label, picker_chip, picker_list, picker_menu, select_row,
 };
@@ -44,14 +43,9 @@ impl KumuApp {
         let Some(session_id) = self.selected else {
             return;
         };
-        self.store
-            .update_session_sandbox(session_id, Some(&value))
-            .ok();
-        self.refresh();
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetSandbox(value));
-        }
-        cx.notify();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.pick(session_id, Axis::Sandbox, value, cx)
+        });
     }
 
     /// The composer's sandbox picker: a text chip showing the policy in force,
@@ -64,10 +58,7 @@ impl KumuApp {
         session: &Session,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let options = cx
-            .try_global::<AgentSessionOptions>()
-            .and_then(|catalogs| catalogs.0.get(session.agent.as_str()))
-            .cloned()?;
+        let options = self.workspace.read(cx).session_options(session).cloned()?;
         if options.sandboxes.is_empty() {
             return None;
         }
@@ -145,8 +136,8 @@ mod tests {
     use crate::ui::widgets::inherited_label;
 
     use super::sandbox_label;
-    use crate::backend::SandboxInfo;
-    use crate::ui::SessionOptions;
+    use crate::agent::SandboxInfo;
+    use crate::app::discovery::SessionOptions;
 
     fn sandbox(value: &str, name: &str) -> SandboxInfo {
         SandboxInfo {

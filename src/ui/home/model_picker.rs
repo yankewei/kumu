@@ -10,11 +10,10 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::agents::AGENTS;
-use crate::backend;
+use crate::agent;
+use crate::agent::AGENTS;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{PickerChrome, agent_logo, picker_chip, picker_list, select_row};
 
 /// The model chip's label: the value in force — the stored pick, else the
@@ -37,77 +36,41 @@ fn model_label(catalog: Option<&SessionOptions>, stored: Option<&str>, agent_nam
 }
 
 impl KumuApp {
-    /// Switch a session's agent and/or model: persist the choice, drop the old
-    /// agent's connection when the agent changes, then apply the model over the
-    /// session's model config option. A session with no live connection just
-    /// stores the pick, which is re-applied when one is opened.
-    ///
-    /// The agent half is only available while the session has no conversation —
-    /// see the guard below.
+    /// Switch the selected session's agent and/or model (see
+    /// [`crate::app::Workspace::pick_model`]).
     fn pick_model(&mut self, agent_id: &'static str, model_value: String, cx: &mut Context<Self>) {
         let Some(session_id) = self.selected else {
             return;
         };
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let agent_changed = session.agent != agent_id;
-        // A session keeps its agent once it has a conversation: the transcript
-        // was written by that agent, and a different one would be handed
-        // history it never produced (the transcript is persisted, but the
-        // agent's own context is not, so the switch is a silent amnesia even
-        // for the same agent's later process). The picker does not offer the
-        // switch in this state — this is the backstop that keeps the rule true
-        // for anything else that reaches here.
-        if agent_changed && session.has_conversation {
-            return;
-        }
-        self.store
-            .update_session_agent_model(session_id, agent_id, Some(&model_value))
-            .ok();
-        if agent_changed {
-            // Mode ids, sandbox values and effort values are the agent's own
-            // vocabulary, so the stored ones stop meaning anything: drop them,
-            // and the pickers fall back to the new agent's defaults until the
-            // user chooses again. Written before the refresh below so the
-            // re-applied values come from the fresh row.
-            //
-            // A model change *within* an agent is deliberately not cleared here:
-            // whether a pick still applies is the backend's call — Codex drops
-            // one the new model does not advertise and restores it when a later
-            // model does, and an ACP agent's level does not depend on the model
-            // at all.
-            self.store.update_session_mode(session_id, None).ok();
-            self.store.update_session_sandbox(session_id, None).ok();
-            self.store.update_session_reasoning(session_id, None).ok();
-            // Dropping the handle closes the old agent subprocess; the fresh
-            // connection below re-applies the stored model on session/new.
-            // Any prompt still waiting on the old connection is settled first,
-            // and the in-flight reply (if any) is abandoned with it.
-            self.cancel_pending_permissions(session_id, cx);
-            self.conns.remove(&session_id);
-            self.conversation.update(cx, |conversation, cx| {
-                conversation.take_turn(session_id, cx)
-            });
-        }
-        self.refresh();
-        // Opening a connection here just to deliver the value would start an
-        // agent subprocess the user never prompted — and for an agent that
-        // cannot run a session, that is an error written into a conversation
-        // that has not begun.
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetModel(model_value));
-        }
-        cx.notify();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.pick_model(session_id, agent_id, model_value, cx)
+        });
+    }
+
+    /// The models each agent offers, for the picker's rail: the selected
+    /// session's own agent as that session reports it, every other agent as its
+    /// probe did.
+    fn model_catalogs(&self, cx: &App) -> HashMap<&'static str, SessionOptions> {
+        let workspace = self.workspace.read(cx);
+        let session = self.selected.and_then(|id| workspace.session(id));
+        AGENTS
+            .iter()
+            .filter_map(|a| {
+                let options = match session {
+                    Some(session) if session.agent == a.id => workspace.session_options(session),
+                    _ => workspace.discovery().catalog(a.id),
+                };
+                Some((a.id, options?.clone()))
+            })
+            .collect()
     }
 
     /// Label for the composer's model picker chip: the selected model's name
     /// (the chip's icon already identifies the agent). Fresh sessions fall
     /// back to the model the agent reports as active, then the agent name.
     fn picker_label(&self, session: &Session, cx: &App) -> String {
-        let catalog = cx
-            .try_global::<AgentSessionOptions>()
-            .and_then(|g| g.0.get(session.agent.as_str()));
+        let workspace = self.workspace.read(cx);
+        let catalog = workspace.session_options(session);
         model_label(
             catalog,
             session.model.as_deref(),
@@ -160,14 +123,13 @@ impl KumuApp {
             })
             .trigger(chip)
             .content(move |_state, _window, cx| {
-                let cache = if cx.has_global::<AgentSessionOptions>() {
-                    cx.global::<AgentSessionOptions>().0.clone()
-                } else {
-                    HashMap::new()
-                };
+                let cache = weak
+                    .upgrade()
+                    .map(|app| app.read(cx).model_catalogs(cx))
+                    .unwrap_or_default();
                 let (cur_agent, cur_model, has_conversation) = weak
                     .upgrade()
-                    .and_then(|app| app.read(cx).selected_session().cloned())
+                    .and_then(|app| app.read(cx).selected_session(cx))
                     .map(|s| (s.agent, s.model, s.has_conversation))
                     .unwrap_or_default();
                 let tab = weak.upgrade().and_then(|app| app.read(cx).model_picker_tab);
@@ -226,7 +188,7 @@ impl KumuApp {
                 // ---- Right: search field + model rows. ----
                 let mut list = picker_list();
                 if searching {
-                    let matched: Vec<(&'static str, &backend::ModelInfo)> = AGENTS
+                    let matched: Vec<(&'static str, &agent::ModelInfo)> = AGENTS
                         .iter()
                         // A locked session only searches its own agent, so a hit
                         // from another one cannot offer an impossible switch.
@@ -368,8 +330,8 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::model_label;
-    use crate::backend::ModelInfo;
-    use crate::ui::SessionOptions;
+    use crate::agent::ModelInfo;
+    use crate::app::discovery::SessionOptions;
 
     fn model(value: &str, name: &str) -> ModelInfo {
         ModelInfo {

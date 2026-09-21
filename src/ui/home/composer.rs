@@ -8,7 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{MoveDown, MoveUp, Textarea};
 
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
-use crate::agents::AGENTS;
+use crate::agent::AGENTS;
 use crate::db::Session;
 
 impl KumuApp {
@@ -86,17 +86,17 @@ impl KumuApp {
                             .child(self.model_picker(session, cx))
                             .children(axes)
                             .child(div().flex_1())
-                            .child(if self.conversation.read(cx).has_turn(session.id) {
+                            .child(if self.workspace.read(cx).has_turn(session.id) {
                                 // A turn is in flight, so sending is refused (see
-                                // `KumuApp::send`) and the slot offers the one
+                                // `Workspace::send`) and the slot offers the one
                                 // action that is available: stopping the turn
                                 // that is running.
                                 Button::new("stop")
                                     .primary()
                                     .small()
                                     .icon(Icon::empty().path("icons/stop.svg"))
-                                    .on_click(cx.listener(|this, _, _, _| {
-                                        this.cancel_turn();
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_turn(cx);
                                     }))
                             } else {
                                 Button::new("send")

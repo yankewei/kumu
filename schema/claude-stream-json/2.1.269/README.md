@@ -3,7 +3,7 @@
 Claude Code publishes no schema generator for this protocol, so unlike
 `schema/codex-app-server/` this snapshot is **captured traffic** rather than a
 generated definition: one real session's lines, kept so the hand-written slice in
-`src/backend/claude/protocol.rs` can be checked against what the CLI actually
+`src/agent/claude/protocol.rs` can be checked against what the CLI actually
 sends without driving a session again.
 
 ## How it was captured
@@ -59,7 +59,7 @@ What the runs settled, none of which the official docs state outright:
   reads `CLAUDE_CODE_EFFORT_LEVEL` (an env var or a settings `env` block — the
   CLI's own text says it "overrides effort this session") for the effort, along
   with the `effortLevel` and `modelSettings.<model>.effortLevel` keys a
-  `/effort` pick saves (`src/backend/claude/settings.rs`), and
+  `/effort` pick saves (`src/agent/claude/settings.rs`), and
   `permissions.defaultMode` for the permission mode. The key name, the managed
   settings directory (`/Library/Application Support/ClaudeCode` on macOS,
   `/etc/claude-code` elsewhere, `managed-settings.json`) and the absence of any
@@ -73,7 +73,7 @@ What the runs settled, none of which the official docs state outright:
 - **The slash commands are a real catalogue, and half of it is terminal-only.**
   `initialize`'s `commands` is what the CLI will run for this session, each entry
   with a `description` and an `argumentHint`; kumu reads the name and the hint and
-  offers the list in the composer (`src/backend/claude/`, `Event::Commands`),
+  offers the list in the composer (`src/agent/claude/`, `Event::Commands`),
   because a client invokes one by sending `/name args` as an ordinary user
   message — the same path `/model` and `/effort` already take. `system/init` then
   names the subset that only works in an interactive terminal

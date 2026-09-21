@@ -10,8 +10,9 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp, PendingPermission};
-use crate::backend::PermissionKind;
+use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
+use crate::agent::PermissionKind;
+use crate::app::turn::PendingPermission;
 use crate::ui::widgets::pill;
 
 impl KumuApp {

@@ -2,7 +2,7 @@
 
 Pi documents this protocol itself (<https://pi.dev/docs/latest/rpc>), but the
 documentation leaves several things unsaid that the backend in
-`src/backend/pi/` has to know. This snapshot is **captured traffic** from a real
+`src/agent/pi/` has to know. This snapshot is **captured traffic** from a real
 `pi --mode rpc` process, kept so those questions can be re-checked without
 driving a session again — the same role
 [`schema/claude-stream-json/`](../claude-stream-json/2.1.269/README.md) plays for
@@ -83,7 +83,7 @@ follows from it:
   with `/`", and that the built-in TUI commands (`/settings`, `/hotkeys`, …) are
   deliberately **not** included because sending them over RPC would not execute —
   which is what makes this list exactly the set worth offering. kumu reads it as
-  the composer's `/` menu (`src/backend/pi/`, `Event::Commands`). **Not verified
+  the composer's `/` menu (`src/agent/pi/`, `Event::Commands`). **Not verified
   against a captured frame**: the captures above ran with `--no-skills` and
   `--no-prompt-templates`, so their command lists are trimmed.
 - **The catalogue is per machine and dynamic.** This machine reports 105 models

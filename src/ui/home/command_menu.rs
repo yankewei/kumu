@@ -13,9 +13,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use crate::backend;
+use crate::agent;
 use crate::db::Session;
-use crate::ui::AgentCommands;
 use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 
 /// The commands a partly typed `/…` could mean, in the agent's own order.
@@ -29,9 +28,9 @@ use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 /// command from another; the agent's order is kept for everything that matches,
 /// so the list does not reshuffle under a keystroke.
 pub(super) fn matching_commands<'a>(
-    commands: &'a [backend::CommandInfo],
+    commands: &'a [agent::CommandInfo],
     input: &str,
-) -> Vec<&'a backend::CommandInfo> {
+) -> Vec<&'a agent::CommandInfo> {
     let typed = match input.strip_prefix('/') {
         Some(typed) if !typed.contains(char::is_whitespace) => typed.to_lowercase(),
         _ => return Vec::new(),
@@ -43,28 +42,10 @@ pub(super) fn matching_commands<'a>(
 }
 
 impl KumuApp {
-    /// The commands the session can run: what its own connection reported,
-    /// else — before it has one, or after its agent changed — what the agent's
-    /// probe reported (`Event::Commands`).
-    ///
-    /// Empty for an agent that has reported none (yet), which is what keeps the
-    /// menu out of that session's composer rather than offering commands that
-    /// could not run.
-    pub(super) fn session_commands(
-        &self,
-        session: &Session,
-        cx: &App,
-    ) -> Vec<backend::CommandInfo> {
-        if let Some((_, commands)) = self
-            .live_commands
-            .get(&session.id)
-            .filter(|(agent, _)| *agent == session.agent)
-        {
-            return commands.clone();
-        }
-        cx.try_global::<AgentCommands>()
-            .and_then(|catalogs| catalogs.0.get(session.agent.as_str()).cloned())
-            .unwrap_or_default()
+    /// The commands the session can run (see
+    /// [`crate::app::Workspace::session_commands`]).
+    pub(super) fn session_commands(&self, session: &Session, cx: &App) -> Vec<agent::CommandInfo> {
+        self.workspace.read(cx).session_commands(session).to_vec()
     }
 
     /// The command Enter completes to: the highlighted match, if the input is a
@@ -84,13 +65,13 @@ impl KumuApp {
     /// the menu is open to take the key — when it is not, Up/Down belong to the
     /// textarea.
     pub(super) fn move_command_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
-        let Some(session) = self.selected_session() else {
+        let Some(session) = self.selected_session(cx) else {
             return false;
         };
-        if self.conversation.read(cx).has_turn(session.id) {
+        if self.workspace.read(cx).has_turn(session.id) {
             return false;
         }
-        let commands = self.session_commands(session, cx);
+        let commands = self.session_commands(&session, cx);
         let typed = self.input_state.read(cx).value();
         let len = matching_commands(&commands, &typed).len();
         if len == 0 {
@@ -136,7 +117,7 @@ impl KumuApp {
     /// command matches it, or a turn is in flight (the composer refuses to send
     /// then, so there is nothing to complete into).
     pub(super) fn command_menu(&self, session: &Session, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.conversation.read(cx).has_turn(session.id) {
+        if self.workspace.read(cx).has_turn(session.id) {
             return None;
         }
         let commands = self.session_commands(session, cx);
@@ -203,7 +184,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::matching_commands;
-    use crate::backend::CommandInfo;
+    use crate::agent::CommandInfo;
 
     fn commands() -> Vec<CommandInfo> {
         vec![

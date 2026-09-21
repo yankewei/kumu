@@ -1,14 +1,11 @@
 //! Settings window, Waku-style: sidebar (back row + search + icon nav) on the
 //! left; a centered content column with card-grouped rows on the right.
 
-use std::collections::{HashMap, HashSet};
-
-use futures::StreamExt;
+use std::collections::HashSet;
 
 use super::widgets::{agent_logo, pill};
-use super::{AgentSessionOptions, SessionOptions};
-use crate::agents::AGENTS;
-use crate::backend;
+use crate::agent::AGENTS;
+use crate::app::{Workspace, WorkspaceEvent};
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -76,32 +73,23 @@ pub struct SettingsWindow {
     font_select: Entity<SelectState<SearchableVec<FontItem>>>,
     /// UI font-size picker over the app's type scale.
     font_size_select: Entity<SelectState<SearchableVec<FontSizeItem>>>,
-    /// Probed session options (models and modes) per agent id.
-    session_options: HashMap<&'static str, SessionOptions>,
-    /// Agents whose probe is still running.
-    probing: HashSet<&'static str>,
+    /// The home window's workspace, whose probes this window shows and
+    /// refreshes; a probe either window starts is the other's too. Held weakly:
+    /// the home window owns it, and closing that window must still tear its
+    /// agents down while this one stays open.
+    workspace: WeakEntity<Workspace>,
     /// The window's overlay for hover labels; mounted by `window_layers`.
     tooltips: Entity<Tooltips>,
 }
 
-/// The registry agents this process has no cached options for, in registry order.
-fn agents_missing_from(cached: &HashMap<&'static str, SessionOptions>) -> Vec<&'static str> {
-    AGENTS
-        .iter()
-        .map(|agent| agent.id)
-        .filter(|id| !cached.contains_key(id))
-        .collect()
-}
-
 impl SettingsWindow {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let session_options = if cx.has_global::<AgentSessionOptions>() {
-            cx.global::<AgentSessionOptions>().0.clone()
-        } else {
-            // Must exist up front: the probe handler below calls global_mut.
-            cx.set_global(AgentSessionOptions::default());
-            HashMap::new()
-        };
+    pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.subscribe(&workspace, |_, _, ev, cx| {
+            if matches!(ev, WorkspaceEvent::Changed) {
+                cx.notify();
+            }
+        })
+        .detach();
 
         // Font picker: every installed family, preselecting the theme's
         // current one (None = placeholder if it's no longer installed).
@@ -141,98 +129,18 @@ impl SettingsWindow {
         })
         .detach();
 
-        // Ask for whatever this process has not discovered yet. The refresh
-        // control on the providers card re-runs the same fan-out over every
-        // agent.
-        let missing = agents_missing_from(&session_options);
-        let mut settings = Self {
+        // Ask for whatever this process has not discovered yet — including an
+        // agent whose last probe failed. The refresh control on the providers
+        // card re-runs the same fan-out over every agent.
+        workspace.update(cx, |workspace, cx| workspace.probe_missing(cx));
+        Self {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
             font_select,
             font_size_select,
-            session_options,
-            probing: HashSet::new(),
+            workspace: workspace.downgrade(),
             tooltips: cx.new(|cx| Tooltips::new(cx)),
-        };
-        settings.probe(missing, cx);
-        settings
-    }
-
-    /// Ask each agent for its session options, replacing whatever is cached as
-    /// the answers arrive.
-    ///
-    /// This is what the composer's pickers read, and so the only way to refresh
-    /// a catalogue mid-run: an agent that was updated, restarted, or pointed at
-    /// another account is otherwise cached for the life of the process.
-    fn probe(&mut self, agents: Vec<&'static str>, cx: &mut Context<Self>) {
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
-        for agent in agents {
-            if let Some(cfg) = backend::Config::for_agent(agent) {
-                backend::probe(agent, cfg, ev_tx.clone());
-                self.probing.insert(agent);
-            }
         }
-        drop(ev_tx);
-
-        // Bridge the agent threads' std channel into the UI: a plain forwarder
-        // thread feeds an async channel the main thread can await.
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
-        std::thread::spawn(move || {
-            for ev in ev_rx {
-                if bridge_tx.unbounded_send(ev).is_err() {
-                    break;
-                }
-            }
-        });
-        cx.spawn(async move |this, cx| {
-            while let Some(ev) = bridge_rx.next().await {
-                let outcome = match &ev {
-                    backend::Event::SessionOptions {
-                        agent,
-                        models,
-                        current_model,
-                        modes,
-                        current_mode,
-                        access,
-                        current_access,
-                        sandboxes,
-                        current_sandbox,
-                        reasoning,
-                        current_reasoning,
-                    } => Some((
-                        *agent,
-                        Some(SessionOptions {
-                            models: models.clone(),
-                            current_model: current_model.clone(),
-                            modes: modes.clone(),
-                            current_mode: current_mode.clone(),
-                            access: access.clone(),
-                            current_access: current_access.clone(),
-                            sandboxes: sandboxes.clone(),
-                            current_sandbox: current_sandbox.clone(),
-                            reasoning: reasoning.clone(),
-                            current_reasoning: current_reasoning.clone(),
-                        }),
-                    )),
-                    backend::Event::ProbeFailed { agent } => Some((*agent, None)),
-                    _ => None,
-                };
-                let Some((agent, options)) = outcome else {
-                    continue;
-                };
-                let _ = this.update(cx, |settings, cx| {
-                    settings.probing.remove(&agent);
-                    if let Some(options) = options {
-                        settings.session_options.insert(agent, options.clone());
-                        cx.global_mut::<AgentSessionOptions>()
-                            .0
-                            .insert(agent, options);
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
     /// Commit a font pick: persist the family and apply it app-wide.
@@ -459,11 +367,13 @@ impl SettingsWindow {
         let card_bg = if dark { muted } else { gpui_kit::gpui::white() };
         // Icon tiles flip to muted so they still contrast against the white card.
         let tile_bg = if dark { base_bg } else { muted };
+        let workspace = self.workspace.upgrade();
+        let discovery = workspace.as_ref().map(|w| w.read(cx).discovery());
         let rows = AGENTS
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let status_pill = if let Some(catalog) = self.session_options.get(a.id) {
+                let status_pill = if let Some(catalog) = discovery.and_then(|d| d.catalog(a.id)) {
                     let providers = catalog
                         .models
                         .iter()
@@ -480,7 +390,7 @@ impl SettingsWindow {
                         muted_fg,
                     )
                     .into_any_element()
-                } else if self.probing.contains(&a.id) {
+                } else if discovery.is_some_and(|d| d.is_probing(a.id)) {
                     pill(false, "检测模型…", radius, primary, link, muted, muted_fg)
                         .into_any_element()
                 } else {
@@ -559,9 +469,11 @@ impl SettingsWindow {
                             .text_color(link)
                             .hover(move |style| style.bg(muted))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let all = AGENTS.iter().map(|agent| agent.id).collect();
-                                this.probe(all, cx);
-                                cx.notify();
+                                let all: Vec<&'static str> =
+                                    AGENTS.iter().map(|agent| agent.id).collect();
+                                let _ = this
+                                    .workspace
+                                    .update(cx, |workspace, cx| workspace.probe(&all, cx));
                             }))
                             .child("刷新"),
                     ),
@@ -668,34 +580,5 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_settings(window, cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
-    // scope through the glob, so the built-in one is imported explicitly.
-    use core::prelude::v1::test;
-
-    use super::{AGENTS, agents_missing_from};
-    use crate::ui::SessionOptions;
-    use std::collections::HashMap;
-
-    /// Startup asks only for what this process has not discovered, so opening
-    /// settings does not re-spawn every agent; the card's refresh control is what
-    /// asks for all of them.
-    #[test]
-    fn startup_probes_only_the_agents_with_no_cached_options() {
-        let mut cached = HashMap::new();
-        cached.insert("codex", SessionOptions::default());
-
-        let missing = agents_missing_from(&cached);
-        assert!(!missing.contains(&"codex"), "a cached agent is left alone");
-        assert_eq!(
-            missing.len(),
-            AGENTS.len() - 1,
-            "every other registry agent is asked for"
-        );
-        assert_eq!(agents_missing_from(&HashMap::new()).len(), AGENTS.len());
     }
 }

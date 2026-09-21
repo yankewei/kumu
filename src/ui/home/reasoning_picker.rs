@@ -13,10 +13,9 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::backend;
+use crate::app::Axis;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{
     PickerChrome, choice_label, in_force, picker_chip, picker_list, picker_menu, select_row,
 };
@@ -41,14 +40,9 @@ impl KumuApp {
         let Some(session_id) = self.selected else {
             return;
         };
-        self.store
-            .update_session_reasoning(session_id, Some(&value))
-            .ok();
-        self.refresh();
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetReasoning(value));
-        }
-        cx.notify();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.pick(session_id, Axis::Reasoning, value, cx)
+        });
     }
 
     /// The composer's reasoning picker: a text chip led by a brain glyph, which
@@ -61,10 +55,7 @@ impl KumuApp {
         session: &Session,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let options = cx
-            .try_global::<AgentSessionOptions>()
-            .and_then(|catalogs| catalogs.0.get(session.agent.as_str()))
-            .cloned()?;
+        let options = self.workspace.read(cx).session_options(session).cloned()?;
         if options.reasoning.is_empty() {
             return None;
         }
@@ -153,8 +144,8 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::reasoning_label;
-    use crate::backend::ReasoningInfo;
-    use crate::ui::SessionOptions;
+    use crate::agent::ReasoningInfo;
+    use crate::app::discovery::SessionOptions;
     use crate::ui::widgets::inherited_label;
 
     fn effort(value: &str, name: &str) -> ReasoningInfo {

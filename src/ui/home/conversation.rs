@@ -6,7 +6,6 @@
 //! the sidebar leaves it untouched. Rows go through a virtual list, so a frame
 //! only builds the rows on screen however long the session has grown.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -19,111 +18,11 @@ use gpui_kit::*;
 
 use super::markdown_mermaid::MermaidMarkdownPlugin;
 use super::permission::render_permission_decision;
-use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, PendingPermission};
+use super::{CONTENT_MAX_REM, CONTENT_MIN_REM};
+use crate::app::turn::TurnBlock;
+use crate::app::{Workspace, WorkspaceEvent};
 use crate::db::Message;
 use crate::ui::widgets::loader;
-
-/// One tool call observed during the live turn, in first-seen order.
-pub(super) struct ToolRun {
-    pub(super) id: String,
-    pub(super) title: String,
-    /// pending / running / done / failed
-    pub(super) status: &'static str,
-    /// Flattened text output from the agent, expandable in the UI.
-    pub(super) content: String,
-    /// Whether the content is expanded.
-    pub(super) open: bool,
-    /// Authorization the agent is still waiting on for this call.
-    pub(super) pending_permission: Option<PendingPermission>,
-    /// The choice the user made (the agent's own option label), kept on the row
-    /// so the conversation shows how the call was authorized.
-    pub(super) decision: Option<String>,
-}
-
-/// Blocks stay in arrival order; tool updates mutate their original block.
-pub(super) enum TurnBlock {
-    Thinking {
-        text: String,
-        open: bool,
-        /// The agent's own label for the message this reasoning belongs to.
-        ///
-        /// The row is held open by it rather than by what came last: an agent
-        /// with a background task running reports that task's progress between
-        /// two chunks of one message, and grouping by adjacency broke one
-        /// sentence into a row per chunk. `None` is an agent that labels
-        /// nothing, and then adjacency is all there is to go on.
-        message: Option<String>,
-    },
-    Tool(ToolRun),
-    Answer {
-        text: String,
-        view: Entity<TextViewState>,
-    },
-}
-
-pub(super) struct TurnState {
-    started_at: std::time::Instant,
-    pub(super) blocks: Vec<TurnBlock>,
-}
-
-impl TurnState {
-    fn new() -> Self {
-        Self {
-            started_at: std::time::Instant::now(),
-            blocks: Vec::new(),
-        }
-    }
-
-    /// How long the turn has been running. Read as it closes, so the total can
-    /// be recorded against the message that ends it.
-    pub(super) fn elapsed(&self) -> std::time::Duration {
-        self.started_at.elapsed()
-    }
-
-    /// Append a reasoning chunk to the row it belongs to, opening one when the
-    /// chunk starts a piece of reasoning of its own.
-    ///
-    /// Which row that is comes from the agent's own label for the message, not
-    /// from what arrived last: a background task reports its progress between
-    /// two chunks of one message, and those reports used to cut the message's
-    /// reasoning into a row per chunk.
-    pub(super) fn push_thinking(&mut self, text: String, message: Option<String>) {
-        if let Some(TurnBlock::Thinking {
-            text: current,
-            message: held,
-            ..
-        }) = self.blocks.last_mut()
-            && continues_reasoning(held.as_deref(), message.as_deref())
-        {
-            current.push_str(&text);
-        } else {
-            self.blocks.push(TurnBlock::Thinking {
-                text,
-                open: false,
-                message,
-            });
-        }
-    }
-
-    /// Whether the row at `index` is reasoning still being written: only the
-    /// last row can be, and anything pushed after it ends it.
-    fn is_thinking(&self, index: usize) -> bool {
-        index + 1 == self.blocks.len() && matches!(self.blocks[index], TurnBlock::Thinking { .. })
-    }
-}
-
-/// Whether a reasoning chunk belongs to the piece of reasoning a row holds.
-///
-/// With both labelled the label decides, so one message's chunks stay one row
-/// whatever lands between them. With either unlabelled nothing contradicts the
-/// row: an agent that labels nothing (Pi sends no id on a streamed message) is
-/// one the UI only has adjacency for.
-fn continues_reasoning(held: Option<&str>, chunk: Option<&str>) -> bool {
-    match (held, chunk) {
-        (Some(held), Some(chunk)) => held == chunk,
-        _ => true,
-    }
-}
 
 /// A persisted tool call, deserialized from the message content.
 #[derive(serde::Deserialize)]
@@ -355,13 +254,24 @@ struct ToolRow {
 /// Where a row's expanded state lives, so its click handler can flip it.
 ///
 /// History rows and tool runs are keyed in [`ConversationView::expanded_rows`];
-/// a live turn block owns an `open` flag of its own.
+/// a live turn's blocks by their turn and index in
+/// [`ConversationView::live_open`].
 enum RowToggle {
     Key(String),
-    Block(usize),
+    Live(u64, usize),
+}
+
+/// How a live reply's markdown view catches up with its text.
+enum AnswerUpdate {
+    /// Feed it the text it has not seen.
+    Append(String),
+    /// Parse the whole text again.
+    Rebuild(String),
 }
 
 pub(super) struct ConversationView {
+    /// Where the live turns come from; the view only caches how to draw them.
+    workspace: Entity<Workspace>,
     /// The session on screen, if any.
     session_id: Option<i64>,
     history: Vec<HistoryEntry>,
@@ -369,28 +279,52 @@ pub(super) struct ConversationView {
     history_rows: Vec<Row>,
     /// Every row the list currently knows about, history then live.
     rows: Vec<Row>,
-    /// Live turn state keyed by session id: streaming thinking, tool calls,
-    /// and the answer being built. Dropped when the turn ends.
-    turns: HashMap<i64, TurnState>,
+    /// Each live reply's parsed markdown, keyed by turn and block, with how
+    /// much of the reply it has been fed: a streamed chunk is appended to the
+    /// view rather than re-parsing the whole reply.
+    answer_views: HashMap<(u64, usize), (Entity<TextViewState>, usize)>,
+    /// Expanded live blocks, by turn and block index.
+    live_open: HashSet<(u64, usize)>,
     /// Expanded rows, keyed by the row's element id: a history row's list
-    /// index, or a tool run's first call. Live turn blocks carry an `open` flag
-    /// of their own instead.
+    /// index, or a tool run's first call. Cleared when another session is put
+    /// on screen, since a history index means nothing in another session.
     expanded_rows: HashSet<String>,
     scroller: Entity<MessageScrollerState>,
 }
 
 impl ConversationView {
-    pub(super) fn new(cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         // The scroller notifies its own state (scrolling away from or back to
         // the tail); this view is what draws the jump button that depends on it.
         cx.observe(&scroller, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&workspace, |this, workspace, ev, cx| match ev {
+            WorkspaceEvent::TurnChanged(session_id) => this.sync_turn(*session_id, cx),
+            WorkspaceEvent::TurnClosed {
+                session_id,
+                turn_id,
+            } => {
+                this.answer_views.retain(|(turn, _), _| turn != turn_id);
+                this.live_open.retain(|(turn, _)| turn != turn_id);
+                this.sync_turn(*session_id, cx);
+            }
+            WorkspaceEvent::HistoryChanged(session_id) => {
+                if this.session_id == Some(*session_id) {
+                    let messages = workspace.read(cx).messages(*session_id);
+                    this.reload_history(*session_id, &messages, cx);
+                }
+            }
+            WorkspaceEvent::Changed => {}
+        })
+        .detach();
         Self {
+            workspace,
             session_id: None,
             history: Vec::new(),
             history_rows: Vec::new(),
             rows: Vec::new(),
-            turns: HashMap::new(),
+            answer_views: HashMap::new(),
+            live_open: HashSet::new(),
             expanded_rows: HashSet::new(),
             scroller,
         }
@@ -403,10 +337,13 @@ impl ConversationView {
         messages: &[Message],
         cx: &mut Context<Self>,
     ) {
+        if self.session_id != session_id {
+            self.expanded_rows.clear();
+        }
         self.session_id = session_id;
         self.history = messages.iter().map(HistoryEntry::decode).collect();
         self.history_rows = self.fold_history(messages);
-        self.rows = self.current_rows();
+        self.rows = self.current_rows(cx);
         let count = self.rows.len();
         self.scroller
             .update(cx, |scroller, cx| scroller.reset(count, cx));
@@ -415,12 +352,7 @@ impl ConversationView {
 
     /// The session's persisted messages changed (a turn was saved, a notice
     /// written). Ignored unless that session is the one on screen.
-    pub(super) fn reload_history(
-        &mut self,
-        session_id: i64,
-        messages: &[Message],
-        cx: &mut Context<Self>,
-    ) {
+    fn reload_history(&mut self, session_id: i64, messages: &[Message], cx: &mut Context<Self>) {
         if self.session_id != Some(session_id) {
             return;
         }
@@ -454,60 +386,60 @@ impl ConversationView {
             .update(cx, |scroller, cx| scroller.scroll_to_end(cx));
     }
 
-    pub(super) fn has_turn(&self, session_id: i64) -> bool {
-        self.turns.contains_key(&session_id)
-    }
-
-    pub(super) fn turn(&self, session_id: i64) -> Option<&TurnState> {
-        self.turns.get(&session_id)
-    }
-
-    /// Mutate the session's live turn, opening it first if there is none, then
-    /// bring the list in line with what changed.
-    pub(super) fn update_turn<R>(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut TurnState, &mut Context<Self>) -> R,
-    ) -> R {
-        let turn = match self.turns.entry(session_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(TurnState::new()),
-        };
-        let result = f(turn, cx);
-        self.sync_turn(session_id, cx);
-        result
-    }
-
-    /// Like [`Self::update_turn`], but only when a turn is already open.
-    pub(super) fn with_turn<R>(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut TurnState) -> R,
-    ) -> Option<R> {
-        let result = f(self.turns.get_mut(&session_id)?);
-        self.sync_turn(session_id, cx);
-        Some(result)
-    }
-
-    /// Close the session's live turn, handing its blocks back.
-    pub(super) fn take_turn(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-    ) -> Option<TurnState> {
-        let turn = self.turns.remove(&session_id);
-        if turn.is_some() {
-            self.sync_turn(session_id, cx);
-        }
-        turn
-    }
-
     fn sync_turn(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        self.sync_answer_views(session_id, cx);
         if self.session_id == Some(session_id) {
             self.sync_rows(cx);
         }
+    }
+
+    /// Bring each reply's markdown view up to its text: feed it the tail it has
+    /// not seen, or rebuild it if the text is no longer a continuation of what
+    /// it was fed (a reply is only appended to, so that is a safety net rather
+    /// than a path taken while streaming).
+    fn sync_answer_views(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        // What each reply block needs, gathered first: the workspace is read
+        // through `cx`, which the views below need mutably.
+        let mut stale = Vec::new();
+        if let Some(turn) = self.workspace.read(cx).turn(session_id) {
+            for (index, block) in turn.blocks.iter().enumerate() {
+                let TurnBlock::Answer(text) = block else {
+                    continue;
+                };
+                let key = (turn.id(), index);
+                let fed = self.answer_views.get(&key).map(|(_, fed)| *fed);
+                if fed == Some(text.len()) {
+                    continue;
+                }
+                let update = match fed {
+                    Some(fed) if fed < text.len() && text.is_char_boundary(fed) => {
+                        AnswerUpdate::Append(text[fed..].to_string())
+                    }
+                    _ => AnswerUpdate::Rebuild(text.clone()),
+                };
+                stale.push((key, text.len(), update));
+            }
+        }
+        for (key, len, update) in stale {
+            match (update, self.answer_views.get_mut(&key)) {
+                (AnswerUpdate::Append(tail), Some((view, fed))) => {
+                    view.update(cx, |state, cx| state.push_str(&tail, cx));
+                    *fed = len;
+                }
+                (AnswerUpdate::Rebuild(text), _) | (AnswerUpdate::Append(text), None) => {
+                    let view = Self::markdown_view(&text, cx);
+                    self.answer_views.insert(key, (view, len));
+                }
+            }
+        }
+    }
+
+    /// A markdown view that repaints the conversation when its background
+    /// parse lands.
+    fn markdown_view(text: &str, cx: &mut Context<Self>) -> Entity<TextViewState> {
+        let view = cx.new(|cx| TextViewState::markdown(text, cx));
+        cx.observe(&view, |_, _, cx| cx.notify()).detach();
+        view
     }
 
     /// Fold the history into rows, with each finished turn's total placed under
@@ -523,9 +455,10 @@ impl ConversationView {
         )
     }
 
-    fn current_rows(&self) -> Vec<Row> {
+    fn current_rows(&self, cx: &App) -> Vec<Row> {
         let mut rows = self.history_rows.clone();
-        if let Some(turn) = self.session_id.and_then(|id| self.turns.get(&id)) {
+        let workspace = self.workspace.read(cx);
+        if let Some(turn) = self.session_id.and_then(|id| workspace.turn(id)) {
             rows.extend(fold_rows(
                 turn.blocks
                     .iter()
@@ -545,7 +478,7 @@ impl ConversationView {
     /// remeasured where they stand (holding the reader's scroll position), and
     /// only the tail that differs is spliced.
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
-        let rows = self.current_rows();
+        let rows = self.current_rows(cx);
         let RowChange { remeasure, splice } = diff_rows(&self.rows, &rows);
         self.rows = rows;
         self.scroller.update(cx, |scroller, cx| {
@@ -562,7 +495,6 @@ impl ConversationView {
     /// The click handler that flips a row's expanded state, wherever it lives.
     fn row_toggle_click(
         cx: &Context<Self>,
-        session_id: i64,
         toggle: RowToggle,
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
         cx.listener(move |this, _, _, cx| {
@@ -574,18 +506,9 @@ impl ConversationView {
                         this.expanded_rows.remove(key);
                     }
                 }
-                RowToggle::Block(index) => {
-                    if let Some(block) = this
-                        .turns
-                        .get_mut(&session_id)
-                        .and_then(|turn| turn.blocks.get_mut(*index))
-                    {
-                        match block {
-                            TurnBlock::Thinking { open, .. } => *open = !*open,
-                            TurnBlock::Tool(run) => run.open = !run.open,
-                            // Only expandable blocks are ever wrapped in `Block`.
-                            TurnBlock::Answer { .. } => {}
-                        }
+                RowToggle::Live(turn, index) => {
+                    if !this.live_open.insert((*turn, *index)) {
+                        this.live_open.remove(&(*turn, *index));
                     }
                 }
             }
@@ -599,19 +522,19 @@ impl ConversationView {
             return div().into_any_element();
         };
         let body = match row {
-            Row::History(index) => self.render_history_entry(index, session_id, cx),
+            Row::History(index) => self.render_history_entry(index, cx),
             Row::HistoryTools(range) => {
                 let rows = range
                     .filter_map(|index| self.history_tool_row(index))
                     .collect();
-                self.render_tool_run(rows, session_id, cx)
+                self.render_tool_run(rows, cx)
             }
             Row::Live(index) => self.render_live_block(index, session_id, cx),
             Row::LiveTools(range) => {
                 let rows = range
-                    .filter_map(|index| self.live_tool_row(session_id, index))
+                    .filter_map(|index| self.live_tool_row(session_id, index, cx))
                     .collect();
-                self.render_tool_run(rows, session_id, cx)
+                self.render_tool_run(rows, cx)
             }
             Row::Placeholder => div()
                 .text_sm()
@@ -630,12 +553,7 @@ impl ConversationView {
             .into_any_element()
     }
 
-    fn render_history_entry(
-        &mut self,
-        index: usize,
-        session_id: i64,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_history_entry(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (radius, muted_fg, primary) = (theme.radius, theme.muted_foreground, theme.primary);
         let Some(entry) = self.history.get_mut(index) else {
@@ -669,7 +587,6 @@ impl ConversationView {
                     false,
                     text,
                     RowToggle::Key(key),
-                    session_id,
                     cx,
                 )
             }
@@ -677,11 +594,7 @@ impl ConversationView {
                 let view = match view {
                     Some(view) => view.clone(),
                     None => {
-                        let source = text.clone();
-                        let created = cx.new(|cx| TextViewState::markdown(&source, cx));
-                        // A long reply parses in the background; repaint when
-                        // it lands.
-                        cx.observe(&created, |_, _, cx| cx.notify()).detach();
+                        let created = Self::markdown_view(text, cx);
                         *view = Some(created.clone());
                         created
                     }
@@ -722,12 +635,14 @@ impl ConversationView {
         })
     }
 
-    fn live_tool_row(&self, session_id: i64, index: usize) -> Option<ToolRow> {
-        let TurnBlock::Tool(run) = self.turns.get(&session_id)?.blocks.get(index)? else {
+    fn live_tool_row(&self, session_id: i64, index: usize, cx: &App) -> Option<ToolRow> {
+        let turn = self.workspace.read(cx).turn(session_id)?;
+        let TurnBlock::Tool(run) = turn.blocks.get(index)? else {
             return None;
         };
+        let key = (turn.id(), index);
         Some(ToolRow {
-            id: format!("tool-live-{}", run.id),
+            id: format!("tool-live-{}-{}", turn.id(), run.id),
             title: run.title.clone().into(),
             status: run.status.into(),
             content: run.content.clone().into(),
@@ -739,8 +654,8 @@ impl ConversationView {
                 .is_none()
                 .then(|| run.decision.clone().map(Into::into))
                 .flatten(),
-            open: run.open,
-            toggle: RowToggle::Block(index),
+            open: self.live_open.contains(&key),
+            toggle: RowToggle::Live(key.0, key.1),
         })
     }
 
@@ -750,27 +665,32 @@ impl ConversationView {
         session_id: i64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(turn) = self.turns.get(&session_id) else {
+        let Some(turn) = self.workspace.read(cx).turn(session_id) else {
             return div().into_any_element();
         };
+        let key = (turn.id(), index);
         match turn.blocks.get(index) {
-            Some(TurnBlock::Thinking { text, open, .. }) => self.render_thinking(
-                format!("thinking-{index}"),
-                *open,
+            Some(TurnBlock::Thinking { text, .. }) => self.render_thinking(
+                format!("thinking-{}-{index}", key.0),
+                self.live_open.contains(&key),
                 turn.is_thinking(index),
                 text.clone().into(),
-                RowToggle::Block(index),
-                session_id,
+                RowToggle::Live(key.0, key.1),
                 cx,
             ),
-            Some(TurnBlock::Answer { view, .. }) => div()
-                .child(
-                    TextView::new(view)
-                        .plugin(MermaidMarkdownPlugin)
-                        .text_sm()
-                        .line_height(relative(1.75)),
-                )
-                .into_any_element(),
+            Some(TurnBlock::Answer(_)) => {
+                let Some((view, _)) = self.answer_views.get(&key) else {
+                    return div().into_any_element();
+                };
+                div()
+                    .child(
+                        TextView::new(view)
+                            .plugin(MermaidMarkdownPlugin)
+                            .text_sm()
+                            .line_height(relative(1.75)),
+                    )
+                    .into_any_element()
+            }
             // Tool blocks are always drawn through their run row.
             Some(TurnBlock::Tool(_)) | None => div().into_any_element(),
         }
@@ -778,7 +698,6 @@ impl ConversationView {
 
     /// A reasoning block: a header that folds the captured text away, with a
     /// spinner while the agent is still thinking.
-    #[allow(clippy::too_many_arguments)]
     fn render_thinking(
         &self,
         id: String,
@@ -786,7 +705,6 @@ impl ConversationView {
         active: bool,
         text: SharedString,
         toggle: RowToggle,
-        session_id: i64,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -820,7 +738,7 @@ impl ConversationView {
                             .child(if active { "思考中…" } else { "已思考" }),
                     )
                     .child(disclosure_caret(open, muted_fg))
-                    .on_click(Self::row_toggle_click(cx, session_id, toggle)),
+                    .on_click(Self::row_toggle_click(cx, toggle)),
             )
             .content(collapsed_body(format!("{id}-body"), text, muted_fg))
             .into_any_element()
@@ -832,7 +750,7 @@ impl ConversationView {
     /// view while it turns (see [`loader`]), so the elapsed time is re-read
     /// there. A ticker would only duplicate what the loader already forces.
     fn render_working(&self, session_id: i64, cx: &Context<Self>) -> AnyElement {
-        let Some(turn) = self.turns.get(&session_id) else {
+        let Some(turn) = self.workspace.read(cx).turn(session_id) else {
             return div().into_any_element();
         };
         let muted_fg = cx.theme().muted_foreground;
@@ -866,12 +784,7 @@ impl ConversationView {
     /// A run of consecutive tool calls. A lone call is left as its own row —
     /// there is nothing to summarize — while two or more hide behind one line
     /// that expands to the calls themselves.
-    fn render_tool_run(
-        &self,
-        rows: Vec<ToolRow>,
-        session_id: i64,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    fn render_tool_run(&self, rows: Vec<ToolRow>, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (radius, muted, muted_fg, success, danger) = (
             theme.radius,
@@ -882,7 +795,7 @@ impl ConversationView {
         );
         let Some((run_status, label)) = fold_summary(&rows) else {
             return match rows.into_iter().next() {
-                Some(row) => self.render_tool_row(row, session_id, cx),
+                Some(row) => self.render_tool_row(row, cx),
                 None => div().into_any_element(),
             };
         };
@@ -918,20 +831,20 @@ impl ConversationView {
                     .child(status)
                     .child(div().text_xs().text_color(muted_fg).child(label))
                     .child(disclosure_caret(open, muted_fg))
-                    .on_click(Self::row_toggle_click(cx, session_id, RowToggle::Key(id))),
+                    .on_click(Self::row_toggle_click(cx, RowToggle::Key(id))),
             )
             .content(
-                v_flex().gap_1().pl_4().children(
-                    rows.into_iter()
-                        .map(|row| self.render_tool_row(row, session_id, cx)),
-                ),
+                v_flex()
+                    .gap_1()
+                    .pl_4()
+                    .children(rows.into_iter().map(|row| self.render_tool_row(row, cx))),
             )
             .into_any_element()
     }
 
     /// One tool call: its status, its title, and — for a call that produced
     /// output — the output behind its own expander.
-    fn render_tool_row(&self, row: ToolRow, session_id: i64, cx: &Context<Self>) -> AnyElement {
+    fn render_tool_row(&self, row: ToolRow, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (radius, muted, muted_fg, success, danger) = (
             theme.radius,
@@ -973,7 +886,7 @@ impl ConversationView {
                         .rounded(radius)
                         .hover(move |s| s.bg(muted))
                         .child(disclosure_caret(open, muted_fg))
-                        .on_click(Self::row_toggle_click(cx, session_id, row.toggle)),
+                        .on_click(Self::row_toggle_click(cx, row.toggle)),
                 )
                 .content(collapsed_body(format!("{id}-body"), row.content, muted_fg))
                 .into_any_element()
@@ -1084,9 +997,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Row, RowChange, RowToggle, RunStatus, ToolRow, ToolRun, TurnBlock, TurnState,
-        continues_reasoning, diff_rows, elapsed_label, fold_rows, fold_summary, rows_with_totals,
-        settled_totals,
+        Row, RowChange, RowToggle, RunStatus, ToolRow, diff_rows, elapsed_label, fold_rows,
+        fold_summary, rows_with_totals, settled_totals,
     };
     use crate::db::Message;
 
@@ -1099,26 +1011,6 @@ mod tests {
             decision: None,
             open: false,
             toggle: RowToggle::Key("t".into()),
-        }
-    }
-
-    fn tool_block(id: &str) -> TurnBlock {
-        TurnBlock::Tool(ToolRun {
-            id: id.into(),
-            title: "工具".to_string(),
-            status: "done",
-            content: String::new(),
-            open: false,
-            pending_permission: None,
-            decision: None,
-        })
-    }
-
-    /// The text of the turn's `index`-th row, which has to be a thinking one.
-    fn thinking_text(turn: &TurnState, index: usize) -> String {
-        match &turn.blocks[index] {
-            TurnBlock::Thinking { text, .. } => text.clone(),
-            _ => panic!("row {index} is not a thinking row"),
         }
     }
 
@@ -1223,96 +1115,6 @@ mod tests {
         let RowChange { remeasure, splice } = diff_rows(&old, &new);
         assert_eq!(remeasure, None);
         assert_eq!(splice, Some((1..3, 1)));
-    }
-
-    /// Whether a chunk continues the row before it, over every combination of
-    /// labels: equal labels stay together, and a side that labelled nothing
-    /// cannot contradict the row, so it joins it.
-    #[test]
-    fn a_chunk_continues_a_row_unless_the_labels_disagree() {
-        assert!(continues_reasoning(Some("m1"), Some("m1")));
-        assert!(continues_reasoning(None, None));
-        assert!(
-            continues_reasoning(None, Some("m1")),
-            "an agent that starts labelling mid-stream still lands in the row it was in"
-        );
-        assert!(
-            continues_reasoning(Some("m1"), None),
-            "a chunk that labels nothing has nothing to say about which message it is"
-        );
-        assert!(
-            !continues_reasoning(Some("m1"), Some("m2")),
-            "another message is another row"
-        );
-    }
-
-    /// One message's reasoning is one row however the stream is interrupted.
-    /// This is the shape omp sends while a background task runs: that task's
-    /// progress reports arrive between two chunks of one message, and they hold
-    /// no row of their own — which is exactly why the row is keyed on the
-    /// message and not, as it was, on what arrived last.
-    #[test]
-    fn one_messages_reasoning_is_one_row_however_the_stream_is_interrupted() {
-        let mut turn = TurnState::new();
-        turn.push_thinking("Still running. ".into(), Some("m1".into()));
-        turn.push_thinking(
-            "Let me continue reading useful files".into(),
-            Some("m1".into()),
-        );
-
-        assert_eq!(
-            turn.blocks.len(),
-            1,
-            "the chunk lands back in the message's own row"
-        );
-        assert_eq!(
-            thinking_text(&turn, 0),
-            "Still running. Let me continue reading useful files"
-        );
-    }
-
-    /// Another message's reasoning opens a row of its own, which is what keeps
-    /// two replies' thinking apart.
-    #[test]
-    fn another_messages_reasoning_opens_its_own_row() {
-        let mut turn = TurnState::new();
-        turn.push_thinking("first".into(), Some("m1".into()));
-        turn.push_thinking("second".into(), Some("m2".into()));
-
-        assert_eq!(turn.blocks.len(), 2);
-        assert_eq!(thinking_text(&turn, 1), "second");
-    }
-
-    /// An agent that labels nothing — Pi sends no id on a streamed message —
-    /// leaves adjacency as the only thing to go on, so its chunks run together
-    /// the way they always have.
-    #[test]
-    fn unlabelled_reasoning_runs_together() {
-        let mut turn = TurnState::new();
-        turn.push_thinking("weigh".into(), None);
-        turn.push_thinking("ing it".into(), None);
-
-        assert_eq!(turn.blocks.len(), 1);
-        assert_eq!(thinking_text(&turn, 0), "weighing it");
-    }
-
-    /// A row that is no longer the last one is not reopened. Something arriving
-    /// between two chunks of one message is shown where it came, rather than an
-    /// earlier row reaching back over it and losing the order the agent sent.
-    #[test]
-    fn a_row_is_never_reopened_across_what_came_after_it() {
-        let mut turn = TurnState::new();
-        turn.push_thinking("before".into(), Some("m1".into()));
-        turn.blocks.push(tool_block("t1"));
-        turn.push_thinking("after".into(), Some("m1".into()));
-
-        assert_eq!(
-            turn.blocks.len(),
-            3,
-            "the later chunk gets a row of its own"
-        );
-        assert_eq!(thinking_text(&turn, 0), "before");
-        assert_eq!(thinking_text(&turn, 2), "after");
     }
 
     /// Only a recorded total becomes a row: a message with no duration and one
