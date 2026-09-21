@@ -12,6 +12,7 @@
 //!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
+//!   - `app/`     what kumu does with agents, as data the UI draws: live turns;
 //!   - `db.rs`    local SQLite persistence (projects/sessions/messages);
 //!   - `agent/`   the agents kumu can drive (`registry`) and their backends on a
 //!     dedicated thread: a facade over one vocabulary (`event`), a per-agent
@@ -19,6 +20,7 @@
 //!     over it to discover their models; home sessions prompt them.
 
 mod agent;
+mod app;
 mod assets;
 mod db;
 mod theme;
