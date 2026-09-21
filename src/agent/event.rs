@@ -7,7 +7,7 @@
 
 use std::sync::mpsc::Sender;
 
-/// Events flowing from the ACP thread to the UI.
+/// Events flowing from the backend thread up to the app.
 pub enum Event {
     /// Log / connection chatter (grey text).
     Log(String),

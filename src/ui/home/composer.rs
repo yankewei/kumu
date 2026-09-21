@@ -88,7 +88,7 @@ impl KumuApp {
                             .child(div().flex_1())
                             .child(if self.workspace.read(cx).has_turn(session.id) {
                                 // A turn is in flight, so sending is refused (see
-                                // `KumuApp::send`) and the slot offers the one
+                                // `Workspace::send`) and the slot offers the one
                                 // action that is available: stopping the turn
                                 // that is running.
                                 Button::new("stop")

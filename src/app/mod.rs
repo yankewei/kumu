@@ -29,6 +29,9 @@ use turn::{PendingPermission, Turn};
 
 pub use session::Axis;
 
+/// The agent a new session starts with, until the user picks another.
+const DEFAULT_AGENT: &str = "omp";
+
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
     /// Something the home view draws: the project or session list, a session's
@@ -108,7 +111,7 @@ impl Workspace {
             && let Some(project) = self.projects.first().cloned()
         {
             self.store
-                .insert_session(project.id, "omp", "会话 1", &project.path)
+                .insert_session(project.id, DEFAULT_AGENT, "会话 1", &project.path)
                 .ok();
             self.refresh();
         }
@@ -213,7 +216,7 @@ impl Workspace {
         let n = self.sessions.len() + 1;
         let id = self
             .store
-            .insert_session(project_id, "omp", &format!("会话 {n}"), &cwd)
+            .insert_session(project_id, DEFAULT_AGENT, &format!("会话 {n}"), &cwd)
             .ok()?;
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);

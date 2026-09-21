@@ -20,11 +20,11 @@ use super::{acp, claude, codex, pi};
 /// request id.
 ///
 /// The senders are handed to the UI so it can answer without going through
-/// [`crate::agent::Cmd`]: the ACP thread is parked on the prompt that is waiting
+/// [`crate::agent::Cmd`]: the backend thread is parked on the prompt that is waiting
 /// for this very answer, so routing the reply through the command channel would
 /// deadlock.
 ///
-/// Only [`Connection`] holds this table strongly; the ACP thread keeps a
+/// Only [`Connection`] holds this table strongly; the backend thread keeps a
 /// [`WeakPermissions`]. That way dropping the last UI-side handle frees the
 /// table, which drops every pending sender and makes the waiting tasks answer
 /// `Cancelled` — the only thing that can unblock a prompt whose agent is sitting
@@ -38,7 +38,7 @@ pub(super) type WeakPermissions = Weak<PermissionTable>;
 /// cannot touch the session's current connection.
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The UI-side handle to one live ACP connection: send commands, and answer
+/// The app-side handle to one live agent connection: send commands, and answer
 /// permission requests.
 ///
 /// Dropping the last clone tears the connection down: the command channel
@@ -215,7 +215,7 @@ mod tests {
     fn dropping_connection_releases_pending_decisions() {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let permissions: SharedPermissions = Arc::new(Mutex::new(HashMap::new()));
-        // The ACP thread only borrows the table.
+        // The backend thread only borrows the table.
         let thread_view = Arc::downgrade(&permissions);
 
         let conn = Connection {
