@@ -52,7 +52,7 @@ pub(super) struct Transport {
 impl Transport {
     /// A transport with nowhere for its sends to go, for tests that drive the
     /// session's message handlers directly and never expect a reply over the
-    /// wire — mirrors [`crate::backend::connection::Connection::detached_for_test`].
+    /// wire — mirrors [`crate::agent::connection::Connection::detached_for_test`].
     #[cfg(test)]
     pub(super) fn detached_for_test() -> Self {
         Self {

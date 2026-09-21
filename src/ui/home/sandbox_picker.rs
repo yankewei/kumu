@@ -11,7 +11,7 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::backend;
+use crate::agent;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
@@ -49,7 +49,7 @@ impl KumuApp {
             .ok();
         self.refresh();
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetSandbox(value));
+            conn.send(agent::Cmd::SetSandbox(value));
         }
         cx.notify();
     }
@@ -145,7 +145,7 @@ mod tests {
     use crate::ui::widgets::inherited_label;
 
     use super::sandbox_label;
-    use crate::backend::SandboxInfo;
+    use crate::agent::SandboxInfo;
     use crate::ui::SessionOptions;
 
     fn sandbox(value: &str, name: &str) -> SandboxInfo {

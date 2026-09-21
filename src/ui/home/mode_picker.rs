@@ -7,7 +7,7 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::backend;
+use crate::agent;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
@@ -49,7 +49,7 @@ impl KumuApp {
             .ok();
         self.refresh();
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetMode(value));
+            conn.send(agent::Cmd::SetMode(value));
         }
         cx.notify();
     }
@@ -139,7 +139,7 @@ mod tests {
     use crate::ui::widgets::inherited_label;
 
     use super::mode_label;
-    use crate::backend::ModeInfo;
+    use crate::agent::ModeInfo;
     use crate::ui::SessionOptions;
 
     fn mode(value: &str, name: &str) -> ModeInfo {

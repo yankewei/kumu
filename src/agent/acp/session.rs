@@ -30,10 +30,10 @@ use super::convert::{
     permission_outcome, reasoning_catalog, status_name, stop_reason, tool_call_content,
     variant_name,
 };
-use crate::backend::config::Config;
-use crate::backend::connection::WeakPermissions;
-use crate::backend::event::{Cmd, Event, PermissionOptionInfo, emit};
-use crate::backend::session::{
+use crate::agent::config::Config;
+use crate::agent::connection::WeakPermissions;
+use crate::agent::event::{Cmd, Event, PermissionOptionInfo, emit};
+use crate::agent::session::{
     CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user, forget_stale_cancels,
     release_pending_permissions,
 };
@@ -122,8 +122,8 @@ fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<E
 /// Drive one ACP session to completion. Called by the shared [`spawn`]
 /// dispatcher, which is one level up, so the visibility follows the caller.
 ///
-/// [`spawn`]: crate::backend::spawn
-pub(in crate::backend) async fn run(
+/// [`spawn`]: crate::agent::spawn
+pub(in crate::agent) async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
@@ -439,8 +439,8 @@ pub(in crate::backend) async fn run(
 mod tests {
     use std::path::PathBuf;
 
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Cmd, Config, Event, PermissionKind, spawn};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Cmd, Config, Event, PermissionKind, spawn};
 
     use super::notification_event;
     use agent_client_protocol::schema::v1::{

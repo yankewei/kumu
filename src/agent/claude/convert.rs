@@ -7,7 +7,7 @@
 //! Codex's sandbox policies) and the agent's own where they are a scale the
 //! user types and reads in Claude Code itself.
 
-use crate::backend::event::{
+use crate::agent::event::{
     AccessInfo, CommandInfo, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
     ReasoningInfo,
 };
@@ -243,7 +243,7 @@ pub(super) fn session_reasoning(reported: &[ModelEntry]) -> Vec<ReasoningInfo> {
 /// as a bare `/`.
 ///
 /// The description each entry also carries is not read: a picker row is the
-/// name and nothing more (see [`crate::backend::CommandInfo`]).
+/// name and nothing more (see [`crate::agent::CommandInfo`]).
 pub(super) fn command_catalog(
     reported: &[CommandEntry],
     terminal_only: &[String],

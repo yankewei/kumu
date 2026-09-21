@@ -20,7 +20,7 @@ use super::{acp, claude, codex, pi};
 /// request id.
 ///
 /// The senders are handed to the UI so it can answer without going through
-/// [`crate::backend::Cmd`]: the ACP thread is parked on the prompt that is waiting
+/// [`crate::agent::Cmd`]: the ACP thread is parked on the prompt that is waiting
 /// for this very answer, so routing the reply through the command channel would
 /// deadlock.
 ///

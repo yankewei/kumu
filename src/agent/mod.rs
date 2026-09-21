@@ -1,4 +1,4 @@
-//! The agent backend layer: how kumu drives local coding agents.
+//! The agent layer: which local coding agents kumu can drive, and how.
 //!
 //! Every backend converges on one vocabulary ([`Event`] out, [`Cmd`] in),
 //! so no protocol type reaches the UI and no UI branch depends on which
@@ -27,6 +27,7 @@
 //!   - `config`     — which backend, and how to launch its subprocess;
 //!   - `connection` — the UI-side handle, the permission table, the thread;
 //!   - `session`    — the contract the four session loops share;
+//!   - `registry`   — the static list of agents, what the UI shows for each;
 //!   - `probe`      — discovery, dispatched to the backend that owns the agent;
 //!   - `acp/`       — the ACP backend (session, probe, protocol translation);
 //!   - `codex/`     — the Codex app-server backend;
@@ -41,6 +42,7 @@ mod connection;
 mod event;
 mod pi;
 mod probe;
+mod registry;
 mod session;
 
 #[cfg(test)]
@@ -56,3 +58,4 @@ pub use event::{
     ReasoningInfo, SandboxInfo,
 };
 pub use probe::probe;
+pub use registry::AGENTS;

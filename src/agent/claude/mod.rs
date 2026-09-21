@@ -19,8 +19,8 @@
 //!   - `settings`  — a read of Claude Code's own configuration files, which is
 //!     where the axes the wire does not carry come from.
 //!
-//! [`Event`]: crate::backend::Event
-//! [`Cmd`]: crate::backend::Cmd
+//! [`Event`]: crate::agent::Event
+//! [`Cmd`]: crate::agent::Cmd
 
 pub(super) mod convert;
 pub(super) mod probe;
@@ -30,7 +30,7 @@ pub(super) mod settings;
 mod protocol;
 mod transport;
 
-use crate::backend::config::SessionPicks;
+use crate::agent::config::SessionPicks;
 
 /// The argv a session's picks become.
 ///

@@ -7,8 +7,8 @@ use futures::StreamExt;
 
 use super::widgets::{agent_logo, pill};
 use super::{AgentSessionOptions, SessionOptions};
-use crate::agents::AGENTS;
-use crate::backend;
+use crate::agent;
+use crate::agent::AGENTS;
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -165,10 +165,10 @@ impl SettingsWindow {
     /// a catalogue mid-run: an agent that was updated, restarted, or pointed at
     /// another account is otherwise cached for the life of the process.
     fn probe(&mut self, agents: Vec<&'static str>, cx: &mut Context<Self>) {
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<agent::Event>();
         for agent in agents {
-            if let Some(cfg) = backend::Config::for_agent(agent) {
-                backend::probe(agent, cfg, ev_tx.clone());
+            if let Some(cfg) = agent::Config::for_agent(agent) {
+                agent::probe(agent, cfg, ev_tx.clone());
                 self.probing.insert(agent);
             }
         }
@@ -176,7 +176,7 @@ impl SettingsWindow {
 
         // Bridge the agent threads' std channel into the UI: a plain forwarder
         // thread feeds an async channel the main thread can await.
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<agent::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -187,7 +187,7 @@ impl SettingsWindow {
         cx.spawn(async move |this, cx| {
             while let Some(ev) = bridge_rx.next().await {
                 let outcome = match &ev {
-                    backend::Event::SessionOptions {
+                    agent::Event::SessionOptions {
                         agent,
                         models,
                         current_model,
@@ -214,7 +214,7 @@ impl SettingsWindow {
                             current_reasoning: current_reasoning.clone(),
                         }),
                     )),
-                    backend::Event::ProbeFailed { agent } => Some((*agent, None)),
+                    agent::Event::ProbeFailed { agent } => Some((*agent, None)),
                     _ => None,
                 };
                 let Some((agent, options)) = outcome else {

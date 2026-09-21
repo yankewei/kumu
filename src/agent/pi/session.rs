@@ -26,8 +26,8 @@
 //!     title is only ever read where it exists — which is exactly what
 //!     [`Event::ToolCall`]'s "empty means untouched" contract wants.
 //!
-//! [`Event`]: crate::backend::Event
-//! [`Cmd`]: crate::backend::Cmd
+//! [`Event`]: crate::agent::Event
+//! [`Cmd`]: crate::agent::Cmd
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -40,10 +40,10 @@ use tokio::sync::mpsc;
 
 use super::convert;
 use super::transport::{self, Transport, debug_log};
-use crate::backend::config::Config;
-use crate::backend::connection::WeakPermissions;
-use crate::backend::event::{Cmd, Event, ModelInfo, ReasoningInfo, emit};
-use crate::backend::session::{
+use crate::agent::config::Config;
+use crate::agent::connection::WeakPermissions;
+use crate::agent::event::{Cmd, Event, ModelInfo, ReasoningInfo, emit};
+use crate::agent::session::{
     CANCELLED, CancelRequests, SessionOptionsBuilder, forget_stale_cancels, settle,
 };
 
@@ -122,7 +122,7 @@ struct Reaction {
     settled: bool,
 }
 
-pub(in crate::backend) async fn run(
+pub(in crate::agent) async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
@@ -716,7 +716,7 @@ fn non_empty(value: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
     use serde_json::json;
     use std::time::Instant;
 
@@ -1036,7 +1036,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         // The connection must outlive both prompts; dropping it is the teardown
         // signal.
-        let conn = crate::backend::spawn(cfg, std::env::temp_dir(), tx);
+        let conn = crate::agent::spawn(cfg, std::env::temp_dir(), tx);
 
         // The handshake is what fills the pickers, and what proves the RPC
         // session is live rather than merely spawned.

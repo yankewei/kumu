@@ -1,7 +1,7 @@
 # Codex `app-server` schema, pinned to 0.153.4
 
 The authoritative schema for the protocol the Codex backend speaks, vendored so
-the hand-written slice in `src/backend/codex/protocol.rs` can be checked against
+the hand-written slice in `src/agent/codex/protocol.rs` can be checked against
 it without a Codex install. The generator is Codex's own:
 
 ```bash

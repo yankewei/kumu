@@ -13,7 +13,7 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::backend;
+use crate::agent;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
@@ -46,7 +46,7 @@ impl KumuApp {
             .ok();
         self.refresh();
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetReasoning(value));
+            conn.send(agent::Cmd::SetReasoning(value));
         }
         cx.notify();
     }
@@ -153,7 +153,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::reasoning_label;
-    use crate::backend::ReasoningInfo;
+    use crate::agent::ReasoningInfo;
     use crate::ui::SessionOptions;
     use crate::ui::widgets::inherited_label;
 

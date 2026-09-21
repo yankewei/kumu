@@ -6,7 +6,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use crate::agents::AGENTS;
+use crate::agent::AGENTS;
 use crate::ui::tooltip::HoverLabel as _;
 use crate::ui::widgets::agent_logo;
 

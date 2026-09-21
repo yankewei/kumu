@@ -10,8 +10,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::agents::AGENTS;
-use crate::backend;
+use crate::agent;
+use crate::agent::AGENTS;
 use crate::db::Session;
 use crate::ui::AgentSessionOptions;
 use crate::ui::SessionOptions;
@@ -96,7 +96,7 @@ impl KumuApp {
         // cannot run a session, that is an error written into a conversation
         // that has not begun.
         if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(backend::Cmd::SetModel(model_value));
+            conn.send(agent::Cmd::SetModel(model_value));
         }
         cx.notify();
     }
@@ -226,7 +226,7 @@ impl KumuApp {
                 // ---- Right: search field + model rows. ----
                 let mut list = picker_list();
                 if searching {
-                    let matched: Vec<(&'static str, &backend::ModelInfo)> = AGENTS
+                    let matched: Vec<(&'static str, &agent::ModelInfo)> = AGENTS
                         .iter()
                         // A locked session only searches its own agent, so a hit
                         // from another one cannot offer an impossible switch.
@@ -368,7 +368,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::model_label;
-    use crate::backend::ModelInfo;
+    use crate::agent::ModelInfo;
     use crate::ui::SessionOptions;
 
     fn model(value: &str, name: &str) -> ModelInfo {

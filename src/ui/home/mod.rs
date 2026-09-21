@@ -25,8 +25,8 @@ use futures::StreamExt;
 
 use self::conversation::{ConversationView, ToolRun, TurnBlock};
 use super::{AgentCommands, AgentSessionOptions, SessionOptions, SettingsWindow};
-use crate::agents::AGENTS;
-use crate::backend;
+use crate::agent;
+use crate::agent::AGENTS;
 use crate::db::{Project, Session, Store, db_path};
 use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
@@ -45,7 +45,7 @@ struct PendingPermission {
     request_id: String,
     title: String,
     detail: String,
-    options: Vec<backend::PermissionOptionInfo>,
+    options: Vec<agent::PermissionOptionInfo>,
 }
 
 /// Whether `conn_id` is still the connection registered for this session.
@@ -53,11 +53,7 @@ struct PendingPermission {
 /// A session's connection is replaced when the agent is switched, so a bridge
 /// task must verify identity before acting: late events and teardown from the
 /// old connection must not touch the session that a newer one now owns.
-fn owns_connection(
-    conns: &HashMap<i64, backend::Connection>,
-    session_id: i64,
-    conn_id: u64,
-) -> bool {
+fn owns_connection(conns: &HashMap<i64, agent::Connection>, session_id: i64, conn_id: u64) -> bool {
     conns
         .get(&session_id)
         .is_some_and(|conn| conn.id() == conn_id)
@@ -119,7 +115,7 @@ pub struct KumuApp {
     conversation: Entity<ConversationView>,
     input_state: Entity<TextareaState>,
     /// Live ACP connections keyed by session id (reused across prompts).
-    conns: HashMap<i64, backend::Connection>,
+    conns: HashMap<i64, agent::Connection>,
     /// Which picker's menu is open, if any. One at a time — see
     /// [`KumuApp::set_picker_open`].
     open_picker: Option<PickerAxis>,
@@ -136,7 +132,7 @@ pub struct KumuApp {
     /// them. What a session can run depends on its working directory (a
     /// project's own commands and skills), so one session's list must not stand
     /// in for another's; [`AgentCommands`] only fills in until a session reports.
-    live_commands: HashMap<i64, (&'static str, Vec<backend::CommandInfo>)>,
+    live_commands: HashMap<i64, (&'static str, Vec<agent::CommandInfo>)>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
 }
@@ -217,15 +213,15 @@ impl KumuApp {
             return;
         }
 
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<agent::Event>();
         for agent in missing {
-            if let Some(cfg) = backend::Config::for_agent(agent) {
-                backend::probe(agent, cfg, ev_tx.clone());
+            if let Some(cfg) = agent::Config::for_agent(agent) {
+                agent::probe(agent, cfg, ev_tx.clone());
             }
         }
         drop(ev_tx);
 
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<agent::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -551,13 +547,13 @@ impl KumuApp {
         self.conversation.update(cx, |conversation, cx| {
             conversation.update_turn(session_id, cx, |_, _| ())
         });
-        conn.send(backend::Cmd::Prompt(text));
+        conn.send(agent::Cmd::Prompt(text));
         cx.notify();
     }
 
     /// Stop the turn in flight, if there is one.
     ///
-    /// The cancel travels out of band rather than as a [`backend::Cmd`]: the
+    /// The cancel travels out of band rather than as a [`agent::Cmd`]: the
     /// backend's command loop is parked on the very turn being cancelled, so a
     /// command would not be read until that turn had already ended. The turn
     /// stays open here until the backend reports it settled, because the agent is
@@ -582,7 +578,7 @@ impl KumuApp {
             self.system_message(session.id, format!("未支持的 agent：{}", session.agent), cx);
             return;
         };
-        let Some(cfg) = backend::Config::for_agent(agent_id) else {
+        let Some(cfg) = agent::Config::for_agent(agent_id) else {
             return;
         };
         let cwd = if session.cwd.is_empty() {
@@ -596,7 +592,7 @@ impl KumuApp {
         // command channel below for the ones that apply theirs after their
         // handshake. Whether either applies is the backend's business — the UI
         // only says what the session is set to.
-        let picks = backend::SessionPicks {
+        let picks = agent::SessionPicks {
             model: session.model.clone(),
             mode: session.mode.clone(),
             reasoning: session.reasoning.clone(),
@@ -613,8 +609,8 @@ impl KumuApp {
 
         // ACP thread -> std channel -> forwarder thread -> async channel ->
         // UI task (same bridge pattern as the settings window's probes).
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<backend::Event>();
-        let conn = backend::spawn(cfg, cwd, ev_tx);
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<agent::Event>();
+        let conn = agent::spawn(cfg, cwd, ev_tx);
         // Remember which connection this bridge task belongs to, so its events
         // and teardown can be ignored once a newer one takes over the session.
         let conn_id = conn.id();
@@ -623,20 +619,20 @@ impl KumuApp {
         // already launched with them (Claude Code) sees the same value twice
         // and skips the repeat.
         if let Some(model) = session.model.clone() {
-            conn.send(backend::Cmd::SetModel(model));
+            conn.send(agent::Cmd::SetModel(model));
         }
         if let Some(mode) = session.mode.clone() {
-            conn.send(backend::Cmd::SetMode(mode));
+            conn.send(agent::Cmd::SetMode(mode));
         }
         if let Some(sandbox) = session.sandbox.clone() {
-            conn.send(backend::Cmd::SetSandbox(sandbox));
+            conn.send(agent::Cmd::SetSandbox(sandbox));
         }
         if let Some(reasoning) = session.reasoning.clone() {
-            conn.send(backend::Cmd::SetReasoning(reasoning));
+            conn.send(agent::Cmd::SetReasoning(reasoning));
         }
         self.conns.insert(session.id, conn);
 
-        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<backend::Event>();
+        let (bridge_tx, mut bridge_rx) = futures::channel::mpsc::unbounded::<agent::Event>();
         std::thread::spawn(move || {
             for ev in ev_rx {
                 if bridge_tx.unbounded_send(ev).is_err() {
@@ -778,14 +774,14 @@ impl KumuApp {
         cx.notify();
     }
 
-    fn on_acp_event(&mut self, session_id: i64, ev: backend::Event, cx: &mut Context<Self>) {
+    fn on_acp_event(&mut self, session_id: i64, ev: agent::Event, cx: &mut Context<Self>) {
         // A turn opening or closing changes the composer (send ↔ stop) and the
         // command menu, which this view draws; a chunk streaming into a turn
         // that is already open only changes the conversation, which repaints
         // itself.
         let had_turn = self.conversation.read(cx).has_turn(session_id);
         match ev {
-            backend::Event::SessionReady { resume_id } => {
+            agent::Event::SessionReady { resume_id } => {
                 match self.store.update_session_resume_id(session_id, &resume_id) {
                     Ok(()) => {
                         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id)
@@ -800,7 +796,7 @@ impl KumuApp {
                     ),
                 }
             }
-            backend::Event::Agent(chunk) => {
+            agent::Event::Agent(chunk) => {
                 // Feed the chunk straight into the session's markdown view:
                 // `push_str` appends incrementally instead of re-parsing the
                 // whole document on every chunk.
@@ -819,13 +815,13 @@ impl KumuApp {
                     })
                 });
             }
-            backend::Event::Thought { text, message } => {
+            agent::Event::Thought { text, message } => {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation
                         .update_turn(session_id, cx, |turn, _| turn.push_thinking(text, message))
                 });
             }
-            backend::Event::ToolCall {
+            agent::Event::ToolCall {
                 id,
                 title,
                 status,
@@ -860,7 +856,7 @@ impl KumuApp {
                     })
                 });
             }
-            backend::Event::PermissionRequest {
+            agent::Event::PermissionRequest {
                 tool_call_id,
                 request_id,
                 title,
@@ -909,11 +905,11 @@ impl KumuApp {
                 // The card above the composer and the sidebar's marker.
                 cx.notify();
             }
-            backend::Event::SessionTitle { title } => {
+            agent::Event::SessionTitle { title } => {
                 self.apply_generated_title(session_id, &title);
                 cx.notify();
             }
-            backend::Event::Done(_) => {
+            agent::Event::Done(_) => {
                 // The turn is over, so nothing can still be authorized.
                 self.cancel_pending_permissions(session_id, cx);
                 let turn = self.conversation.update(cx, |conversation, cx| {
@@ -953,7 +949,7 @@ impl KumuApp {
                 self.reload_messages(session_id, cx);
                 cx.notify();
             }
-            backend::Event::Error(err) => {
+            agent::Event::Error(err) => {
                 self.cancel_pending_permissions(session_id, cx);
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.take_turn(session_id, cx)
@@ -963,7 +959,7 @@ impl KumuApp {
             }
             // A probe (no session) speaks for the agent in general; a live
             // session for itself alone.
-            backend::Event::Commands { agent, commands } => {
+            agent::Event::Commands { agent, commands } => {
                 if session_id < 0 {
                     if !cx.has_global::<AgentCommands>() {
                         cx.set_global(AgentCommands::default());
@@ -976,7 +972,7 @@ impl KumuApp {
             }
             // The axes are independent — an agent may offer any subset of them —
             // so an entirely empty report is not worth caching.
-            backend::Event::SessionOptions {
+            agent::Event::SessionOptions {
                 agent,
                 models,
                 current_model,
@@ -1171,7 +1167,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::{ProjectPick, neighbor_session, owns_connection, resolve_project_pick};
-    use crate::backend;
+    use crate::agent;
     use crate::db::{Project, Session};
     use std::collections::HashMap;
 
@@ -1240,15 +1236,15 @@ mod tests {
     /// session, or they would clobber the connection that succeeded it.
     #[test]
     fn only_the_registered_connection_owns_a_session() {
-        let mut conns: HashMap<i64, backend::Connection> = HashMap::new();
-        conns.insert(7, backend::Connection::detached_for_test(1));
+        let mut conns: HashMap<i64, agent::Connection> = HashMap::new();
+        conns.insert(7, agent::Connection::detached_for_test(1));
 
         assert!(owns_connection(&conns, 7, 1));
         assert!(!owns_connection(&conns, 7, 2), "another connection");
         assert!(!owns_connection(&conns, 8, 1), "another session");
 
         // Replacement under the same session id: the old connection is stale.
-        conns.insert(7, backend::Connection::detached_for_test(2));
+        conns.insert(7, agent::Connection::detached_for_test(2));
         assert!(
             !owns_connection(&conns, 7, 1),
             "the replaced connection must not match"

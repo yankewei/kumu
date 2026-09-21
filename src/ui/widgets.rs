@@ -6,7 +6,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::backend;
+use crate::agent;
 
 /// What a chip says when nothing is in force on its axis: the agent's own
 /// configuration decides, and it says which agent, so the label answers "what
@@ -299,7 +299,7 @@ pub trait CatalogueChoice {
     fn name(&self) -> &str;
 }
 
-impl CatalogueChoice for backend::ModeInfo {
+impl CatalogueChoice for agent::ModeInfo {
     fn value(&self) -> &str {
         &self.value
     }
@@ -309,7 +309,7 @@ impl CatalogueChoice for backend::ModeInfo {
     }
 }
 
-impl CatalogueChoice for backend::AccessInfo {
+impl CatalogueChoice for agent::AccessInfo {
     fn value(&self) -> &str {
         &self.value
     }
@@ -319,7 +319,7 @@ impl CatalogueChoice for backend::AccessInfo {
     }
 }
 
-impl CatalogueChoice for backend::SandboxInfo {
+impl CatalogueChoice for agent::SandboxInfo {
     fn value(&self) -> &str {
         &self.value
     }
@@ -329,7 +329,7 @@ impl CatalogueChoice for backend::SandboxInfo {
     }
 }
 
-impl CatalogueChoice for backend::ReasoningInfo {
+impl CatalogueChoice for agent::ReasoningInfo {
     fn value(&self) -> &str {
         &self.value
     }
@@ -389,7 +389,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::{axis_label, choice_label, in_force, inherited_label};
-    use crate::backend::{ModeInfo, ReasoningInfo};
+    use crate::agent::{ModeInfo, ReasoningInfo};
 
     fn mode(value: &str, name: &str) -> ModeInfo {
         ModeInfo {

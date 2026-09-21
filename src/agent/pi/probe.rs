@@ -15,10 +15,10 @@ use std::sync::mpsc::Sender;
 
 use serde_json::json;
 
-use crate::backend::config::Config;
-use crate::backend::event::{Event, emit};
-use crate::backend::probe::run;
-use crate::backend::session::SessionOptionsBuilder;
+use crate::agent::config::Config;
+use crate::agent::event::{Event, emit};
+use crate::agent::probe::run;
+use crate::agent::session::SessionOptionsBuilder;
 
 use super::convert;
 use super::transport;
@@ -114,8 +114,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::probe;
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Config, Event};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Config, Event};
 
     /// End-to-end: probe a real `pi` and expect the catalogue it reports.
     /// Ignored by default, so a plain `cargo test` never drives a real agent;
@@ -233,7 +233,7 @@ mod tests {
             "missing",
             Config {
                 agent: "missing",
-                backend: crate::backend::config::Backend::Pi,
+                backend: crate::agent::config::Backend::Pi,
                 command: "/nonexistent/kumu-pi-test".into(),
                 args: vec![],
                 env: vec![],

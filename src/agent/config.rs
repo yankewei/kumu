@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 /// The protocol a subprocess speaks. [`spawn`] and [`probe`] dispatch on it.
 ///
-/// [`spawn`]: crate::backend::spawn
-/// [`probe`]: crate::backend::probe
+/// [`spawn`]: crate::agent::spawn
+/// [`probe`]: crate::agent::probe
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     /// Agent Client Protocol v1 over stdio.

@@ -29,10 +29,10 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crate::backend::config::Config;
-use crate::backend::event::{CommandInfo, Event, emit};
-use crate::backend::probe::run;
-use crate::backend::session::SessionOptionsBuilder;
+use crate::agent::config::Config;
+use crate::agent::event::{CommandInfo, Event, emit};
+use crate::agent::probe::run;
+use crate::agent::session::SessionOptionsBuilder;
 
 use super::transport::{self, debug_log};
 use super::{convert, protocol, settings};
@@ -120,8 +120,8 @@ async fn command_catalogue(cfg: &Config) -> Result<Vec<CommandInfo>, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Config, Event};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Config, Event};
 
     use super::probe;
 
@@ -245,7 +245,7 @@ mod tests {
             "missing",
             Config {
                 agent: "missing",
-                backend: crate::backend::config::Backend::Claude,
+                backend: crate::agent::config::Backend::Claude,
                 command: "/nonexistent/kumu-claude-test".into(),
                 args: vec![],
                 env: vec![],

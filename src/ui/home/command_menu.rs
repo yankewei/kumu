@@ -13,7 +13,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use crate::backend;
+use crate::agent;
 use crate::db::Session;
 use crate::ui::AgentCommands;
 use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
@@ -29,9 +29,9 @@ use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 /// command from another; the agent's order is kept for everything that matches,
 /// so the list does not reshuffle under a keystroke.
 pub(super) fn matching_commands<'a>(
-    commands: &'a [backend::CommandInfo],
+    commands: &'a [agent::CommandInfo],
     input: &str,
-) -> Vec<&'a backend::CommandInfo> {
+) -> Vec<&'a agent::CommandInfo> {
     let typed = match input.strip_prefix('/') {
         Some(typed) if !typed.contains(char::is_whitespace) => typed.to_lowercase(),
         _ => return Vec::new(),
@@ -50,11 +50,7 @@ impl KumuApp {
     /// Empty for an agent that has reported none (yet), which is what keeps the
     /// menu out of that session's composer rather than offering commands that
     /// could not run.
-    pub(super) fn session_commands(
-        &self,
-        session: &Session,
-        cx: &App,
-    ) -> Vec<backend::CommandInfo> {
+    pub(super) fn session_commands(&self, session: &Session, cx: &App) -> Vec<agent::CommandInfo> {
         if let Some((_, commands)) = self
             .live_commands
             .get(&session.id)
@@ -203,7 +199,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::matching_commands;
-    use crate::backend::CommandInfo;
+    use crate::agent::CommandInfo;
 
     fn commands() -> Vec<CommandInfo> {
         vec![

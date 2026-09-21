@@ -13,8 +13,8 @@ use agent_client_protocol::schema::v1::{
     ToolCallUpdate,
 };
 
-use crate::backend::event::{CommandInfo, ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
-use crate::backend::session::CANCELLED;
+use crate::agent::event::{CommandInfo, ModeInfo, ModelInfo, PermissionKind, ReasoningInfo};
+use crate::agent::session::CANCELLED;
 
 /// A select session config option, located by [`select`].
 struct Select<'a> {

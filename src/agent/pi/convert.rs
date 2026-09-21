@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::backend::event::{CommandInfo, ModelInfo, ReasoningInfo};
+use crate::agent::event::{CommandInfo, ModelInfo, ReasoningInfo};
 
 /// Provider and model id are joined with `/` because that is the form Pi's own
 /// `--model` accepts, and therefore the form kumu sends back.

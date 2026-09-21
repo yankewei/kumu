@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use gpui_kit::Global;
 
-use crate::backend;
+use crate::agent;
 
 pub use home::KumuApp;
 pub use settings::SettingsWindow;
@@ -24,15 +24,15 @@ pub use settings::SettingsWindow;
 /// axis here", and the matching picker renders nothing.
 #[derive(Clone, Default)]
 pub struct SessionOptions {
-    pub models: Vec<backend::ModelInfo>,
+    pub models: Vec<agent::ModelInfo>,
     pub current_model: Option<String>,
-    pub modes: Vec<backend::ModeInfo>,
+    pub modes: Vec<agent::ModeInfo>,
     pub current_mode: Option<String>,
-    pub access: Vec<backend::AccessInfo>,
+    pub access: Vec<agent::AccessInfo>,
     pub current_access: Option<String>,
-    pub sandboxes: Vec<backend::SandboxInfo>,
+    pub sandboxes: Vec<agent::SandboxInfo>,
     pub current_sandbox: Option<String>,
-    pub reasoning: Vec<backend::ReasoningInfo>,
+    pub reasoning: Vec<agent::ReasoningInfo>,
     pub current_reasoning: Option<String>,
 }
 
@@ -53,6 +53,6 @@ impl Global for AgentSessionOptions {}
 /// list cached beside them. A command list arrives on its own and is replaced
 /// only by another one.
 #[derive(Default)]
-pub struct AgentCommands(pub HashMap<&'static str, Vec<backend::CommandInfo>>);
+pub struct AgentCommands(pub HashMap<&'static str, Vec<agent::CommandInfo>>);
 
 impl Global for AgentCommands {}

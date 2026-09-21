@@ -17,10 +17,10 @@ use agent_client_protocol::{
 };
 
 use super::convert::{command_catalog, mode_catalog, model_catalog, reasoning_catalog};
-use crate::backend::config::Config;
-use crate::backend::event::{Event, emit};
-use crate::backend::probe::run;
-use crate::backend::session::SessionOptionsBuilder;
+use crate::agent::config::Config;
+use crate::agent::event::{Event, emit};
+use crate::agent::probe::run;
+use crate::agent::session::SessionOptionsBuilder;
 
 /// How long to wait for the command catalogue after creating the session.
 ///
@@ -103,8 +103,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::probe;
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Config, Event};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Config, Event};
 
     /// End-to-end: probe a real local agent (KUMU_AGENT, default omp) and
     /// expect a Models event. Ignored by default, so a plain `cargo test` never
@@ -197,7 +197,7 @@ mod tests {
             "missing",
             Config {
                 agent: "missing",
-                backend: crate::backend::config::Backend::Acp,
+                backend: crate::agent::config::Backend::Acp,
                 command: "/nonexistent/kumu-agent-test".into(),
                 args: vec![],
                 env: vec![],

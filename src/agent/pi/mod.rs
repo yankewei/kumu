@@ -23,8 +23,8 @@
 //! no wire slice worth pinning as types. What *was* pinned is the behaviour
 //! checked against the real CLI, kept under `schema/pi-rpc/`.
 //!
-//! [`Event`]: crate::backend::Event
-//! [`Cmd`]: crate::backend::Cmd
+//! [`Event`]: crate::agent::Event
+//! [`Cmd`]: crate::agent::Cmd
 
 pub(super) mod convert;
 pub(super) mod probe;

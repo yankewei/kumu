@@ -46,7 +46,7 @@ pub enum Event {
     Done(String),
     /// The agent is asking for authorization before running a tool call. The UI
     /// shows the options on the matching tool row and answers back via
-    /// [`crate::backend::Connection::resolve_permission`].
+    /// [`crate::agent::Connection::resolve_permission`].
     PermissionRequest {
         /// Tool call this request belongs to, so the UI can attach the prompt
         /// to the row it already rendered.
@@ -223,7 +223,7 @@ pub struct PermissionOptionInfo {
     pub kind: PermissionKind,
 }
 
-/// UI -> backend commands on the channel returned by [`crate::backend::spawn`].
+/// UI -> backend commands on the channel returned by [`crate::agent::spawn`].
 pub enum Cmd {
     Prompt(String),
     /// Select the session's model by its config-option value.

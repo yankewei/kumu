@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::backend::event::{
+use crate::agent::event::{
     CommandInfo, Event, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo, SandboxInfo,
 };
 

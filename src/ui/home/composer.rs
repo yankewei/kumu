@@ -8,7 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{MoveDown, MoveUp, Textarea};
 
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
-use crate::agents::AGENTS;
+use crate::agent::AGENTS;
 use crate::db::Session;
 
 impl KumuApp {

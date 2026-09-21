@@ -8,10 +8,10 @@ use std::sync::mpsc::Sender;
 
 use serde_json::json;
 
-use crate::backend::config::Config;
-use crate::backend::event::{Event, emit};
-use crate::backend::probe::run;
-use crate::backend::session::SessionOptionsBuilder;
+use crate::agent::config::Config;
+use crate::agent::event::{Event, emit};
+use crate::agent::probe::run;
+use crate::agent::session::SessionOptionsBuilder;
 
 use super::protocol::{ModelListResult, SkillsListResult};
 use super::transport::debug_log;
@@ -77,8 +77,8 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::probe;
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Config, Event};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Config, Event};
 
     /// End-to-end: probe a real Codex install (`codex app-server`) and expect
     /// its model catalog and its commands. Ignored by default, so a plain

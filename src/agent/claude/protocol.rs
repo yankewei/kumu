@@ -21,7 +21,7 @@ use serde_json::Value;
 ///
 /// The control messages are absent on purpose: the transport consumes
 /// `control_response` to settle the request it belongs to, and turns
-/// `control_request` into its own [`crate::backend::claude::transport::Message`],
+/// `control_request` into its own [`crate::agent::claude::transport::Message`],
 /// so neither ever reaches the session as a stream line.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]

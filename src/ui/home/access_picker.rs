@@ -126,7 +126,7 @@ mod tests {
     use crate::ui::widgets::inherited_label;
 
     use super::access_label;
-    use crate::backend::AccessInfo;
+    use crate::agent::AccessInfo;
     use crate::ui::SessionOptions;
 
     fn policy(value: &str, name: &str) -> AccessInfo {

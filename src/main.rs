@@ -12,16 +12,14 @@
 //!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `agents.rs` static registry of agents kumu can drive;
 //!   - `db.rs`    local SQLite persistence (projects/sessions/messages);
-//!   - `backend/` the agent backends on a dedicated thread: a facade over one
-//!     vocabulary (`event`), a per-agent launch config, and one submodule per
-//!     protocol. Settings probes agents over it to discover their models; home
-//!     sessions prompt them.
+//!   - `agent/`   the agents kumu can drive (`registry`) and their backends on a
+//!     dedicated thread: a facade over one vocabulary (`event`), a per-agent
+//!     launch config, and one submodule per protocol. Settings probes agents
+//!     over it to discover their models; home sessions prompt them.
 
-mod agents;
+mod agent;
 mod assets;
-mod backend;
 mod db;
 mod theme;
 mod ui;

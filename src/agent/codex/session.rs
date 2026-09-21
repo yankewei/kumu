@@ -18,10 +18,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::config::Config;
-use crate::backend::connection::WeakPermissions;
-use crate::backend::event::{Cmd, Event, ModelInfo, emit};
-use crate::backend::session::{
+use crate::agent::config::Config;
+use crate::agent::connection::WeakPermissions;
+use crate::agent::event::{Cmd, Event, ModelInfo, emit};
+use crate::agent::session::{
     CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
     forget_stale_cancels, release_pending_permissions, settle,
 };
@@ -155,7 +155,7 @@ impl SessionState {
     }
 }
 
-pub(in crate::backend) async fn run(
+pub(in crate::agent) async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
@@ -990,8 +990,8 @@ fn push_line(buffer: &mut String, line: &str) {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Cmd, Config, Event, PermissionKind, spawn};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Cmd, Config, Event, PermissionKind, spawn};
 
     use super::{Shared, Transport, handle_notification};
     use serde_json::json;

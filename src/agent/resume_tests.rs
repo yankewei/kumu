@@ -31,7 +31,7 @@ impl Fixture {
         cfg.command = "python3".into();
         cfg.args = vec![
             format!(
-                "{}/src/backend/test_support/resume_agent.py",
+                "{}/src/agent/test_support/resume_agent.py",
                 env!("CARGO_MANIFEST_DIR")
             ),
             protocol.into(),

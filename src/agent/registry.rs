@@ -1,4 +1,5 @@
-//! Static registry of agents kumu can drive. ACP wiring is the next step.
+//! Static registry of agents kumu can drive. Which protocol each one speaks is
+//! decided in `config`, keyed by the `id` here.
 
 /// One drivable agent: id used in storage, name shown in the UI.
 pub struct AgentDef {

@@ -33,12 +33,12 @@ use super::convert;
 use super::protocol::{self, ContentBlock, Incoming, ResultEvent};
 use super::settings;
 use super::transport::{self, Message, Transport, debug_log};
-use crate::backend::config::{Config, SessionPicks};
-use crate::backend::connection::WeakPermissions;
-use crate::backend::event::{
+use crate::agent::config::{Config, SessionPicks};
+use crate::agent::connection::WeakPermissions;
+use crate::agent::event::{
     AccessInfo, Cmd, CommandInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit,
 };
-use crate::backend::session::{
+use crate::agent::session::{
     CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
     forget_stale_cancels, release_pending_permissions, settle,
 };
@@ -172,7 +172,7 @@ fn reported_effort(launched: &SessionPicks, model: Option<&str>) -> String {
     effort_in_force(launched, model).unwrap_or_else(|| convert::default_effort(model).to_string())
 }
 
-pub(in crate::backend) async fn run(
+pub(in crate::agent) async fn run(
     cfg: Config,
     cwd: PathBuf,
     ev_tx: Sender<Event>,
@@ -706,8 +706,8 @@ fn deny_response(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::backend::{Cmd, Config, Event, PermissionKind, SessionPicks, spawn};
+    use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
+    use crate::agent::{Cmd, Config, Event, PermissionKind, SessionPicks, spawn};
 
     use super::{Awaiting, CommandInfo, Message, Options, Shared, Transport, handle_message};
     use serde_json::{Value, json};

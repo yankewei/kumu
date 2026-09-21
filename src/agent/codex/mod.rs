@@ -12,8 +12,8 @@
 //!   - `session`   — handshake, the single thread, and the command loop;
 //!   - `probe`     — model and skill discovery (`model/list`, `skills/list`).
 //!
-//! [`Event`]: crate::backend::Event
-//! [`Cmd`]: crate::backend::Cmd
+//! [`Event`]: crate::agent::Event
+//! [`Cmd`]: crate::agent::Cmd
 
 pub(super) mod probe;
 pub(super) mod session;
