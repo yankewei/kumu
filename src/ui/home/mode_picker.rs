@@ -7,10 +7,10 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::agent;
+use crate::app::Axis;
+use crate::app::discovery::AgentSessionOptions;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{
     PickerChrome, axis_label, in_force, picker_chip, picker_list, picker_menu, select_row,
 };
@@ -44,14 +44,9 @@ impl KumuApp {
         let Some(session_id) = self.selected else {
             return;
         };
-        self.store
-            .update_session_mode(session_id, Some(&value))
-            .ok();
-        self.refresh();
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(agent::Cmd::SetMode(value));
-        }
-        cx.notify();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.pick(session_id, Axis::Mode, value, cx)
+        });
     }
 
     /// The composer's mode picker: a text chip showing the mode in force, which
@@ -140,7 +135,7 @@ mod tests {
 
     use super::mode_label;
     use crate::agent::ModeInfo;
-    use crate::ui::SessionOptions;
+    use crate::app::discovery::SessionOptions;
 
     fn mode(value: &str, name: &str) -> ModeInfo {
         ModeInfo {

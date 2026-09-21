@@ -14,8 +14,8 @@ use gpui_kit::*;
 
 use super::KumuApp;
 use crate::agent;
+use crate::app::discovery::AgentCommands;
 use crate::db::Session;
-use crate::ui::AgentCommands;
 use crate::ui::widgets::{PickerChrome, select_row, tracked_picker_menu};
 
 /// The commands a partly typed `/…` could mean, in the agent's own order.
@@ -52,11 +52,12 @@ impl KumuApp {
     /// could not run.
     pub(super) fn session_commands(&self, session: &Session, cx: &App) -> Vec<agent::CommandInfo> {
         if let Some((_, commands)) = self
-            .live_commands
-            .get(&session.id)
+            .workspace
+            .read(cx)
+            .live_commands(session.id)
             .filter(|(agent, _)| *agent == session.agent)
         {
-            return commands.clone();
+            return commands.to_vec();
         }
         cx.try_global::<AgentCommands>()
             .and_then(|catalogs| catalogs.0.get(session.agent.as_str()).cloned())
@@ -80,13 +81,13 @@ impl KumuApp {
     /// the menu is open to take the key — when it is not, Up/Down belong to the
     /// textarea.
     pub(super) fn move_command_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
-        let Some(session) = self.selected_session() else {
+        let Some(session) = self.selected_session(cx) else {
             return false;
         };
-        if self.conversation.read(cx).has_turn(session.id) {
+        if self.workspace.read(cx).has_turn(session.id) {
             return false;
         }
-        let commands = self.session_commands(session, cx);
+        let commands = self.session_commands(&session, cx);
         let typed = self.input_state.read(cx).value();
         let len = matching_commands(&commands, &typed).len();
         if len == 0 {
@@ -132,7 +133,7 @@ impl KumuApp {
     /// command matches it, or a turn is in flight (the composer refuses to send
     /// then, so there is nothing to complete into).
     pub(super) fn command_menu(&self, session: &Session, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.conversation.read(cx).has_turn(session.id) {
+        if self.workspace.read(cx).has_turn(session.id) {
             return None;
         }
         let commands = self.session_commands(session, cx);

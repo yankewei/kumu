@@ -15,9 +15,9 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
+use crate::app::discovery::AgentSessionOptions;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{
     PickerChrome, axis_label, in_force, picker_chip, picker_list, picker_menu, select_row,
 };
@@ -127,7 +127,7 @@ mod tests {
 
     use super::access_label;
     use crate::agent::AccessInfo;
-    use crate::ui::SessionOptions;
+    use crate::app::discovery::SessionOptions;
 
     fn policy(value: &str, name: &str) -> AccessInfo {
         AccessInfo {

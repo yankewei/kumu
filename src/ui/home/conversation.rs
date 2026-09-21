@@ -6,7 +6,6 @@
 //! the sidebar leaves it untouched. Rows go through a virtual list, so a frame
 //! only builds the rows on screen however long the session has grown.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -20,7 +19,8 @@ use gpui_kit::*;
 use super::markdown_mermaid::MermaidMarkdownPlugin;
 use super::permission::render_permission_decision;
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM};
-use crate::app::turn::{Turn, TurnBlock};
+use crate::app::turn::TurnBlock;
+use crate::app::{Workspace, WorkspaceEvent};
 use crate::db::Message;
 use crate::ui::widgets::loader;
 
@@ -261,7 +261,17 @@ enum RowToggle {
     Live(u64, usize),
 }
 
+/// How a live reply's markdown view catches up with its text.
+enum AnswerUpdate {
+    /// Feed it the text it has not seen.
+    Append(String),
+    /// Parse the whole text again.
+    Rebuild(String),
+}
+
 pub(super) struct ConversationView {
+    /// Where the live turns come from; the view only caches how to draw them.
+    workspace: Entity<Workspace>,
     /// The session on screen, if any.
     session_id: Option<i64>,
     history: Vec<HistoryEntry>,
@@ -269,9 +279,6 @@ pub(super) struct ConversationView {
     history_rows: Vec<Row>,
     /// Every row the list currently knows about, history then live.
     rows: Vec<Row>,
-    /// Live turn state keyed by session id: streaming thinking, tool calls,
-    /// and the answer being built. Dropped when the turn ends.
-    turns: HashMap<i64, Turn>,
     /// Each live reply's parsed markdown, keyed by turn and block, with how
     /// much of the reply it has been fed: a streamed chunk is appended to the
     /// view rather than re-parsing the whole reply.
@@ -286,17 +293,36 @@ pub(super) struct ConversationView {
 }
 
 impl ConversationView {
-    pub(super) fn new(cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         // The scroller notifies its own state (scrolling away from or back to
         // the tail); this view is what draws the jump button that depends on it.
         cx.observe(&scroller, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&workspace, |this, workspace, ev, cx| match ev {
+            WorkspaceEvent::TurnChanged(session_id) => this.sync_turn(*session_id, cx),
+            WorkspaceEvent::TurnClosed {
+                session_id,
+                turn_id,
+            } => {
+                this.answer_views.retain(|(turn, _), _| turn != turn_id);
+                this.live_open.retain(|(turn, _)| turn != turn_id);
+                this.sync_turn(*session_id, cx);
+            }
+            WorkspaceEvent::HistoryChanged(session_id) => {
+                if this.session_id == Some(*session_id) {
+                    let messages = workspace.read(cx).messages(*session_id);
+                    this.reload_history(*session_id, &messages, cx);
+                }
+            }
+            WorkspaceEvent::Changed => {}
+        })
+        .detach();
         Self {
+            workspace,
             session_id: None,
             history: Vec::new(),
             history_rows: Vec::new(),
             rows: Vec::new(),
-            turns: HashMap::new(),
             answer_views: HashMap::new(),
             live_open: HashSet::new(),
             expanded_rows: HashSet::new(),
@@ -317,7 +343,7 @@ impl ConversationView {
         self.session_id = session_id;
         self.history = messages.iter().map(HistoryEntry::decode).collect();
         self.history_rows = self.fold_history(messages);
-        self.rows = self.current_rows();
+        self.rows = self.current_rows(cx);
         let count = self.rows.len();
         self.scroller
             .update(cx, |scroller, cx| scroller.reset(count, cx));
@@ -326,12 +352,7 @@ impl ConversationView {
 
     /// The session's persisted messages changed (a turn was saved, a notice
     /// written). Ignored unless that session is the one on screen.
-    pub(super) fn reload_history(
-        &mut self,
-        session_id: i64,
-        messages: &[Message],
-        cx: &mut Context<Self>,
-    ) {
+    fn reload_history(&mut self, session_id: i64, messages: &[Message], cx: &mut Context<Self>) {
         if self.session_id != Some(session_id) {
             return;
         }
@@ -365,54 +386,6 @@ impl ConversationView {
             .update(cx, |scroller, cx| scroller.scroll_to_end(cx));
     }
 
-    pub(super) fn has_turn(&self, session_id: i64) -> bool {
-        self.turns.contains_key(&session_id)
-    }
-
-    pub(super) fn turn(&self, session_id: i64) -> Option<&Turn> {
-        self.turns.get(&session_id)
-    }
-
-    /// Mutate the session's live turn, opening it first if there is none, then
-    /// bring the list in line with what changed.
-    pub(super) fn update_turn<R>(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut Turn) -> R,
-    ) -> R {
-        let turn = match self.turns.entry(session_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(Turn::new()),
-        };
-        let result = f(turn);
-        self.sync_turn(session_id, cx);
-        result
-    }
-
-    /// Like [`Self::update_turn`], but only when a turn is already open.
-    pub(super) fn with_turn<R>(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut Turn) -> R,
-    ) -> Option<R> {
-        let result = f(self.turns.get_mut(&session_id)?);
-        self.sync_turn(session_id, cx);
-        Some(result)
-    }
-
-    /// Close the session's live turn, handing its blocks back and dropping
-    /// what was cached to draw them.
-    pub(super) fn take_turn(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<Turn> {
-        let turn = self.turns.remove(&session_id)?;
-        let id = turn.id();
-        self.answer_views.retain(|(turn, _), _| *turn != id);
-        self.live_open.retain(|(turn, _)| *turn != id);
-        self.sync_turn(session_id, cx);
-        Some(turn)
-    }
-
     fn sync_turn(&mut self, session_id: i64, cx: &mut Context<Self>) {
         self.sync_answer_views(session_id, cx);
         if self.session_id == Some(session_id) {
@@ -425,30 +398,37 @@ impl ConversationView {
     /// it was fed (a reply is only appended to, so that is a safety net rather
     /// than a path taken while streaming).
     fn sync_answer_views(&mut self, session_id: i64, cx: &mut Context<Self>) {
-        let Some(turn) = self.turns.get(&session_id) else {
-            return;
-        };
-        let turn_id = turn.id();
-        for (index, block) in turn.blocks.iter().enumerate() {
-            let TurnBlock::Answer(text) = block else {
-                continue;
-            };
-            match self.answer_views.entry((turn_id, index)) {
-                Entry::Occupied(mut entry) => {
-                    let (view, fed) = entry.get_mut();
-                    if *fed == text.len() {
-                        continue;
-                    }
-                    if *fed < text.len() && text.is_char_boundary(*fed) {
-                        let tail = &text[*fed..];
-                        view.update(cx, |state, cx| state.push_str(tail, cx));
-                    } else {
-                        *view = Self::markdown_view(text, cx);
-                    }
-                    *fed = text.len();
+        // What each reply block needs, gathered first: the workspace is read
+        // through `cx`, which the views below need mutably.
+        let mut stale = Vec::new();
+        if let Some(turn) = self.workspace.read(cx).turn(session_id) {
+            for (index, block) in turn.blocks.iter().enumerate() {
+                let TurnBlock::Answer(text) = block else {
+                    continue;
+                };
+                let key = (turn.id(), index);
+                let fed = self.answer_views.get(&key).map(|(_, fed)| *fed);
+                if fed == Some(text.len()) {
+                    continue;
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert((Self::markdown_view(text, cx), text.len()));
+                let update = match fed {
+                    Some(fed) if fed < text.len() && text.is_char_boundary(fed) => {
+                        AnswerUpdate::Append(text[fed..].to_string())
+                    }
+                    _ => AnswerUpdate::Rebuild(text.clone()),
+                };
+                stale.push((key, text.len(), update));
+            }
+        }
+        for (key, len, update) in stale {
+            match (update, self.answer_views.get_mut(&key)) {
+                (AnswerUpdate::Append(tail), Some((view, fed))) => {
+                    view.update(cx, |state, cx| state.push_str(&tail, cx));
+                    *fed = len;
+                }
+                (AnswerUpdate::Rebuild(text), _) | (AnswerUpdate::Append(text), None) => {
+                    let view = Self::markdown_view(&text, cx);
+                    self.answer_views.insert(key, (view, len));
                 }
             }
         }
@@ -475,9 +455,10 @@ impl ConversationView {
         )
     }
 
-    fn current_rows(&self) -> Vec<Row> {
+    fn current_rows(&self, cx: &App) -> Vec<Row> {
         let mut rows = self.history_rows.clone();
-        if let Some(turn) = self.session_id.and_then(|id| self.turns.get(&id)) {
+        let workspace = self.workspace.read(cx);
+        if let Some(turn) = self.session_id.and_then(|id| workspace.turn(id)) {
             rows.extend(fold_rows(
                 turn.blocks
                     .iter()
@@ -497,7 +478,7 @@ impl ConversationView {
     /// remeasured where they stand (holding the reader's scroll position), and
     /// only the tail that differs is spliced.
     fn sync_rows(&mut self, cx: &mut Context<Self>) {
-        let rows = self.current_rows();
+        let rows = self.current_rows(cx);
         let RowChange { remeasure, splice } = diff_rows(&self.rows, &rows);
         self.rows = rows;
         self.scroller.update(cx, |scroller, cx| {
@@ -551,7 +532,7 @@ impl ConversationView {
             Row::Live(index) => self.render_live_block(index, session_id, cx),
             Row::LiveTools(range) => {
                 let rows = range
-                    .filter_map(|index| self.live_tool_row(session_id, index))
+                    .filter_map(|index| self.live_tool_row(session_id, index, cx))
                     .collect();
                 self.render_tool_run(rows, cx)
             }
@@ -654,8 +635,8 @@ impl ConversationView {
         })
     }
 
-    fn live_tool_row(&self, session_id: i64, index: usize) -> Option<ToolRow> {
-        let turn = self.turns.get(&session_id)?;
+    fn live_tool_row(&self, session_id: i64, index: usize, cx: &App) -> Option<ToolRow> {
+        let turn = self.workspace.read(cx).turn(session_id)?;
         let TurnBlock::Tool(run) = turn.blocks.get(index)? else {
             return None;
         };
@@ -684,7 +665,7 @@ impl ConversationView {
         session_id: i64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(turn) = self.turns.get(&session_id) else {
+        let Some(turn) = self.workspace.read(cx).turn(session_id) else {
             return div().into_any_element();
         };
         let key = (turn.id(), index);
@@ -769,7 +750,7 @@ impl ConversationView {
     /// view while it turns (see [`loader`]), so the elapsed time is re-read
     /// there. A ticker would only duplicate what the loader already forces.
     fn render_working(&self, session_id: i64, cx: &Context<Self>) -> AnyElement {
-        let Some(turn) = self.turns.get(&session_id) else {
+        let Some(turn) = self.workspace.read(cx).turn(session_id) else {
             return div().into_any_element();
         };
         let muted_fg = cx.theme().muted_foreground;

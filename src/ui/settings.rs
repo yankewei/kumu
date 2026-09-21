@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use futures::StreamExt;
 
 use super::widgets::{agent_logo, pill};
-use super::{AgentSessionOptions, SessionOptions};
 use crate::agent;
 use crate::agent::AGENTS;
+use crate::app::discovery::{AgentSessionOptions, SessionOptions};
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -678,7 +678,7 @@ mod tests {
     use core::prelude::v1::test;
 
     use super::{AGENTS, agents_missing_from};
-    use crate::ui::SessionOptions;
+    use crate::app::discovery::SessionOptions;
     use std::collections::HashMap;
 
     /// Startup asks only for what this process has not discovered, so opening

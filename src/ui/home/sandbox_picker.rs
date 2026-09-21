@@ -11,10 +11,10 @@ use gpui_kit::*;
 use gpui_kit::component::popover::Popover;
 
 use super::{KumuApp, PickerAxis};
-use crate::agent;
+use crate::app::Axis;
+use crate::app::discovery::AgentSessionOptions;
+use crate::app::discovery::SessionOptions;
 use crate::db::Session;
-use crate::ui::AgentSessionOptions;
-use crate::ui::SessionOptions;
 use crate::ui::widgets::{
     PickerChrome, axis_label, picker_chip, picker_list, picker_menu, select_row,
 };
@@ -44,14 +44,9 @@ impl KumuApp {
         let Some(session_id) = self.selected else {
             return;
         };
-        self.store
-            .update_session_sandbox(session_id, Some(&value))
-            .ok();
-        self.refresh();
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(agent::Cmd::SetSandbox(value));
-        }
-        cx.notify();
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.pick(session_id, Axis::Sandbox, value, cx)
+        });
     }
 
     /// The composer's sandbox picker: a text chip showing the policy in force,
@@ -146,7 +141,7 @@ mod tests {
 
     use super::sandbox_label;
     use crate::agent::SandboxInfo;
-    use crate::ui::SessionOptions;
+    use crate::app::discovery::SessionOptions;
 
     fn sandbox(value: &str, name: &str) -> SandboxInfo {
         SandboxInfo {
