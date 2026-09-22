@@ -405,7 +405,15 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
         // force and the model kumu's pick resolved to.
         "init" => {
             if let Some(resume_id) = system.session_id.filter(|id| !id.is_empty()) {
-                emit(&shared.ev_tx, Event::SessionReady { resume_id });
+                emit(
+                    &shared.ev_tx,
+                    Event::SessionReady {
+                        resume_id,
+                        // The CLI reopens its own session from the id it
+                        // reports; dropping the process never strands it.
+                        resumable: true,
+                    },
+                );
             }
             let model = system.model.filter(|model| !model.is_empty());
             {

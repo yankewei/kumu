@@ -406,19 +406,35 @@ impl Workspace {
     /// Fold one event from a session's live connection into the workspace.
     fn on_agent_event(&mut self, session_id: i64, ev: agent::Event, cx: &mut Context<Self>) {
         match ev {
-            agent::Event::SessionReady { resume_id } => {
-                match self.store.update_session_resume_id(session_id, &resume_id) {
-                    Ok(()) => {
-                        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id)
-                        {
-                            session.resume_id = Some(resume_id);
+            agent::Event::SessionReady {
+                resume_id,
+                resumable,
+            } => {
+                // An agent that will not load its own id back cannot be
+                // restored from it, so the connection must be kept rather than
+                // reclaimed; remember that, and do not persist a cursor that
+                // only a connect-time error would come of. The session still
+                // gets the ordinary "no saved context" notice on a later
+                // reconnect, which is a fresh conversation rather than a
+                // failure loop.
+                if !resumable {
+                    self.unresumable.insert(session_id);
+                } else {
+                    self.unresumable.remove(&session_id);
+                    match self.store.update_session_resume_id(session_id, &resume_id) {
+                        Ok(()) => {
+                            if let Some(session) =
+                                self.sessions.iter_mut().find(|s| s.id == session_id)
+                            {
+                                session.resume_id = Some(resume_id);
+                            }
                         }
+                        Err(error) => self.system_message(
+                            session_id,
+                            format!("保存 agent 会话标识失败，重启后将无法恢复上下文：{error}"),
+                            cx,
+                        ),
                     }
-                    Err(error) => self.system_message(
-                        session_id,
-                        format!("保存 agent 会话标识失败，重启后将无法恢复上下文：{error}"),
-                        cx,
-                    ),
                 }
             }
             agent::Event::Agent(chunk) => {

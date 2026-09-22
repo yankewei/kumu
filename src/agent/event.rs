@@ -41,7 +41,14 @@ pub enum Event {
     /// The agent named the session (session/info update with a title).
     SessionTitle { title: String },
     /// The backend opened a conversation and supplied its durable restore cursor.
-    SessionReady { resume_id: String },
+    ///
+    /// `resumable` says whether that cursor can actually reopen the conversation
+    /// in a later connection. An ACP agent that does not advertise `load_session`
+    /// still hands back an id for the session it just created, but will refuse
+    /// to load it, so dropping that connection loses the conversation for good;
+    /// the flag is `false` there, and `true` everywhere a reconnect can restore
+    /// the session from `resume_id`.
+    SessionReady { resume_id: String, resumable: bool },
     /// The prompt turn ended with this stop reason.
     Done(String),
     /// The agent is asking for authorization before running a tool call. The UI
@@ -256,7 +263,10 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                 )
             }
             Event::SessionTitle { title } => eprintln!("[agent] title: {title}"),
-            Event::SessionReady { resume_id } => eprintln!("[agent] session ready: {resume_id}"),
+            Event::SessionReady {
+                resume_id,
+                resumable,
+            } => eprintln!("[agent] session ready: {resume_id} (resumable: {resumable})"),
             Event::Done(s) => eprintln!("[agent] done: {s}"),
             Event::PermissionRequest {
                 tool_call_id,

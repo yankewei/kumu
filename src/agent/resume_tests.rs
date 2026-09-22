@@ -72,7 +72,7 @@ fn prompt(conn: &Connection, rx: &Receiver<Event>, text: &str, store: &Store, id
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap()
         {
-            Event::SessionReady { resume_id } => {
+            Event::SessionReady { resume_id, .. } => {
                 store.update_session_resume_id(id, &resume_id).unwrap()
             }
             Event::Agent(text) => answer.push_str(&text),
@@ -217,4 +217,37 @@ fn acp_checks_restore_capability_before_loading() {
     finish_connection(conn, rx);
     let log = std::fs::read_to_string(fixture.directory.join("requests.jsonl")).unwrap();
     assert!(!log.contains("session/load") && !log.contains("session/new"));
+}
+
+/// A fresh session says whether its agent will load it back. That flag is what
+/// keeps the app from reclaiming a connection it could not reopen, so an agent
+/// without `load_session` must report `false` rather than hand back a cursor it
+/// would refuse to use.
+#[test]
+fn a_fresh_session_reports_whether_it_can_be_resumed() {
+    for (no_load, expected) in [(false, true), (true, false)] {
+        let fixture = Fixture::new();
+        let mut cfg = fixture.config("omp", None);
+        cfg.env.push((
+            "KUMU_FAKE_NO_LOAD".into(),
+            if no_load { "1" } else { "0" }.into(),
+        ));
+        let (tx, rx) = channel();
+        let conn = spawn(cfg, fixture.directory.clone(), tx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Event::SessionReady { resumable, .. } => {
+                    assert_eq!(resumable, expected, "KUMU_FAKE_NO_LOAD={no_load}");
+                    break;
+                }
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        finish_connection(conn, rx);
+    }
 }

@@ -453,6 +453,9 @@ async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
             &shared.ev_tx,
             Event::SessionReady {
                 resume_id: path.to_string(),
+                // Pi reopens the session from its file, so the connection is
+                // safe to drop and reopen.
+                resumable: true,
             },
         );
     }

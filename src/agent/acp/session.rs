@@ -255,8 +255,15 @@ pub(in crate::agent) async fn run(
                     )),
                 );
 
+                // Whether this agent will load a session id back: the one thing
+                // that decides whether a connection may be reclaimed later. It
+                // is reported with the session so the app can keep the
+                // connections that cannot be reopened instead of closing one
+                // and stranding its conversation.
+                let resumable = init.agent_capabilities.load_session;
+
                 let (session_id, config_options) = if let Some(id) = &cfg.session.resume_id {
-                    if !init.agent_capabilities.load_session {
+                    if !resumable {
                         return Err(agent_client_protocol::Error::new(
                             -32603,
                             "当前 agent 不支持恢复会话，未开启新会话。请新建会话，或使用支持恢复的 agent 版本。",
@@ -278,7 +285,13 @@ pub(in crate::agent) async fn run(
                     (created.session_id, created.config_options)
                 };
                 loading.store(false, Ordering::Release);
-                emit(&log_tx, Event::SessionReady { resume_id: session_id.0.to_string() });
+                emit(
+                    &log_tx,
+                    Event::SessionReady {
+                        resume_id: session_id.0.to_string(),
+                        resumable,
+                    },
+                );
                 emit(&log_tx, Event::Log(format!("session ready: {session_id}")));
 
                 // Read the model, mode and reasoning config options: their ids

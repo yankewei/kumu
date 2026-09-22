@@ -289,6 +289,9 @@ pub(in crate::agent) async fn run(
         &ev_tx,
         Event::SessionReady {
             resume_id: thread_id.clone(),
+            // app-server reopens a thread from its id, so a fresh process
+            // restores a session rather than losing it.
+            resumable: true,
         },
     );
     emit(
