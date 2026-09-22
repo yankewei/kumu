@@ -17,7 +17,7 @@ pub mod discovery;
 mod session;
 pub mod turn;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui_kit::{Context, EventEmitter};
@@ -31,6 +31,13 @@ pub use session::Axis;
 
 /// The agent a new session starts with, until the user picks another.
 const DEFAULT_AGENT: &str = "omp";
+
+/// How many agent subprocesses may stay connected at once.
+///
+/// A session whose connection is reclaimed reconnects on its next prompt and
+/// resumes its agent-side context from the stored `resume_id`, so the cap
+/// trades a little latency for a bounded number of live processes.
+const MAX_LIVE_CONNECTIONS: usize = 3;
 
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
@@ -58,6 +65,15 @@ pub struct Workspace {
     sessions: Vec<Session>,
     /// Live connections keyed by session id, reused across prompts.
     conns: HashMap<i64, agent::Connection>,
+    /// Each live session's position in the reclamation order, least recently
+    /// used first. Kept in step with `conns` by [`Self::touch_connection`] and
+    /// [`Self::forget_connection`], and read by
+    /// [`Self::reclaim_idle_connections`].
+    conn_lru: Vec<i64>,
+    /// Sessions already told that their history cannot be resumed. A reclaimed
+    /// connection is opened again on the next prompt, and without this the
+    /// notice would be written into the conversation every time.
+    no_resume_notified: HashSet<i64>,
     /// Each session's turn in flight: streaming reasoning, tool calls, and the
     /// reply being built. Dropped when the turn ends.
     turns: HashMap<i64, Turn>,
@@ -86,6 +102,8 @@ impl Workspace {
             projects: Vec::new(),
             sessions: Vec::new(),
             conns: HashMap::new(),
+            conn_lru: Vec::new(),
+            no_resume_notified: HashSet::new(),
             turns: HashMap::new(),
             live_commands: HashMap::new(),
             live_options: HashMap::new(),
@@ -258,12 +276,56 @@ impl Workspace {
     /// remove the row and its history.
     pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
         self.cancel_pending_permissions(session_id);
-        self.conns.remove(&session_id);
+        self.forget_connection(session_id);
         self.live_commands.remove(&session_id);
         self.live_options.remove(&session_id);
+        self.no_resume_notified.remove(&session_id);
         self.take_turn(session_id, cx);
         self.store.delete_session(session_id).ok();
         self.refresh();
+        cx.emit(WorkspaceEvent::Changed);
+    }
+
+    /// Record that a session's connection was used just now, so a later
+    /// reclamation keeps the most recently used ones. The only writer is
+    /// [`Self::ensure_connection`], which is the only place a connection is
+    /// opened or reused.
+    fn touch_connection(&mut self, session_id: i64) {
+        self.conn_lru.retain(|&id| id != session_id);
+        self.conn_lru.push(session_id);
+    }
+
+    /// Drop the session's live connection handle — which tears down its agent
+    /// subprocess — and forget its place in the reclamation order.
+    ///
+    /// The last-reported commands and options are left in place: they still
+    /// describe what the agent offers, and a reconnect refreshes them.
+    fn forget_connection(&mut self, session_id: i64) {
+        self.conns.remove(&session_id);
+        self.conn_lru.retain(|&id| id != session_id);
+    }
+
+    /// Close the least recently used idle connections once more than
+    /// [`MAX_LIVE_CONNECTIONS`] are open, so agent subprocesses do not
+    /// accumulate for the life of the app.
+    ///
+    /// A session with a turn in flight is never closed — its agent is running —
+    /// and neither is `active`, the session the caller is acting on: the one
+    /// being prompted, or the one whose turn just ended. A reclaimed session
+    /// reconnects on its next prompt and resumes its agent-side context from
+    /// the stored `resume_id`.
+    fn reclaim_idle_connections(&mut self, active: i64, cx: &mut Context<Self>) {
+        let conns = &self.conns;
+        self.conn_lru.retain(|id| conns.contains_key(id));
+        let busy: HashSet<i64> = self.turns.keys().copied().collect();
+        let evictions = idle_evictions(&self.conn_lru, &busy, active, MAX_LIVE_CONNECTIONS);
+        if evictions.is_empty() {
+            return;
+        }
+        for session_id in evictions {
+            self.cancel_pending_permissions(session_id);
+            self.forget_connection(session_id);
+        }
         cx.emit(WorkspaceEvent::Changed);
     }
 
@@ -348,9 +410,31 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
     ProjectPick::New { name }
 }
 
+/// Which idle connections to close to get back down to `cap`, least recently
+/// used first.
+///
+/// `order` is the reclamation order, least recently used first. The session
+/// being prompted (`active`) and any session with a turn in flight (`busy`)
+/// are skipped: their agent is not something to stop.
+fn idle_evictions(order: &[i64], busy: &HashSet<i64>, active: i64, cap: usize) -> Vec<i64> {
+    let mut evictions = Vec::new();
+    for &session_id in order {
+        if order.len() - evictions.len() <= cap {
+            break;
+        }
+        if session_id == active || busy.contains(&session_id) {
+            continue;
+        }
+        evictions.push(session_id);
+    }
+    evictions
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProjectPick, resolve_project_pick};
+    use std::collections::HashSet;
+
+    use super::{ProjectPick, idle_evictions, resolve_project_pick};
     use crate::db::Project;
 
     fn project(id: i64, path: &str) -> Project {
@@ -394,5 +478,38 @@ mod tests {
                 name: "/".to_string()
             }
         );
+    }
+
+    /// Nothing is closed while the open connections are within the cap.
+    #[test]
+    fn nothing_is_evicted_under_the_cap() {
+        assert!(idle_evictions(&[1, 2], &HashSet::new(), 2, 3).is_empty());
+        assert!(idle_evictions(&[1, 2, 3], &HashSet::new(), 3, 3).is_empty());
+    }
+
+    /// Over the cap the least recently used connections go first.
+    #[test]
+    fn the_least_recently_used_idle_connections_are_evicted() {
+        assert_eq!(
+            idle_evictions(&[1, 2, 3, 4, 5], &HashSet::new(), 5, 3),
+            vec![1, 2]
+        );
+    }
+
+    /// The session being prompted is kept even when it is the oldest.
+    #[test]
+    fn the_active_session_is_never_evicted() {
+        assert_eq!(
+            idle_evictions(&[1, 2, 3, 4], &HashSet::new(), 1, 3),
+            vec![2]
+        );
+    }
+
+    /// A session with a turn in flight is skipped: its agent is running and
+    /// must not be stopped to make room.
+    #[test]
+    fn a_busy_session_is_never_evicted() {
+        let busy = HashSet::from([1_i64]);
+        assert_eq!(idle_evictions(&[1, 2, 3, 4], &busy, 4, 3), vec![2]);
     }
 }

@@ -80,6 +80,12 @@ impl Workspace {
         cx.emit(WorkspaceEvent::Changed);
 
         self.ensure_connection(&session, cx);
+        // Opening or reusing this prompt's connection is the only way the pool
+        // grows, so it is the moment to close the least recently used idle ones
+        // back down to the cap.
+        if self.conns.contains_key(&session_id) {
+            self.reclaim_idle_connections(session_id, cx);
+        }
         // No connection means nothing will ever answer this prompt (an agent
         // this build no longer supports, say), so leave it looking delivered
         // rather than in flight; `ensure_connection` has written the notice
@@ -177,7 +183,7 @@ impl Workspace {
             // still waiting on the old connection is settled first, and the
             // in-flight reply (if any) is abandoned with it.
             self.cancel_pending_permissions(session_id);
-            self.conns.remove(&session_id);
+            self.forget_connection(session_id);
             self.live_commands.remove(&session_id);
             self.live_options.remove(&session_id);
             self.take_turn(session_id, cx);
@@ -240,6 +246,11 @@ impl Workspace {
     }
 
     /// Close the session's live turn, handing it back.
+    ///
+    /// A turn ending is when its connection can become idle — its agent is no
+    /// longer running — so this is also where the pool is trimmed back to the
+    /// cap. The session itself is kept: its turn just ended, and the user is
+    /// watching it.
     pub(super) fn take_turn(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<Turn> {
         let turn = self.turns.remove(&session_id)?;
         cx.emit(WorkspaceEvent::TurnClosed {
@@ -247,6 +258,7 @@ impl Workspace {
             turn_id: turn.id(),
         });
         cx.emit(WorkspaceEvent::Changed);
+        self.reclaim_idle_connections(session_id, cx);
         Some(turn)
     }
 
@@ -254,6 +266,8 @@ impl Workspace {
     /// that folds its events back into the workspace.
     fn ensure_connection(&mut self, session: &Session, cx: &mut Context<Self>) {
         if self.conns.contains_key(&session.id) {
+            // Reusing it is a use of it, so it stays the most recently used.
+            self.touch_connection(session.id);
             return;
         }
         let agent_id = agent::AGENTS
@@ -285,7 +299,13 @@ impl Workspace {
             resume_id: session.resume_id.clone(),
         };
         let cfg = cfg.with_session(picks);
-        if session.has_conversation && session.resume_id.is_none() {
+        // Said once per session per run: a reclaimed connection is opened again
+        // on the next prompt, and repeating a notice that is written into the
+        // conversation would pile up a copy per reconnect.
+        if session.has_conversation
+            && session.resume_id.is_none()
+            && self.no_resume_notified.insert(session.id)
+        {
             self.system_message(
                 session.id,
                 "这段历史没有保存 agent 会话标识，无法恢复原来的上下文；本次将开启新的 agent 会话。".into(),
@@ -315,6 +335,7 @@ impl Workspace {
             conn.send(agent::Cmd::SetReasoning(reasoning));
         }
         self.conns.insert(session.id, conn);
+        self.touch_connection(session.id);
 
         let mut events = discovery::bridge(ev_rx);
         let session_id = session.id;
@@ -362,7 +383,7 @@ impl Workspace {
         // without either, which would otherwise leave the turn — and the
         // composer, which refuses to send while one exists — stuck for good.
         self.take_turn(session_id, cx);
-        self.conns.remove(&session_id);
+        self.forget_connection(session_id);
         cx.emit(WorkspaceEvent::Changed);
     }
 
