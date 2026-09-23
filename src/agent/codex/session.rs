@@ -289,6 +289,9 @@ pub(in crate::agent) async fn run(
         &ev_tx,
         Event::SessionReady {
             resume_id: thread_id.clone(),
+            // app-server reopens a thread from its id, so a fresh process
+            // restores a session rather than losing it.
+            resumable: true,
         },
     );
     emit(
@@ -797,6 +800,9 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             };
             shared.commands.lock().unwrap().clear();
             shared.streamed.lock().unwrap().clear();
+            // The details remembered for approval requests belong to this turn
+            // alone; without this they accumulate for the life of the process.
+            shared.details.lock().unwrap().clear();
             if let Some(done) = shared.turn_done.lock().unwrap().take() {
                 let _ = done.send(notification.turn);
             }
@@ -1229,6 +1235,36 @@ mod tests {
         let turn = done_rx.try_recv().expect("turn/completed should wake it");
         assert_eq!(turn.status, "completed");
         assert!(shared.commands.lock().unwrap().is_empty());
+        drop(rx);
+    }
+
+    /// The details remembered for approvals belong to the turn that produced
+    /// them, so its completion drops them instead of letting every item of
+    /// every turn pile up for the life of the process.
+    #[test]
+    fn turn_completed_drops_the_details_remembered_for_its_items() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "item/completed",
+            json!({"item": {
+                "type": "commandExecution", "id": "cmd1", "command": "ls",
+                "status": "completed", "aggregatedOutput": "done output",
+            }}),
+        );
+        assert!(
+            !shared.details.lock().unwrap().is_empty(),
+            "an item's detail is remembered for its approval request"
+        );
+        handle_notification(
+            &shared,
+            "turn/completed",
+            json!({"turn": {"id": "t1", "status": "completed"}}),
+        );
+        assert!(
+            shared.details.lock().unwrap().is_empty(),
+            "details must not outlive the turn that produced them"
+        );
         drop(rx);
     }
 

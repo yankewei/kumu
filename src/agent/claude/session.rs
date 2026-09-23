@@ -405,7 +405,15 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
         // force and the model kumu's pick resolved to.
         "init" => {
             if let Some(resume_id) = system.session_id.filter(|id| !id.is_empty()) {
-                emit(&shared.ev_tx, Event::SessionReady { resume_id });
+                emit(
+                    &shared.ev_tx,
+                    Event::SessionReady {
+                        resume_id,
+                        // The CLI reopens its own session from the id it
+                        // reports; dropping the process never strands it.
+                        resumable: true,
+                    },
+                );
             }
             let model = system.model.filter(|model| !model.is_empty());
             {
@@ -641,6 +649,11 @@ fn on_result(shared: &Shared, result: ResultEvent) {
             if let Some(tx) = shared.turn_done.lock().unwrap().take() {
                 let _ = tx.send(result);
             }
+            // The markers that keep a settled turn's content from being shown
+            // twice are only needed for that turn: the next one streams under
+            // fresh message ids, so keeping them would grow for the life of the
+            // process.
+            shared.streamed.lock().unwrap().clear();
         }
     }
 }
@@ -893,6 +906,46 @@ mod tests {
             "thinking that never streamed must still show when the complete message arrives: {:?}",
             kinds(&events)
         );
+    }
+
+    /// The `streamed` markers exist only to keep one turn's settled content
+    /// from being shown twice. Once its `result` arrives they are dead weight,
+    /// so they are dropped rather than accumulating per message id for the life
+    /// of the process.
+    #[test]
+    fn a_settled_turn_drops_the_streamed_markers() {
+        let (shared, rx) = shared_for_test();
+        let shared = Arc::new(shared);
+        drive(
+            &shared,
+            &[
+                json!({
+                    "type": "stream_event",
+                    "event": {"type": "message_start", "message": {"id": "m1"}},
+                }),
+                json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "hi"},
+                    },
+                }),
+            ],
+        );
+        assert!(
+            !shared.streamed.lock().unwrap().is_empty(),
+            "a streamed delta marks its message"
+        );
+        shared.awaiting.lock().unwrap().push_back(Awaiting::Prompt);
+        drive(
+            &shared,
+            &[json!({"type": "result", "subtype": "success", "is_error": false})],
+        );
+        assert!(
+            shared.streamed.lock().unwrap().is_empty(),
+            "markers must not outlive the turn their result settles"
+        );
+        drop(rx);
     }
 
     /// A command sent as a message (`/model`, `/effort`) is queued as a command
