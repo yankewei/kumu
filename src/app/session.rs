@@ -382,8 +382,11 @@ impl Workspace {
         // failure reports `Error` first); this covers a connection that died
         // without either, which would otherwise leave the turn — and the
         // composer, which refuses to send while one exists — stuck for good.
-        self.take_turn(session_id, cx);
+        // The handle goes first: closing the turn trims the pool back to the
+        // cap, and a dead connection still counted there would push out a
+        // live idle one for nothing.
         self.forget_connection(session_id);
+        self.take_turn(session_id, cx);
         cx.emit(WorkspaceEvent::Changed);
     }
 
