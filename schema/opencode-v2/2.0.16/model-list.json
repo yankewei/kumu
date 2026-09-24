@@ -1,0 +1,210 @@
+{
+ "location": {
+  "directory": "/work"
+ },
+ "data": [
+  {
+   "id": "gpt-5.6-sol",
+   "modelID": "gpt-5.6-sol",
+   "providerID": "commandcode",
+   "name": "Command Code GPT-5.6 Sol",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "baseURL": "https://api.commandcode.ai/provider/v1",
+    "provider": "commandcode"
+   },
+   "capabilities": {
+    "tools": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "output": [
+     "text"
+    ]
+   },
+   "variants": [
+    {
+     "id": "low",
+     "settings": {
+      "reasoningEffort": "low"
+     }
+    },
+    {
+     "id": "medium",
+     "settings": {
+      "reasoningEffort": "medium"
+     }
+    },
+    {
+     "id": "high",
+     "settings": {
+      "reasoningEffort": "high"
+     }
+    }
+   ],
+   "time": {
+    "released": 0
+   },
+   "cost": [],
+   "status": "active",
+   "enabled": true,
+   "limit": {
+    "context": 1050000,
+    "output": 128000
+   }
+  },
+  {
+   "id": "gpt-5.6-terra",
+   "modelID": "gpt-5.6-terra",
+   "providerID": "commandcode",
+   "name": "Command Code GPT-5.6 Terra",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "baseURL": "https://api.commandcode.ai/provider/v1",
+    "provider": "commandcode"
+   },
+   "capabilities": {
+    "tools": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "output": [
+     "text"
+    ]
+   },
+   "variants": [
+    {
+     "id": "low",
+     "settings": {
+      "reasoningEffort": "low"
+     }
+    },
+    {
+     "id": "medium",
+     "settings": {
+      "reasoningEffort": "medium"
+     }
+    },
+    {
+     "id": "high",
+     "settings": {
+      "reasoningEffort": "high"
+     }
+    }
+   ],
+   "time": {
+    "released": 0
+   },
+   "cost": [],
+   "status": "active",
+   "enabled": true,
+   "limit": {
+    "context": 1050000,
+    "output": 128000
+   }
+  },
+  {
+   "id": "gpt-5.6-luna",
+   "modelID": "gpt-5.6-luna",
+   "providerID": "commandcode",
+   "name": "Command Code GPT-5.6 Luna",
+   "package": "@opencode/ai/providers/openai-compatible",
+   "settings": {
+    "baseURL": "https://api.commandcode.ai/provider/v1",
+    "provider": "commandcode"
+   },
+   "capabilities": {
+    "tools": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "output": [
+     "text"
+    ]
+   },
+   "variants": [
+    {
+     "id": "low",
+     "settings": {
+      "reasoningEffort": "low"
+     }
+    },
+    {
+     "id": "medium",
+     "settings": {
+      "reasoningEffort": "medium"
+     }
+    },
+    {
+     "id": "high",
+     "settings": {
+      "reasoningEffort": "high"
+     }
+    }
+   ],
+   "time": {
+    "released": 0
+   },
+   "cost": [],
+   "status": "active",
+   "enabled": true,
+   "limit": {
+    "context": 1050000,
+    "output": 128000
+   }
+  },
+  {
+   "id": "claude-haiku-4-5-20251001",
+   "modelID": "claude-haiku-4-5-20251001",
+   "providerID": "commandcode-anthropic",
+   "name": "Command Code Claude Haiku 4.5",
+   "package": "@opencode/ai/providers/anthropic",
+   "settings": {
+    "baseURL": "https://api.commandcode.ai/provider/v1"
+   },
+   "capabilities": {
+    "tools": true,
+    "input": [
+     "text",
+     "image"
+    ],
+    "output": [
+     "text"
+    ]
+   },
+   "variants": [
+    {
+     "id": "high",
+     "settings": {
+      "thinking": {
+       "type": "enabled",
+       "budgetTokens": 16000
+      }
+     }
+    },
+    {
+     "id": "max",
+     "settings": {
+      "thinking": {
+       "type": "enabled",
+       "budgetTokens": 31999
+      }
+     }
+    }
+   ],
+   "time": {
+    "released": 0
+   },
+   "cost": [],
+   "status": "active",
+   "enabled": true,
+   "limit": {
+    "context": 200000,
+    "output": 64000
+   }
+  }
+ ]
+}

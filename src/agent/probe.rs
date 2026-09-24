@@ -12,10 +12,12 @@ use super::event::{Event, emit};
 
 /// How long a probe may take before it is reported as failed.
 ///
-/// Generous on purpose: an agent's first handshake can be slow. It is still
+/// Generous on purpose: an agent's first handshake can be slow, and it has to
+/// outlast the slowest backend's own budget — opencode allows its server 30s
+/// to start on a fresh machine, then 10s for the model catalogue. It is still
 /// bounded, because a probe that reported nothing either way would leave
 /// whoever asked for the options waiting with no verdict at all.
-const TIMEOUT: Duration = Duration::from_secs(15);
+const TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Discover an agent's session options and report them as
 /// [`Event::SessionOptions`], or [`Event::ProbeFailed`] when the agent is
@@ -26,6 +28,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
         Backend::Codex => super::codex::probe::probe(agent, cfg, ev_tx),
         Backend::Claude => super::claude::probe::probe(agent, cfg, ev_tx),
         Backend::Pi => super::pi::probe::probe(agent, cfg, ev_tx),
+        Backend::Opencode => super::opencode::probe::probe(agent, cfg, ev_tx),
     }
 }
 

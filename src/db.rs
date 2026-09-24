@@ -47,6 +47,10 @@ pub struct Session {
     /// counting them would lock a session to whichever agent happened to fail
     /// first.
     pub has_conversation: bool,
+    /// How full the agent last said the context was, and what it had cost, as
+    /// the JSON the app wrote. Kept so the indicator survives a restart rather
+    /// than waiting for the next turn to report again.
+    pub usage: Option<String>,
 }
 
 /// A chat message stored in a session.
@@ -61,6 +65,10 @@ pub struct Message {
     /// settled total is anchored, so it is recorded here rather than in a table
     /// nothing else would read.
     pub duration_ms: Option<i64>,
+    /// The image files a user message was sent with, in the order attached.
+    /// Paths into kumu's own attachment folder, so the history keeps showing
+    /// them whatever becomes of the file the user picked.
+    pub images: Vec<String>,
 }
 
 pub struct Store {
@@ -98,6 +106,7 @@ impl Store {
                 sandbox TEXT,
                 reasoning TEXT,
                 title_manual INTEGER NOT NULL DEFAULT 0,
+                usage TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -107,6 +116,7 @@ impl Store {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 duration_ms INTEGER,
+                attachments TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS settings (
@@ -120,7 +130,7 @@ impl Store {
                 ON messages(session_id);",
         )?;
         // Migrations for dbs created before model/mode/sandbox/reasoning/
-        // title_manual/duration_ms were part of CREATE TABLE (duplicate-column
+        // title_manual/duration_ms/attachments/usage were part of CREATE TABLE (duplicate-column
         // errors on fresh dbs are expected and ignored).
         self.conn
             .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
@@ -142,6 +152,12 @@ impl Store {
             .ok();
         self.conn
             .execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER", [])
+            .ok();
+        self.conn
+            .execute("ALTER TABLE messages ADD COLUMN attachments TEXT", [])
+            .ok();
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN usage TEXT", [])
             .ok();
         let has_resume_id: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
@@ -185,7 +201,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, project_id, agent, title, cwd, model, mode, sandbox, reasoning,
-                        title_manual, resume_id,
+                        title_manual, resume_id, usage,
                         EXISTS(
                             SELECT 1 FROM messages
                             WHERE messages.session_id = sessions.id AND messages.role <> 'system'
@@ -206,7 +222,8 @@ impl Store {
                 reasoning: row.get(8)?,
                 title_manual: row.get(9)?,
                 resume_id: row.get(10)?,
-                has_conversation: row.get(11)?,
+                usage: row.get(11)?,
+                has_conversation: row.get(12)?,
             })
         })
         .unwrap()
@@ -249,6 +266,16 @@ impl Store {
             "UPDATE sessions SET resume_id = CASE WHEN agent = ?1 THEN resume_id ELSE NULL END,
              agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
             params![agent, model, id],
+        )?;
+        Ok(())
+    }
+
+    /// Remember what the agent last reported about the session's context, as
+    /// the JSON the app encodes.
+    pub fn update_session_usage(&self, id: i64, usage: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET usage = ?1 WHERE id = ?2",
+            params![usage, id],
         )?;
         Ok(())
     }
@@ -326,14 +353,18 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT role, content, duration_ms FROM messages WHERE session_id = ?1 ORDER BY id",
+                "SELECT role, content, duration_ms, attachments FROM messages WHERE session_id = ?1 ORDER BY id",
             )
             .unwrap();
         stmt.query_map(params![session_id], |row| {
+            let attachments: Option<String> = row.get(3)?;
             Ok(Message {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 duration_ms: row.get(2)?,
+                images: attachments
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
             })
         })
         .unwrap()
@@ -342,15 +373,38 @@ impl Store {
     }
 
     pub fn insert_message(&self, session_id: i64, role: &str, content: &str) -> Result<i64> {
+        self.insert_row(session_id, role, content, None)
+    }
+
+    /// Insert what the user sent: the text and the images that went with it.
+    pub fn insert_user_message(
+        &self,
+        session_id: i64,
+        text: &str,
+        images: &[String],
+    ) -> Result<i64> {
+        let attachments =
+            (!images.is_empty()).then(|| serde_json::to_string(images).unwrap_or_default());
+        self.insert_row(session_id, "user", text, attachments)
+    }
+
+    fn insert_row(
+        &self,
+        session_id: i64,
+        role: &str,
+        content: &str,
+        attachments: Option<String>,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (session_id, role, content) VALUES (?1, ?2, ?3)",
-            params![session_id, role, content],
+            "INSERT INTO messages (session_id, role, content, attachments) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, role, content, attachments],
         )?;
+        let id = self.conn.last_insert_rowid();
         self.conn.execute(
             "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1",
             params![session_id],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(id)
     }
 
     /// Record how long the turn this message closed ran.
@@ -498,6 +552,24 @@ mod tests {
         assert!(store.messages(doomed).is_empty());
         assert_eq!(store.messages(kept).len(), 1);
         assert_eq!(store.messages(kept)[0].content, "留下我");
+    }
+
+    /// A user message keeps the images it was sent with, in order; one sent
+    /// without any reads back with none.
+    #[test]
+    fn a_user_message_keeps_its_images() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+        let images = vec!["/a.png".to_string(), "/b.jpg".to_string()];
+        store.insert_user_message(session, "看图", &images).unwrap();
+        store.insert_user_message(session, "只有字", &[]).unwrap();
+
+        let messages = store.messages(session);
+        assert_eq!(messages[0].images, images);
+        assert!(messages[1].images.is_empty());
     }
 
     /// Deleting an unknown id is a no-op rather than an error, so a stale

@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    CancelNotification, ContentBlock, ImageContent, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionConfigId, SessionConfigOption, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{
@@ -32,11 +33,37 @@ use super::convert::{
 };
 use crate::agent::config::Config;
 use crate::agent::connection::WeakPermissions;
-use crate::agent::event::{Cmd, Event, PermissionOptionInfo, emit};
+use crate::agent::event::{Cmd, Cost, Event, PermissionOptionInfo, Prompt, Usage, emit};
 use crate::agent::session::{
     CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user, forget_stale_cancels,
     release_pending_permissions,
 };
+
+/// A prompt as ACP content: each image inline as base64, then the text.
+///
+/// `takes_images` is the agent's own `promptCapabilities.image`; without it an
+/// image-bearing prompt is an error rather than a prompt quietly sent without
+/// what the user attached.
+fn prompt_blocks(
+    request: &Prompt,
+    takes_images: bool,
+) -> std::result::Result<Vec<ContentBlock>, String> {
+    if !request.images.is_empty() && !takes_images {
+        return Err("当前 agent 不接受图片输入，消息未发送。".to_string());
+    }
+    let mut blocks = Vec::with_capacity(request.images.len() + 1);
+    for image in &request.images {
+        let data = image.base64()?;
+        blocks.push(ContentBlock::Image(ImageContent::new(
+            data,
+            image.mime.as_str(),
+        )));
+    }
+    if !request.text.is_empty() || blocks.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(request.text.as_str())));
+    }
+    Ok(blocks)
+}
 
 /// Translate one session update into the event it produces, or none for an
 /// update kind nobody renders — every kind maps to at most one `Event`.
@@ -91,6 +118,15 @@ fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<E
             .map(|title| title.trim().to_string())
             .filter(|title| !title.is_empty())
             .map(|title| Event::SessionTitle { title }),
+        // The context as the agent measures it; the cost is its own option.
+        SessionUpdate::UsageUpdate(update) => Some(Event::Usage(Usage::reported(
+            Some(update.used),
+            Some(update.size),
+            update.cost.map(|cost| Cost {
+                amount: cost.amount,
+                currency: cost.currency,
+            }),
+        ))),
         // The agent's command catalogue, replaced whole whenever it says so:
         // these are usually the commands its own TUI offers, and invoking one is
         // a prompt that starts with the command text.
@@ -98,24 +134,70 @@ fn notification_event(agent_id: &'static str, update: SessionUpdate) -> Option<E
             agent: agent_id,
             commands: command_catalog(&update.available_commands),
         }),
+        // The agent changing its own model, mode or reasoning level.
         SessionUpdate::ConfigOptionUpdate(update) => {
-            // The notification carries the complete state, so every catalog is
-            // rebuilt from it. This is what keeps the pickers honest when the
-            // agent changes its own model, mode or reasoning level.
-            let config_options = Some(update.config_options);
-            let (_, current_model, models) = model_catalog(&config_options);
-            let (_, current_mode, modes) = mode_catalog(&config_options);
-            let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
-            // ACP has no access or sandbox axis, so neither is set.
-            Some(
-                SessionOptionsBuilder::new(agent_id)
-                    .models(models, current_model)
-                    .modes(modes, current_mode)
-                    .reasoning(reasoning, current_reasoning)
-                    .build(),
-            )
+            Some(options_event(agent_id, update.config_options))
         }
         other => Some(Event::Log(format!("update: {}", variant_name(&other)))),
+    }
+}
+
+/// The session's options from a complete set of config options, as both a
+/// `config_option_update` notification and a `set_config_option` response
+/// carry them: every catalog is rebuilt, since one pick can change another
+/// axis's list (opencode offers each model its own reasoning levels).
+fn options_event(agent_id: &'static str, config_options: Vec<SessionConfigOption>) -> Event {
+    let config_options = Some(config_options);
+    let (_, current_model, models) = model_catalog(&config_options);
+    let (_, current_mode, modes) = mode_catalog(&config_options);
+    let (_, current_reasoning, reasoning) = reasoning_catalog(&config_options);
+    // ACP has no access or sandbox axis, so neither is set.
+    SessionOptionsBuilder::new(agent_id)
+        .models(models, current_model)
+        .modes(modes, current_mode)
+        .reasoning(reasoning, current_reasoning)
+        .build()
+}
+
+/// Set one config option, returning the complete options the agent answers
+/// with.
+///
+/// The answer is the only word on the change: the spec reserves the
+/// `config_option_update` notification for changes the agent makes itself, and
+/// opencode sends none for a pick the client made. `None` when the agent has no
+/// such option or refused it; either is logged under `axis`.
+async fn set_config_option(
+    connection: &ConnectionTo<agent_client_protocol::Agent>,
+    session_id: &SessionId,
+    option_id: Option<&SessionConfigId>,
+    axis: &str,
+    value: &str,
+    log_tx: &Sender<Event>,
+) -> Option<Vec<SessionConfigOption>> {
+    let Some(option_id) = option_id else {
+        emit(
+            log_tx,
+            Event::Log(format!("no {axis} config option to set")),
+        );
+        return None;
+    };
+    match connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            option_id.clone(),
+            value,
+        ))
+        .block_task()
+        .await
+    {
+        Ok(response) => {
+            emit(log_tx, Event::Log(format!("{axis} set: {value}")));
+            Some(response.config_options)
+        }
+        Err(err) => {
+            emit(log_tx, Event::Log(format!("set {axis} failed: {err}")));
+            None
+        }
     }
 }
 
@@ -261,6 +343,8 @@ pub(in crate::agent) async fn run(
                 // connections that cannot be reopened instead of closing one
                 // and stranding its conversation.
                 let resumable = init.agent_capabilities.load_session;
+                // Every agent takes text; images only when it says so.
+                let takes_images = init.agent_capabilities.prompt_capabilities.image;
 
                 let (session_id, config_options) = if let Some(id) = &cfg.session.resume_id {
                     if !resumable {
@@ -323,16 +407,35 @@ pub(in crate::agent) async fn run(
                     emit(&ev_tx, Event::Done(stop_reason(&response.stop_reason)));
                 }
 
+                // What the agent answers a pick with replaces the session's
+                // options: the pick itself, and whatever it changed on another
+                // axis.
+                let set_axis = async |option_id: Option<&SessionConfigId>, axis: &str, value: &str| {
+                    if let Some(config_options) =
+                        set_config_option(&connection, &session_id, option_id, axis, value, &log_tx)
+                            .await
+                    {
+                        emit(&ev_tx, options_event(agent_id, config_options));
+                    }
+                };
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        Cmd::Prompt(text) => {
+                        Cmd::Prompt(request) => {
                             forget_stale_cancels(&mut cancels);
+                            // Refused on this side rather than sent: an agent
+                            // that did not advertise images is not required to
+                            // accept them, and a turn that fails for it here
+                            // says why in words.
+                            let blocks = match prompt_blocks(&request, takes_images) {
+                                Ok(blocks) => blocks,
+                                Err(error) => {
+                                    emit(&ev_tx, Event::Error(error));
+                                    continue;
+                                }
+                            };
                             emit(&log_tx, Event::Log("prompt sent".into()));
                             let prompt = connection
-                                .send_request(PromptRequest::new(
-                                    session_id.clone(),
-                                    vec![ContentBlock::Text(TextContent::new(text))],
-                                ))
+                                .send_request(PromptRequest::new(session_id.clone(), blocks))
                                 .block_task();
                             // The cancel has to reach the agent while this request
                             // is outstanding, so it is watched for here rather
@@ -365,76 +468,21 @@ pub(in crate::agent) async fn run(
                             };
                             emit(&ev_tx, Event::Done(stop_reason(&response.stop_reason)));
                         }
-                        Cmd::SetModel(value) => match &model_option_id {
-                            Some(option_id) => {
-                                if let Err(err) = connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        session_id.clone(),
-                                        option_id.clone(),
-                                        value.as_str(),
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    emit(&log_tx, Event::Log(format!("set model failed: {err}")));
-                                } else {
-                                    emit(&log_tx, Event::Log(format!("model set: {value}")));
-                                }
-                            }
-                            None => {
-                                emit(&log_tx, Event::Log("no model config option to set".into()))
-                            }
-                        },
-                        Cmd::SetMode(value) => match &mode_option_id {
-                            Some(option_id) => {
-                                if let Err(err) = connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        session_id.clone(),
-                                        option_id.clone(),
-                                        value.as_str(),
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    emit(&log_tx, Event::Log(format!("set mode failed: {err}")));
-                                } else {
-                                    emit(&log_tx, Event::Log(format!("mode set: {value}")));
-                                }
-                            }
-                            None => {
-                                emit(&log_tx, Event::Log("no mode config option to set".into()))
-                            }
-                        },
                         Cmd::SetSandbox(value) => {
                             // ACP has no sandbox axis, so the UI offers no chip
                             // for one and this should not arrive; saying so beats
                             // dropping it silently.
                             emit(&log_tx, Event::Log(format!("no sandbox to set: {value}")));
                         }
-                        Cmd::SetReasoning(value) => match &reasoning_option_id {
-                            Some(option_id) => {
-                                if let Err(err) = connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        session_id.clone(),
-                                        option_id.clone(),
-                                        value.as_str(),
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    emit(
-                                        &log_tx,
-                                        Event::Log(format!("set reasoning failed: {err}")),
-                                    );
-                                } else {
-                                    emit(&log_tx, Event::Log(format!("reasoning set: {value}")));
-                                }
-                            }
-                            None => emit(
-                                &log_tx,
-                                Event::Log("no reasoning config option to set".into()),
-                            ),
-                        },
+                        Cmd::SetModel(value) => {
+                            set_axis(model_option_id.as_ref(), "model", &value).await
+                        }
+                        Cmd::SetMode(value) => {
+                            set_axis(mode_option_id.as_ref(), "mode", &value).await
+                        }
+                        Cmd::SetReasoning(value) => {
+                            set_axis(reasoning_option_id.as_ref(), "reasoning", &value).await
+                        }
                     }
                 }
                 // The dropped senders wake any task still waiting on a user
@@ -458,8 +506,9 @@ mod tests {
     use super::notification_event;
     use agent_client_protocol::schema::v1::{
         AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
-        ContentChunk, Plan, SessionInfoUpdate, SessionUpdate, TextContent, ToolCall,
+        ContentChunk, Cost, Plan, SessionInfoUpdate, SessionUpdate, TextContent, ToolCall,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UnstructuredCommandInput,
+        UsageUpdate,
     };
 
     fn text(t: &str) -> ContentBlock {
@@ -617,19 +666,90 @@ mod tests {
         assert!(matches!(event, Some(Event::Log(msg)) if msg.contains("plan")));
     }
 
-    /// End-to-end: spawn a real agent (KUMU_AGENT, default omp), send one
+    /// A model switch's answer is the whole new state, and the event built from
+    /// it carries the new model's own reasoning levels — the list opencode
+    /// narrows when it moves to a model with fewer of them.
+    #[test]
+    fn a_set_answer_replaces_every_catalog() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+            SessionConfigSelectOptions,
+        };
+        let select = |id: &str, category, current: &str, values: &[&str]| {
+            SessionConfigOption::select(
+                id.to_string(),
+                id.to_string(),
+                current.to_string(),
+                SessionConfigSelectOptions::Ungrouped(
+                    values
+                        .iter()
+                        .map(|v| SessionConfigSelectOption::new(v.to_string(), *v))
+                        .collect(),
+                ),
+            )
+            .category(category)
+        };
+        let answer = vec![
+            select(
+                "model",
+                SessionConfigOptionCategory::Model,
+                "opencode/claude-haiku-4-5",
+                &["opencode/claude-haiku-4-5", "opencode/claude-opus-4-8"],
+            ),
+            select(
+                "effort",
+                SessionConfigOptionCategory::ThoughtLevel,
+                "default",
+                &["high", "max", "default"],
+            ),
+        ];
+        let Event::SessionOptions {
+            current_model,
+            reasoning,
+            ..
+        } = super::options_event("opencode", answer)
+        else {
+            panic!("expected SessionOptions");
+        };
+        assert_eq!(current_model.as_deref(), Some("opencode/claude-haiku-4-5"));
+        let levels: Vec<&str> = reasoning.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(levels, ["high", "max", "default"]);
+    }
+
+    /// A usage update carries the context and the cost through; a window of
+    /// zero is an agent that does not know its window, not an empty one.
+    #[test]
+    fn a_usage_update_reports_the_context() {
+        let update = UsageUpdate::new(60_000, 200_000).cost(Cost::new(0.45, "USD"));
+        let Some(Event::Usage(usage)) =
+            notification_event("omp", SessionUpdate::UsageUpdate(update))
+        else {
+            panic!("expected a Usage event");
+        };
+        assert_eq!(usage.used, Some(60_000));
+        assert_eq!(usage.window, Some(200_000));
+        assert_eq!(usage.cost, Some(crate::agent::event::Cost::usd(0.45)));
+
+        let Some(Event::Usage(usage)) = notification_event(
+            "omp",
+            SessionUpdate::UsageUpdate(UsageUpdate::new(1_000, 0)),
+        ) else {
+            panic!("expected a Usage event");
+        };
+        assert_eq!((usage.window, usage.cost), (None, None));
+    }
+
+    /// End-to-end: spawn a real omp, send one
     /// prompt, and expect streamed Agent chunks followed by Done — the same
     /// path the home window uses. Ignored by default, so a plain `cargo test`
     /// never drives a real agent; `cargo test -- --ignored` runs it, and it
     /// skips itself when the binary is absent.
     #[test]
-    #[ignore = "drives a real agent binary (KUMU_AGENT)"]
+    #[ignore = "drives a real omp binary"]
     fn session_prompts_agent_end_to_end() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {
-            Ok("opencode") => "opencode",
-            _ => "omp",
-        };
+        // omp is the one agent left on ACP; opencode speaks its v2 API.
+        let agent: &'static str = "omp";
         let mut cfg = Config::for_agent(agent).expect("known agent");
         if !command_exists(&cfg.command) {
             println!(

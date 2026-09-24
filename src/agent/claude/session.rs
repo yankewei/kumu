@@ -36,7 +36,8 @@ use super::transport::{self, Message, Transport, debug_log};
 use crate::agent::config::{Config, SessionPicks};
 use crate::agent::connection::WeakPermissions;
 use crate::agent::event::{
-    AccessInfo, Cmd, CommandInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit,
+    AccessInfo, Cmd, CommandInfo, Cost, Event, ModeInfo, ModelInfo, Prompt, ReasoningInfo,
+    SandboxInfo, Usage, emit,
 };
 use crate::agent::session::{
     CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
@@ -106,6 +107,11 @@ struct Shared {
     /// What this connection was launched with, so a command that only repeats
     /// it does not need saying again.
     launched: SessionPicks,
+    /// The context as last measured, re-reported whole on every change, and the
+    /// model it was measured on: each main-conversation message moves `used`
+    /// and names its model, and a `result` fills in that model's window and the
+    /// cost, which only it carries.
+    usage: Mutex<(Usage, Option<String>)>,
 }
 
 impl Shared {
@@ -231,6 +237,7 @@ pub(in crate::agent) async fn run(
         // is offered until `system/init` says otherwise.
         commands: Mutex::new(convert::command_catalog(&reported.commands, &[])),
         launched: cfg.session.clone(),
+        usage: Mutex::default(),
         cancelled: AtomicBool::new(false),
     });
     shared.emit_options();
@@ -251,12 +258,12 @@ pub(in crate::agent) async fn run(
     // before the UI loop starts.
     if let Some(auto) = cfg.auto_prompt.clone() {
         emit(&ev_tx, Event::Log(format!("auto prompt: {auto}")));
-        prompt(&shared, &auto, &mut cancels).await;
+        prompt(&shared, &auto.into(), &mut cancels).await;
     }
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            Cmd::Prompt(text) => prompt(&shared, &text, &mut cancels).await,
+            Cmd::Prompt(request) => prompt(&shared, &request, &mut cancels).await,
             Cmd::SetModel(value) => {
                 // The model is a launch flag, so a change mid-session rides the
                 // documented `/model` command instead.
@@ -316,13 +323,22 @@ pub(in crate::agent) async fn run(
 }
 
 /// Send one prompt and wait for the turn it opens to end.
-async fn prompt(shared: &Arc<Shared>, text: &str, cancels: &mut CancelRequests) {
+async fn prompt(shared: &Arc<Shared>, request: &Prompt, cancels: &mut CancelRequests) {
     forget_stale_cancels(cancels);
+    // Read before anything is armed: an attachment that cannot be read ends the
+    // turn here, with nothing sent and nothing left waiting on a reply.
+    let message = match prompt_message(request) {
+        Ok(message) => message,
+        Err(error) => {
+            emit(&shared.ev_tx, Event::Error(error));
+            return;
+        }
+    };
     shared.cancelled.store(false, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     *shared.turn_done.lock().unwrap() = Some(tx);
     shared.awaiting.lock().unwrap().push_back(Awaiting::Prompt);
-    shared.transport.send(user_message(text));
+    shared.transport.send(message);
     // The interrupt has to reach the CLI while the turn is running, so it is
     // watched for here rather than on the command channel: the loop is parked on
     // this very await.
@@ -368,6 +384,30 @@ fn user_message(text: &str) -> Value {
         "type": "user",
         "message": {"role": "user", "content": text},
     })
+}
+
+/// A prompt as a user message: the plain string form when it is only text, and
+/// the Messages API's content blocks when images come with it — each inline as
+/// base64, ahead of the text, which is the order Anthropic recommends.
+fn prompt_message(request: &Prompt) -> Result<Value, String> {
+    if request.images.is_empty() {
+        return Ok(user_message(&request.text));
+    }
+    let mut content = Vec::new();
+    for image in &request.images {
+        let data = image.base64()?;
+        content.push(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.mime, "data": data},
+        }));
+    }
+    if !request.text.is_empty() {
+        content.push(json!({"type": "text", "text": request.text}));
+    }
+    Ok(json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    }))
 }
 
 fn handle_message(shared: &Arc<Shared>, message: Message) {
@@ -478,6 +518,19 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
 /// An `assistant` message: the complete blocks of a reply, after the same
 /// blocks' deltas have already been streamed.
 fn on_assistant(shared: &Shared, message: &protocol::AssistantMessage) {
+    // A message the CLI makes up itself (a login or API failure, say) carries
+    // all-zero usage: that is no measurement, not an empty context.
+    if message.parent_tool_use_id.is_none()
+        && let Some(usage) = &message.message.usage
+        && usage.context_tokens() > 0
+    {
+        let (current, model) = &mut *shared.usage.lock().unwrap();
+        if message.message.model.is_some() {
+            *model = message.message.model.clone();
+        }
+        current.used = Some(usage.context_tokens());
+        emit(&shared.ev_tx, Event::Usage(current.clone()));
+    }
     let id = message.message.id.as_str();
     // Checked per kind, not once for the whole message: text reliably streams,
     // but a model may hand back thinking that never did (or the reverse), and
@@ -608,6 +661,21 @@ fn on_stream_event(shared: &Shared, event: &protocol::StreamEvent) {
 
 /// The last line of a turn, and of every command sent as a message.
 fn on_result(shared: &Shared, result: ResultEvent) {
+    {
+        let (current, model) = &mut *shared.usage.lock().unwrap();
+        if let Some(window) = result.context_window(model.as_deref()) {
+            current.window = Some(window);
+        }
+        if let Some(amount) = result.total_cost_usd {
+            current.cost = Some(Cost::usd(amount));
+        }
+        // A turn that never reached a model reports nothing spent and nothing
+        // measured, which is no report at all.
+        let report = Usage::reported(current.used, current.window, current.cost.clone());
+        if report != Usage::default() {
+            emit(&shared.ev_tx, Event::Usage(report));
+        }
+    }
     match shared.awaiting.lock().unwrap().pop_front() {
         Some(Awaiting::Command) => {
             if result.is_error {
@@ -759,6 +827,7 @@ mod tests {
             }),
             commands: Mutex::new(Vec::new()),
             launched: SessionPicks::default(),
+            usage: Mutex::default(),
             cancelled: AtomicBool::new(false),
         };
         (shared, rx)
@@ -800,6 +869,7 @@ mod tests {
                 Event::SessionOptions { .. } => "options",
                 Event::Commands { .. } => "commands",
                 Event::ProbeFailed { .. } => "failed",
+                Event::Usage(_) => "usage",
             })
             .collect()
     }
@@ -1259,8 +1329,7 @@ mod tests {
         // fresh configuration approves nothing, and the session was launched
         // with the host as the answerer.
         conn.send(Cmd::Prompt(
-            "Create a file named probe.txt in the current directory containing exactly: ok"
-                .to_string(),
+            "Create a file named probe.txt in the current directory containing exactly: ok".into(),
         ));
 
         let mut text = String::new();

@@ -24,6 +24,9 @@ pub enum Backend {
     /// Pi's own RPC mode: newline-delimited JSON commands in, replies and
     /// events out, over a single `pi --mode rpc` process.
     Pi,
+    /// opencode's own v2 API: HTTP and server-sent events against a private
+    /// `opencode serve` process, which lives as long as its stdin.
+    Opencode,
 }
 
 /// The session's saved selections and backend restore cursor.
@@ -90,8 +93,10 @@ impl Config {
         }
     }
 
-    /// `opencode acp`, with the RC gateway key injected so the subprocess can
-    /// reach a model even when launched from a GUI app.
+    /// `opencode serve`, opencode's v2 API, with the RC gateway key injected
+    /// so the server can reach a model even when launched from a GUI app. The
+    /// server's own arguments (`--stdio --port 0`) and its password are the
+    /// transport's to choose, so `args` stays empty.
     fn opencode(agent: &'static str) -> Self {
         let mut env = Vec::new();
         if let Some(key) = opencode_api_key() {
@@ -99,9 +104,9 @@ impl Config {
         }
         Self {
             agent,
-            backend: Backend::Acp,
+            backend: Backend::Opencode,
             command: opencode_bin(),
-            args: vec!["acp".to_string()],
+            args: Vec::new(),
             env,
             auto_prompt: auto_prompt_env(),
             session: SessionPicks::default(),

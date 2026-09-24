@@ -1,0 +1,56 @@
+{
+ "location": {
+  "directory": "/work"
+ },
+ "data": {
+  "id": "gpt-5.6-sol",
+  "modelID": "gpt-5.6-sol",
+  "providerID": "commandcode",
+  "name": "Command Code GPT-5.6 Sol",
+  "package": "@opencode/ai/providers/openai-compatible",
+  "settings": {
+   "baseURL": "https://api.commandcode.ai/provider/v1",
+   "provider": "commandcode"
+  },
+  "capabilities": {
+   "tools": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "output": [
+    "text"
+   ]
+  },
+  "variants": [
+   {
+    "id": "low",
+    "settings": {
+     "reasoningEffort": "low"
+    }
+   },
+   {
+    "id": "medium",
+    "settings": {
+     "reasoningEffort": "medium"
+    }
+   },
+   {
+    "id": "high",
+    "settings": {
+     "reasoningEffort": "high"
+    }
+   }
+  ],
+  "time": {
+   "released": 0
+  },
+  "cost": [],
+  "status": "active",
+  "enabled": true,
+  "limit": {
+   "context": 1050000,
+   "output": 128000
+  }
+ }
+}

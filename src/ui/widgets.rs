@@ -242,6 +242,19 @@ pub fn select_row(
         .on_click(on_click)
 }
 
+/// An image as a fixed-size square thumbnail, cropped to fill it. The size is
+/// fixed so a row measures the same before and after the image loads.
+pub fn image_thumbnail(path: std::path::PathBuf, size: Rems, radius: Pixels, border: Hsla) -> Div {
+    div()
+        .size(size)
+        .flex_none()
+        .rounded(radius)
+        .border_1()
+        .border_color(border)
+        .overflow_hidden()
+        .child(img(path).size_full().object_fit(ObjectFit::Cover))
+}
+
 /// An agent's logo at `size`: svg logos are alpha masks tinted with `tint`;
 /// other formats (png) keep their own colors. Falls back to a Bot icon.
 pub fn agent_logo(logo: Option<&'static str>, size: Pixels, tint: Hsla) -> AnyElement {

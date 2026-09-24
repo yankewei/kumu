@@ -10,7 +10,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
+use super::KumuApp;
 use crate::agent::PermissionKind;
 use crate::app::turn::PendingPermission;
 use crate::ui::widgets::pill;
@@ -144,19 +144,7 @@ impl KumuApp {
 
         // Shares the composer's backdrop so the two read as one input region,
         // separated from the conversation by the divider above.
-        v_flex()
-            .flex_none()
-            .px_5()
-            .pt_3()
-            .bg(muted.opacity(0.5))
-            .child(
-                v_flex()
-                    .w_full()
-                    .max_w(rems(CONTENT_MAX_REM))
-                    .min_w(rems(CONTENT_MIN_REM))
-                    .mx_auto()
-                    .child(card.child(actions)),
-            )
+        super::input_region(muted, card.child(actions))
     }
 }
 

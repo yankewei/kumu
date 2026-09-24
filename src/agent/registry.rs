@@ -22,7 +22,7 @@ pub const AGENTS: [AgentDef; 5] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
-        desc: "ACP v1",
+        desc: "opencode serve · v2 API",
         logo: Some("opencode.png"),
         drives_sessions: true,
     },

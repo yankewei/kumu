@@ -36,6 +36,15 @@ fn owns_connection(conns: &HashMap<i64, agent::Connection>, session_id: i64, con
         .is_some_and(|conn| conn.id() == conn_id)
 }
 
+/// A new usage report over the last one: the report wins, except where it does
+/// not know the window and the last one did (see [`agent::Usage`]).
+fn merge_usage(previous: Option<&agent::Usage>, mut usage: agent::Usage) -> agent::Usage {
+    if usage.window.is_none() {
+        usage.window = previous.and_then(|p| p.window);
+    }
+    usage
+}
+
 /// The title a session falls back to from its first message, until the agent
 /// names it: the first line, cut at 24 characters.
 fn fallback_title(text: &str) -> Option<String> {
@@ -53,12 +62,18 @@ fn fallback_title(text: &str) -> Option<String> {
 impl Workspace {
     /// Send a prompt to the session's agent, returning whether it was taken.
     ///
-    /// Refused when the text is empty or the session already has a turn in
-    /// flight: one turn per session at a time, while other sessions run on
-    /// their own.
-    pub fn send(&mut self, session_id: i64, text: &str, cx: &mut Context<Self>) -> bool {
+    /// Refused when there is neither text nor an image, or the session already
+    /// has a turn in flight: one turn per session at a time, while other
+    /// sessions run on their own.
+    pub fn send(
+        &mut self,
+        session_id: i64,
+        text: &str,
+        images: Vec<agent::ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let text = text.trim();
-        if text.is_empty() || self.has_turn(session_id) {
+        if (text.is_empty() && images.is_empty()) || self.has_turn(session_id) {
             return false;
         }
         let Some(session) = self.session(session_id).cloned() else {
@@ -66,12 +81,17 @@ impl Workspace {
         };
         // Until the agent reports a real title (session/info), fall back to
         // the first line of the first user message.
-        if session.title.starts_with("会话 ")
-            && let Some(title) = fallback_title(text)
-        {
+        if session.title.starts_with("会话 ") {
+            let title = fallback_title(text).unwrap_or_else(|| "图片".to_string());
             self.apply_generated_title(session_id, &title);
         }
-        self.store.insert_message(session_id, "user", text).ok();
+        let paths: Vec<String> = images
+            .iter()
+            .map(|image| image.path.to_string_lossy().into_owned())
+            .collect();
+        self.store
+            .insert_user_message(session_id, text, &paths)
+            .ok();
         // The first message is what fixes the session's agent, so the list is
         // re-read here rather than letting the flag lag a turn behind the
         // picker that reads it.
@@ -98,8 +118,26 @@ impl Workspace {
         // while, and until then the conversation would show no sign that the
         // prompt was accepted.
         self.update_turn(session_id, cx, |_| ());
-        conn.send(agent::Cmd::Prompt(text.to_string()));
+        conn.send(agent::Cmd::Prompt(agent::Prompt {
+            text: text.to_string(),
+            images,
+        }));
         true
+    }
+
+    /// Keep the agent's latest usage report for the session, on the session row
+    /// as well, so a restart still shows it.
+    fn record_usage(&mut self, session_id: i64, usage: agent::Usage, cx: &mut Context<Self>) {
+        let previous = self.usage.get(&session_id);
+        let usage = merge_usage(previous, usage);
+        if previous == Some(&usage) {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&usage) {
+            self.store.update_session_usage(session_id, &json).ok();
+        }
+        self.usage.insert(session_id, usage);
+        cx.emit(WorkspaceEvent::Changed);
     }
 
     /// Stop the session's turn in flight, if there is one.
@@ -171,10 +209,11 @@ impl Workspace {
             // re-applied values come from the fresh row.
             //
             // A model change *within* an agent is deliberately not cleared here:
-            // whether a pick still applies is the backend's call — Codex drops
-            // one the new model does not advertise and restores it when a later
-            // model does, and an ACP agent's level does not depend on the model
-            // at all.
+            // whether a pick still applies is the agent's call, and it answers
+            // with the new model's levels — Codex drops one the new model does
+            // not advertise and restores it when a later model does, and opencode
+            // reports each model's own list back from the model switch. The picker only honours a stored pick the current
+            // list still offers.
             self.store.update_session_mode(session_id, None).ok();
             self.store.update_session_sandbox(session_id, None).ok();
             self.store.update_session_reasoning(session_id, None).ok();
@@ -523,6 +562,7 @@ impl Workspace {
                     cx.emit(WorkspaceEvent::Changed);
                 }
             }
+            agent::Event::Usage(usage) => self.record_usage(session_id, usage, cx),
             agent::Event::Log(_) | agent::Event::ProbeFailed { .. } => {}
         }
     }
@@ -532,7 +572,7 @@ impl Workspace {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{fallback_title, owns_connection};
+    use super::{fallback_title, merge_usage, owns_connection};
     use crate::agent;
 
     /// A session's connection is replaced when the agent is switched. Events
@@ -558,6 +598,35 @@ mod tests {
         // Once gone, nothing owns the session.
         conns.remove(&7);
         assert!(!owns_connection(&conns, 7, 2));
+    }
+
+    /// A report without a window keeps the one already known; everything else
+    /// is the report's, including a context it no longer knows.
+    #[test]
+    fn a_usage_report_keeps_the_known_window() {
+        let known = agent::Usage {
+            used: Some(10),
+            window: Some(200_000),
+            cost: Some(agent::Cost::usd(0.1)),
+        };
+        let merged = merge_usage(
+            Some(&known),
+            agent::Usage {
+                used: None,
+                window: None,
+                cost: None,
+            },
+        );
+        assert_eq!(merged.window, Some(200_000));
+        assert_eq!((merged.used, merged.cost), (None, None));
+        let replaced = merge_usage(
+            Some(&known),
+            agent::Usage {
+                window: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(replaced.window, Some(1_000_000));
     }
 
     /// The fallback title is the first line, cut at 24 characters with an

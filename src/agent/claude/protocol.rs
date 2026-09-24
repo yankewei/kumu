@@ -93,6 +93,11 @@ pub(super) struct SystemEvent {
 pub(super) struct AssistantMessage {
     #[serde(default)]
     pub message: Message,
+    /// The `Task` call a subagent's message belongs to; `None` for the main
+    /// conversation. A subagent runs in a context of its own, so its usage
+    /// says nothing about how full the session's is.
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -103,6 +108,37 @@ pub(super) struct Message {
     pub id: String,
     #[serde(default)]
     pub content: ContentBlocks,
+    /// The model that wrote the message, without the `[1m]`-style suffix the
+    /// `result`'s `modelUsage` keys carry.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The Messages API usage of the call that produced this message.
+    #[serde(default)]
+    pub usage: Option<MessageUsage>,
+}
+
+/// One model call's token counts, as the Messages API reports them.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct MessageUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl MessageUsage {
+    /// What the context holds after this call: everything sent, cached or not,
+    /// plus the reply, which the next call sends back.
+    pub(super) fn context_tokens(&self) -> u64 {
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
+    }
 }
 
 /// A message's content: the CLI sends an array of blocks, and a bare string
@@ -222,9 +258,46 @@ pub(super) struct ResultEvent {
     /// Tool calls that nothing approved, in the order they were refused.
     #[serde(rename = "permission_denials", default)]
     pub permission_denials: Vec<Value>,
+    /// What the CLI process has spent so far, in dollars. It counts this
+    /// process only: a session resumed in a new one starts again from zero.
+    #[serde(rename = "total_cost_usd", default)]
+    pub total_cost_usd: Option<f64>,
+    /// Per-model totals, keyed by the model's name with any context suffix
+    /// (`opus[1m]`). Only the window is read.
+    #[serde(rename = "modelUsage", default)]
+    pub model_usage: std::collections::HashMap<String, ModelUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ModelUsage {
+    #[serde(rename = "contextWindow", default)]
+    pub context_window: Option<u64>,
 }
 
 impl ResultEvent {
+    /// The context window of `model`, as the message that named it spelled it.
+    ///
+    /// The keys may carry a suffix the message's model does not (`opus[1m]`
+    /// against `opus`), so a key that extends the name with `[` counts too.
+    /// With no model, or no key for it, the one model the turn used is the
+    /// answer; with several, none is guessed.
+    pub(super) fn context_window(&self, model: Option<&str>) -> Option<u64> {
+        let named = model.and_then(|model| {
+            self.model_usage.iter().find(|(key, _)| {
+                key.as_str() == model
+                    || key
+                        .strip_prefix(model)
+                        .is_some_and(|rest| rest.starts_with('['))
+            })
+        });
+        let usage = match named {
+            Some((_, usage)) => usage,
+            None if self.model_usage.len() == 1 => self.model_usage.values().next()?,
+            None => return None,
+        };
+        usage.context_window.filter(|window| *window > 0)
+    }
+
     /// What to show the user when the turn failed: the CLI puts the failure
     /// text in `result`, and the `error_*` subtype is the fallback.
     pub(super) fn failure(&self) -> String {
@@ -538,6 +611,32 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
         assert!(result.permission_denials.is_empty());
+    }
+
+    /// The captured turn used two models: the one the reply came from is found
+    /// under its suffixed key, and its window is the answer — not the helper
+    /// model's, and not a guess when the model is unknown.
+    #[test]
+    fn the_window_is_the_replying_models() {
+        let Incoming::Result(result) = from_captured("result") else {
+            panic!("not a result");
+        };
+        assert_eq!(
+            result.context_window(Some("deepseek-v4-pro")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            result.context_window(Some("deepseek-v4-flash")),
+            Some(200_000)
+        );
+        assert_eq!(result.context_window(None), None, "two models, none named");
+        assert!(result.total_cost_usd.is_some());
+
+        let Incoming::Assistant(message) = from_captured("assistant-tool-use") else {
+            panic!("not an assistant message");
+        };
+        assert_eq!(message.message.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(message.message.usage.unwrap().context_tokens(), 20_378);
     }
 
     /// The streaming events are raw API events; only the deltas carry text, and

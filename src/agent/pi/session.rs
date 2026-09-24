@@ -42,7 +42,7 @@ use super::convert;
 use super::transport::{self, Transport, debug_log};
 use crate::agent::config::Config;
 use crate::agent::connection::WeakPermissions;
-use crate::agent::event::{Cmd, Event, ModelInfo, ReasoningInfo, emit};
+use crate::agent::event::{Cmd, Event, ModelInfo, Prompt, ReasoningInfo, emit};
 use crate::agent::session::{
     CANCELLED, CancelRequests, SessionOptionsBuilder, forget_stale_cancels, settle,
 };
@@ -235,7 +235,7 @@ pub(in crate::agent) async fn run(
     // UI loop starts.
     if let Some(auto) = cfg.auto_prompt.clone() {
         emit(&ev_tx, Event::Log(format!("auto prompt: {auto}")));
-        prompt(&shared, &auto, &mut cancels).await;
+        prompt(&shared, &auto.into(), &mut cancels).await;
     }
 
     loop {
@@ -245,7 +245,7 @@ pub(in crate::agent) async fn run(
         // and the UI would go on believing it could still prompt a dead agent.
         futures::select! {
             command = cmd_rx.recv().fuse() => match command {
-                Some(Cmd::Prompt(text)) => prompt(&shared, &text, &mut cancels).await,
+                Some(Cmd::Prompt(request)) => prompt(&shared, &request, &mut cancels).await,
                 Some(Cmd::SetModel(value)) => set_model(&shared, &value).await,
                 Some(Cmd::SetReasoning(value)) => set_reasoning(&shared, &value).await,
                 // The composer only offers the axes an agent reports, and Pi
@@ -268,15 +268,42 @@ pub(in crate::agent) async fn run(
     Ok(())
 }
 
+/// The `prompt` command: the text, with any images inline as Pi's own
+/// `ImageContent` (`{type, data, mimeType}`, base64) — the documented optional
+/// `images` field, left off when there are none.
+fn prompt_command(request: &Prompt) -> Result<Value, String> {
+    let mut command = json!({"type": "prompt", "message": request.text});
+    if !request.images.is_empty() {
+        let images = request
+            .images
+            .iter()
+            .map(|image| {
+                let data = image.base64()?;
+                Ok(json!({"type": "image", "data": data, "mimeType": image.mime}))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        command["images"] = json!(images);
+    }
+    Ok(command)
+}
+
 /// Send a prompt and follow it to the end of its turn.
-async fn prompt(shared: &Arc<Shared>, text: &str, cancels: &mut CancelRequests) {
+async fn prompt(shared: &Arc<Shared>, request: &Prompt, cancels: &mut CancelRequests) {
     forget_stale_cancels(cancels);
+    // Read before anything is armed: an attachment that cannot be read ends the
+    // turn here, with nothing sent to Pi.
+    let command = match prompt_command(request) {
+        Ok(command) => command,
+        Err(error) => {
+            emit(&shared.ev_tx, Event::Error(error));
+            return;
+        }
+    };
     *shared.stream.lock().unwrap() = PiStream::default();
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<Signal>();
     *shared.turn.lock().unwrap() = Some(signal_tx);
 
-    let request = json!({"type": "prompt", "message": text});
-    if let Err(error) = shared.transport.request(request).await {
+    if let Err(error) = shared.transport.request(command).await {
         // Refused before Pi took it, so no run was opened and no event is
         // coming: nothing to wait for, and the reason is worth showing.
         *shared.turn.lock().unwrap() = None;
@@ -336,6 +363,32 @@ async fn prompt(shared: &Arc<Shared>, text: &str, cancels: &mut CancelRequests) 
 
     for event in settle_events(failure, exited, cancelled) {
         emit(&shared.ev_tx, event);
+    }
+    // Pi does not push usage, so it is asked for once the turn is over — after
+    // the settle, so the turn is not held open for it. A process that has
+    // exited has nothing to answer with.
+    if !exited {
+        report_usage(shared).await;
+    }
+}
+
+/// Ask Pi how full the context is and what the session has cost. A failed ask
+/// only costs the indicator an update, so it is logged rather than shown.
+async fn report_usage(shared: &Arc<Shared>) {
+    match shared
+        .transport
+        .request(json!({"type": "get_session_stats"}))
+        .await
+    {
+        Ok(data) => {
+            if let Some(usage) = convert::session_usage(&data) {
+                emit(&shared.ev_tx, Event::Usage(usage));
+            }
+        }
+        Err(error) => emit(
+            &shared.ev_tx,
+            Event::Log(format!("get_session_stats 失败：{error}")),
+        ),
     }
 }
 
@@ -752,6 +805,7 @@ mod tests {
                 Event::SessionOptions { .. } => "options",
                 Event::Commands { .. } => "commands",
                 Event::ProbeFailed { .. } => "failed",
+                Event::Usage(_) => "usage",
             })
             .collect()
     }

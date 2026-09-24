@@ -107,6 +107,7 @@ impl KumuApp {
                     };
                     let sid = s.id;
                     let title = s.title.clone();
+                    let title_tooltip = title.clone();
                     let agent = AGENTS.iter().find(|a| a.id == s.agent).and_then(|a| a.logo);
                     // A prompt can be waiting on a session the user is not
                     // looking at, so mark the row that needs an answer.
@@ -114,6 +115,7 @@ impl KumuApp {
                     tree.push(
                         div()
                             .id(format!("session-{sid}"))
+                            .min_w_0()
                             .px_3()
                             .py_1p5()
                             .cursor_pointer()
@@ -130,7 +132,17 @@ impl KumuApp {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().text_xs().child(title))
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .id(format!("session-name-{sid}"))
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .truncate()
+                                            .hover_label(&self.tooltips, title_tooltip)
+                                            .child(title),
+                                    )
                                     .when(waiting, |this| {
                                         this.child(
                                             div()
@@ -140,7 +152,11 @@ impl KumuApp {
                                                 .bg(theme.warning),
                                         )
                                     })
-                                    .child(agent_logo(agent, px(14.), tag)),
+                                    .child(div().size(px(14.)).flex_none().child(agent_logo(
+                                        agent,
+                                        px(14.),
+                                        tag,
+                                    ))),
                             )
                             // Right-click the row for its actions; deleting is
                             // destructive, so it asks for confirmation first.
