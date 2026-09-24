@@ -122,6 +122,55 @@ pub enum Event {
     },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
+    /// How full the session's context is, and what it has cost so far.
+    Usage(Usage),
+}
+
+/// How full a session's context is, as the agent last reported it.
+///
+/// Every field is optional because the protocols disagree on what they report:
+/// ACP's cost is optional, Codex reports no cost at all, and Pi forgets how full
+/// the context is right after a compaction until the next reply measures it.
+/// Each report replaces the last one, except that a report which does not know
+/// the window leaves the last known one standing: a Claude Code process only
+/// learns it at the end of its first turn, and the model rarely changes.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Usage {
+    /// Tokens in the context now: what the next request will send.
+    pub used: Option<u64>,
+    /// The model's context window, in tokens.
+    pub window: Option<u64>,
+    /// What the session has cost so far.
+    pub cost: Option<Cost>,
+}
+
+impl Usage {
+    /// A report as an agent gives it, with zero read as "not known": no agent
+    /// has a context window of zero, and a context or cost of zero is what one
+    /// reports before it has measured anything.
+    pub(super) fn reported(used: Option<u64>, window: Option<u64>, cost: Option<Cost>) -> Self {
+        Self {
+            used: used.filter(|used| *used > 0),
+            window: window.filter(|window| *window > 0),
+            cost: cost.filter(|cost| cost.amount > 0.),
+        }
+    }
+}
+
+/// An amount of money in an ISO 4217 currency ("USD").
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl Cost {
+    pub fn usd(amount: f64) -> Self {
+        Self {
+            amount,
+            currency: "USD".to_string(),
+        }
+    }
 }
 
 /// One selectable model as exposed by an agent.
@@ -230,9 +279,58 @@ pub struct PermissionOptionInfo {
     pub kind: PermissionKind,
 }
 
+/// What the user sends as one prompt: the text, and the images attached to it.
+///
+/// Images travel as files rather than bytes. Codex's app-server takes a local
+/// path and reads the file itself, while the other protocols want the bytes
+/// inline — so each backend reads the file only if its wire needs it, and a
+/// prompt stays cheap to move across the channel.
+///
+/// A file the user references by name is not an attachment: it is written into
+/// the text as `@path`, and the agent reads it with its own tools from the
+/// project directory it runs in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prompt {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// An image attached to a prompt: a file on disk and its MIME type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageAttachment {
+    pub path: std::path::PathBuf,
+    pub mime: String,
+}
+
+impl ImageAttachment {
+    /// The file's bytes as base64, for the protocols that carry images inline;
+    /// the error is the message the user is shown.
+    pub(super) fn base64(&self) -> Result<String, String> {
+        use base64::Engine as _;
+        std::fs::read(&self.path)
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+            .map_err(|error| format!("读取图片 {} 失败：{error}", self.path.display()))
+    }
+}
+
 /// UI -> backend commands on the channel returned by [`crate::agent::spawn`].
 pub enum Cmd {
-    Prompt(String),
+    Prompt(Prompt),
     /// Select the session's model by its config-option value.
     SetModel(String),
     /// Select the session's mode by its config-option value.
@@ -332,6 +430,7 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                     .join(", "),
             ),
             Event::ProbeFailed { agent } => eprintln!("[agent] probe {agent} failed"),
+            Event::Usage(usage) => eprintln!("[agent] usage: {usage:?}"),
         }
     }
     let _ = tx.send(ev);

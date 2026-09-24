@@ -106,18 +106,16 @@ mod tests {
     use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
     use crate::agent::{Config, Event};
 
-    /// End-to-end: probe a real local agent (KUMU_AGENT, default omp) and
+    /// End-to-end: probe a real local omp and
     /// expect a Models event. Ignored by default, so a plain `cargo test` never
     /// drives a real agent; `cargo test -- --ignored` runs it, and it skips
     /// itself when the binary is absent.
     #[test]
-    #[ignore = "drives a real agent binary (KUMU_AGENT)"]
+    #[ignore = "drives a real omp binary"]
     fn probe_discovers_models() {
         let _guard = AGENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let agent: &'static str = match std::env::var("KUMU_AGENT").as_deref() {
-            Ok("opencode") => "opencode",
-            _ => "omp",
-        };
+        // omp is the one agent left on ACP; opencode speaks its v2 API.
+        let agent: &'static str = "omp";
         let cfg = Config::for_agent(agent).expect("known agent");
         if !command_exists(&cfg.command) {
             println!("skipping probe_discovers_models: {} not found", cfg.command);

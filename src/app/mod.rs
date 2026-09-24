@@ -7,20 +7,25 @@
 //!   - `session`   — a session's flow: sending, connections, the events a live
 //!     agent reports, permissions and picks;
 //!   - `turn`      — a live turn as plain data, and how agent events fold into it;
-//!   - `discovery` — what each agent offers, as its probe reports it.
+//!   - `discovery` — what each agent offers, as its probe reports it;
+//!   - `attachments` — images attached to prompts, kept beside the database;
+//!   - `files`     — the names a project's files go by, for `@` references.
 //!
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
 //! notify: a streamed chunk only concerns the conversation, and notifying the
 //! whole home view per chunk is what made the window stutter.
 
+pub mod attachments;
 pub mod discovery;
+mod files;
 mod session;
 pub mod turn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use gpui_kit::{Context, EventEmitter};
+use gpui_kit::{AppContext, Context, EventEmitter};
 
 use crate::agent;
 use crate::db::{Message, Project, Session, Store, db_path};
@@ -103,6 +108,15 @@ pub struct Workspace {
     live_options: HashMap<i64, (&'static str, SessionOptions)>,
     /// What each agent offers in general, as probed.
     discovery: Discovery,
+    /// Each project directory's files, as last listed, for completing `@`
+    /// references; keyed by the directory a session runs in.
+    project_files: HashMap<String, Arc<files::FileIndex>>,
+    /// What each session's agent last reported about its context, decoded once
+    /// from the store at start and kept current by [`Self::record_usage`].
+    usage: HashMap<i64, agent::Usage>,
+    /// Directories being listed right now, so a burst of keystrokes does not
+    /// start a listing per key.
+    listing_files: HashSet<String>,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -123,8 +137,19 @@ impl Workspace {
             live_commands: HashMap::new(),
             live_options: HashMap::new(),
             discovery: Discovery::default(),
+            project_files: HashMap::new(),
+            usage: HashMap::new(),
+            listing_files: HashSet::new(),
         };
         workspace.bootstrap();
+        workspace.usage = workspace
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let usage = serde_json::from_str(session.usage.as_deref()?).ok()?;
+                Some((session.id, usage))
+            })
+            .collect();
         workspace.probe_missing(cx);
         workspace
     }
@@ -153,6 +178,50 @@ impl Workspace {
     fn refresh(&mut self) {
         self.projects = self.store.projects();
         self.sessions = self.store.sessions();
+    }
+
+    /// The entries under `dir` that a reference typed as `query` could mean,
+    /// best first; empty until the directory has been listed (see
+    /// [`Self::refresh_project_files`]).
+    pub fn file_matches(&self, dir: &str, query: &str, limit: usize) -> Vec<String> {
+        self.project_files
+            .get(dir)
+            .map(|entries| {
+                files::rank(entries, query, limit)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List `dir`'s files again, off the main thread.
+    ///
+    /// Called when a reference starts being typed rather than on every key: a
+    /// file created since the last listing shows up the next time an `@` is
+    /// typed, and the keys in between search the list already in hand.
+    pub fn refresh_project_files(&mut self, dir: &str, cx: &mut Context<Self>) {
+        if !self.listing_files.insert(dir.to_string()) {
+            return;
+        }
+        let dir = dir.to_string();
+        let root = PathBuf::from(&dir);
+        let task = cx.background_spawn(async move { files::list(&root) });
+        cx.spawn(async move |this, cx| {
+            let entries = task.await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.listing_files.remove(&dir);
+                workspace.project_files.insert(dir, Arc::new(entries));
+                cx.emit(WorkspaceEvent::Changed);
+            });
+        })
+        .detach();
+    }
+
+    /// How full the session's context is and what it has cost, as its agent
+    /// last reported; `None` before any report.
+    pub fn usage(&self, session_id: i64) -> Option<&agent::Usage> {
+        self.usage.get(&session_id)
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -297,6 +366,7 @@ impl Workspace {
         self.no_resume_notified.remove(&session_id);
         self.unresumable.remove(&session_id);
         self.reclaim_notified.remove(&session_id);
+        self.usage.remove(&session_id);
         self.take_turn(session_id, cx);
         self.store.delete_session(session_id).ok();
         self.refresh();

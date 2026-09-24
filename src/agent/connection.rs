@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::config::{Backend, Config};
 use super::event::{Cmd, Event};
-use super::{acp, claude, codex, pi};
+use super::{acp, claude, codex, opencode, pi};
 
 /// The table of pending permission requests awaiting a user decision, keyed by
 /// request id.
@@ -154,6 +154,14 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
                     thread_permissions,
                 )),
                 Backend::Pi => rt.block_on(pi::session::run(
+                    cfg,
+                    cwd,
+                    ev_tx.clone(),
+                    cmd_rx,
+                    cancel_rx,
+                    thread_permissions,
+                )),
+                Backend::Opencode => rt.block_on(opencode::session::run(
                     cfg,
                     cwd,
                     ev_tx.clone(),

@@ -23,6 +23,7 @@ mod agent;
 mod app;
 mod assets;
 mod db;
+mod dock_icon;
 mod theme;
 mod ui;
 
@@ -35,6 +36,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        dock_icon::install();
         theme::load_kumu_themes(cx);
         let mut window_options = TitleBar::window_options();
         window_options.window_bounds = Some(WindowBounds::centered(size(px(1360.), px(900.)), cx));

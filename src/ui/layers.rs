@@ -21,8 +21,8 @@ use super::tooltip::Tooltips;
 
 /// The overlay layers for a `Root`-hosted window.
 ///
-/// Sheets and notifications would be mounted here too, one call each; the app
-/// opens neither yet, so dialogs and hover labels are what there is.
+/// Sheets would be mounted here too, one call; the app opens none yet, so
+/// dialogs, notifications and hover labels are what there is.
 ///
 /// `use<>` opts out of edition 2024's implicit lifetime capture: the layer
 /// borrows neither `window` nor `cx` once built, so callers can keep using
@@ -34,5 +34,6 @@ pub fn window_layers(
 ) -> impl IntoElement + use<> {
     div()
         .children(Root::render_dialog_layer(window, cx))
+        .children(Root::render_notification_layer(window, cx))
         .child(tooltips.clone())
 }

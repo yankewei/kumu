@@ -259,6 +259,31 @@ pub(super) struct ThreadNameUpdatedNotification {
     pub thread_name: Option<String>,
 }
 
+/// Params of `thread/tokenUsage/updated`, sent after each model call.
+///
+/// Only what the context indicator reads is modelled: `last` is the call just
+/// made — its total is what the thread's context holds now, the figure Codex's
+/// own TUI shows — while `total` sums every call and says nothing about how
+/// full the context is.
+#[derive(Debug, Deserialize)]
+pub(super) struct TokenUsageUpdatedNotification {
+    #[serde(rename = "tokenUsage")]
+    pub token_usage: ThreadTokenUsage,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ThreadTokenUsage {
+    pub last: TokenUsageBreakdown,
+    #[serde(rename = "modelContextWindow", default)]
+    pub model_context_window: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TokenUsageBreakdown {
+    #[serde(rename = "totalTokens")]
+    pub total_tokens: u64,
+}
+
 /// Params of `item/commandExecution/requestApproval`.
 #[derive(Debug, Deserialize)]
 pub(super) struct CommandApprovalParams {

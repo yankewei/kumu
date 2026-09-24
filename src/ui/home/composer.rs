@@ -5,11 +5,12 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{MoveDown, MoveUp, Textarea};
+use gpui_kit::component::input::{MoveDown, MoveUp, Paste, Textarea};
 
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM, KumuApp};
 use crate::agent::AGENTS;
 use crate::db::Session;
+use crate::ui::widgets::image_thumbnail;
 
 impl KumuApp {
     pub(super) fn render_composer(&self, session: &Session, cx: &Context<Self>) -> Div {
@@ -31,6 +32,7 @@ impl KumuApp {
             axes.extend(self.mode_picker(session, cx));
             axes.extend(self.sandbox_picker(session, cx));
         }
+        let ring = theme.ring;
         // Composer: the lower half of the conversation area —
         // a multi-line textarea with the send button inside,
         // on the same centered column as the messages.
@@ -50,20 +52,34 @@ impl KumuApp {
                     .border_color(border)
                     .bg(theme.background)
                     .overflow_hidden()
+                    // Files dropped on the composer join the message: images
+                    // as attachments, anything else as a reference.
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(ring))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.take_paths(paths.paths(), window, cx);
+                    }))
+                    .children(self.render_attachments(cx))
                     .child(
                         div()
                             .p_2()
+                            // A pasted image or Finder file is taken here; plain
+                            // text goes on to the textarea as usual.
+                            .capture_action(cx.listener(|this, _: &Paste, window, cx| {
+                                if this.paste(window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
                             // While the slash-command menu is open, Up/Down move
                             // its highlight. Caught on the way down to the
                             // textarea, which would otherwise take them as caret
                             // moves; with the menu closed they pass through.
                             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                                if this.move_command_cursor(false, cx) {
+                                if this.move_menu_cursor(false, cx) {
                                     cx.stop_propagation();
                                 }
                             }))
                             .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                                if this.move_command_cursor(true, cx) {
+                                if this.move_menu_cursor(true, cx) {
                                     cx.stop_propagation();
                                 }
                             }))
@@ -83,9 +99,22 @@ impl KumuApp {
                             .bg(theme.muted.opacity(0.5))
                             .px_2()
                             .py_1p5()
+                            .child(
+                                Button::new("attach")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::empty().path("icons/paperclip.svg"))
+                                    .tooltip("添加图片或文件")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.pick_attachments(window, cx);
+                                    })),
+                            )
                             .child(self.model_picker(session, cx))
                             .children(axes)
                             .child(div().flex_1())
+                            // Beside send: how full the context is decides
+                            // whether the next message still fits.
+                            .children(self.usage_indicator(session, cx))
                             .child(if self.workspace.read(cx).has_turn(session.id) {
                                 // A turn is in flight, so sending is refused (see
                                 // `Workspace::send`) and the slot offers the one
@@ -109,6 +138,41 @@ impl KumuApp {
                             }),
                     ),
             )
+    }
+}
+
+impl KumuApp {
+    /// The images waiting to be sent, as a row of thumbnails above the input,
+    /// each with a button that takes it back off; nothing when there are none.
+    fn render_attachments(&self, cx: &Context<Self>) -> Option<Div> {
+        let attachments = self.attachments(self.selected?);
+        if attachments.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let thumbnails = attachments.iter().enumerate().map(|(index, image)| {
+            image_thumbnail(image.path.clone(), rems(3.5), theme.radius, theme.border)
+                .relative()
+                .child(
+                    div().absolute().top_0p5().right_0p5().child(
+                        Button::new(("remove-attachment", index))
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("移除")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_attachment(index, cx);
+                            })),
+                    ),
+                )
+        });
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_2()
+                .px_2()
+                .pt_2()
+                .children(thumbnails),
+        )
     }
 }
 

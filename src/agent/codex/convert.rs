@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use crate::agent::event::{
-    CommandInfo, Event, ModelInfo, PermissionKind, PermissionOptionInfo, ReasoningInfo, SandboxInfo,
+    CommandInfo, Event, ImageAttachment, ModelInfo, PermissionKind, PermissionOptionInfo,
+    ReasoningInfo, SandboxInfo,
 };
 
 use super::protocol::{
@@ -314,19 +315,27 @@ pub(super) fn compaction_event(item: &ThreadItem, done: bool) -> Option<Event> {
 /// Codex's own TUI sends instead: the text with the skill spelled `$name`, plus
 /// a structured `skill` item naming it by path, which Codex prefers over the
 /// text mention and so resolves unambiguously. Anything else is plain text.
-pub(super) fn turn_input(text: &str, skills: &[Skill]) -> Value {
+///
+/// Attached images go ahead of the text as `localImage` items, as the TUI sends
+/// them: app-server reads the file itself, so only the path crosses the wire.
+pub(super) fn turn_input(text: &str, images: &[ImageAttachment], skills: &[Skill]) -> Value {
+    let mut input: Vec<Value> = images
+        .iter()
+        .map(|image| json!({ "type": "localImage", "path": image.path }))
+        .collect();
     let invoked = text.strip_prefix('/').and_then(|rest| {
         let name = rest.split(char::is_whitespace).next()?;
         let skill = skills.iter().find(|skill| skill.name == name)?;
         Some((skill, &rest[name.len()..]))
     });
     match invoked {
-        Some((skill, args)) => json!([
-            { "type": "text", "text": format!("${}{args}", skill.name) },
-            { "type": "skill", "name": skill.name, "path": skill.path },
-        ]),
-        None => json!([{ "type": "text", "text": text }]),
+        Some((skill, args)) => {
+            input.push(json!({ "type": "text", "text": format!("${}{args}", skill.name) }));
+            input.push(json!({ "type": "skill", "name": skill.name, "path": skill.path }));
+        }
+        None => input.push(json!({ "type": "text", "text": text })),
     }
+    Value::Array(input)
 }
 
 /// Build the picker catalog from `model/list`: its visible models, and the one
@@ -958,14 +967,14 @@ mod tests {
             scope: "user".into(),
         }];
         assert_eq!(
-            turn_input("/pdf:pdf 读一下 report.pdf", &skills),
+            turn_input("/pdf:pdf 读一下 report.pdf", &[], &skills),
             json!([
                 {"type": "text", "text": "$pdf:pdf 读一下 report.pdf"},
                 {"type": "skill", "name": "pdf:pdf", "path": "/skills/pdf/SKILL.md"},
             ])
         );
         assert_eq!(
-            turn_input("/pdf:pdf", &skills),
+            turn_input("/pdf:pdf", &[], &skills),
             json!([
                 {"type": "text", "text": "$pdf:pdf"},
                 {"type": "skill", "name": "pdf:pdf", "path": "/skills/pdf/SKILL.md"},
@@ -973,10 +982,26 @@ mod tests {
         );
         for text in ["/pdf 读一下", "/usr/bin/env", "请用 /pdf:pdf"] {
             assert_eq!(
-                turn_input(text, &skills),
+                turn_input(text, &[], &skills),
                 json!([{"type": "text", "text": text}]),
                 "{text:?} names no skill"
             );
         }
+    }
+
+    /// Images go ahead of the text as local paths, for app-server to read.
+    #[test]
+    fn attached_images_go_out_as_local_paths() {
+        let image = ImageAttachment {
+            path: "/tmp/shot.png".into(),
+            mime: "image/png".into(),
+        };
+        assert_eq!(
+            turn_input("这是什么", &[image], &[]),
+            json!([
+                {"type": "localImage", "path": "/tmp/shot.png"},
+                {"type": "text", "text": "这是什么"},
+            ])
+        );
     }
 }

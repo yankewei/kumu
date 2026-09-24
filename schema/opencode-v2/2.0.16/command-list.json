@@ -1,0 +1,15 @@
+{
+ "location": {
+  "directory": "/work"
+ },
+ "data": [
+  {
+   "name": "init",
+   "description": "guided AGENTS.md setup"
+  },
+  {
+   "name": "review",
+   "description": "review changes [commit|branch|pr], defaults to uncommitted"
+  }
+ ]
+}

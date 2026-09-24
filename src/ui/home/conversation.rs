@@ -22,7 +22,7 @@ use super::{CONTENT_MAX_REM, CONTENT_MIN_REM};
 use crate::app::turn::TurnBlock;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::db::Message;
-use crate::ui::widgets::loader;
+use crate::ui::widgets::{image_thumbnail, loader};
 
 /// A persisted tool call, deserialized from the message content.
 #[derive(serde::Deserialize)]
@@ -39,7 +39,11 @@ struct ToolPayload {
 /// A persisted message, decoded once when the history is loaded rather than on
 /// every frame that shows it.
 enum HistoryEntry {
-    User(SharedString),
+    /// What the user sent: the text, and the images that went with it.
+    User {
+        text: SharedString,
+        images: Vec<std::path::PathBuf>,
+    },
     /// A system notice, or a tool row this build cannot decode, shown as it
     /// stands rather than dropped.
     Note(SharedString),
@@ -63,7 +67,10 @@ impl HistoryEntry {
     fn decode(message: &Message) -> Self {
         let content = SharedString::from(message.content.clone());
         match message.role.as_str() {
-            "user" => Self::User(content),
+            "user" => Self::User {
+                text: content,
+                images: message.images.iter().map(Into::into).collect(),
+            },
             "system" => Self::Note(content),
             "thinking" => Self::Thinking(content),
             "tool" => match serde_json::from_str::<ToolPayload>(&message.content) {
@@ -555,22 +562,49 @@ impl ConversationView {
 
     fn render_history_entry(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (radius, muted_fg, primary) = (theme.radius, theme.muted_foreground, theme.primary);
+        let (radius, muted_fg, primary, border) = (
+            theme.radius,
+            theme.muted_foreground,
+            theme.primary,
+            theme.border,
+        );
         let Some(entry) = self.history.get_mut(index) else {
             return div().into_any_element();
         };
         match entry {
-            HistoryEntry::User(text) => h_flex()
-                .justify_end()
-                .child(
-                    div()
-                        .max_w(relative(0.78))
-                        .px_3()
-                        .py_2()
-                        .rounded(radius)
-                        .bg(primary.opacity(0.1))
-                        .child(div().text_sm().child(text.clone())),
-                )
+            HistoryEntry::User { text, images } => v_flex()
+                .items_end()
+                .gap_1p5()
+                // A click opens the image in the system viewer, full size.
+                .when(!images.is_empty(), |row| {
+                    row.child(
+                        h_flex()
+                            .max_w(relative(0.78))
+                            .flex_wrap()
+                            .justify_end()
+                            .gap_1p5()
+                            .children(images.iter().enumerate().map(|(image_index, path)| {
+                                let open = path.clone();
+                                image_thumbnail(path.clone(), rems(6.), radius, border)
+                                    .id(SharedString::from(format!(
+                                        "user-image-{index}-{image_index}"
+                                    )))
+                                    .cursor_pointer()
+                                    .on_click(move |_, _, cx| cx.open_with_system(&open))
+                            })),
+                    )
+                })
+                .when(!text.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .max_w(relative(0.78))
+                            .px_3()
+                            .py_2()
+                            .rounded(radius)
+                            .bg(primary.opacity(0.1))
+                            .child(div().text_sm().child(text.clone())),
+                    )
+                })
                 .into_any_element(),
             HistoryEntry::Note(text) => div()
                 .text_xs()
@@ -1125,6 +1159,7 @@ mod tests {
             role: "agent".into(),
             content: "在".into(),
             duration_ms,
+            images: Vec::new(),
         };
         let totals = settled_totals(&[message(None), message(Some(0)), message(Some(1_500))]);
 

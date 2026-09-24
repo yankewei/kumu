@@ -41,6 +41,26 @@ pub(super) fn matching_commands<'a>(
         .collect()
 }
 
+/// The menu open above the input, with the rows it lists: a file reference's,
+/// or the slash-command menu — never both.
+///
+/// Decided once, in [`KumuApp::open_menu`], and read by everything that acts on
+/// it — the render, Enter and Up/Down — so they cannot disagree about which
+/// menu is on screen.
+pub(super) enum OpenMenu {
+    Mention(Vec<String>),
+    Command(Vec<agent::CommandInfo>),
+}
+
+impl OpenMenu {
+    fn len(&self) -> usize {
+        match self {
+            Self::Mention(entries) => entries.len(),
+            Self::Command(commands) => commands.len(),
+        }
+    }
+}
+
 impl KumuApp {
     /// The commands the session can run (see
     /// [`crate::app::Workspace::session_commands`]).
@@ -48,42 +68,73 @@ impl KumuApp {
         self.workspace.read(cx).session_commands(session).to_vec()
     }
 
-    /// The command Enter completes to: the highlighted match, if the input is a
-    /// bare command at all.
+    /// The menu open above the input, if any.
     ///
-    /// The cursor is clamped rather than trusted, because the catalogue can be
-    /// replaced (a live session reporting its own) without the input changing.
-    pub(super) fn chosen_command(&self, session: &Session, cx: &App) -> Option<String> {
+    /// A file reference at the caret comes first: its menu is about the word
+    /// being typed wherever it is. The command menu needs the input to be a
+    /// bare command, and is closed while a turn runs — the composer refuses to
+    /// send then, so there is nothing to complete into. A menu with nothing to
+    /// list is no menu.
+    pub(super) fn open_menu(&self, session: &Session, cx: &App) -> Option<OpenMenu> {
+        if let Some(entries) = self.mention_matches(session, cx)
+            && !entries.is_empty()
+        {
+            return Some(OpenMenu::Mention(entries));
+        }
+        if self.workspace.read(cx).has_turn(session.id) {
+            return None;
+        }
         let commands = self.session_commands(session, cx);
         let typed = self.input_state.read(cx).value();
-        let matches = matching_commands(&commands, &typed);
-        let last = matches.len().checked_sub(1)?;
-        Some(matches[self.command_cursor.min(last)].name.clone())
+        let matches: Vec<agent::CommandInfo> = matching_commands(&commands, &typed)
+            .into_iter()
+            .cloned()
+            .collect();
+        (!matches.is_empty()).then_some(OpenMenu::Command(matches))
     }
 
-    /// Move the highlight by one row, wrapping at either end. Returns whether
-    /// the menu is open to take the key — when it is not, Up/Down belong to the
-    /// textarea.
-    pub(super) fn move_command_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
+    /// Complete the open menu's highlighted row, returning whether a menu was
+    /// open to complete: Enter completes first and sends second.
+    ///
+    /// The cursor is clamped rather than trusted, because a list can be
+    /// replaced (a live session reporting its own commands, a project listed
+    /// again) without the input changing.
+    pub(super) fn complete_menu(
+        &mut self,
+        session: &Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.open_menu(session, cx) else {
+            return false;
+        };
+        let cursor = self.menu_cursor.min(menu.len() - 1);
+        match menu {
+            OpenMenu::Mention(entries) => self.complete_mention(&entries[cursor], window, cx),
+            OpenMenu::Command(commands) => {
+                self.complete_command(&commands[cursor].name, window, cx)
+            }
+        }
+        true
+    }
+
+    /// Move the open menu's highlight by one row, wrapping at either end.
+    /// Returns whether a menu is open to take the key — when none is, Up/Down
+    /// belong to the textarea.
+    pub(super) fn move_menu_cursor(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
         let Some(session) = self.selected_session(cx) else {
             return false;
         };
-        if self.workspace.read(cx).has_turn(session.id) {
+        let Some(len) = self.open_menu(&session, cx).map(|menu| menu.len()) else {
             return false;
-        }
-        let commands = self.session_commands(&session, cx);
-        let typed = self.input_state.read(cx).value();
-        let len = matching_commands(&commands, &typed).len();
-        if len == 0 {
-            return false;
-        }
-        let current = self.command_cursor.min(len - 1);
-        self.command_cursor = if down {
+        };
+        let current = self.menu_cursor.min(len - 1);
+        self.menu_cursor = if down {
             (current + 1) % len
         } else {
             (current + len - 1) % len
         };
-        self.command_scroll.scroll_to_item(self.command_cursor);
+        self.menu_scroll.scroll_to_item(self.menu_cursor);
         cx.notify();
         true
     }
@@ -113,67 +164,61 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// The command menu, or nothing when the input is not a bare command, no
-    /// command matches it, or a turn is in flight (the composer refuses to send
-    /// then, so there is nothing to complete into).
-    pub(super) fn command_menu(&self, session: &Session, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.workspace.read(cx).has_turn(session.id) {
-            return None;
-        }
-        let commands = self.session_commands(session, cx);
-        if commands.is_empty() {
-            return None;
-        }
-        let typed = self.input_state.read(cx).value();
-        let matches = matching_commands(&commands, &typed);
-        if matches.is_empty() {
-            return None;
-        }
-
-        let theme = cx.theme();
-        let chrome = PickerChrome::new(theme);
+    /// The open menu, drawn above the input.
+    pub(super) fn render_open_menu(&self, menu: OpenMenu, cx: &Context<Self>) -> AnyElement {
+        let chrome = PickerChrome::new(cx.theme());
         let weak = cx.entity().downgrade();
-        let cursor = self.command_cursor.min(matches.len() - 1);
-        let rows = matches.iter().enumerate().map(|(index, command)| {
-            let name = command.name.clone();
-            let weak = weak.clone();
-            select_row(
-                &chrome,
-                &format!("/{name}"),
-                command.hint.clone(),
-                // The highlighted row is what Enter completes to.
-                index == cursor,
-                move |_, window, cx| {
-                    let _ = weak.update(cx, |app, cx| {
-                        app.complete_command(&name, window, cx);
-                    });
-                },
-            )
-        });
-
-        // The same backdrop recipe as the permission card above it: the two read
-        // as one input region, on the composer's centered column.
-        Some(
-            v_flex()
-                .flex_none()
-                .px_5()
-                .pt_3()
-                .bg(theme.muted.opacity(0.5))
-                .child(
-                    v_flex()
-                        .w_full()
-                        .max_w(rems(super::CONTENT_MAX_REM))
-                        .min_w(rems(super::CONTENT_MIN_REM))
-                        .mx_auto()
-                        .child(tracked_picker_menu(
-                            "command-menu",
+        // The highlighted row is what Enter completes to.
+        let cursor = self.menu_cursor.min(menu.len() - 1);
+        let (id, rows): (&str, Vec<_>) = match menu {
+            OpenMenu::Mention(entries) => (
+                "mention-menu",
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let weak = weak.clone();
+                        select_row(
                             &chrome,
-                            &self.command_scroll,
-                            rows,
-                        )),
-                )
-                .into_any_element(),
+                            &entry.clone(),
+                            None,
+                            index == cursor,
+                            move |_, window, cx| {
+                                let _ = weak
+                                    .update(cx, |app, cx| app.complete_mention(&entry, window, cx));
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            OpenMenu::Command(commands) => (
+                "command-menu",
+                commands
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, command)| {
+                        let name = command.name;
+                        let weak = weak.clone();
+                        select_row(
+                            &chrome,
+                            &format!("/{name}"),
+                            command.hint,
+                            index == cursor,
+                            move |_, window, cx| {
+                                let _ = weak.update(cx, |app, cx| {
+                                    app.complete_command(&name, window, cx);
+                                });
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        super::input_region(
+            cx.theme().muted,
+            tracked_picker_menu(id, &chrome, &self.menu_scroll, rows),
         )
+        .into_any_element()
     }
 }
 

@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::config::Config;
 use crate::agent::connection::WeakPermissions;
-use crate::agent::event::{Cmd, Event, ModelInfo, emit};
+use crate::agent::event::{Cmd, Event, ImageAttachment, ModelInfo, Prompt, Usage, emit};
 use crate::agent::session::{
     CANCELLED, CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user,
     forget_stale_cancels, release_pending_permissions, settle,
@@ -30,8 +30,8 @@ use super::convert::{self, BuiltinCommand};
 use super::protocol::{
     AccountResult, CommandApprovalParams, DeltaNotification, ErrorNotification,
     FileChangeApprovalParams, InitializeResult, ItemNotification, ModelListResult, Skill,
-    SkillsListResult, ThreadItem, ThreadNameUpdatedNotification, ThreadStartResult, Turn,
-    TurnCompletedNotification, TurnStartResult,
+    SkillsListResult, ThreadItem, ThreadNameUpdatedNotification, ThreadStartResult,
+    TokenUsageUpdatedNotification, Turn, TurnCompletedNotification, TurnStartResult,
 };
 use super::transport::{Message, Transport};
 
@@ -88,7 +88,8 @@ struct TurnOverrides<'a> {
 /// run as turns are methods of their own, which take none of them.
 #[derive(Clone, Copy)]
 enum TurnRequest<'a> {
-    Prompt(&'a str),
+    /// The text and the images attached to it.
+    Prompt(&'a str, &'a [ImageAttachment]),
     Compact,
     /// `review/start`'s target.
     Review(&'a Value),
@@ -366,7 +367,7 @@ pub(in crate::agent) async fn run(
                 sandbox: state.sandbox.as_deref(),
                 reasoning: state.reasoning.as_deref(),
             },
-            &auto,
+            &auto.into(),
             &mut cancels,
         )
         .await;
@@ -381,7 +382,7 @@ pub(in crate::agent) async fn run(
             },
         };
         match cmd {
-            Cmd::Prompt(text) => {
+            Cmd::Prompt(request) => {
                 run_prompt(
                     &transport,
                     &shared,
@@ -392,7 +393,7 @@ pub(in crate::agent) async fn run(
                         sandbox: state.sandbox.as_deref(),
                         reasoning: state.reasoning.as_deref(),
                     },
-                    &text,
+                    &request,
                     &mut cancels,
                 )
                 .await;
@@ -456,12 +457,12 @@ async fn run_prompt(
     ev_tx: &Sender<Event>,
     thread_id: &str,
     overrides: TurnOverrides<'_>,
-    text: &str,
+    prompt: &Prompt,
     cancels: &mut CancelRequests,
 ) {
-    let request = match convert::builtin_command(text) {
-        None => TurnRequest::Prompt(text),
-        Some(BuiltinCommand::Init) => TurnRequest::Prompt(convert::INIT_PROMPT),
+    let request = match convert::builtin_command(&prompt.text) {
+        None => TurnRequest::Prompt(&prompt.text, &prompt.images),
+        Some(BuiltinCommand::Init) => TurnRequest::Prompt(convert::INIT_PROMPT, &prompt.images),
         Some(BuiltinCommand::Compact) => TurnRequest::Compact,
         Some(BuiltinCommand::Review(target)) => {
             let request = TurnRequest::Review(&target);
@@ -520,8 +521,8 @@ async fn run_turn(
     *shared.turn_done.lock().unwrap() = Some(done_tx);
     *shared.turn_id.lock().unwrap() = None;
     let started = match turn {
-        TurnRequest::Prompt(text) => {
-            let input = convert::turn_input(text, &shared.skills.lock().unwrap());
+        TurnRequest::Prompt(text, images) => {
+            let input = convert::turn_input(text, images, &shared.skills.lock().unwrap());
             let mut params = json!({
                 "threadId": thread_id,
                 "input": input,
@@ -793,6 +794,23 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
                 emit(&shared.ev_tx, Event::SessionTitle { title });
             }
         }
+        // How full the context is after the call just made. Codex reports no
+        // cost: its sign-in is a subscription, not a meter.
+        "thread/tokenUsage/updated" => {
+            if let Ok(notification) =
+                serde_json::from_value::<TokenUsageUpdatedNotification>(params)
+            {
+                let usage = notification.token_usage;
+                emit(
+                    &shared.ev_tx,
+                    Event::Usage(Usage::reported(
+                        Some(usage.last.total_tokens),
+                        usage.model_context_window,
+                        None,
+                    )),
+                );
+            }
+        }
         "turn/completed" => {
             let Ok(notification) = serde_json::from_value::<TurnCompletedNotification>(params)
             else {
@@ -848,7 +866,6 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
         | "remoteControl/status/changed"
         | "hook/started"
         | "hook/completed"
-        | "thread/tokenUsage/updated"
         | "account/rateLimits/updated" => {}
         other => emit(&shared.ev_tx, Event::Log(format!("update: {other}"))),
     }
@@ -1048,6 +1065,7 @@ mod tests {
                 Event::SessionOptions { .. } => "options",
                 Event::Commands { .. } => "commands",
                 Event::ProbeFailed { .. } => "failed",
+                Event::Usage(_) => "usage",
             })
             .collect()
     }
@@ -1193,6 +1211,31 @@ mod tests {
             .last();
         assert_eq!(last.as_deref(), Some("命令：\nls\n\n输出：\nstreamed"));
         assert!(shared.commands.lock().unwrap().is_empty());
+    }
+
+    /// The context is the last call's total, over the model's window; the
+    /// running total across calls is not how full the context is.
+    #[test]
+    fn token_usage_reports_the_last_call_against_the_window() {
+        let (shared, rx) = shared_for_test();
+        handle_notification(
+            &shared,
+            "thread/tokenUsage/updated",
+            json!({"threadId": "t", "turnId": "u", "tokenUsage": {
+                "last": {"totalTokens": 30_000, "inputTokens": 29_000, "cachedInputTokens": 0,
+                         "outputTokens": 1_000, "reasoningOutputTokens": 0},
+                "total": {"totalTokens": 90_000, "inputTokens": 87_000, "cachedInputTokens": 0,
+                          "outputTokens": 3_000, "reasoningOutputTokens": 0},
+                "modelContextWindow": 258_400,
+            }}),
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::Usage(usage)]
+                if usage.used == Some(30_000) && usage.window == Some(258_400) && usage.cost.is_none()),
+            "{:?}",
+            kinds(&events)
+        );
     }
 
     /// The agent's own title for the thread replaces kumu's; a cleared name

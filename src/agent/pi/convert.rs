@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::agent::event::{CommandInfo, ModelInfo, ReasoningInfo};
+use crate::agent::event::{CommandInfo, Cost, ModelInfo, ReasoningInfo, Usage};
 
 /// Provider and model id are joined with `/` because that is the form Pi's own
 /// `--model` accepts, and therefore the form kumu sends back.
@@ -279,10 +279,57 @@ pub(super) fn failure(message: &Value) -> Option<String> {
     Some(detail.unwrap_or("pi 的这一轮失败了").to_string())
 }
 
+/// The context and cost from `get_session_stats`.
+///
+/// `contextUsage` is Pi's own estimate of the context — the one its footer and
+/// compaction use — and is absent without a model, while its `tokens` is `null`
+/// right after a compaction until the next reply measures it. `cost` covers the
+/// whole session file, so it survives a reconnect. `None` when the reply holds
+/// neither.
+pub(super) fn session_usage(data: &Value) -> Option<Usage> {
+    let context = data.get("contextUsage");
+    let usage = Usage::reported(
+        context
+            .and_then(|c| c.get("tokens"))
+            .and_then(Value::as_u64),
+        context
+            .and_then(|c| c.get("contextWindow"))
+            .and_then(Value::as_u64),
+        data.get("cost").and_then(Value::as_f64).map(Cost::usd),
+    );
+    (usage != Usage::default()).then_some(usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The stats reply's context estimate and session cost become the usage;
+    /// right after a compaction the context is unknown but the window and cost
+    /// still stand.
+    #[test]
+    fn session_stats_become_usage() {
+        let usage = session_usage(&json!({
+            "tokens": {"input": 50000, "output": 10000, "total": 105000},
+            "cost": 0.45,
+            "contextUsage": {"tokens": 60000, "contextWindow": 200000, "percent": 30},
+        }))
+        .unwrap();
+        assert_eq!(usage.used, Some(60_000));
+        assert_eq!(usage.window, Some(200_000));
+        assert_eq!(usage.cost, Some(Cost::usd(0.45)));
+
+        let compacted = session_usage(&json!({
+            "cost": 0.45,
+            "contextUsage": {"tokens": null, "contextWindow": 200000, "percent": null},
+        }))
+        .unwrap();
+        assert_eq!(compacted.used, None);
+        assert_eq!(compacted.window, Some(200_000));
+
+        assert_eq!(session_usage(&json!({"sessionId": "x"})), None);
+    }
 
     /// The command catalogue is what Pi says a client may invoke — extension
     /// commands, prompt templates and skills alike — in Pi's own order, with the

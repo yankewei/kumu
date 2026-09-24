@@ -10,6 +10,12 @@ use gpui_kit::gpui::{AssetSource, Result, SharedString};
 #[folder = "assets"]
 struct KumuAssets;
 
+/// kumu's app icon, embedded so it is available however the binary was started
+/// (the Dock icon needs it before any bundle exists — see `dock_icon`).
+pub fn app_icon() -> Option<Cow<'static, [u8]>> {
+    KumuAssets::get("AppIcon.icns").map(|file| file.data)
+}
+
 pub struct KumuAssetSource;
 
 impl AssetSource for KumuAssetSource {
@@ -59,5 +65,8 @@ mod tests {
                 .is_some()
         );
         assert!(KumuAssetSource.load("missing.svg").unwrap().is_none());
+        // The Dock icon loads through here; losing the file silently falls
+        // back to macOS's generic executable icon.
+        assert!(app_icon().is_some());
     }
 }

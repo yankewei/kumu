@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- kumu: several agents, each on its own protocol, converging on one prompt. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2d3440"/>
+      <stop offset="1" stop-color="#15181e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="trunk" x1="540" y1="0" x2="660" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#62adef"/>
+      <stop offset="1" stop-color="#e9eef6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#62adef" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#62adef" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dy="12"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- macOS icon grid: 824pt tile centred on a 1024pt canvas -->
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  </g>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <circle cx="748" cy="512" r="200" fill="url(#glow)" clip-path="url(#tile)"/>
+
+  <g fill="none" stroke-width="46" stroke-linecap="round">
+    <path d="M 262 318 C 420 318, 430 512, 590 512" stroke="#a3a8f7"/>
+    <path d="M 262 706 C 420 706, 430 512, 590 512" stroke="#5fd3b5"/>
+    <path d="M 262 512 L 652 512" stroke="url(#trunk)"/>
+  </g>
+
+  <circle cx="262" cy="318" r="42" fill="#a3a8f7"/>
+  <circle cx="262" cy="512" r="42" fill="#62adef"/>
+  <circle cx="262" cy="706" r="42" fill="#5fd3b5"/>
+
+  <!-- the one prompt everything lands in: a text cursor -->
+  <rect x="712" y="422" width="72" height="180" rx="20" fill="#f2f5fa"/>
+</svg>

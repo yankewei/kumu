@@ -6,7 +6,9 @@
 //! [`Config::for_agent`] and dispatched in [`spawn`] and [`probe`].
 //!
 //! Backends:
-//!   - `acp`    — Agent Client Protocol v1 over stdio (`opencode acp`, `omp acp`);
+//!   - `acp`      — Agent Client Protocol v1 over stdio (`omp acp`);
+//!   - `opencode` — opencode's own v2 API: a private `opencode serve` per
+//!     session, over HTTP and server-sent events on a local port;
 //!   - `codex`  — OpenAI Codex `app-server` JSON-RPC over stdio;
 //!   - `claude` — Claude Code's headless stream-json protocol over stdio;
 //!   - `pi`     — Pi's own RPC mode over stdio.
@@ -32,7 +34,8 @@
 //!   - `acp/`       — the ACP backend (session, probe, protocol translation);
 //!   - `codex/`     — the Codex app-server backend;
 //!   - `claude/`    — the Claude Code backend;
-//!   - `pi/`        — the Pi backend.
+//!   - `pi/`        — the Pi backend;
+//!   - `opencode/`  — the opencode v2 backend.
 
 mod acp;
 mod claude;
@@ -40,6 +43,7 @@ mod codex;
 mod config;
 mod connection;
 mod event;
+mod opencode;
 mod pi;
 mod probe;
 mod registry;
@@ -54,8 +58,8 @@ mod resume_tests;
 pub use config::{Config, SessionPicks};
 pub use connection::{Connection, spawn};
 pub use event::{
-    AccessInfo, Cmd, CommandInfo, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
-    ReasoningInfo, SandboxInfo,
+    AccessInfo, Cmd, CommandInfo, Cost, Event, ImageAttachment, ModeInfo, ModelInfo,
+    PermissionKind, PermissionOptionInfo, Prompt, ReasoningInfo, SandboxInfo, Usage,
 };
 pub use probe::probe;
 pub use registry::AGENTS;
