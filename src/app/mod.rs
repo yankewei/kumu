@@ -5,34 +5,30 @@
 //!   - this module — [`Workspace`]: projects, sessions, and the entity that owns
 //!     them;
 //!   - `session`   — a session's flow: sending, connections, the events a live
-//!     agent reports, permissions and picks;
+//!     agent reports, and permissions;
 //!   - `turn`      — a live turn as plain data, and how agent events fold into it;
-//!   - `discovery` — what each agent offers, as its probe reports it;
-//!   - `attachments` — images attached to prompts, kept beside the database;
-//!   - `files`     — the names a project's files go by, for `@` references.
+//!   - `discovery` — what each agent offers, as its probe reports it.
 //!
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
 //! notify: a streamed chunk only concerns the conversation, and notifying the
 //! whole home view per chunk is what made the window stutter.
 
-pub mod attachments;
 pub mod discovery;
-mod files;
 mod session;
 pub mod turn;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use gpui_kit::{AppContext, Context, EventEmitter};
+use futures::StreamExt;
+use gpui_kit::{Context, EventEmitter};
 
 use crate::agent;
 use crate::db::{Message, Project, Session, Store, db_path};
-use discovery::{Discovery, SessionOptions};
+use crate::term::{KeyInput, Snapshot, Term, TermColors};
+use crate::theme;
+use discovery::Discovery;
 use turn::{PendingPermission, Turn};
-
-pub use session::Axis;
 
 /// The agent a new session starts with, until the user picks another.
 const DEFAULT_AGENT: &str = "omp";
@@ -48,11 +44,19 @@ const DEFAULT_AGENT: &str = "omp";
 /// guarantee when such a session is among the live ones.
 const MAX_LIVE_CONNECTIONS: usize = 3;
 
+/// How many native agent TUIs may stay running at once.
+///
+/// A session past the cap is stopped, least recently shown first. Selecting it
+/// again starts a new process. There is no exception for a session that cannot
+/// be resumed: the TUI is the agent's own, and starting it over is the whole
+/// recovery.
+const MAX_LIVE_TERMINALS: usize = 4;
+
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
     /// Something the home view draws: the project or session list, a session's
-    /// title or picks, a turn opening or closing, a permission prompt, what an
-    /// agent offers.
+    /// title, a turn opening or closing, a permission prompt, what an agent
+    /// offers.
     Changed,
     /// A session's live turn changed — streamed text, reasoning, a tool update.
     /// Only the conversation draws it.
@@ -61,6 +65,8 @@ pub enum WorkspaceEvent {
     TurnClosed { session_id: i64, turn_id: u64 },
     /// A session's saved history changed: a prompt, a finished turn, a notice.
     HistoryChanged(i64),
+    /// A session's terminal grid changed. Only the terminal pane draws it.
+    Frame(i64),
 }
 
 /// Projects, sessions, and each session's live connection and turn.
@@ -79,6 +85,12 @@ pub struct Workspace {
     /// [`Self::forget_connection`], and read by
     /// [`Self::reclaim_idle_connections`].
     conn_lru: Vec<i64>,
+    /// Native TUI processes keyed by session id. A hidden session keeps
+    /// reading, so its agent does not block on a full pty, until the cap
+    /// stops it.
+    terms: HashMap<i64, Term>,
+    /// Least recently shown first. Only sessions whose process is still running.
+    term_lru: Vec<i64>,
     /// Sessions already told that their history cannot be resumed. A reclaimed
     /// connection is opened again on the next prompt, and without this the
     /// notice would be written into the conversation every time.
@@ -95,28 +107,11 @@ pub struct Workspace {
     /// Each session's turn in flight: streaming reasoning, tool calls, and the
     /// reply being built. Dropped when the turn ends.
     turns: HashMap<i64, Turn>,
-    /// The commands each live session reported, with the agent that reported
-    /// them. What a session can run depends on its working directory (a
-    /// project's own commands and skills), so one session's list must not stand
-    /// in for another's; the agent's probed list only fills in until a session
-    /// reports.
-    live_commands: HashMap<i64, (&'static str, Vec<agent::CommandInfo>)>,
-    /// The options each live session reported, with the agent that reported
-    /// them: the models it offers, and the values in force on *its* process.
-    /// Two sessions of one agent may run different models — and a Codex model
-    /// has its own efforts — so this is per session, over the agent's catalog.
-    live_options: HashMap<i64, (&'static str, SessionOptions)>,
     /// What each agent offers in general, as probed.
     discovery: Discovery,
-    /// Each project directory's files, as last listed, for completing `@`
-    /// references; keyed by the directory a session runs in.
-    project_files: HashMap<String, Arc<files::FileIndex>>,
     /// What each session's agent last reported about its context, decoded once
     /// from the store at start and kept current by [`Self::record_usage`].
     usage: HashMap<i64, agent::Usage>,
-    /// Directories being listed right now, so a burst of keystrokes does not
-    /// start a listing per key.
-    listing_files: HashSet<String>,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -130,16 +125,14 @@ impl Workspace {
             sessions: Vec::new(),
             conns: HashMap::new(),
             conn_lru: Vec::new(),
+            terms: HashMap::new(),
+            term_lru: Vec::new(),
             no_resume_notified: HashSet::new(),
             unresumable: HashSet::new(),
             reclaim_notified: HashSet::new(),
             turns: HashMap::new(),
-            live_commands: HashMap::new(),
-            live_options: HashMap::new(),
             discovery: Discovery::default(),
-            project_files: HashMap::new(),
             usage: HashMap::new(),
-            listing_files: HashSet::new(),
         };
         workspace.bootstrap();
         workspace.usage = workspace
@@ -154,7 +147,7 @@ impl Workspace {
         workspace
     }
 
-    /// A first run gets a project for the current directory and a session in
+    /// A first run gets a project for the current directory and a shell in
     /// it, so the window never opens onto nothing.
     fn bootstrap(&mut self) {
         if self.store.projects().is_empty() {
@@ -169,7 +162,7 @@ impl Workspace {
             && let Some(project) = self.projects.first().cloned()
         {
             self.store
-                .insert_session(project.id, DEFAULT_AGENT, "会话 1", &project.path)
+                .insert_session(project.id, crate::term::SHELL, "终端 1", &project.path)
                 .ok();
             self.refresh();
         }
@@ -178,50 +171,6 @@ impl Workspace {
     fn refresh(&mut self) {
         self.projects = self.store.projects();
         self.sessions = self.store.sessions();
-    }
-
-    /// The entries under `dir` that a reference typed as `query` could mean,
-    /// best first; empty until the directory has been listed (see
-    /// [`Self::refresh_project_files`]).
-    pub fn file_matches(&self, dir: &str, query: &str, limit: usize) -> Vec<String> {
-        self.project_files
-            .get(dir)
-            .map(|entries| {
-                files::rank(entries, query, limit)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// List `dir`'s files again, off the main thread.
-    ///
-    /// Called when a reference starts being typed rather than on every key: a
-    /// file created since the last listing shows up the next time an `@` is
-    /// typed, and the keys in between search the list already in hand.
-    pub fn refresh_project_files(&mut self, dir: &str, cx: &mut Context<Self>) {
-        if !self.listing_files.insert(dir.to_string()) {
-            return;
-        }
-        let dir = dir.to_string();
-        let root = PathBuf::from(&dir);
-        let task = cx.background_spawn(async move { files::list(&root) });
-        cx.spawn(async move |this, cx| {
-            let entries = task.await;
-            let _ = this.update(cx, |workspace, cx| {
-                workspace.listing_files.remove(&dir);
-                workspace.project_files.insert(dir, Arc::new(entries));
-                cx.emit(WorkspaceEvent::Changed);
-            });
-        })
-        .detach();
-    }
-
-    /// How full the session's context is and what it has cost, as its agent
-    /// last reported; `None` before any report.
-    pub fn usage(&self, session_id: i64) -> Option<&agent::Usage> {
-        self.usage.get(&session_id)
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -234,6 +183,144 @@ impl Workspace {
 
     pub fn session(&self, id: i64) -> Option<&Session> {
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    /// The session's screen, after making sure its process is running.
+    ///
+    /// Agent sessions launch that agent's interactive TUI; shell sessions
+    /// launch the user's `$SHELL`. An exited process starts again. A fifth
+    /// running process stops the one shown least recently.
+    pub fn show_terminal(&mut self, session_id: i64, cx: &mut Context<Self>) -> Snapshot {
+        if self
+            .terms
+            .get(&session_id)
+            .is_some_and(|term| !term.snapshot().exited)
+        {
+            self.touch_terminal(session_id);
+            self.terminal_wake_handled(session_id);
+            return self.terms[&session_id].snapshot();
+        }
+        self.terms.remove(&session_id);
+        self.term_lru.retain(|&id| id != session_id);
+        self.reclaim_terminals();
+        let Some(session) = self.session(session_id).cloned() else {
+            return Snapshot::blank("", "");
+        };
+        let colors = theme::term_colors(cx);
+        let launch = if crate::term::is_shell(&session.agent) {
+            Some(crate::term::default_shell())
+        } else {
+            agent::interactive(&session.agent)
+        };
+        let Some((program, args)) = launch else {
+            let mut snapshot = Snapshot::blank_with(&session.agent, &session.cwd, colors.bg);
+            snapshot.exited = true;
+            snapshot.spawn_error = Some("没有这个 agent".to_string());
+            return snapshot;
+        };
+        let (term, wake) = Term::launch(program, args, PathBuf::from(&session.cwd), colors);
+        let snapshot = term.snapshot();
+        self.terms.insert(session_id, term);
+        self.touch_terminal(session_id);
+        self.watch_terminal(session_id, wake, cx);
+        snapshot
+    }
+
+    /// Push the UI theme's colors into every live terminal.
+    pub fn set_terminal_colors(&self, colors: TermColors) {
+        for term in self.terms.values() {
+            term.set_colors(colors);
+        }
+    }
+
+    pub fn terminal_snapshot(&self, session_id: i64) -> Option<Snapshot> {
+        self.terms.get(&session_id).map(Term::snapshot)
+    }
+
+    pub fn terminal_generation(&self, session_id: i64) -> Option<u64> {
+        self.terms.get(&session_id).map(Term::generation)
+    }
+
+    pub fn terminal_wake_handled(&self, session_id: i64) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.wake_handled();
+        }
+    }
+
+    pub fn terminal_key(&self, session_id: i64, input: KeyInput) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.key(input);
+        }
+    }
+
+    pub fn terminal_write(&self, session_id: i64, bytes: impl Into<Vec<u8>>) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.write(bytes);
+        }
+    }
+
+    pub fn terminal_resize(&self, session_id: i64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.resize(cols, rows, cell_w, cell_h);
+        }
+    }
+
+    fn touch_terminal(&mut self, session_id: i64) {
+        self.term_lru.retain(|&id| id != session_id);
+        self.term_lru.push(session_id);
+    }
+
+    fn forget_terminal(&mut self, session_id: i64) {
+        self.terms.remove(&session_id);
+        self.term_lru.retain(|&id| id != session_id);
+    }
+
+    /// Drop exited processes, then stop the least recently shown ones until
+    /// one more process fits under the cap.
+    fn reclaim_terminals(&mut self) {
+        let dead: Vec<i64> = self
+            .terms
+            .iter()
+            .filter(|(_, term)| term.snapshot().exited)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead {
+            self.forget_terminal(id);
+        }
+        let alive: Vec<i64> = self
+            .term_lru
+            .iter()
+            .copied()
+            .filter(|id| self.terms.contains_key(id))
+            .collect();
+        for id in terminal_evictions(&alive, MAX_LIVE_TERMINALS) {
+            self.forget_terminal(id);
+        }
+    }
+
+    fn watch_terminal(
+        &self,
+        session_id: i64,
+        mut wake: futures::channel::mpsc::UnboundedReceiver<()>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while wake.next().await.is_some() {
+                let watching = this
+                    .update(cx, |workspace, cx| {
+                        if !workspace.terms.contains_key(&session_id) {
+                            return false;
+                        }
+                        cx.emit(WorkspaceEvent::Frame(session_id));
+                        true
+                    })
+                    .unwrap_or(false);
+                if !watching {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// A session's saved history, read from the store.
@@ -259,32 +346,6 @@ impl Workspace {
         &self.discovery
     }
 
-    /// The options the session's pickers offer: what its own connection
-    /// reported, else — before it has one, or after its agent changed — what
-    /// the agent's probe reported.
-    pub fn session_options(&self, session: &Session) -> Option<&SessionOptions> {
-        self.live_options
-            .get(&session.id)
-            .filter(|(agent, _)| *agent == session.agent)
-            .map(|(_, options)| options)
-            .or_else(|| self.discovery.catalog(&session.agent))
-    }
-
-    /// The commands the session can run, from the same two sources as
-    /// [`Self::session_options`].
-    ///
-    /// Empty for an agent that has reported none (yet), which is what keeps the
-    /// menu out of that session's composer rather than offering commands that
-    /// could not run.
-    pub fn session_commands(&self, session: &Session) -> &[agent::CommandInfo] {
-        self.live_commands
-            .get(&session.id)
-            .filter(|(agent, _)| *agent == session.agent)
-            .map(|(_, commands)| commands.as_slice())
-            .or_else(|| self.discovery.commands(&session.agent))
-            .unwrap_or_default()
-    }
-
     /// Add the folder at `path` as a project, named after the folder itself —
     /// or, when it already is one, return that project instead of inserting a
     /// duplicate row.
@@ -299,9 +360,28 @@ impl Workspace {
         Some(id)
     }
 
-    /// Start a session in `project_id`, or in the first project when none is
-    /// given, returning its id.
+    /// Start an agent session in `project_id`, or in the first project when
+    /// none is given, returning its id.
     pub fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) -> Option<i64> {
+        self.insert_session(project_id, DEFAULT_AGENT, "会话", cx)
+    }
+
+    /// Start a pure shell session in `project_id` (or the first project).
+    pub fn new_shell_session(
+        &mut self,
+        project_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) -> Option<i64> {
+        self.insert_session(project_id, crate::term::SHELL, "终端", cx)
+    }
+
+    fn insert_session(
+        &mut self,
+        project_id: Option<i64>,
+        agent: &str,
+        title_prefix: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<i64> {
         let project_id = match project_id.or_else(|| self.projects.first().map(|p| p.id)) {
             Some(id) => id,
             None => self
@@ -318,7 +398,7 @@ impl Workspace {
         let n = self.sessions.len() + 1;
         let id = self
             .store
-            .insert_session(project_id, DEFAULT_AGENT, &format!("会话 {n}"), &cwd)
+            .insert_session(project_id, agent, &format!("{title_prefix} {n}"), &cwd)
             .ok()?;
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
@@ -360,9 +440,8 @@ impl Workspace {
     /// remove the row and its history.
     pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
         self.cancel_pending_permissions(session_id);
+        self.forget_terminal(session_id);
         self.forget_connection(session_id);
-        self.live_commands.remove(&session_id);
-        self.live_options.remove(&session_id);
         self.no_resume_notified.remove(&session_id);
         self.unresumable.remove(&session_id);
         self.reclaim_notified.remove(&session_id);
@@ -384,9 +463,6 @@ impl Workspace {
 
     /// Drop the session's live connection handle — which tears down its agent
     /// subprocess — and forget its place in the reclamation order.
-    ///
-    /// The last-reported commands and options are left in place: they still
-    /// describe what the agent offers, and a reconnect refreshes them.
     fn forget_connection(&mut self, session_id: i64) {
         self.conns.remove(&session_id);
         self.conn_lru.retain(|&id| id != session_id);
@@ -450,7 +526,7 @@ impl Workspace {
     }
 
     /// Probe the agents nothing is known about yet — never probed, or probed
-    /// and failed — so the pickers have something to offer before any session
+    /// and failed — so the settings window has a catalogue before any session
     /// has connected.
     pub fn probe_missing(&mut self, cx: &mut Context<Self>) {
         let missing = self.discovery.missing();
@@ -552,11 +628,24 @@ fn idle_evictions(
     evictions
 }
 
+/// Which running terminals to stop so one more fits under `cap`, least
+/// recently shown first. `order` does not include the session about to start.
+fn terminal_evictions(order: &[i64], cap: usize) -> Vec<i64> {
+    let mut evictions = Vec::new();
+    for &session_id in order {
+        if order.len() - evictions.len() < cap {
+            break;
+        }
+        evictions.push(session_id);
+    }
+    evictions
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{ProjectPick, idle_evictions, resolve_project_pick};
+    use super::{ProjectPick, idle_evictions, resolve_project_pick, terminal_evictions};
     use crate::db::Project;
 
     fn project(id: i64, path: &str) -> Project {
@@ -565,6 +654,13 @@ mod tests {
             name: format!("project-{id}"),
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn a_fifth_terminal_stops_the_least_recently_shown() {
+        assert!(terminal_evictions(&[1, 2, 3], 4).is_empty());
+        assert_eq!(terminal_evictions(&[1, 2, 3, 4], 4), vec![1]);
+        assert_eq!(terminal_evictions(&[1, 2, 3, 4, 5], 4), vec![1, 2]);
     }
 
     /// Picking a folder that is already a project selects it rather than

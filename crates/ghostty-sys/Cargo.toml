@@ -1,0 +1,9 @@
+[package]
+name = "ghostty-sys"
+version = "0.0.0"
+edition = "2024"
+publish = false
+links = "ghostty-vt"
+
+[build-dependencies]
+bindgen = "0.72"

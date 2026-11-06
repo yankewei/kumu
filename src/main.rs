@@ -24,6 +24,7 @@ mod app;
 mod assets;
 mod db;
 mod dock_icon;
+mod term;
 mod theme;
 mod ui;
 

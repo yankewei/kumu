@@ -1,33 +1,21 @@
 //! Home window: projects → sessions tree on the left, the selected session's
-//! conversation on the right. Owns the settings window handle.
+//! terminal on the right. Owns the settings window handle.
 
-mod access_picker;
-mod command_menu;
-mod composer;
 mod conversation;
 mod markdown_mermaid;
-mod mention_menu;
 mod mermaid_viewer;
-mod mode_picker;
-mod model_picker;
-mod permission;
-mod reasoning_picker;
-mod sandbox_picker;
 mod sidebar;
-mod usage_indicator;
+mod terminal;
 
-// Shared column width keeps the conversation and composer aligned.
+// Shared column width for the conversation history.
 const CONTENT_MAX_REM: f32 = 44.;
 const CONTENT_MIN_REM: f32 = 24.;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use self::conversation::ConversationView;
 use super::SettingsWindow;
-use crate::agent::{AGENTS, ImageAttachment};
-use crate::app::attachments;
-use crate::app::turn::PendingPermission;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::db::Session;
 use crate::ui::layers;
@@ -35,35 +23,15 @@ use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-/// The backdrop everything above the input sits on — the permission card and
-/// the menus — so they read as one input region with the composer, on its
-/// centered column.
-fn input_region(muted: Hsla, child: impl IntoElement) -> Div {
-    v_flex()
-        .flex_none()
-        .px_5()
-        .pt_3()
-        .bg(muted.opacity(0.5))
-        .child(
-            v_flex()
-                .w_full()
-                .max_w(rems(CONTENT_MAX_REM))
-                .min_w(rems(CONTENT_MIN_REM))
-                .mx_auto()
-                .child(child),
-        )
-}
-
 /// Which session to select after `id` is deleted.
 ///
 /// The nearest sibling in the same project (the next one, else the previous),
-/// else the first session left anywhere, else none — so the conversation pane
-/// never goes blank while sessions remain.
+/// else the first session left anywhere, else none — so the right pane never
+/// goes blank while sessions remain.
 fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
     let project = sessions.iter().find(|s| s.id == id)?.project_id;
     let mut siblings: Vec<i64> = sessions
@@ -91,47 +59,22 @@ pub struct KumuApp {
     /// The selected session's history and every session's live turn. Its own
     /// entity so streaming and animation repaint that column alone.
     conversation: Entity<ConversationView>,
+    /// The chat input's text. The terminal is the visible pane now, but the
+    /// send path still reads this, so a composer can return without rewiring.
     input_state: Entity<TextareaState>,
-    /// Which picker's menu is open, if any. One at a time — see
-    /// [`KumuApp::set_picker_open`].
-    open_picker: Option<PickerAxis>,
-    /// Model picker state: which agent's rail tab is active (None = the
-    /// session's current agent), and the search field that no other picker has
-    /// (the other lists are short enough to read whole).
-    model_picker_tab: Option<&'static str>,
-    model_search: Entity<InputState>,
-    /// The highlighted row of the menu open above the input — the slash-command
-    /// menu or the file-reference one, never both — and the scroll that keeps
-    /// it in view. Back to the first match whenever the input changes.
-    menu_cursor: usize,
-    menu_scroll: ScrollHandle,
-    /// Images waiting to go with each session's next message, in the order
-    /// attached: an image belongs to the session it was attached in, so
-    /// switching sessions before sending does not hand it to another agent.
-    attachments: HashMap<i64, Vec<ImageAttachment>>,
-    /// How many images each session still has being copied in; its message
-    /// waits for them, or it would go without them.
-    stashing: HashMap<i64, usize>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
-}
-
-/// Which composer picker's menu is open.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PickerAxis {
-    Model,
-    Reasoning,
-    Access,
-    Mode,
-    Sandbox,
+    /// Native-agent TUI for the selected session.
+    terminal: Entity<terminal::TerminalView>,
 }
 
 impl KumuApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(Workspace::new);
+        let terminal_workspace = workspace.clone();
         // Only what the home view itself draws: a streamed chunk is the
         // conversation's alone, and repainting the whole window per chunk is
-        // what used to make it stutter.
+        // what used to make it stutter. A terminal frame is the pane's own.
         cx.subscribe(&workspace, |_, _, ev, cx| {
             if matches!(ev, WorkspaceEvent::Changed) {
                 cx.notify();
@@ -152,50 +95,54 @@ impl KumuApp {
                     // inserts a newline (the textarea handles the newline).
                     .submit_on_enter(true)
             }),
-            open_picker: None,
-            model_picker_tab: None,
-            model_search: cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…")),
-            menu_cursor: 0,
-            menu_scroll: ScrollHandle::new(),
-            attachments: HashMap::new(),
-            stashing: HashMap::new(),
             tooltips: cx.new(|cx| Tooltips::new(cx)),
+            terminal: cx.new(|cx| terminal::TerminalView::new(terminal_workspace, window, cx)),
         };
-        // Enter in the composer sends the prompt (Shift+Enter newline is
+        // Enter in the chat input sends the prompt (Shift+Enter newline is
         // handled by the textarea itself via submit_on_enter).
         cx.subscribe_in(&app.input_state, window, |this, _, ev, window, cx| {
-            match ev {
-                // Shift+Enter also emits PressEnter; only plain Enter sends.
-                InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
-                // A new prefix is a new list, so the highlight starts over.
-                InputEvent::Change => {
-                    this.menu_cursor = 0;
-                    this.menu_scroll.scroll_to_item(0);
-                    this.track_reference(cx);
-                }
-                _ => {}
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                this.send(window, cx);
             }
         })
         .detach();
         if let Some(first) = app.workspace.read(cx).sessions().first().map(|s| s.id) {
             app.select_session(first, cx);
+            app.focus_terminal(window, cx);
         }
         app
     }
 
     fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
         self.selected = Some(id);
+        self.terminal
+            .update(cx, |terminal, cx| terminal.show(id, cx));
         let messages = self.workspace.read(cx).messages(id);
         self.conversation.update(cx, |conversation, cx| {
             conversation.show(Some(id), &messages, cx)
         });
     }
 
-    /// Start a session — in `project_id`, or the first project — and show it.
+    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal
+            .update(cx, |terminal, cx| terminal.focus(window, cx));
+    }
+
+    /// Start an agent session — in `project_id`, or the first project — and show it.
     fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
         let id = self
             .workspace
             .update(cx, |workspace, cx| workspace.new_session(project_id, cx));
+        if let Some(id) = id {
+            self.select_session(id, cx);
+        }
+    }
+
+    /// Start a pure shell session — in `project_id`, or the first project — and show it.
+    fn new_shell_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
+        let id = self.workspace.update(cx, |workspace, cx| {
+            workspace.new_shell_session(project_id, cx)
+        });
         if let Some(id) = id {
             self.select_session(id, cx);
         }
@@ -317,7 +264,6 @@ impl KumuApp {
 
     /// Delete a session, then land on its neighbor if it was the one on screen.
     fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
-        self.attachments.remove(&session_id);
         // Pick the fallback while the doomed row is still in the list.
         let next = neighbor_session(self.workspace.read(cx).sessions(), session_id);
         self.workspace
@@ -328,6 +274,7 @@ impl KumuApp {
                 Some(next) => self.select_session(next, cx),
                 None => {
                     self.selected = None;
+                    self.terminal.update(cx, |terminal, cx| terminal.clear(cx));
                     self.conversation
                         .update(cx, |conversation, cx| conversation.show(None, &[], cx));
                 }
@@ -340,207 +287,17 @@ impl KumuApp {
         let Some(session) = self.selected_session(cx) else {
             return;
         };
-        // While a menu is open, Enter completes to the row it highlights, so the
-        // effect is visible before the key is pressed. Sending takes a second
-        // Enter.
-        if self.complete_menu(&session, window, cx) {
-            return;
-        }
-        // The raw value rather than a trimmed one reaches the check above: a
-        // completed command ends with a space, and that space is what closes
-        // the menu. The workspace trims what it sends.
-        if self.stashing.get(&session.id).is_some_and(|&n| n > 0) {
-            window.push_notification(Notification::info("图片还在处理中，请稍后再发送"), cx);
-            return;
-        }
         let text = self.input_state.read(cx).value().to_string();
-        let images = self.attachments(session.id).to_vec();
         let sent = self.workspace.update(cx, |workspace, cx| {
-            workspace.send(session.id, &text, images, cx)
+            workspace.send(session.id, &text, Vec::new(), cx)
         });
         if !sent {
             return;
         }
-        self.attachments.remove(&session.id);
         self.conversation
             .update(cx, |conversation, cx| conversation.scroll_to_end(cx));
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
-    }
-
-    /// List the session's files again when a reference is opened — an `@` with
-    /// nothing after it yet — so the menu offers what is on disk now, and the
-    /// keys typed after it search the list already in hand.
-    fn track_reference(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.selected_session(cx) else {
-            return;
-        };
-        let input = self.input_state.read(cx);
-        let opened = matches!(
-            mention_menu::mention_at(&input.value(), input.cursor()),
-            Some((_, ""))
-        );
-        if opened {
-            self.workspace.update(cx, |workspace, cx| {
-                workspace.refresh_project_files(&session.cwd, cx)
-            });
-        }
-    }
-
-    /// Attach image files, or reference the ones that are not images. Returns
-    /// whether there was anything to take.
-    fn take_paths(
-        &mut self,
-        paths: &[PathBuf],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(session) = self.selected_session(cx) else {
-            return false;
-        };
-        let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
-            .iter()
-            .cloned()
-            .partition(|path| attachments::image_mime(path).is_some());
-        if !images.is_empty() {
-            self.stash_images(
-                move || {
-                    images
-                        .iter()
-                        .map(|path| attachments::stash_file(path))
-                        .collect()
-                },
-                window,
-                cx,
-            );
-        }
-        self.insert_references(&session, &others, window, cx);
-        !paths.is_empty()
-    }
-
-    /// Take a paste the textarea cannot: an image, or files copied in Finder.
-    /// Returns whether it was taken; plain text is left to the textarea.
-    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(item) = cx.read_from_clipboard() else {
-            return false;
-        };
-        if self.selected.is_none() {
-            return false;
-        }
-        let mut taken = false;
-        for entry in item.entries() {
-            match entry {
-                ClipboardEntry::ExternalPaths(paths) => {
-                    taken |= self.take_paths(paths.paths(), window, cx);
-                }
-                ClipboardEntry::Image(image) => {
-                    let (bytes, mime) = (image.bytes.clone(), image.format.mime_type());
-                    self.stash_images(
-                        move || vec![attachments::stash_bytes(&bytes, mime)],
-                        window,
-                        cx,
-                    );
-                    taken = true;
-                }
-                ClipboardEntry::String(_) => {}
-            }
-            // The first entry the clipboard offers is what was copied; the rest
-            // are other forms of it (a Finder file also comes as its name).
-            if taken {
-                break;
-            }
-        }
-        taken
-    }
-
-    /// Open a file picker: the images picked are attached, and any other file
-    /// is referenced, as a dropped one would be.
-    fn pick_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("添加".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else {
-                return;
-            };
-            let _ = this.update_in(cx, |app, window, cx| app.take_paths(&paths, window, cx));
-        })
-        .detach();
-    }
-
-    /// Copy images into kumu's attachment folder off the UI thread — a
-    /// screenshot is megabytes to read, hash and write — and queue them once
-    /// they are there.
-    fn stash_images(
-        &mut self,
-        stash: impl FnOnce() -> Vec<Result<ImageAttachment, String>> + Send + 'static,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session_id) = self.selected else {
-            return;
-        };
-        *self.stashing.entry(session_id).or_default() += 1;
-        let task = cx.background_spawn(async move { stash() });
-        cx.spawn_in(window, async move |this, cx| {
-            let stashed = task.await;
-            let _ = this.update_in(cx, |app, window, cx| {
-                if let Some(pending) = app.stashing.get_mut(&session_id) {
-                    *pending -= 1;
-                }
-                for image in stashed {
-                    app.add_attachment(session_id, image, window, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Queue an attachment, or say why it could not be. The reason is a
-    /// passing notification rather than a note in the conversation: nothing was
-    /// sent, so there is nothing for the history to keep.
-    fn add_attachment(
-        &mut self,
-        session_id: i64,
-        stashed: Result<ImageAttachment, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match stashed {
-            Ok(image) => {
-                let queued = self.attachments.entry(session_id).or_default();
-                if !queued.contains(&image) {
-                    queued.push(image);
-                }
-            }
-            Err(error) => window.push_notification(Notification::error(error), cx),
-        }
-        cx.notify();
-    }
-
-    /// The images waiting to go with `session_id`'s next message.
-    fn attachments(&self, session_id: i64) -> &[ImageAttachment] {
-        self.attachments.get(&session_id).map_or(&[], Vec::as_slice)
-    }
-
-    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(queued) = self.selected.and_then(|id| self.attachments.get_mut(&id)) else {
-            return;
-        };
-        if index < queued.len() {
-            queued.remove(index);
-            cx.notify();
-        }
-    }
-
-    /// Stop the selected session's turn in flight, if there is one.
-    fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        if let Some(session_id) = self.selected {
-            self.workspace.read(cx).cancel_turn(session_id);
-        }
     }
 
     /// Whether any tool call in this session is still waiting on the user.
@@ -551,52 +308,20 @@ impl KumuApp {
             .is_some()
     }
 
-    /// The oldest outstanding permission prompt for a session, if any.
-    fn pending_permission_for(&self, session_id: i64, cx: &App) -> Option<PendingPermission> {
-        self.workspace
-            .read(cx)
-            .pending_permission(session_id)
-            .cloned()
-    }
-
-    /// Answer a permission prompt with the option the user chose; `None`
-    /// declines it.
-    fn resolve_permission(
-        &mut self,
-        session_id: i64,
-        request_id: &str,
-        option_id: Option<String>,
-        label: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.workspace.update(cx, |workspace, cx| {
-            workspace.resolve_permission(session_id, request_id, option_id, label, cx)
-        });
-    }
-
     /// The session on screen, as the workspace has it now.
     fn selected_session(&self, cx: &App) -> Option<Session> {
         self.workspace.read(cx).session(self.selected?).cloned()
     }
 
-    fn agent_name(&self, agent_id: &str) -> String {
-        AGENTS
-            .iter()
-            .find(|a| a.id == agent_id)
-            .map(|a| a.name.to_string())
-            .unwrap_or_else(|| agent_id.to_string())
-    }
-
     /// Focus the settings window if it's open, else open a new one (resizable,
     /// opens at its minimum size).
     fn open_settings(&mut self, cx: &mut Context<Self>) {
-        if let Some(handle) = &self.settings_window {
-            if handle
+        if let Some(handle) = &self.settings_window
+            && handle
                 .update(cx, |_, window, _| window.activate_window())
                 .is_ok()
-            {
-                return;
-            }
+        {
+            return;
         }
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
@@ -613,80 +338,58 @@ impl KumuApp {
         }
     }
 
-    /// Record a picker opening or closing.
-    ///
-    /// Only one is open at a time: the chips sit in a row and their menus
-    /// overlap. A close only clears the flag when it is *that* picker closing —
-    /// opening a second chip dismisses the first, and the two reports can arrive
-    /// in either order, so clearing unconditionally would drop the menu the user
-    /// just opened.
-    fn set_picker_open(&mut self, axis: PickerAxis, open: bool) {
-        self.open_picker = if open {
-            Some(axis)
-        } else if self.open_picker == Some(axis) {
-            None
-        } else {
-            self.open_picker
-        };
-    }
-
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
-        let right =
-            match self.selected_session(cx) {
-                Some(session) => v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .px_4()
-                            .py_2()
-                            .child(div().text_sm().font_medium().child(session.title.clone())),
-                    )
-                    // Cached: this frame reuses the conversation's last paint
-                    // unless the conversation itself was notified.
-                    .child(
-                        self.conversation.clone().cached(
-                            StyleRefinement::default()
-                                .flex_1()
-                                .min_h_0()
-                                .min_w_0()
-                                .w_full(),
+        let right = match self.selected_session(cx) {
+            Some(session) => v_flex()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .px_4()
+                        .py_2()
+                        .child(div().text_sm().font_medium().child(session.title.clone())),
+                )
+                // Native-agent TUI fills the pane; chat composer is gone.
+                .child(
+                    self.terminal.clone().cached(
+                        StyleRefinement::default()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .w_full(),
+                    ),
+                ),
+            None => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(theme.muted_foreground)
+                .child(div().text_sm().child("还没有会话"))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Button::new("empty-new").ghost().label("新建会话").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.new_session(None, cx);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            Button::new("empty-new-shell")
+                                .ghost()
+                                .label("新建终端")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.new_shell_session(None, cx);
+                                    cx.notify();
+                                })),
                         ),
-                    )
-                    .child(div().h_px().w_full().bg(theme.border))
-                    // A pending authorization sits directly above the input, so
-                    // the decision is always in reach.
-                    .children(
-                        self.pending_permission_for(session.id, cx)
-                            .map(|pending| self.render_permission_card(session.id, &pending, cx)),
-                    )
-                    // The open menu goes closest to the input: it is about
-                    // what is being typed, and it is gone the moment the message
-                    // is sent, while the card above it answers a decision the
-                    // agent is still blocked on.
-                    .children(
-                        self.open_menu(&session, cx)
-                            .map(|menu| self.render_open_menu(menu, cx)),
-                    )
-                    .child(self.render_composer(&session, cx)),
-                None => v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .text_color(theme.muted_foreground)
-                    .child(div().text_sm().child("还没有会话"))
-                    .child(Button::new("empty-new").ghost().label("新建会话").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.new_session(None, cx);
-                            cx.notify();
-                        }),
-                    )),
-            };
+                ),
+        };
 
         // Full-width title bar strip: brand on the left (traffic lights float
         // to its left); the settings entry lives in the sidebar's bottom-left.

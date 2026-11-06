@@ -48,7 +48,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
             .reasoning(reasoning, current_reasoning)
             .build();
         emit(&ev_tx, options);
-        // The skills are the composer's commands. Best effort, like Claude's
+        // The skills are the session's commands. Best effort, like Claude's
         // catalogue: a Codex that cannot list them is still installed and its
         // models still reported. The working directory is this process's, the
         // same one the other probes use, so its repo-scoped skills belong to no

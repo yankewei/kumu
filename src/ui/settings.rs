@@ -180,12 +180,7 @@ impl SettingsWindow {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
-        let (foreground, muted_fg, border, radius) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.border,
-            theme.radius,
-        );
+        let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
         let (sidebar, sidebar_fg, sidebar_border) = (
             theme.sidebar,
             theme.sidebar_foreground,
@@ -193,7 +188,6 @@ impl SettingsWindow {
         );
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
-        let (primary, link, muted) = (theme.primary, theme.link, theme.muted);
         let dark = theme.mode.is_dark();
 
         let query = self.search_state.read(cx).value().to_lowercase();
@@ -284,20 +278,8 @@ impl SettingsWindow {
         };
 
         let cards: Vec<AnyElement> = match self.settings_page {
-            SettingsPage::Providers => vec![self.render_providers_card(
-                cx,
-                dark,
-                theme.background,
-                radius,
-                primary,
-                link,
-                muted,
-                muted_fg,
-                border,
-            )],
-            SettingsPage::General => {
-                vec![self.render_general_card(dark, radius, primary, link, muted, muted_fg, border)]
-            }
+            SettingsPage::Providers => vec![self.render_providers_card(cx, dark, theme)],
+            SettingsPage::General => vec![self.render_general_card(dark, theme)],
         };
 
         let right = v_flex()
@@ -351,18 +333,16 @@ impl SettingsWindow {
         div().w_full().px_5().py_4().rounded_lg().bg(bg)
     }
 
-    fn render_providers_card(
-        &self,
-        cx: &Context<Self>,
-        dark: bool,
-        base_bg: Hsla,
-        radius: Pixels,
-        primary: Hsla,
-        link: Hsla,
-        muted: Hsla,
-        muted_fg: Hsla,
-        border: Hsla,
-    ) -> AnyElement {
+    fn render_providers_card(&self, cx: &Context<Self>, dark: bool, theme: &Theme) -> AnyElement {
+        let (base_bg, radius, primary, link, muted, muted_fg, border) = (
+            theme.background,
+            theme.radius,
+            theme.primary,
+            theme.link,
+            theme.muted,
+            theme.muted_foreground,
+            theme.border,
+        );
         // White card on the light panel; keep the muted surface in dark mode.
         let card_bg = if dark { muted } else { gpui_kit::gpui::white() };
         // Icon tiles flip to muted so they still contrast against the white card.
@@ -482,16 +462,15 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn render_general_card(
-        &self,
-        dark: bool,
-        radius: Pixels,
-        primary: Hsla,
-        link: Hsla,
-        muted: Hsla,
-        muted_fg: Hsla,
-        border: Hsla,
-    ) -> AnyElement {
+    fn render_general_card(&self, dark: bool, theme: &Theme) -> AnyElement {
+        let (radius, primary, link, muted, muted_fg, border) = (
+            theme.radius,
+            theme.primary,
+            theme.link,
+            theme.muted,
+            theme.muted_foreground,
+            theme.border,
+        );
         let row = |title: &'static str,
                    desc: &'static str,
                    control: AnyElement,

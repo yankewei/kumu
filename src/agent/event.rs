@@ -51,23 +51,15 @@ pub enum Event {
     SessionReady { resume_id: String, resumable: bool },
     /// The prompt turn ended with this stop reason.
     Done(String),
-    /// The agent is asking for authorization before running a tool call. The UI
-    /// shows the options on the matching tool row and answers back via
-    /// [`crate::agent::Connection::resolve_permission`].
+    /// The agent is asking for authorization before running a tool call, so
+    /// the matching tool row can be marked as waiting; the answer travels back
+    /// via [`crate::agent::Connection::resolve_permission`].
     PermissionRequest {
         /// Tool call this request belongs to, so the UI can attach the prompt
         /// to the row it already rendered.
         tool_call_id: String,
         /// Stable id used by the UI to answer this request.
         request_id: String,
-        /// The agent's description of what it wants to do.
-        title: String,
-        /// What the agent is proposing, taken from the tool call's content
-        /// (text or file diff) and falling back to its `raw_input`; may be
-        /// empty when the agent describes nothing.
-        detail: String,
-        /// The options the agent offers, passed through verbatim.
-        options: Vec<PermissionOptionInfo>,
     },
     /// A fatal error occurred.
     Error(String),
@@ -78,8 +70,7 @@ pub enum Event {
     /// Agents differ in which axes they have: modes are an ACP config option,
     /// the sandbox is Codex's own setting, and reasoning is an ACP config
     /// option that Codex only has per model. An empty list is therefore the
-    /// normal way to say "this agent has no such axis", and the matching picker
-    /// renders nothing rather than an empty menu.
+    /// normal way to say "this agent has no such axis".
     SessionOptions {
         agent: &'static str,
         models: Vec<ModelInfo>,
@@ -112,7 +103,7 @@ pub enum Event {
     /// — at the handshake, and again whenever the agent changes it.
     ///
     /// An empty list is the honest report for an agent that has none, which is
-    /// what keeps the menu off the composer there rather than offering commands
+    /// what keeps the menu off the chat input there rather than offering commands
     /// that could not run. Codex's app-server has no slash commands of its own
     /// (they live in its TUI), so its backend reports the few built-ins it runs
     /// itself, then the session's skills.
@@ -192,8 +183,8 @@ pub struct ModelInfo {
 /// kumu resolves — the agent recognizes the `/name` prefix in a prompt, so
 /// invoking one is just sending it.
 ///
-/// The description an agent offers is deliberately not carried: the composer's
-/// lists show the same source's long prose nowhere else (a picker row is the
+/// The description an agent offers is deliberately not carried: the lists show
+/// the same source's long prose nowhere else (a catalogue row is the
 /// name and nothing more), so it is dropped at this boundary rather than
 /// carried up to be discarded at render time.
 #[derive(Clone, Debug, PartialEq)]
@@ -253,30 +244,6 @@ pub struct SandboxInfo {
     pub value: String,
     /// Human-readable label.
     pub name: String,
-}
-
-/// What a permission option means, used to pick the UI treatment. The label is
-/// always the agent's own `name`; this only decides the button styling.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum PermissionKind {
-    AllowOnce,
-    AllowAlways,
-    RejectOnce,
-    RejectAlways,
-    /// A kind this build doesn't know about (`PermissionOptionKind` is
-    /// `#[non_exhaustive]`); rendered neutrally rather than as a rejection.
-    Other,
-}
-
-/// One permission option offered by the agent, passed through verbatim.
-#[derive(Clone, Debug)]
-pub struct PermissionOptionInfo {
-    /// Value to echo back in the response.
-    pub id: String,
-    /// Label to display.
-    pub name: String,
-    /// Semantic classification for styling.
-    pub kind: PermissionKind,
 }
 
 /// What the user sends as one prompt: the text, and the images attached to it.
@@ -369,12 +336,7 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
             Event::PermissionRequest {
                 tool_call_id,
                 request_id,
-                options,
-                ..
-            } => eprintln!(
-                "[agent] permission {request_id} for tool {tool_call_id}: {} options",
-                options.len()
-            ),
+            } => eprintln!("[agent] permission {request_id} for tool {tool_call_id}"),
             Event::Error(s) => eprintln!("[agent] error: {s}"),
             Event::Log(s) => eprintln!("[agent] log: {s}"),
             Event::SessionOptions {
@@ -401,22 +363,22 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                     .len(),
                 modes
                     .iter()
-                    .map(|m| m.name.as_str())
+                    .map(|m| format!("{}({})", m.name, m.value))
                     .collect::<Vec<_>>()
                     .join(", "),
                 access
                     .iter()
-                    .map(|a| a.name.as_str())
+                    .map(|a| format!("{}({})", a.name, a.value))
                     .collect::<Vec<_>>()
                     .join(", "),
                 sandboxes
                     .iter()
-                    .map(|s| s.name.as_str())
+                    .map(|s| format!("{}({})", s.name, s.value))
                     .collect::<Vec<_>>()
                     .join(", "),
                 reasoning
                     .iter()
-                    .map(|r| r.name.as_str())
+                    .map(|r| format!("{}({})", r.name, r.value))
                     .collect::<Vec<_>>()
                     .join(", "),
             ),

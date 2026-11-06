@@ -10,10 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use crate::agent::event::{
-    CommandInfo, Cost, Event, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
-    ReasoningInfo, Usage,
-};
+use crate::agent::event::{CommandInfo, Cost, Event, ModeInfo, ModelInfo, ReasoningInfo, Usage};
 use crate::agent::session::{CANCELLED, SessionOptionsBuilder};
 
 /// One model as `GET /api/model` lists it.
@@ -29,7 +26,7 @@ pub(super) struct ModelEntry {
 }
 
 impl ModelEntry {
-    /// The value kumu stores and the picker sends back: `provider/id`. The id
+    /// The value kumu stores and sends back: `provider/id`. The id
     /// may contain `/` itself (`deepseek/deepseek-v4.1-flash`), so a value is
     /// split at its first `/` only — which is also the shape the ACP backend
     /// stored, so a session's saved pick carries over.
@@ -164,7 +161,7 @@ impl Catalog {
     }
 
     /// The session's options. Reasoning is the model in force's own list, so
-    /// switching model changes what the effort picker offers.
+    /// switching model changes what the effort axis offers.
     pub fn options(&self, agent: &'static str) -> Event {
         let models = self
             .models
@@ -230,27 +227,6 @@ pub(super) fn command_call<'a>(
         .iter()
         .any(|command| command.name == name)
         .then(|| (name, rest[name.len()..].trim()))
-}
-
-/// The permission options: opencode's three replies, as their own values.
-pub(super) fn permission_options() -> Vec<PermissionOptionInfo> {
-    vec![
-        PermissionOptionInfo {
-            id: "once".to_string(),
-            name: "允许一次".to_string(),
-            kind: PermissionKind::AllowOnce,
-        },
-        PermissionOptionInfo {
-            id: "always".to_string(),
-            name: "总是允许".to_string(),
-            kind: PermissionKind::AllowAlways,
-        },
-        PermissionOptionInfo {
-            id: "reject".to_string(),
-            name: "拒绝".to_string(),
-            kind: PermissionKind::RejectOnce,
-        },
-    ]
 }
 
 /// How a turn ended, as the event stream reports it.

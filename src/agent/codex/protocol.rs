@@ -67,7 +67,7 @@ pub(super) struct ModelListResult {
     pub data: Vec<Model>,
 }
 
-/// One entry of `model/list`. Only the fields the picker needs are modelled.
+/// One entry of `model/list`. Only the fields the catalogue needs are modelled.
 #[derive(Debug, Deserialize)]
 pub(super) struct Model {
     /// The value to send back as `model` on a turn.
@@ -86,7 +86,7 @@ pub(super) struct Model {
     #[serde(rename = "defaultReasoningEffort", default)]
     pub default_reasoning_effort: Option<String>,
     /// The efforts this model advertises; the set differs per model, so this is
-    /// the catalogue the reasoning picker reads.
+    /// the catalogue the reasoning axis reads.
     #[serde(rename = "supportedReasoningEfforts", default)]
     pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
 }
@@ -113,7 +113,7 @@ pub(super) struct ThreadStartResult {
     pub model: String,
     /// The sandbox policy in force for the thread, as the agent resolved it.
     /// This echo is the only place kumu can learn the effective policy, so it is
-    /// what the picker labels itself with.
+    /// what the catalogue labels itself with.
     #[serde(default)]
     pub sandbox: Option<SandboxPolicy>,
     /// The reasoning effort in force for the thread, as the agent resolved it.
@@ -125,7 +125,7 @@ pub(super) struct ThreadStartResult {
 
 /// The sandbox policy a thread reports it is running under.
 ///
-/// Only the tag is read: it tells the picker which value is in force. The
+/// Only the tag is read: it tells the catalogue which value is in force. The
 /// variant fields (writable roots, network access) are the agent's business.
 /// Note that this is the *object* form — `thread/start` accepts the same
 /// policies as kebab-case strings, and `turn/start` takes this form back.
@@ -284,30 +284,19 @@ pub(super) struct TokenUsageBreakdown {
     pub total_tokens: u64,
 }
 
-/// Params of `item/commandExecution/requestApproval`.
+/// Params of `item/commandExecution/requestApproval`: only the item the
+/// request belongs to is read.
 #[derive(Debug, Deserialize)]
 pub(super) struct CommandApprovalParams {
     #[serde(rename = "itemId", default)]
     pub item_id: String,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub reason: Option<String>,
 }
 
-/// Params of `item/fileChange/requestApproval`. The request itself describes no
-/// change — only the item id — so the diff comes from the item we saw start.
+/// Params of `item/fileChange/requestApproval`.
 #[derive(Debug, Deserialize)]
 pub(super) struct FileChangeApprovalParams {
     #[serde(rename = "itemId", default)]
     pub item_id: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// Set when the agent wants write access to a whole root.
-    #[serde(rename = "grantRoot", default)]
-    pub grant_root: Option<String>,
 }
 
 /// Codex's best-effort description of what a shell command will do. A single
@@ -508,7 +497,7 @@ mod tests {
 
     /// `model/list` carries the value to send back and the label to show.
     #[test]
-    fn model_list_reads_the_picker_fields() {
+    fn model_list_reads_the_catalogue_fields() {
         let result: ModelListResult = serde_json::from_str(
             r#"{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol",
                 "displayName":"GPT-5.6-Sol","description":"d","hidden":false,

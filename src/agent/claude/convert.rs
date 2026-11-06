@@ -1,19 +1,16 @@
 //! Protocol -> app translation. What Claude Code reports about a session over
 //! the handshake (its model catalogue, its commands) is mapped here; everything
 //! else is a fixed vocabulary — the values `claude` accepts on its own flags,
-//! which the pickers can therefore offer before any session exists.
+//! which a session can therefore be offered before it exists.
 //!
 //! The labels are kumu's own where the concept is kumu's to name (as with
 //! Codex's sandbox policies) and the agent's own where they are a scale the
 //! user types and reads in Claude Code itself.
 
-use crate::agent::event::{
-    AccessInfo, CommandInfo, ModeInfo, ModelInfo, PermissionKind, PermissionOptionInfo,
-    ReasoningInfo,
-};
+use crate::agent::event::{AccessInfo, CommandInfo, ModeInfo, ModelInfo, ReasoningInfo};
 use serde_json::Value;
 
-use super::protocol::{CommandEntry, ControlRequestBody, ModelEntry};
+use super::protocol::{CommandEntry, ModelEntry};
 
 /// The provider label Claude Code's models are filed under.
 ///
@@ -22,9 +19,9 @@ use super::protocol::{CommandEntry, ControlRequestBody, ModelEntry};
 /// Bedrock, Google Cloud's Agent Platform, Microsoft Foundry, or a gateway —
 /// is decided by the account's own configuration, which kumu cannot see.
 /// Labelling each alias by itself would file every one under its own
-/// "provider" in the picker, so one constant is used instead. `modelProvider`
+/// "provider" in the catalogue, so one constant is used instead. `modelProvider`
 /// is never borrowed from a live session for the same reason Codex's backend
-/// does not borrow its thread's: the picker would regroup the moment a session
+/// does not borrow its thread's: the catalogue would regroup the moment a session
 /// started.
 const PROVIDER: &str = "anthropic";
 
@@ -71,7 +68,7 @@ pub(super) fn model_options() -> Vec<ModelInfo> {
 /// configuration is itself `plan`, the session keeps reporting plan.
 ///
 /// ACP agents report their own modes for this same axis (`build` / `plan`), which
-/// is why it is one chip whichever agent a session runs.
+/// is why it is one axis whichever agent a session runs.
 pub(super) fn mode_options() -> Vec<ModeInfo> {
     [("default", "构建"), ("plan", "计划")]
         .into_iter()
@@ -91,7 +88,7 @@ pub(super) fn mode_options() -> Vec<ModeInfo> {
 /// CLI accepts, but "deny whatever would have prompted" has no counterpart on
 /// the other agents kumu drives, so it is not an offer here. A session a user
 /// configured into either one still reports it — see [`current_access`] — so the
-/// chip never claims nothing is in force when something is.
+/// axis never claims nothing is in force when something is.
 pub(super) fn access_options() -> Vec<AccessInfo> {
     [
         ("default", "监督"),
@@ -164,7 +161,7 @@ pub(super) fn reasoning_options() -> Vec<ReasoningInfo> {
 /// The level Claude Code runs a model at when nothing else names one.
 ///
 /// Documented rather than reported: nothing in the protocol says what effort a
-/// session resolved to, so with nothing picked and nothing saved, the chip has
+/// session resolved to, so with nothing picked and nothing saved, the axis has
 /// only the model table to go on — `high` on every model that supports effort
 /// except Opus 4.7, which is `xhigh` (see
 /// <https://code.claude.com/docs/en/model-config#choose-an-effort-level>).
@@ -181,7 +178,7 @@ pub(super) fn default_effort(model: Option<&str>) -> &'static str {
     }
 }
 
-/// A live session's picker catalogue, as the `initialize` response reports it,
+/// A live session's catalogue catalogue, as the `initialize` response reports it,
 /// falling back to the fixed vocabulary above when the report was empty — an
 /// older CLI, or a shape this backend does not recognise, should still leave
 /// the user something to pick.
@@ -242,7 +239,7 @@ pub(super) fn session_reasoning(reported: &[ModelEntry]) -> Vec<ReasoningInfo> {
 /// it travels. A name the response leaves empty is dropped rather than offered
 /// as a bare `/`.
 ///
-/// The description each entry also carries is not read: a picker row is the
+/// The description each entry also carries is not read: a catalogue row is the
 /// name and nothing more (see [`crate::agent::CommandInfo`]).
 pub(super) fn command_catalog(
     reported: &[CommandEntry],
@@ -260,51 +257,6 @@ pub(super) fn command_catalog(
                 .filter(|hint| !hint.trim().is_empty()),
         })
         .collect()
-}
-
-/// kumu's answers to a Claude Code permission request.
-///
-/// Two, not four: "always" is the CLI's own `permission_suggestions`, and those
-/// are heterogeneous updates (`setMode` in the captured request, rule additions
-/// in the Agent SDK's docs) whose shapes need their own verification. Echoing
-/// one back is therefore left out rather than guessed at, and the permission
-/// card's own cancel answer covers the rest.
-pub(super) fn permission_options() -> Vec<PermissionOptionInfo> {
-    vec![
-        PermissionOptionInfo {
-            id: ALLOW_OPTION.to_string(),
-            name: "允许一次".to_string(),
-            kind: PermissionKind::AllowOnce,
-        },
-        PermissionOptionInfo {
-            id: DENY_OPTION.to_string(),
-            name: "拒绝".to_string(),
-            kind: PermissionKind::RejectOnce,
-        },
-    ]
-}
-
-/// The permission card's headline: the CLI's own one-line summary when it made
-/// one, else the same title the tool row carries.
-pub(super) fn permission_title(request: &ControlRequestBody) -> String {
-    let tool = request
-        .display_name
-        .as_deref()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&request.tool_name);
-    match request.description.as_deref().filter(|d| !d.is_empty()) {
-        Some(description) => format!("{tool} · {description}"),
-        None => tool_title(&request.tool_name, &request.input),
-    }
-}
-
-/// The permission card's body: the call's own parameters, pretty-printed, so
-/// the prompt is answerable on its own.
-pub(super) fn permission_detail(request: &ControlRequestBody) -> String {
-    if request.input.is_null() {
-        return String::new();
-    }
-    serde_json::to_string_pretty(&request.input).unwrap_or_default()
 }
 
 /// The row title for a tool call: Claude Code's tool name plus whatever makes
@@ -352,10 +304,8 @@ pub(super) fn tool_content(content: &Value) -> String {
     }
 }
 
-/// The id of the allow answer in [`permission_options`].
+/// The id the backend compares an answer against to mean "allow once".
 pub(super) const ALLOW_OPTION: &str = "allow-once";
-/// The id of the refuse answer in [`permission_options`].
-pub(super) const DENY_OPTION: &str = "deny-once";
 
 #[cfg(test)]
 mod tests {
@@ -364,7 +314,7 @@ mod tests {
 
     /// Every alias must be offered with a value `--model` accepts and a label
     /// distinct from the raw value, and they must all share one provider so the
-    /// picker does not file each alias under a provider of its own.
+    /// catalogue does not file each alias under a provider of its own.
     #[test]
     fn model_options_label_the_aliases_under_one_provider() {
         let models = model_options();
@@ -400,7 +350,7 @@ mod tests {
         }
     }
 
-    /// The work mode axis is the one chip whose values are what the agent is
+    /// The work mode axis is the one axis whose values are what the agent is
     /// doing, and `default` (构建) is the wire's way of saying "not planning":
     /// Claude Code has no separate flag for the normal working mode.
     #[test]
@@ -523,7 +473,7 @@ mod tests {
         assert!(models.iter().all(|m| m.provider == PROVIDER));
     }
 
-    /// An empty report is not an empty picker: the documented aliases stand in.
+    /// An empty report is not an empty catalogue: the documented aliases stand in.
     #[test]
     fn an_empty_report_falls_back_to_the_documented_vocabulary() {
         assert_eq!(
@@ -599,18 +549,6 @@ mod tests {
         );
     }
 
-    /// A permission request gets exactly two answers, and the allow id is the
-    /// one the backend compares against.
-    #[test]
-    fn permission_options_offer_allow_once_and_refuse() {
-        let options = permission_options();
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].id, ALLOW_OPTION);
-        assert_eq!(options[0].kind, PermissionKind::AllowOnce);
-        assert_eq!(options[1].id, DENY_OPTION);
-        assert_eq!(options[1].kind, PermissionKind::RejectOnce);
-    }
-
     /// Tool rows lead with the tool's name and then the recognisable part of
     /// the call, and a call with nothing to add is just the name.
     #[test]
@@ -644,36 +582,5 @@ mod tests {
         );
         assert_eq!(tool_content(&Value::Null), "");
         assert_eq!(tool_content(&json!(42)), "42");
-    }
-
-    /// The permission card leads with the CLI's summary when it made one, and
-    /// falls back to the tool row's title when it did not.
-    #[test]
-    fn permission_titles_prefer_the_clis_own_summary() {
-        let with_summary = ControlRequestBody {
-            subtype: "can_use_tool".into(),
-            tool_name: "Write".into(),
-            display_name: Some("Write".into()),
-            description: Some("probe.txt".into()),
-            input: json!({"file_path": "/tmp/probe.txt"}),
-            tool_use_id: Some("call_1".into()),
-        };
-        assert_eq!(permission_title(&with_summary), "Write · probe.txt");
-        assert!(permission_detail(&with_summary).contains("/tmp/probe.txt"));
-
-        let without_summary = ControlRequestBody {
-            description: None,
-            ..with_summary
-        };
-        assert_eq!(
-            permission_title(&without_summary),
-            format!("Write · /tmp/probe.txt")
-        );
-
-        let no_input = ControlRequestBody {
-            input: Value::Null,
-            ..without_summary
-        };
-        assert_eq!(permission_detail(&no_input), "");
     }
 }
