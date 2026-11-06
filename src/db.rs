@@ -256,20 +256,6 @@ impl Store {
         tx.commit()
     }
 
-    pub fn update_session_agent_model(
-        &self,
-        id: i64,
-        agent: &str,
-        model: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET resume_id = CASE WHEN agent = ?1 THEN resume_id ELSE NULL END,
-             agent = ?1, model = ?2, updated_at = datetime('now') WHERE id = ?3",
-            params![agent, model, id],
-        )?;
-        Ok(())
-    }
-
     /// Remember what the agent last reported about the session's context, as
     /// the JSON the app encodes.
     pub fn update_session_usage(&self, id: i64, usage: &str) -> Result<()> {
@@ -285,39 +271,6 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET resume_id = ?1 WHERE id = ?2",
             params![resume_id, id],
-        )?;
-        Ok(())
-    }
-
-    /// Remember the session's mode, or clear it (`None`) when it no longer
-    /// applies — mode ids are agent-specific, so switching agents invalidates
-    /// the stored one.
-    pub fn update_session_mode(&self, id: i64, mode: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET mode = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![mode, id],
-        )?;
-        Ok(())
-    }
-
-    /// Remember the session's sandbox policy, or clear it (`None`) when it no
-    /// longer applies — the values are Codex's own vocabulary, so switching to
-    /// an agent without the concept invalidates the stored one.
-    pub fn update_session_sandbox(&self, id: i64, sandbox: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET sandbox = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![sandbox, id],
-        )?;
-        Ok(())
-    }
-
-    /// Remember the session's reasoning effort, or clear it (`None`) when it no
-    /// longer applies — the set is advertised per model, so switching the model
-    /// (or the agent) invalidates a stored one.
-    pub fn update_session_reasoning(&self, id: i64, reasoning: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET reasoning = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![reasoning, id],
         )?;
         Ok(())
     }
@@ -435,7 +388,7 @@ const SETTING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 
 /// Read one app setting; None when unset.
 pub fn get_setting(key: &str) -> Option<String> {
-    let conn = Connection::open(&db_path()).ok()?;
+    let conn = Connection::open(db_path()).ok()?;
     conn.busy_timeout(SETTING_BUSY_TIMEOUT).ok()?;
     conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
         row.get(0)
@@ -445,7 +398,7 @@ pub fn get_setting(key: &str) -> Option<String> {
 
 /// Persist one app setting.
 pub fn set_setting(key: &str, value: &str) -> Result<()> {
-    let conn = Connection::open(&db_path())?;
+    let conn = Connection::open(db_path())?;
     conn.busy_timeout(SETTING_BUSY_TIMEOUT)?;
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -507,25 +460,6 @@ mod tests {
             store.sessions()[0].resume_id.as_deref(),
             Some("backend-session")
         );
-    }
-
-    #[test]
-    fn model_changes_keep_restore_cursor_but_agent_changes_clear_it() {
-        let store = store();
-        let project = store.insert_project("test", "/tmp").unwrap();
-        let id = store
-            .insert_session(project, "omp", "test", "/tmp")
-            .unwrap();
-        store.update_session_resume_id(id, "omp-session").unwrap();
-        store
-            .update_session_agent_model(id, "omp", Some("another-model"))
-            .unwrap();
-        assert_eq!(
-            store.sessions()[0].resume_id.as_deref(),
-            Some("omp-session")
-        );
-        store.update_session_agent_model(id, "codex", None).unwrap();
-        assert!(store.sessions()[0].resume_id.is_none());
     }
 
     /// Deleting a session drops its history with it, and touches nothing else:
@@ -611,78 +545,6 @@ mod tests {
             "a generated title is refused once the user has renamed the session"
         );
         assert_eq!(store.sessions()[0].title, "重构 backend");
-    }
-
-    /// The chosen mode is remembered across reads, and clearing it is how a
-    /// session falls back to the agent's default — mode ids are agent-specific,
-    /// so switching agents has to be able to drop a stale one.
-    #[test]
-    fn session_mode_round_trips_and_clears() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let session = store
-            .insert_session(project, "omp", "会话 1", "/tmp")
-            .unwrap();
-        assert_eq!(
-            store.sessions()[0].mode,
-            None,
-            "a new session stores no mode"
-        );
-
-        store.update_session_mode(session, Some("ask")).unwrap();
-        assert_eq!(store.sessions()[0].mode.as_deref(), Some("ask"));
-
-        store.update_session_mode(session, None).unwrap();
-        assert_eq!(store.sessions()[0].mode, None);
-    }
-
-    /// The chosen sandbox policy is remembered across reads, and clearing it is
-    /// how a session goes back to whatever the agent's own configuration says.
-    #[test]
-    fn session_sandbox_round_trips_and_clears() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let session = store
-            .insert_session(project, "codex", "会话 1", "/tmp")
-            .unwrap();
-        assert_eq!(
-            store.sessions()[0].sandbox,
-            None,
-            "a new session overrides nothing"
-        );
-
-        store
-            .update_session_sandbox(session, Some("read-only"))
-            .unwrap();
-        assert_eq!(store.sessions()[0].sandbox.as_deref(), Some("read-only"));
-
-        store.update_session_sandbox(session, None).unwrap();
-        assert_eq!(store.sessions()[0].sandbox, None);
-    }
-
-    /// The chosen reasoning effort round-trips the same way, and clearing it is
-    /// how a session falls back to the model's own default — the effort set is
-    /// per model, so a model switch has to be able to drop a stale one.
-    #[test]
-    fn session_reasoning_round_trips_and_clears() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let session = store
-            .insert_session(project, "codex", "会话 1", "/tmp")
-            .unwrap();
-        assert_eq!(
-            store.sessions()[0].reasoning,
-            None,
-            "a new session overrides nothing"
-        );
-
-        store
-            .update_session_reasoning(session, Some("xhigh"))
-            .unwrap();
-        assert_eq!(store.sessions()[0].reasoning.as_deref(), Some("xhigh"));
-
-        store.update_session_reasoning(session, None).unwrap();
-        assert_eq!(store.sessions()[0].reasoning, None);
     }
 
     /// `has_conversation` is what fixes a session's agent, so it must stay false

@@ -27,13 +27,12 @@ use agent_client_protocol::{
 };
 
 use super::convert::{
-    command_catalog, mode_catalog, model_catalog, permission_detail, permission_kind,
-    permission_outcome, reasoning_catalog, status_name, stop_reason, tool_call_content,
-    variant_name,
+    command_catalog, mode_catalog, model_catalog, permission_outcome, reasoning_catalog,
+    status_name, stop_reason, tool_call_content, variant_name,
 };
 use crate::agent::config::Config;
 use crate::agent::connection::WeakPermissions;
-use crate::agent::event::{Cmd, Cost, Event, PermissionOptionInfo, Prompt, Usage, emit};
+use crate::agent::event::{Cmd, Cost, Event, Prompt, Usage, emit};
 use crate::agent::session::{
     CancelRequests, PermissionQuestion, SessionOptionsBuilder, ask_user, forget_stale_cancels,
     release_pending_permissions,
@@ -294,17 +293,6 @@ pub(in crate::agent) async fn run(
                     &perm_tx,
                     PermissionQuestion {
                         tool_call_id: request.tool_call.tool_call_id.0.to_string(),
-                        title: request.tool_call.fields.title.clone().unwrap_or_default(),
-                        detail: permission_detail(&request.tool_call),
-                        options: request
-                            .options
-                            .iter()
-                            .map(|o| PermissionOptionInfo {
-                                id: o.option_id.0.to_string(),
-                                name: o.name.clone(),
-                                kind: permission_kind(&o.kind),
-                            })
-                            .collect(),
                     },
                     move |option_id| {
                         emit(
@@ -380,7 +368,7 @@ pub(in crate::agent) async fn run(
 
                 // Read the model, mode and reasoning config options: their ids
                 // let the UI switch any of them later; the catalogs feed the
-                // composer's pickers.
+                // chat input's catalogues.
                 let (model_option_id, current_model, models) =
                     model_catalog(&config_options);
                 let (mode_option_id, current_mode, modes) =
@@ -469,7 +457,7 @@ pub(in crate::agent) async fn run(
                             emit(&ev_tx, Event::Done(stop_reason(&response.stop_reason)));
                         }
                         Cmd::SetSandbox(value) => {
-                            // ACP has no sandbox axis, so the UI offers no chip
+                            // ACP has no sandbox axis, so the UI offers no control
                             // for one and this should not arrive; saying so beats
                             // dropping it silently.
                             emit(&log_tx, Event::Log(format!("no sandbox to set: {value}")));
@@ -501,7 +489,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::agent::{Cmd, Config, Event, PermissionKind, spawn};
+    use crate::agent::{Cmd, Config, Event, spawn};
 
     use super::notification_event;
     use agent_client_protocol::schema::v1::{
@@ -803,24 +791,10 @@ mod tests {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("prompt timed out") {
                 Event::Agent(chunk) => text.push_str(&chunk),
-                // Nobody is there to click, so take the first allow option and
-                // let the turn finish; this also exercises the answer path.
-                Event::PermissionRequest {
-                    request_id,
-                    options,
-                    ..
-                } => {
-                    let choice = options
-                        .iter()
-                        .find(|o| {
-                            matches!(
-                                o.kind,
-                                PermissionKind::AllowOnce | PermissionKind::AllowAlways
-                            )
-                        })
-                        .or_else(|| options.first())
-                        .map(|o| o.id.clone());
-                    conn.resolve_permission(&request_id, choice);
+                // Nobody is there to click, so answer the protocol's cancelled
+                // outcome; this still exercises the answer path.
+                Event::PermissionRequest { request_id, .. } => {
+                    conn.resolve_permission(&request_id, None);
                 }
                 Event::Done(_) => {
                     println!("{agent} replied: {text:?}");

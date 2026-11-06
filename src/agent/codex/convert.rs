@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use crate::agent::event::{
-    CommandInfo, Event, ImageAttachment, ModelInfo, PermissionKind, PermissionOptionInfo,
-    ReasoningInfo, SandboxInfo,
+    CommandInfo, Event, ImageAttachment, ModelInfo, ReasoningInfo, SandboxInfo,
 };
 
 use super::protocol::{
@@ -23,7 +22,7 @@ use super::protocol::{
 /// The provider label Codex models are filed under.
 ///
 /// `model/list` reports no provider, and borrowing the thread's
-/// `modelProvider` instead would make the picker regroup the moment a session
+/// `modelProvider` instead would make the catalogue regroup the moment a session
 /// started, so the probe and a live session label alike.
 const PROVIDER: &str = "openai";
 
@@ -195,7 +194,7 @@ pub(super) fn tool_event_with_content(item: &ThreadItem, content: String) -> Opt
 /// Codex's own order (repo, then user, then system), each name once.
 ///
 /// A name repeated across scopes keeps its first — the most local — entry,
-/// which is the one a composer row can mean.
+/// which is the one a list row can mean.
 pub(super) fn skill_catalog(listed: SkillsListResult) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
     for skill in listed.data.into_iter().flat_map(|entry| entry.skills) {
@@ -275,7 +274,7 @@ pub(super) fn builtin_command(text: &str) -> Option<BuiltinCommand> {
     }
 }
 
-/// The composer's slash commands: the built-ins, then the skills.
+/// The session's slash commands: the built-ins, then the skills.
 ///
 /// A skill takes the rest of the line as free text, with nothing said about
 /// what it should be. One named like a built-in is left out, since typing it
@@ -311,7 +310,7 @@ pub(super) fn compaction_event(item: &ThreadItem, done: bool) -> Option<Event> {
 /// A prompt as `turn/start` input.
 ///
 /// A prompt that opens with `/name`, where `name` is a skill, is how the
-/// composer invokes one, but app-server does not parse slashes. It becomes what
+/// the chat input invokes one, but app-server does not parse slashes. It becomes what
 /// Codex's own TUI sends instead: the text with the skill spelled `$name`, plus
 /// a structured `skill` item naming it by path, which Codex prefers over the
 /// text mention and so resolves unambiguously. Anything else is plain text.
@@ -338,7 +337,7 @@ pub(super) fn turn_input(text: &str, images: &[ImageAttachment], skills: &[Skill
     Value::Array(input)
 }
 
-/// Build the picker catalog from `model/list`: its visible models, and the one
+/// Build the catalogue catalog from `model/list`: its visible models, and the one
 /// the agent recommends as the active value.
 pub(super) fn model_catalog(listed: &ModelListResult) -> (Option<String>, Vec<ModelInfo>) {
     let mut models = Vec::new();
@@ -361,7 +360,7 @@ pub(super) fn model_catalog(listed: &ModelListResult) -> (Option<String>, Vec<Mo
         });
     }
     models.sort_by(|a, b| a.name.cmp(&b.name));
-    // An agent that names no default still needs something for the chip.
+    // An agent that names no default still needs something for the axis.
     if default.is_none() {
         default = models.first().map(|model| model.value.clone());
     }
@@ -407,9 +406,9 @@ pub(super) fn model_reasoning(listed: &ModelListResult) -> HashMap<String, Model
         .collect()
 }
 
-/// The session-level list the picker offers for a model: its advertised efforts,
+/// The session-level list the catalogue offers for a model: its advertised efforts,
 /// in the agent's order. Empty when the model is unknown or advertises none,
-/// which is what keeps the chip off the toolbar.
+/// which is what keeps the axis off the toolbar.
 pub(super) fn reasoning_options(
     reasoning: &HashMap<String, ModelReasoning>,
     model: Option<&str>,
@@ -477,9 +476,9 @@ pub(super) fn sandbox_options() -> Vec<SandboxInfo> {
     .collect()
 }
 
-/// The picker value for the policy a thread reports it is running under.
+/// The catalogue value for the policy a thread reports it is running under.
 ///
-/// `None` for a policy kumu does not offer, so the chip falls back to its
+/// `None` for a policy kumu does not offer, so the axis falls back to its
 /// inherited label instead of claiming a value that is not in the menu.
 pub(super) fn sandbox_mode_value(policy: &SandboxPolicy) -> Option<&'static str> {
     match policy {
@@ -490,7 +489,7 @@ pub(super) fn sandbox_mode_value(policy: &SandboxPolicy) -> Option<&'static str>
     }
 }
 
-/// The `turn/start.sandboxPolicy` payload for a picker value.
+/// The `turn/start.sandboxPolicy` payload for a catalogue value.
 ///
 /// This exists to hide a real asymmetry in the protocol: `thread/start` takes a
 /// kebab-case string (`"read-only"`), while `turn/start` takes a camelCase
@@ -505,36 +504,6 @@ pub(super) fn sandbox_policy(value: &str) -> Option<Value> {
         _ => return None,
     };
     Some(json!({ "type": kind }))
-}
-
-/// The decisions kumu offers for an approval.
-///
-/// app-server sends no option list — the decision vocabulary is fixed by the
-/// protocol — so the labels are kumu's own and the ids are the wire values that
-/// get echoed back verbatim.
-pub(super) fn approval_options() -> Vec<PermissionOptionInfo> {
-    vec![
-        PermissionOptionInfo {
-            id: "accept".to_string(),
-            name: "允许一次".to_string(),
-            kind: PermissionKind::AllowOnce,
-        },
-        PermissionOptionInfo {
-            id: "acceptForSession".to_string(),
-            name: "本次会话都允许".to_string(),
-            kind: PermissionKind::AllowAlways,
-        },
-        PermissionOptionInfo {
-            id: "decline".to_string(),
-            name: "拒绝".to_string(),
-            kind: PermissionKind::RejectOnce,
-        },
-        PermissionOptionInfo {
-            id: "cancel".to_string(),
-            name: "取消本轮".to_string(),
-            kind: PermissionKind::Other,
-        },
-    ]
 }
 
 /// The decision value to send back for a chosen option.
@@ -708,7 +677,7 @@ mod tests {
     }
 
     /// The session-level list comes from the selected model, and a model with no
-    /// efforts yields none — the source of "no reasoning chip here".
+    /// efforts yields none — the source of "no reasoning axis here".
     #[test]
     fn reasoning_options_follow_the_model() {
         let reasoning = model_reasoning(&reasoning_catalog());
@@ -820,7 +789,7 @@ mod tests {
         assert_eq!(sandbox_policy(""), None);
     }
 
-    /// The agent's echo is read back into the picker's own values, and an echo
+    /// The agent's echo is read back into the catalogue's own values, and an echo
     /// kumu has no value for is reported as unknown rather than mapped onto the
     /// nearest one.
     #[test]
@@ -840,15 +809,6 @@ mod tests {
         );
         assert_eq!(parse(r#"{"type":"externalSandbox"}"#), None);
         assert_eq!(parse(r#"{"type":"somethingNew"}"#), None);
-    }
-
-    #[test]
-    fn approvals_offer_the_protocols_decisions() {
-        let ids = approval_options()
-            .iter()
-            .map(|option| option.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["accept", "acceptForSession", "decline", "cancel"]);
     }
 
     /// Only the two affirmative answers can reach the agent as consent.

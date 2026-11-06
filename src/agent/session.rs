@@ -16,17 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use super::connection::{PermissionTable, WeakPermissions};
-use super::event::{
-    AccessInfo, Event, ModeInfo, ModelInfo, PermissionOptionInfo, ReasoningInfo, SandboxInfo, emit,
-};
+use super::event::{AccessInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit};
 
 /// Assembles [`Event::SessionOptions`], whose twelve fields are the same for
 /// every agent; only the source of each list differs.
 ///
 /// Every axis starts empty, which is the established way to say "this agent has
-/// no such axis": the matching picker renders nothing rather than an empty menu.
-/// So a backend fills in only the axes it actually has, and saying nothing about
-/// an axis is how it reports not having one.
+/// no such axis". A backend fills in only the axes it actually has, and saying
+/// nothing about an axis is how it reports not having one.
 pub(super) struct SessionOptionsBuilder {
     agent: &'static str,
     models: Vec<ModelInfo>,
@@ -144,12 +141,9 @@ pub(super) fn settle(stop: impl Into<String>, failure: Option<String>) -> Vec<Ev
     events
 }
 
-/// The question the UI is asked before a tool call runs.
+/// Which tool call the UI is asked about before it runs.
 pub(super) struct PermissionQuestion {
     pub tool_call_id: String,
-    pub title: String,
-    pub detail: String,
-    pub options: Vec<PermissionOptionInfo>,
 }
 
 /// Hand one approval question to the UI, and let `answer` reply to the agent
@@ -178,9 +172,6 @@ pub(super) fn ask_user<F>(
         Event::PermissionRequest {
             tool_call_id: question.tool_call_id,
             request_id,
-            title: question.title,
-            detail: question.detail,
-            options: question.options,
         },
     );
     // Waiting for the user here would stall the dispatch loop and every other

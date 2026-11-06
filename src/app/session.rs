@@ -1,6 +1,5 @@
 //! A session's flow: sending a prompt, the connection that carries it, the
-//! events the agent reports back, permission decisions, and the picks that
-//! configure the session.
+//! events the agent reports back, and permission bookkeeping.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,22 +7,11 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use gpui_kit::Context;
 
-use super::discovery::{self, SessionOptions};
+use super::discovery;
 use super::turn::{PendingPermission, Turn};
 use super::{Workspace, WorkspaceEvent};
 use crate::agent;
 use crate::db::Session;
-
-/// A session setting other than its model, each stored on the session and
-/// applied over its connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Axis {
-    /// The work mode. Claude Code's access policy is the same stored value — one
-    /// permission mode, two chips — so the access chip picks this axis too.
-    Mode,
-    Sandbox,
-    Reasoning,
-}
 
 /// Whether `conn_id` is still the connection registered for this session.
 ///
@@ -93,8 +81,7 @@ impl Workspace {
             .insert_user_message(session_id, text, &paths)
             .ok();
         // The first message is what fixes the session's agent, so the list is
-        // re-read here rather than letting the flag lag a turn behind the
-        // picker that reads it.
+        // re-read here rather than letting the flag lag a turn behind.
         self.refresh();
         cx.emit(WorkspaceEvent::HistoryChanged(session_id));
         cx.emit(WorkspaceEvent::Changed);
@@ -140,131 +127,6 @@ impl Workspace {
         cx.emit(WorkspaceEvent::Changed);
     }
 
-    /// Stop the session's turn in flight, if there is one.
-    ///
-    /// The cancel travels out of band rather than as an [`agent::Cmd`]: the
-    /// backend's command loop is parked on the very turn being cancelled, so a
-    /// command would not be read until that turn had already ended. The turn
-    /// stays open until the backend reports it settled, because the agent is
-    /// still running until it says otherwise.
-    pub fn cancel_turn(&self, session_id: i64) {
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.cancel();
-        }
-    }
-
-    /// Record the user's decision for a pending permission and hand it to the
-    /// agent. `option_id` of `None` cancels the request.
-    pub fn resolve_permission(
-        &mut self,
-        session_id: i64,
-        request_id: &str,
-        option_id: Option<String>,
-        label: String,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.resolve_permission(request_id, option_id);
-        }
-        if let Some(turn) = self.turns.get_mut(&session_id) {
-            turn.resolve_permission(request_id, label);
-            cx.emit(WorkspaceEvent::TurnChanged(session_id));
-        }
-        cx.emit(WorkspaceEvent::Changed);
-    }
-
-    /// Switch a session's agent and/or model: persist the choice, drop the old
-    /// agent's connection when the agent changes, then apply the model over the
-    /// session's live connection. A session with no live connection just stores
-    /// the pick, which is re-applied when one is opened.
-    pub fn pick_model(
-        &mut self,
-        session_id: i64,
-        agent_id: &'static str,
-        model_value: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-        let agent_changed = session.agent != agent_id;
-        // A session keeps its agent once it has a conversation: the transcript
-        // was written by that agent, and a different one would be handed
-        // history it never produced (the transcript is persisted, but the
-        // agent's own context is not, so the switch is a silent amnesia even
-        // for the same agent's later process). The picker does not offer the
-        // switch in this state — this is the backstop that keeps the rule true
-        // for anything else that reaches here.
-        if agent_changed && session.has_conversation {
-            return;
-        }
-        self.store
-            .update_session_agent_model(session_id, agent_id, Some(&model_value))
-            .ok();
-        if agent_changed {
-            // Mode ids, sandbox values and effort values are the agent's own
-            // vocabulary, so the stored ones stop meaning anything: drop them,
-            // and the pickers fall back to the new agent's defaults until the
-            // user chooses again. Written before the refresh below so the
-            // re-applied values come from the fresh row.
-            //
-            // A model change *within* an agent is deliberately not cleared here:
-            // whether a pick still applies is the agent's call, and it answers
-            // with the new model's levels — Codex drops one the new model does
-            // not advertise and restores it when a later model does, and opencode
-            // reports each model's own list back from the model switch. The picker only honours a stored pick the current
-            // list still offers.
-            self.store.update_session_mode(session_id, None).ok();
-            self.store.update_session_sandbox(session_id, None).ok();
-            self.store.update_session_reasoning(session_id, None).ok();
-            // Dropping the handle closes the old agent subprocess; the fresh
-            // connection re-applies the stored model on session/new. Any prompt
-            // still waiting on the old connection is settled first, and the
-            // in-flight reply (if any) is abandoned with it.
-            self.cancel_pending_permissions(session_id);
-            self.forget_connection(session_id);
-            self.live_commands.remove(&session_id);
-            self.live_options.remove(&session_id);
-            self.take_turn(session_id, cx);
-        }
-        self.refresh();
-        // Opening a connection here just to deliver the value would start an
-        // agent subprocess the user never prompted — and for an agent that
-        // cannot run a session, that is an error written into a conversation
-        // that has not begun.
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(agent::Cmd::SetModel(model_value));
-        }
-        cx.emit(WorkspaceEvent::Changed);
-    }
-
-    /// Set one of the session's other axes: persist it, then apply it over the
-    /// session's live connection. A session with no live connection just stores
-    /// the pick, which is re-applied when one is opened.
-    pub fn pick(&mut self, session_id: i64, axis: Axis, value: String, cx: &mut Context<Self>) {
-        let (stored, cmd) = match axis {
-            Axis::Mode => (
-                self.store.update_session_mode(session_id, Some(&value)),
-                agent::Cmd::SetMode(value),
-            ),
-            Axis::Sandbox => (
-                self.store.update_session_sandbox(session_id, Some(&value)),
-                agent::Cmd::SetSandbox(value),
-            ),
-            Axis::Reasoning => (
-                self.store
-                    .update_session_reasoning(session_id, Some(&value)),
-                agent::Cmd::SetReasoning(value),
-            ),
-        };
-        stored.ok();
-        self.refresh();
-        if let Some(conn) = self.conns.get(&session_id) {
-            conn.send(cmd);
-        }
-        cx.emit(WorkspaceEvent::Changed);
-    }
-
     /// Mutate the session's live turn, opening it first if there is none.
     fn update_turn<R>(
         &mut self,
@@ -275,9 +137,8 @@ impl Workspace {
         let opened = !self.turns.contains_key(&session_id);
         let result = f(self.turns.entry(session_id).or_insert_with(Turn::new));
         cx.emit(WorkspaceEvent::TurnChanged(session_id));
-        // A turn opening changes the composer (send ↔ stop) and the command
-        // menu; a chunk streaming into one already open changes only the
-        // conversation.
+        // A turn opening changes what the home view draws; a chunk streaming
+        // into one already open changes only the conversation.
         if opened {
             cx.emit(WorkspaceEvent::Changed);
         }
@@ -307,6 +168,10 @@ impl Workspace {
         if self.conns.contains_key(&session.id) {
             // Reusing it is a use of it, so it stays the most recently used.
             self.touch_connection(session.id);
+            return;
+        }
+        // A pure shell has no agent subprocess to drive.
+        if crate::term::is_shell(&session.agent) {
             return;
         }
         let agent_id = agent::AGENTS
@@ -419,8 +284,8 @@ impl Workspace {
         // answer now, so the working indicator must not keep counting. The
         // normal paths have already dropped it (a turn ends with `Done`, and a
         // failure reports `Error` first); this covers a connection that died
-        // without either, which would otherwise leave the turn — and the
-        // composer, which refuses to send while one exists — stuck for good.
+        // without either, which would otherwise leave the turn — and the send
+        // path, which refuses to send while one exists — stuck for good.
         // The handle goes first: closing the turn trims the pool back to the
         // cap, and a dead connection still counted there would push out a
         // live idle one for nothing.
@@ -498,16 +363,8 @@ impl Workspace {
             agent::Event::PermissionRequest {
                 tool_call_id,
                 request_id,
-                title,
-                detail,
-                options,
             } => {
-                let pending = PendingPermission {
-                    request_id,
-                    title,
-                    detail,
-                    options,
-                };
+                let pending = PendingPermission { request_id };
                 let previous = self.update_turn(session_id, cx, |turn| {
                     turn.request_permission(tool_call_id, pending)
                 });
@@ -515,7 +372,7 @@ impl Workspace {
                 if let (Some(previous), Some(conn)) = (previous, self.conns.get(&session_id)) {
                     conn.resolve_permission(&previous, None);
                 }
-                // The card above the composer and the sidebar's marker.
+                // The sidebar's marker.
                 cx.emit(WorkspaceEvent::Changed);
             }
             agent::Event::SessionTitle { title } => {
@@ -547,23 +404,13 @@ impl Workspace {
                 self.take_turn(session_id, cx);
                 self.system_message(session_id, err, cx);
             }
-            // A live session speaks for itself alone.
-            agent::Event::Commands { agent, commands } => {
-                self.live_commands.insert(session_id, (agent, commands));
-                cx.emit(WorkspaceEvent::Changed);
-            }
-            // What this session's process offers and runs with; the agent's
-            // catalog stays what its probe said.
-            ev @ agent::Event::SessionOptions { .. } => {
-                if let Some((agent, options)) = SessionOptions::from_event(&ev)
-                    && !options.is_empty()
-                {
-                    self.live_options.insert(session_id, (agent, options));
-                    cx.emit(WorkspaceEvent::Changed);
-                }
-            }
             agent::Event::Usage(usage) => self.record_usage(session_id, usage, cx),
-            agent::Event::Log(_) | agent::Event::ProbeFailed { .. } => {}
+            // A live session's own catalogues are not drawn while the chat pane
+            // is off; the agent's probe report is what the settings window shows.
+            agent::Event::Commands { .. }
+            | agent::Event::SessionOptions { .. }
+            | agent::Event::Log(_)
+            | agent::Event::ProbeFailed { .. } => {}
         }
     }
 }
@@ -607,7 +454,7 @@ mod tests {
         let known = agent::Usage {
             used: Some(10),
             window: Some(200_000),
-            cost: Some(agent::Cost::usd(0.1)),
+            cost: None,
         };
         let merged = merge_usage(
             Some(&known),

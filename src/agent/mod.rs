@@ -55,11 +55,10 @@ mod test_support;
 #[cfg(test)]
 mod resume_tests;
 
-pub use config::{Config, SessionPicks};
+pub use config::{Config, SessionPicks, interactive};
 pub use connection::{Connection, spawn};
 pub use event::{
-    AccessInfo, Cmd, CommandInfo, Cost, Event, ImageAttachment, ModeInfo, ModelInfo,
-    PermissionKind, PermissionOptionInfo, Prompt, ReasoningInfo, SandboxInfo, Usage,
+    Cmd, Event, ImageAttachment, ModeInfo, ModelInfo, Prompt, ReasoningInfo, SandboxInfo, Usage,
 };
 pub use probe::probe;
 pub use registry::AGENTS;

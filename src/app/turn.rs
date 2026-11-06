@@ -8,20 +8,15 @@
 
 use std::time::{Duration, Instant};
 
-use crate::agent;
-
 /// Distinguishes turns so a render cache keyed on one cannot be picked up by
 /// the next, even when both are the same session's and start at block 0.
 static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// A permission request waiting for the user, shown above the composer while
-/// its tool call is still parked on the agent's side.
+/// A permission request waiting for the user while its tool call is still
+/// parked on the agent's side.
 #[derive(Clone)]
 pub struct PendingPermission {
     pub request_id: String,
-    pub title: String,
-    pub detail: String,
-    pub options: Vec<agent::PermissionOptionInfo>,
 }
 
 /// One tool call observed during the live turn, in first-seen order.
@@ -143,7 +138,7 @@ impl Turn {
     /// earlier one as cancelled.
     ///
     /// The request can arrive before the tool call it refers to; the row is then
-    /// seeded from what the request itself carries so the prompt is never dropped.
+    /// seeded so the prompt is never dropped.
     pub fn request_permission(
         &mut self,
         tool_call_id: String,
@@ -152,7 +147,7 @@ impl Turn {
         if self.tool_mut(&tool_call_id).is_none() {
             self.blocks.push(TurnBlock::Tool(ToolRun {
                 id: tool_call_id.clone(),
-                title: pending.title.clone(),
+                title: String::new(),
                 status: "pending",
                 content: String::new(),
                 pending_permission: None,
@@ -163,24 +158,6 @@ impl Turn {
             .pending_permission
             .replace(pending)
             .map(|previous| previous.request_id)
-    }
-
-    /// Record the user's decision on the row its request was parked on.
-    pub fn resolve_permission(&mut self, request_id: &str, label: String) {
-        for block in &mut self.blocks {
-            let TurnBlock::Tool(run) = block else {
-                continue;
-            };
-            if run
-                .pending_permission
-                .as_ref()
-                .is_some_and(|p| p.request_id == request_id)
-            {
-                run.pending_permission = None;
-                run.decision = Some(label);
-                return;
-            }
-        }
     }
 
     /// Take every request still waiting on the user, for the caller to answer
@@ -271,9 +248,6 @@ mod tests {
     fn pending(request_id: &str) -> PendingPermission {
         PendingPermission {
             request_id: request_id.into(),
-            title: "运行命令".into(),
-            detail: String::new(),
-            options: Vec::new(),
         }
     }
 
@@ -351,13 +325,10 @@ mod tests {
             turn.request_permission("t1".into(), pending("p2")),
             Some("p1".into())
         );
-
-        turn.resolve_permission("p2", "允许".into());
-        assert!(turn.pending_permission().is_none());
-        let TurnBlock::Tool(run) = &turn.blocks[0] else {
-            unreachable!()
-        };
-        assert_eq!(run.decision.as_deref(), Some("允许"));
+        assert_eq!(
+            turn.pending_permission().map(|p| p.request_id.as_str()),
+            Some("p2")
+        );
     }
 
     /// A saved turn keeps block order, joins streamed reply text, and drops

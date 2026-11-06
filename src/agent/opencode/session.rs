@@ -292,9 +292,6 @@ fn on_permission(shared: &Arc<Shared>, ask: PermissionAsk) {
         &shared.ev_tx,
         PermissionQuestion {
             tool_call_id: ask.tool_call_id,
-            title: ask.title,
-            detail: ask.detail,
-            options: convert::permission_options(),
         },
         reply,
     );
@@ -398,7 +395,7 @@ async fn switch_model(shared: &Arc<Shared>, model: Option<&str>, variant: Option
             shared.emit_options();
         }
         // Not an `Error`: that would end the turn a prompt queued behind this
-        // pick is about to run. Re-sending the options puts the picker back on
+        // pick is about to run. Re-sending the options puts the catalogue back on
         // the model the session is still running.
         Err(error) => {
             emit(&shared.ev_tx, Event::Log(format!("切换模型失败：{error}")));
@@ -421,7 +418,7 @@ async fn set_mode(shared: &Arc<Shared>, value: &str) {
             emit(&shared.ev_tx, Event::Log(format!("mode set: {value}")));
             shared.emit_options();
         }
-        // As for a model: logged, and the picker put back.
+        // As for a model: logged, and the catalogue put back.
         Err(error) => {
             emit(&shared.ev_tx, Event::Log(format!("切换模式失败：{error}")));
             shared.emit_options();

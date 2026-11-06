@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 agent-client-protocol = "2.1"
 futures = "0.3"
+ghostty-sys = { path = "crates/ghostty-sys" }
 gpui-kit = "0.6"
+portable-pty = "=0.9.0"
 merman = { version = "=0.8.0-alpha.6", default-features = false, features = ["svg", "layout-cytoscape"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8"

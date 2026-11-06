@@ -7,6 +7,8 @@
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use crate::term::{Rgb, TermColors};
+
 #[derive(Default)]
 pub(crate) struct ThemeRevision(pub u64);
 
@@ -59,6 +61,59 @@ pub fn change_mode(mode: impl Into<ThemeMode>, window: Option<&mut Window>, cx: 
     cx.default_global::<ThemeRevision>().0 += 1;
     apply_saved_font(cx);
     install_text_view_style(cx);
+}
+
+/// Terminal typeface: theme mono family, sized with the UI font scale so the
+/// settings font-size control grows the grid with the rest of the app.
+pub fn term_font(cx: &App) -> (SharedString, f32) {
+    let theme = Theme::global(cx);
+    let family = theme.mono_font_family.clone();
+    let size = f32::from(theme.mono_font_size) * (f32::from(theme.font_size) / DEFAULT_FONT_SIZE);
+    (family, size.max(10.))
+}
+
+/// Terminal colors taken from the active UI theme.
+pub fn term_colors(cx: &App) -> TermColors {
+    let theme = Theme::global(cx);
+    let rgb = |c: Hsla| {
+        let rgba = c.to_rgb();
+        Rgb(
+            (rgba.r * 255.).round() as u8,
+            (rgba.g * 255.).round() as u8,
+            (rgba.b * 255.).round() as u8,
+        )
+    };
+    let fg = rgb(theme.foreground);
+    let bg = rgb(theme.background);
+    // ANSI black: ink on light themes, the surface itself on dark ones.
+    let ansi_black = if theme.mode.is_dark() {
+        bg
+    } else {
+        rgb(theme.foreground)
+    };
+    TermColors {
+        fg,
+        bg,
+        cursor: rgb(theme.caret),
+        palette: [
+            ansi_black,
+            rgb(theme.red),
+            rgb(theme.green),
+            rgb(theme.yellow),
+            rgb(theme.blue),
+            rgb(theme.magenta),
+            rgb(theme.cyan),
+            fg,
+            rgb(theme.muted_foreground),
+            rgb(theme.red_light),
+            rgb(theme.green_light),
+            rgb(theme.yellow_light),
+            rgb(theme.blue_light),
+            rgb(theme.magenta_light),
+            rgb(theme.cyan_light),
+            fg,
+        ],
+    }
 }
 
 /// Set the app-wide UI font family: update the theme global, push it down to

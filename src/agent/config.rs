@@ -118,7 +118,7 @@ impl Config {
         Self {
             agent,
             backend: Backend::Acp,
-            command: std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_string()),
+            command: omp_bin(),
             args: vec!["acp".to_string()],
             env: Vec::new(),
             auto_prompt: auto_prompt_env(),
@@ -223,6 +223,38 @@ fn auto_prompt_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The interactive TUI for an agent: the program itself, with no protocol
+/// subcommand. `omp acp`, `opencode serve`, `codex app-server`, `claude -p`,
+/// and `pi --mode rpc` are the headless transports, not this.
+pub fn interactive(agent: &str) -> Option<(String, Vec<String>)> {
+    let command = match agent {
+        "opencode" => opencode_bin(),
+        "omp" => omp_bin(),
+        "codex" => codex_bin(),
+        "claude" => claude_bin(),
+        "pi" => pi_bin(),
+        _ => return None,
+    };
+    Some((command, Vec::new()))
+}
+
+fn omp_bin() -> String {
+    std::env::var("OMP_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin/omp"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/omp"));
+        candidates.push(PathBuf::from("/usr/local/bin/omp"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "omp".to_string()
+    })
+}
+
 fn opencode_bin() -> String {
     std::env::var("OPENCODE_BIN").unwrap_or_else(|_| {
         if let Some(home) = std::env::var_os("HOME") {
@@ -313,10 +345,10 @@ fn pi_bin() -> String {
 /// Resolve an API key for the RC gateway: env first, then the key opencode
 /// stored in its auth.json, so a GUI-launched process still works.
 fn opencode_api_key() -> Option<String> {
-    if let Ok(k) = std::env::var("OPENCODE_API_KEY") {
-        if !k.is_empty() {
-            return Some(k);
-        }
+    if let Ok(key) = std::env::var("OPENCODE_API_KEY")
+        && !key.is_empty()
+    {
+        return Some(key);
     }
     let home = std::env::var_os("HOME")?;
     let auth_path = PathBuf::from(&home).join(".local/share/opencode/auth.json");
@@ -327,4 +359,19 @@ fn opencode_api_key() -> Option<String> {
         .and_then(|k| k.as_str())
         .filter(|k| !k.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interactive;
+
+    #[test]
+    fn interactive_launch_is_the_tui() {
+        for agent in ["opencode", "omp", "codex", "claude", "pi"] {
+            let (command, args) = interactive(agent).expect(agent);
+            assert!(!command.is_empty(), "{agent}");
+            assert!(args.is_empty(), "{agent} args were {args:?}");
+        }
+        assert!(interactive("nope").is_none());
+    }
 }

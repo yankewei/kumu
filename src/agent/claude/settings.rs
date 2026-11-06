@@ -1,6 +1,6 @@
 //! Claude Code's own configuration files, read and never written.
 //!
-//! Two of the composer's axes cannot be discovered over the wire: the CLI
+//! Two of the session's axes cannot be discovered over the wire: the CLI
 //! reports no effort in force anywhere, and the mode it reports is the one in
 //! force rather than the one a fresh session would start in. Both are in its
 //! configuration files, so this is where the settings window's best guess comes
@@ -24,7 +24,7 @@
 //! Two things are deliberately not modelled: a per-model `maxEffortLevel` cap,
 //! and the hold the CLI keeps on Fable 5, Opus 4.8 and Opus 4.7's default effort
 //! across sessions. Both live inside the CLI, and a guess would put a number on
-//! the chip that nothing here can verify.
+//! the axis that nothing here can verify.
 
 use std::path::{Path, PathBuf};
 

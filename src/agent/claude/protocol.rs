@@ -324,14 +324,6 @@ pub(super) struct ControlRequest {
 pub(super) struct ControlRequestBody {
     #[serde(default)]
     pub subtype: String,
-    #[serde(rename = "tool_name", default)]
-    pub tool_name: String,
-    /// The tool's own label for itself, e.g. `Write`.
-    #[serde(rename = "display_name", default)]
-    pub display_name: Option<String>,
-    /// A one-line summary the CLI made for the call, e.g. the file name.
-    #[serde(default)]
-    pub description: Option<String>,
     #[serde(default)]
     pub input: Value,
     #[serde(rename = "tool_use_id", default)]
@@ -401,8 +393,8 @@ pub(super) struct ModelEntry {
     #[serde(rename = "supportsEffort", default)]
     pub supports_effort: bool,
     /// The efforts this model accepts, ascending. An unsupported level clamps
-    /// down rather than failing, so the union across models is what the picker
-    /// offers.
+    /// down rather than failing, so the union across models is what a session
+    /// is offered.
     #[serde(rename = "supportedEffortLevels", default)]
     pub supported_effort_levels: Vec<String>,
 }
@@ -443,7 +435,7 @@ mod tests {
     }
 
     /// `system/init` carries the model the session resolved to and the mode in
-    /// force — the two things the composer labels itself with.
+    /// force — the two things a session is labelled with.
     #[test]
     fn init_reports_the_effective_model_and_mode() {
         let Incoming::System(init) = from_captured("init") else {
@@ -513,16 +505,13 @@ mod tests {
         assert!(is_error);
     }
 
-    /// `can_use_tool` is what kumu answers; its input and the tool-use id are
-    /// what the permission card and the tool row are built from.
+    /// `can_use_tool` is what kumu answers; its input and the tool-use id link
+    /// the request to the row the tool call opened.
     #[test]
-    fn can_use_tool_carries_the_tool_the_input_and_its_row_id() {
+    fn can_use_tool_carries_the_input_and_its_row_id() {
         let request: ControlRequest =
             serde_json::from_value(captured("control-can-use-tool")).unwrap();
         assert_eq!(request.request.subtype, "can_use_tool");
-        assert_eq!(request.request.tool_name, "Write");
-        assert_eq!(request.request.display_name.as_deref(), Some("Write"));
-        assert_eq!(request.request.description.as_deref(), Some("probe.txt"));
         assert!(request.request.input.get("file_path").is_some());
         assert_eq!(
             request.request.tool_use_id.as_deref(),

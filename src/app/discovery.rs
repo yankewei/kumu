@@ -14,19 +14,13 @@ use crate::agent;
 ///
 /// Which lists are empty depends on the agent — ACP agents have modes and a
 /// reasoning level, Codex has a sandbox policy — so an empty list means "no such
-/// axis here", and the matching picker renders nothing.
+/// axis here".
 #[derive(Clone, Default)]
 pub struct SessionOptions {
     pub models: Vec<agent::ModelInfo>,
-    pub current_model: Option<String>,
     pub modes: Vec<agent::ModeInfo>,
-    pub current_mode: Option<String>,
-    pub access: Vec<agent::AccessInfo>,
-    pub current_access: Option<String>,
     pub sandboxes: Vec<agent::SandboxInfo>,
-    pub current_sandbox: Option<String>,
     pub reasoning: Vec<agent::ReasoningInfo>,
-    pub current_reasoning: Option<String>,
 }
 
 impl SessionOptions {
@@ -36,15 +30,10 @@ impl SessionOptions {
         let agent::Event::SessionOptions {
             agent,
             models,
-            current_model,
             modes,
-            current_mode,
-            access,
-            current_access,
             sandboxes,
-            current_sandbox,
             reasoning,
-            current_reasoning,
+            ..
         } = ev
         else {
             return None;
@@ -53,15 +42,9 @@ impl SessionOptions {
             *agent,
             Self {
                 models: models.clone(),
-                current_model: current_model.clone(),
                 modes: modes.clone(),
-                current_mode: current_mode.clone(),
-                access: access.clone(),
-                current_access: current_access.clone(),
                 sandboxes: sandboxes.clone(),
-                current_sandbox: current_sandbox.clone(),
                 reasoning: reasoning.clone(),
-                current_reasoning: current_reasoning.clone(),
             },
         ))
     }
@@ -80,27 +63,18 @@ impl SessionOptions {
 /// What each agent offers, as its probe reported it, and which probes are
 /// still out.
 ///
-/// This is the agent in general — what a session of it starts from before its
-/// own connection reports. A live session's report is its own and never lands
-/// here (see [`super::Workspace::session_options`]), so one session's model or
-/// effort cannot become every other session's default.
+/// This is the agent in general — what a session of it starts from. Nothing
+/// session-scoped is cached here, so one session's model or effort cannot
+/// become every other session's default.
 #[derive(Default)]
 pub struct Discovery {
     catalogs: HashMap<&'static str, SessionOptions>,
-    /// Slash commands per agent, cached apart from the options: those are axes
-    /// with a value in force, re-reported whole, while a command list arrives on
-    /// its own and is replaced only by another one.
-    commands: HashMap<&'static str, Vec<agent::CommandInfo>>,
     probing: HashSet<&'static str>,
 }
 
 impl Discovery {
     pub fn catalog(&self, agent: &str) -> Option<&SessionOptions> {
         self.catalogs.get(agent)
-    }
-
-    pub fn commands(&self, agent: &str) -> Option<&[agent::CommandInfo]> {
-        self.commands.get(agent).map(Vec::as_slice)
     }
 
     pub fn is_probing(&self, agent: &str) -> bool {
@@ -131,11 +105,8 @@ impl Discovery {
     /// changed.
     pub(super) fn record(&mut self, ev: agent::Event) -> bool {
         match ev {
-            agent::Event::Commands { agent, commands } => {
-                self.commands.insert(agent, commands);
-                true
-            }
             agent::Event::ProbeFailed { agent } => self.probing.remove(agent),
+            agent::Event::Commands { .. } => false,
             ev => {
                 let Some((agent, options)) = SessionOptions::from_event(&ev) else {
                     return false;

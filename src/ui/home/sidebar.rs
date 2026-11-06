@@ -74,6 +74,25 @@ impl KumuApp {
                     )
                     .child(
                         div()
+                            .id(format!("project-new-shell-{project_id}"))
+                            .rounded(radius)
+                            .p_0p5()
+                            .cursor_pointer()
+                            .text_color(muted_fg)
+                            .opacity(0.)
+                            .group_hover(group.clone(), |style| style.opacity(1.))
+                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                            .hover_label(&self.tooltips, "新建终端")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.new_shell_session(Some(project_id), cx);
+                                this.focus_terminal(window, cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::SquareTerminal).small()),
+                    )
+                    .child(
+                        div()
                             .id(format!("project-new-session-{project_id}"))
                             .rounded(radius)
                             .p_0p5()
@@ -82,8 +101,10 @@ impl KumuApp {
                             .opacity(0.)
                             .group_hover(group, |style| style.opacity(1.))
                             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .hover_label(&self.tooltips, "新建会话")
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.new_session(Some(project_id), cx);
+                                this.focus_terminal(window, cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
@@ -108,6 +129,7 @@ impl KumuApp {
                     let sid = s.id;
                     let title = s.title.clone();
                     let title_tooltip = title.clone();
+                    let shell = crate::term::is_shell(&s.agent);
                     let agent = AGENTS.iter().find(|a| a.id == s.agent).and_then(|a| a.logo);
                     // A prompt can be waiting on a session the user is not
                     // looking at, so mark the row that needs an answer.
@@ -124,8 +146,9 @@ impl KumuApp {
                             .when(!active, |this| {
                                 this.hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.select_session(sid, cx);
+                                this.focus_terminal(window, cx);
                                 cx.notify();
                             }))
                             .child(
@@ -152,11 +175,14 @@ impl KumuApp {
                                                 .bg(theme.warning),
                                         )
                                     })
-                                    .child(div().size(px(14.)).flex_none().child(agent_logo(
-                                        agent,
-                                        px(14.),
-                                        tag,
-                                    ))),
+                                    .child(div().size(px(14.)).flex_none().child(if shell {
+                                        Icon::new(IconName::SquareTerminal)
+                                            .with_size(px(14.))
+                                            .text_color(tag)
+                                            .into_any_element()
+                                    } else {
+                                        agent_logo(agent, px(14.), tag)
+                                    })),
                             )
                             // Right-click the row for its actions; deleting is
                             // destructive, so it asks for confirmation first.

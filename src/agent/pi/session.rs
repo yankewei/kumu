@@ -52,7 +52,7 @@ use crate::agent::session::{
 ///
 /// Pi handles some messages without invoking the agent at all, and those open no
 /// run and settle nothing — so waiting only for `agent_settled` would park the
-/// turn, and with it the composer, which refuses to send while one is open.
+/// turn, and with it the send path, which refuses to send while one is open.
 /// `agent_start` is emitted before the first model call, so once it has arrived
 /// the wait becomes unbounded: a turn may legitimately run for minutes, and a
 /// timeout on it would cut off real work.
@@ -248,7 +248,7 @@ pub(in crate::agent) async fn run(
                 Some(Cmd::Prompt(request)) => prompt(&shared, &request, &mut cancels).await,
                 Some(Cmd::SetModel(value)) => set_model(&shared, &value).await,
                 Some(Cmd::SetReasoning(value)) => set_reasoning(&shared, &value).await,
-                // The composer only offers the axes an agent reports, and Pi
+                // The UI only offers the axes an agent reports, and Pi
                 // reports neither of these, so reaching here means a stored pick
                 // outlived the agent that had the axis it belonged to.
                 Some(Cmd::SetMode(value)) => {
@@ -401,7 +401,7 @@ async fn report_usage(shared: &Arc<Shared>) {
 ///
 /// The documented recipe for an Esc key is `clear_queue` and then `abort`, so
 /// that queued steering and follow-up messages are not continued after the
-/// abort. kumu never queues one — the composer refuses to prompt while a turn is
+/// abort. kumu never queues one — the send path refuses to prompt while a turn is
 /// open — so there is nothing to clear and `clear_queue` is left out.
 async fn abort(shared: &Arc<Shared>) {
     emit(&shared.ev_tx, Event::Log("cancel requested".into()));
@@ -454,7 +454,7 @@ async fn set_model(shared: &Arc<Shared>, value: &str) {
             }
         }
         // Reported rather than logged: the user picked this model, so a refusal
-        // is theirs to see — and the picker's stored value is now wrong.
+        // is theirs to see — and the catalogue's stored value is now wrong.
         Err(error) => emit(
             &shared.ev_tx,
             Event::Error(format!("切换模型失败：{error}")),
@@ -488,7 +488,7 @@ async fn set_reasoning(shared: &Arc<Shared>, value: &str) {
 /// decides which levels exist, and a change of either usually means the session
 /// was reconfigured. A request that fails keeps the last good answer rather than
 /// emptying the menu — the session is still driven by commands either way, and a
-/// picker that silently lost its models would look like the agent had stopped
+/// catalogue that silently lost its models would look like the agent had stopped
 /// offering any.
 async fn refresh_options(shared: &Arc<Shared>) -> Result<(), String> {
     let state = shared
@@ -1072,7 +1072,7 @@ mod tests {
     /// turn, which still has to settle. What this covers is the part that could
     /// hang: Pi acknowledges a prompt before it runs one, and only
     /// `agent_settled` ends it, so a prompt that never settles would leave the
-    /// composer refusing to send for good. Two prompts in a row is what proves
+    /// send path refusing to send for good. Two prompts in a row is what proves
     /// the loop re-arms.
     ///
     /// Ignored by default, so a plain `cargo test` never drives a real agent;
@@ -1095,7 +1095,7 @@ mod tests {
         // signal.
         let conn = crate::agent::spawn(cfg, std::env::temp_dir(), tx);
 
-        // The handshake is what fills the pickers, and what proves the RPC
+        // The handshake is what fills the catalogues, and what proves the RPC
         // session is live rather than merely spawned.
         let mut announced = false;
         let handshake_deadline = Instant::now() + Duration::from_secs(60);

@@ -2,8 +2,8 @@
 //!
 //! The conversation is its own entity, embedded as a cached view, so the things
 //! that change it many times a second — streamed chunks and the working spinner
-//! — repaint this column alone, and a keystroke in the composer or a hover in
-//! the sidebar leaves it untouched. Rows go through a virtual list, so a frame
+//! — repaint this column alone, and a hover in the sidebar leaves it untouched.
+//! Rows go through a virtual list, so a frame
 //! only builds the rows on screen however long the session has grown.
 
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::markdown_mermaid::MermaidMarkdownPlugin;
-use super::permission::render_permission_decision;
 use super::{CONTENT_MAX_REM, CONTENT_MIN_REM};
 use crate::app::turn::TurnBlock;
 use crate::app::{Workspace, WorkspaceEvent};
@@ -322,6 +321,7 @@ impl ConversationView {
                 }
             }
             WorkspaceEvent::Changed => {}
+            WorkspaceEvent::Frame(_) => {}
         })
         .detach();
         Self {
@@ -523,7 +523,7 @@ impl ConversationView {
         })
     }
 
-    /// Render list row `index`, on the same centered column as the composer.
+    /// Render list row `index`, on the same centered column as the terminal.
     fn render_row(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let (Some(row), Some(session_id)) = (self.rows.get(index).cloned(), self.session_id) else {
             return div().into_any_element();
@@ -680,9 +680,9 @@ impl ConversationView {
             title: run.title.clone().into(),
             status: run.status.into(),
             content: run.content.clone().into(),
-            // The prompt itself lives above the composer; the row only records
-            // how the call ended up authorized, and stays quiet while a prompt
-            // is still parked on it.
+            // The prompt itself lives in the terminal; the row only records how
+            // the call ended up authorized, and stays quiet while a prompt is
+            // still parked on it.
             decision: run
                 .pending_permission
                 .is_none()
@@ -1020,6 +1020,18 @@ fn collapsed_body(
         .text_xs()
         .text_color(muted_fg)
         .child(text)
+}
+
+/// The one-line echo of a decision, kept under the tool row so the history
+/// shows how the call was authorized.
+fn render_permission_decision(decision: &str, muted_fg: Hsla) -> Div {
+    div()
+        .ml_8()
+        .px_1()
+        .py_0p5()
+        .text_xs()
+        .text_color(muted_fg)
+        .child(format!("权限 · {decision}"))
 }
 
 #[cfg(test)]

@@ -57,9 +57,6 @@ struct Shared {
     /// rather than appending, so deltas have to be summed — and rendered with
     /// their command — before being sent up.
     commands: Mutex<HashMap<String, CommandRow>>,
-    /// Rendered content per item, so an approval prompt can show the diff it
-    /// refers to — the request itself carries only the item id.
-    details: Mutex<HashMap<String, String>>,
     /// The running turn's id, as `turn/started` reports it. An interrupt needs
     /// it, and a compaction's start response does not carry one.
     turn_id: Mutex<Option<String>>,
@@ -68,11 +65,9 @@ struct Shared {
     streamed: Mutex<HashSet<String>>,
 }
 
-/// The prompt an approval request turns into.
+/// The row an approval request belongs to.
 struct ApprovalPrompt {
     item_id: String,
-    title: String,
-    detail: String,
 }
 
 /// The session's picks as a turn carries them: everything `turn/start` accepts
@@ -113,10 +108,9 @@ struct SessionState {
     /// so switching back restores it.
     sandbox: Option<String>,
     pick: Option<String>,
-    /// What the thread reported is in force, for the chip before the user picks.
-    /// It is never sent back: re-asserting a resolved policy could change it
-    /// (Codex's own `workspaceWrite`, for example, carries roots the picker's
-    /// bare form does not).
+    /// What the thread reported is in force, before the user picks. It is never
+    /// sent back: re-asserting a resolved policy could change it (Codex's own
+    /// `workspaceWrite`, for example, carries roots the bare form does not).
     reported_sandbox: Option<String>,
     /// The effort a turn carries: the pick reconciled against the model in force.
     reasoning: Option<String>,
@@ -125,7 +119,7 @@ struct SessionState {
 impl SessionState {
     /// The effort to carry: the one wanted when the model in force advertises
     /// it, else that model's own default. `None` for a model with no reasoning
-    /// axis, which is what keeps the chip — and the `effort` field — absent.
+    /// axis, which is what keeps the axis — and the `effort` field — absent.
     fn reconcile(&self, wanted: Option<&str>) -> Option<String> {
         if convert::supports_effort(&self.efforts, self.model.as_deref(), wanted) {
             return wanted.map(str::to_string);
@@ -182,7 +176,6 @@ pub(in crate::agent) async fn run(
         next_request_id: AtomicU64::new(1),
         turn_done: Mutex::new(None),
         commands: Mutex::new(HashMap::new()),
-        details: Mutex::new(HashMap::new()),
         turn_id: Mutex::new(None),
         streamed: Mutex::new(HashSet::new()),
     });
@@ -219,8 +212,8 @@ pub(in crate::agent) async fn run(
     // it opens one, so by now they are almost always queued behind the
     // handshake. Collecting them here rather than in the loop below lets them
     // configure the thread itself — which is both the honest place for a
-    // session-wide setting and the only one the agent echoes back, so the
-    // picker can label itself from the real policy instead of assuming one.
+    // session-wide setting and the only one the agent echoes back, so a
+    // catalogue can label itself from the real policy instead of assuming one.
     // Anything else (a prompt) keeps its order and is handled by the loop.
     let mut queue: VecDeque<Cmd> = VecDeque::new();
     while let Ok(cmd) = cmd_rx.try_recv() {
@@ -247,7 +240,7 @@ pub(in crate::agent) async fn run(
         }
         Cmd::SetMode(value) => {
             // Codex exposes no session mode this backend maps yet; the mode
-            // chip stays hidden because no modes are ever reported.
+            // axis stays hidden because no modes are ever reported.
             emit(
                 &ev_tx,
                 Event::Log(format!("no mode config option to set: {value}")),
@@ -319,8 +312,8 @@ pub(in crate::agent) async fn run(
         );
     }
 
-    // The catalogues. An empty mode list is correct: the picker renders nothing
-    // when the agent reports no modes.
+    // The catalogues. An empty mode list is correct: the agent reported no
+    // modes.
     let listed: ModelListResult = request(&transport, "model/list", json!({})).await?;
     let (catalog_model, models) = convert::model_catalog(&listed);
     // The thread's own report is the truth about what is in force; the catalogue
@@ -402,8 +395,8 @@ pub(in crate::agent) async fn run(
                 emit(&ev_tx, Event::Log(format!("model set: {value}")));
                 state.model = Some(value);
                 // The reasoning set belongs to the model, so a pick this model
-                // does not advertise stops being sent — and the picker has to be
-                // told the new set, which it cannot derive itself.
+                // does not advertise stops being sent — and the catalogue has to
+                // be told the new set, which it cannot derive itself.
                 let wanted = state.pick.clone();
                 state.reasoning = state.reconcile(wanted.as_deref());
                 state.emit(cfg.agent, &ev_tx);
@@ -642,7 +635,7 @@ async fn run_turn(
 
 /// List the session's skills and report them as its commands.
 ///
-/// Best effort: a failure costs the composer its menu, not the session, so it
+/// Best effort: a failure costs the chat input its menu, not the session, so it
 /// only reaches the log. `force_reload` bypasses Codex's cache, for when it has
 /// said the files changed.
 async fn refresh_skills(shared: &Shared, force_reload: bool) {
@@ -771,13 +764,6 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
                     .map(|row| row.output.as_str());
                 convert::item_content(&item, streamed)
             };
-            if !detail.is_empty() {
-                shared
-                    .details
-                    .lock()
-                    .unwrap()
-                    .insert(item.id().to_string(), detail.clone());
-            }
             if let Some(event) = convert::tool_event_with_content(&item, detail) {
                 emit(&shared.ev_tx, event);
             }
@@ -818,9 +804,6 @@ fn handle_notification(shared: &Shared, method: &str, params: Value) {
             };
             shared.commands.lock().unwrap().clear();
             shared.streamed.lock().unwrap().clear();
-            // The details remembered for approval requests belong to this turn
-            // alone; without this they accumulate for the life of the process.
-            shared.details.lock().unwrap().clear();
             if let Some(done) = shared.turn_done.lock().unwrap().take() {
                 let _ = done.send(notification.turn);
             }
@@ -889,11 +872,6 @@ fn handle_request(shared: &Arc<Shared>, id: Value, method: &str, params: Value) 
             serde_json::from_value::<CommandApprovalParams>(params)
                 .ok()
                 .map(|params| ApprovalPrompt {
-                    title: params
-                        .command
-                        .clone()
-                        .unwrap_or_else(|| "命令执行".to_string()),
-                    detail: command_detail(&params, shared),
                     item_id: params.item_id,
                 })
         }
@@ -901,8 +879,6 @@ fn handle_request(shared: &Arc<Shared>, id: Value, method: &str, params: Value) 
             serde_json::from_value::<FileChangeApprovalParams>(params)
                 .ok()
                 .map(|params| ApprovalPrompt {
-                    title: "文件改动".to_string(),
-                    detail: file_change_detail(&params, shared),
                     item_id: params.item_id,
                 })
         }
@@ -938,9 +914,6 @@ fn handle_request(shared: &Arc<Shared>, id: Value, method: &str, params: Value) 
         &shared.ev_tx,
         PermissionQuestion {
             tool_call_id: prompt.item_id,
-            title: prompt.title,
-            detail: prompt.detail,
-            options: convert::approval_options(),
         },
         move |option_id| {
             emit(
@@ -958,63 +931,12 @@ fn decision_payload(option_id: Option<&str>) -> Value {
     json!({ "decision": convert::decision(option_id) })
 }
 
-/// What a command approval shows: why, and where it would run. The command
-/// itself is already the prompt's title.
-fn command_detail(params: &CommandApprovalParams, shared: &Shared) -> String {
-    let mut detail = String::new();
-    if let Some(reason) = &params.reason {
-        detail.push_str(reason);
-    }
-    if let Some(cwd) = &params.cwd {
-        push_line(&mut detail, &format!("工作目录：{cwd}"));
-    }
-    if detail.is_empty() {
-        detail = item_detail(shared, &params.item_id);
-    }
-    detail
-}
-
-/// What a file-change approval shows: why, and the diff the item proposed.
-fn file_change_detail(params: &FileChangeApprovalParams, shared: &Shared) -> String {
-    let mut detail = String::new();
-    if let Some(reason) = &params.reason {
-        detail.push_str(reason);
-    }
-    if let Some(root) = &params.grant_root {
-        push_line(&mut detail, &format!("请求写入权限：{root}"));
-    }
-    if detail.is_empty() {
-        detail = item_detail(shared, &params.item_id);
-    }
-    detail
-}
-
-/// The content remembered for an item when it started, so a request carrying
-/// only an item id can still show what it is about.
-fn item_detail(shared: &Shared, item_id: &str) -> String {
-    shared
-        .details
-        .lock()
-        .unwrap()
-        .get(item_id)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// Append a line, keeping exactly one newline between parts.
-fn push_line(buffer: &mut String, line: &str) {
-    if !buffer.is_empty() && !buffer.ends_with('\n') {
-        buffer.push('\n');
-    }
-    buffer.push_str(line);
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::agent::{Cmd, Config, Event, PermissionKind, spawn};
+    use crate::agent::{Cmd, Config, Event, spawn};
 
     use super::{Shared, Transport, handle_notification};
     use serde_json::json;
@@ -1040,7 +962,6 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             turn_done: Mutex::new(None),
             commands: Mutex::new(HashMap::new()),
-            details: Mutex::new(HashMap::new()),
             turn_id: Mutex::new(None),
             streamed: Mutex::new(HashSet::new()),
         };
@@ -1281,36 +1202,6 @@ mod tests {
         drop(rx);
     }
 
-    /// The details remembered for approvals belong to the turn that produced
-    /// them, so its completion drops them instead of letting every item of
-    /// every turn pile up for the life of the process.
-    #[test]
-    fn turn_completed_drops_the_details_remembered_for_its_items() {
-        let (shared, rx) = shared_for_test();
-        handle_notification(
-            &shared,
-            "item/completed",
-            json!({"item": {
-                "type": "commandExecution", "id": "cmd1", "command": "ls",
-                "status": "completed", "aggregatedOutput": "done output",
-            }}),
-        );
-        assert!(
-            !shared.details.lock().unwrap().is_empty(),
-            "an item's detail is remembered for its approval request"
-        );
-        handle_notification(
-            &shared,
-            "turn/completed",
-            json!({"turn": {"id": "t1", "status": "completed"}}),
-        );
-        assert!(
-            shared.details.lock().unwrap().is_empty(),
-            "details must not outlive the turn that produced them"
-        );
-        drop(rx);
-    }
-
     /// A notification method this build has never seen still reaches the log
     /// instead of being silently dropped — the canary for app-server growing a
     /// new notification.
@@ -1381,7 +1272,7 @@ mod tests {
                 } => {
                     assert!(
                         sandboxes.iter().any(|s| s.value == "read-only"),
-                        "the sandbox picker should offer read-only: {sandboxes:?}"
+                        "the sandbox catalogue should offer read-only: {sandboxes:?}"
                     );
                     assert_eq!(
                         current_sandbox.as_deref(),
@@ -1421,24 +1312,10 @@ mod tests {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("prompt timed out") {
                 Event::Agent(chunk) => text.push_str(&chunk),
-                // Nobody is there to click, so take the first allow option and
-                // let the turn finish; this also exercises the answer path.
-                Event::PermissionRequest {
-                    request_id,
-                    options,
-                    ..
-                } => {
-                    let choice = options
-                        .iter()
-                        .find(|option| {
-                            matches!(
-                                option.kind,
-                                PermissionKind::AllowOnce | PermissionKind::AllowAlways
-                            )
-                        })
-                        .or_else(|| options.first())
-                        .map(|option| option.id.clone());
-                    conn.resolve_permission(&request_id, choice);
+                // Nobody is there to click, so accept the call once and let the
+                // turn finish; this also exercises the answer path.
+                Event::PermissionRequest { request_id, .. } => {
+                    conn.resolve_permission(&request_id, Some("accept".to_string()));
                 }
                 Event::Done(_) => {
                     println!("codex replied: {text:?}");

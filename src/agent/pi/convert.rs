@@ -80,7 +80,7 @@ pub(super) fn model_catalog(data: &Value) -> Vec<ModelInfo> {
         .collect()
 }
 
-/// The model in force, as the `provider/model` value the picker selects on.
+/// The model in force, as the `provider/model` value a session selects on.
 pub(super) fn current_model(data: &Value) -> Option<String> {
     let model = data.get("model")?;
     let provider = model.get("provider").and_then(Value::as_str)?;
@@ -123,7 +123,7 @@ pub(super) fn reasoning_catalog(data: &Value) -> Vec<ReasoningInfo> {
 /// `skill`) is not carried: the name already says which namespace it is in
 /// (`skill:` is part of it), and no row in a kumu menu names a source.
 ///
-/// Pi reports a description for each and kumu carries none: a picker row is the
+/// Pi reports a description for each and kumu carries none: a list row is the
 /// name and nothing more, so it is dropped here rather than at render time.
 pub(super) fn command_catalog(data: &Value) -> Vec<CommandInfo> {
     data.get("commands")

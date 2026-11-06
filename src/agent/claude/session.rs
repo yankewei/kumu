@@ -167,7 +167,7 @@ fn effort_in_force(launched: &SessionPicks, model: Option<&str>) -> Option<Strin
         .or_else(|| settings::effort_in_force(model))
 }
 
-/// What the reasoning chip shows: the level in force, else the model's own
+/// What the reasoning axis shows: the level in force, else the model's own
 /// documented default.
 ///
 /// The CLI reports the level it resolved to nowhere, so a session that is
@@ -194,7 +194,7 @@ pub(in crate::agent) async fn run(
     // The handshake answers with the account's catalogue and the mode in force,
     // and must precede the first user message. `system/init` — which repeats the
     // mode and names the resolved model — only arrives with the first turn, so
-    // this is the only place the pickers can be filled before a prompt.
+    // this is the only place the axes can be filled before a prompt.
     let reported: protocol::InitializeResponse = transport
         .control(json!({"subtype": "initialize", "hooks": null}))
         .await
@@ -286,7 +286,7 @@ pub(in crate::agent) async fn run(
                     match shared.transport.control(request).await {
                         Ok(_) => {
                             {
-                                // Both chips are projections of this one value,
+                                // Both axes are projections of this one value,
                                 // so a pick on either moves both.
                                 let mut options = shared.options.lock().unwrap();
                                 options.current_mode = convert::current_mode(Some(&value));
@@ -304,7 +304,7 @@ pub(in crate::agent) async fn run(
             Cmd::SetSandbox(value) => {
                 // This backend offers no sandbox axis — Claude's sandbox lives
                 // in its own settings with no per-session form — so the UI has
-                // no chip for one and this should not arrive. Saying so beats
+                // no control for one and this should not arrive. Saying so beats
                 // dropping it silently, the same answer the ACP backend gives.
                 emit(
                     &shared.ev_tx,
@@ -477,8 +477,8 @@ fn on_system(shared: &Shared, system: protocol::SystemEvent) {
             shared.emit_options();
             // The first turn is also where the CLI names the commands that only
             // run in an interactive terminal. Sending one over this wire does
-            // nothing, so they are dropped from the catalogue the composer
-            // offers rather than left there as an entry that cannot act.
+            // nothing, so they are dropped from the catalogue a session offers
+            // rather than left there as an entry that cannot act.
             if !system.terminal_slash_commands.is_empty() {
                 let terminal = system.terminal_slash_commands;
                 let mut commands = shared.commands.lock().unwrap();
@@ -762,9 +762,6 @@ fn on_can_use_tool(shared: &Arc<Shared>, request_id: &str, body: protocol::Contr
         &shared.ev_tx,
         PermissionQuestion {
             tool_call_id: body.tool_use_id.clone().unwrap_or_default(),
-            title: convert::permission_title(&body),
-            detail: convert::permission_detail(&body),
-            options: convert::permission_options(),
         },
         move |option_id| {
             let allowed = option_id.as_deref() == Some(convert::ALLOW_OPTION);
@@ -788,9 +785,11 @@ fn deny_response(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use crate::agent::test_support::{AGENT_TEST_LOCK, command_exists};
-    use crate::agent::{Cmd, Config, Event, PermissionKind, SessionPicks, spawn};
+    use crate::agent::{Cmd, Config, Event, SessionPicks, spawn};
 
-    use super::{Awaiting, CommandInfo, Message, Options, Shared, Transport, handle_message};
+    use super::{
+        Awaiting, CommandInfo, Message, Options, Shared, Transport, convert, handle_message,
+    };
     use serde_json::{Value, json};
     use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -1102,7 +1101,7 @@ mod tests {
     }
 
     /// `system/init` reports the model the session resolved to and projects the
-    /// one permission mode onto both the work-mode and access-policy chips.
+    /// one permission mode onto both the work-mode and access-policy axes.
     #[test]
     fn system_init_reports_the_resolved_model_and_permission_mode() {
         let (shared, rx) = shared_for_test();
@@ -1340,25 +1339,11 @@ mod tests {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining).expect("prompt timed out") {
                 Event::Agent(chunk) => text.push_str(&chunk),
-                // Nobody is here to click, so take the first allow option and
-                // let the turn finish; this is the answer path.
-                Event::PermissionRequest {
-                    request_id,
-                    options,
-                    ..
-                } => {
+                // Nobody is here to click, so allow the call once and let the
+                // turn finish; this is the answer path.
+                Event::PermissionRequest { request_id, .. } => {
                     asked = true;
-                    let choice = options
-                        .iter()
-                        .find(|option| {
-                            matches!(
-                                option.kind,
-                                PermissionKind::AllowOnce | PermissionKind::AllowAlways
-                            )
-                        })
-                        .or_else(|| options.first())
-                        .map(|option| option.id.clone());
-                    conn.resolve_permission(&request_id, choice);
+                    conn.resolve_permission(&request_id, Some(convert::ALLOW_OPTION.to_string()));
                 }
                 // The mid-session change is reported by re-emitting the
                 // catalogue, with both projections moved.
@@ -1394,7 +1379,7 @@ mod tests {
                     assert_eq!(
                         access_applied.as_deref(),
                         Some("default"),
-                        "the access chip reads the same value the work chip does"
+                        "the access axis reads the same value the work axis does"
                     );
                     assert!(
                         home.join("probe.txt").exists(),

@@ -49,12 +49,10 @@ pub struct Connection {
     /// still belongs to the session's current connection.
     id: u64,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
-    /// Asks the backend to cancel the turn in flight.
-    ///
-    /// Out of band, for the same reason the permission table is: the command
-    /// loop is parked on the very turn being cancelled, so routing this through
-    /// [`Cmd`] would not deliver it until that turn had already ended.
-    cancel_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Keeps the backend's cancel channel open. Nothing sends on it while the
+    /// chat pane has no stop control, but a closed channel would wake the
+    /// backend's select arm as if a cancel had been requested.
+    _cancel_tx: tokio::sync::mpsc::UnboundedSender<()>,
     permissions: SharedPermissions,
 }
 
@@ -68,15 +66,6 @@ impl Connection {
     /// Queue a command; non-blocking.
     pub fn send(&self, cmd: Cmd) {
         let _ = self.cmd_tx.send(cmd);
-    }
-
-    /// Ask the backend to cancel the turn in flight; non-blocking.
-    ///
-    /// A no-op when no turn is open: the request is simply dropped before the
-    /// next turn starts, so a click that races the end of a turn cannot settle
-    /// the one after it.
-    pub fn cancel(&self) {
-        let _ = self.cancel_tx.send(());
     }
 
     /// Answer a pending permission request. `option_id` of `None` responds with
@@ -95,7 +84,7 @@ impl Connection {
         Self {
             id,
             cmd_tx: tokio::sync::mpsc::unbounded_channel().0,
-            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
+            _cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -178,7 +167,7 @@ pub fn spawn(cfg: Config, cwd: PathBuf, ev_tx: Sender<Event>) -> Connection {
     Connection {
         id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         cmd_tx,
-        cancel_tx,
+        _cancel_tx: cancel_tx,
         permissions,
     }
 }
@@ -196,7 +185,7 @@ mod tests {
         let conn = Connection {
             id: 1,
             cmd_tx,
-            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
+            _cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: permissions.clone(),
         };
 
@@ -229,7 +218,7 @@ mod tests {
         let conn = Connection {
             id: 1,
             cmd_tx,
-            cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
+            _cancel_tx: tokio::sync::mpsc::unbounded_channel().0,
             permissions: permissions.clone(),
         };
         let (tx, mut rx) = tokio::sync::oneshot::channel();

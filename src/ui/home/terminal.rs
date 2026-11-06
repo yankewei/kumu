@@ -1,0 +1,838 @@
+//! The right-hand pane: the selected session's own TUI.
+//!
+//! Painting follows the herdr/Zed path: merge same-color backgrounds and
+//! same-style text into runs, force glyphs onto the cell grid, and reuse a
+//! row's shaped ops while its [`Arc`] is unchanged. IME composition (Pinyin
+//! and friends) goes through [`EntityInputHandler`].
+
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui_kit::component::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+use crate::agent::AGENTS;
+use crate::app::{Workspace, WorkspaceEvent};
+use crate::term::{self, Cell as TermCell, CursorShape, KeyInput, Rgb, Snapshot};
+use crate::theme::{self, ThemeRevision};
+use crate::ui::widgets::agent_logo;
+
+/// Inset around the cell grid, matching the padded look of a pane TUI.
+const PAD_X: f32 = 14.;
+const PAD_Y: f32 = 10.;
+
+/// Cached drawing for one viewport, keyed by the snapshot's row Arcs.
+struct PaintCache {
+    cell: (Pixels, Pixels),
+    font: (SharedString, u32),
+    rows: Vec<(Arc<Vec<TermCell>>, Vec<RowOp>)>,
+}
+
+/// Where the last paint put the cursor cell, for the IME candidate window.
+#[derive(Clone, Copy)]
+struct CursorAt {
+    bounds: Option<Bounds<Pixels>>,
+    cell: (Pixels, Pixels),
+}
+
+pub struct TerminalView {
+    workspace: Entity<Workspace>,
+    session: Option<i64>,
+    snapshot: Snapshot,
+    focus: FocusHandle,
+    /// Theme revision last pushed into the live terminals.
+    theme_rev: u64,
+    /// IME composition preview ("nihao" before 你好).
+    marked: Option<String>,
+    cursor_at: Rc<Cell<CursorAt>>,
+    /// The last size sent to the process on screen, so a repaint does not
+    /// resize again. Cleared when the session changes.
+    sent: Rc<Cell<(u16, u16, u32, u32)>>,
+    painted: Rc<RefCell<PaintCache>>,
+}
+
+impl TerminalView {
+    pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.subscribe(&workspace, |this, _, ev, cx| {
+            if let WorkspaceEvent::Frame(session_id) = ev
+                && this.session == Some(*session_id)
+            {
+                this.pull(cx);
+            }
+        })
+        .detach();
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        Self {
+            workspace,
+            session: None,
+            snapshot: Snapshot::blank("", ""),
+            focus,
+            theme_rev: u64::MAX,
+            marked: None,
+            cursor_at: Rc::new(Cell::new(CursorAt {
+                bounds: None,
+                cell: (px(0.), px(0.)),
+            })),
+            sent: Rc::new(Cell::new((0, 0, 0, 0))),
+            painted: Rc::new(RefCell::new(PaintCache {
+                cell: (px(0.), px(0.)),
+                font: (SharedString::from(""), 0),
+                rows: Vec::new(),
+            })),
+        }
+    }
+
+    fn sync_theme(&mut self, cx: &mut Context<Self>) {
+        let rev = cx.default_global::<ThemeRevision>().0;
+        if rev == self.theme_rev {
+            return;
+        }
+        self.theme_rev = rev;
+        let colors = theme::term_colors(cx);
+        self.workspace
+            .update(cx, |workspace, _| workspace.set_terminal_colors(colors));
+        // Default cells change with the theme; drop shaped rows.
+        self.painted.borrow_mut().rows.clear();
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus.focus(window, cx);
+    }
+
+    /// Show `session_id`, starting its TUI if it is not already running.
+    pub fn show(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        self.session = Some(session_id);
+        self.sent.set((0, 0, 0, 0));
+        self.marked = None;
+        self.painted.borrow_mut().rows.clear();
+        self.sync_theme(cx);
+        self.snapshot = self
+            .workspace
+            .update(cx, |workspace, cx| workspace.show_terminal(session_id, cx));
+        cx.notify();
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.session = None;
+        self.sent.set((0, 0, 0, 0));
+        self.marked = None;
+        self.painted.borrow_mut().rows.clear();
+        self.snapshot = Snapshot::blank("", "");
+        cx.notify();
+    }
+
+    fn pull(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_wake_handled(session_id)
+        });
+        loop {
+            let generation = self.workspace.read(cx).terminal_generation(session_id);
+            let Some(snapshot) = self.workspace.read(cx).terminal_snapshot(session_id) else {
+                return;
+            };
+            self.snapshot = snapshot;
+            if self.workspace.read(cx).terminal_generation(session_id) == generation {
+                break;
+            }
+        }
+        cx.notify();
+    }
+
+    fn write_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_write(session_id, text.as_bytes().to_vec())
+        });
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        // IME / character composition: the EntityInputHandler owns these.
+        if event.prefer_character_input {
+            return;
+        }
+        if event.keystroke.modifiers.platform {
+            return;
+        }
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let input = KeyInput {
+            key: event.keystroke.key.clone(),
+            key_char: event.keystroke.key_char.clone(),
+            shift: event.keystroke.modifiers.shift,
+            control: event.keystroke.modifiers.control,
+            alt: event.keystroke.modifiers.alt,
+        };
+        self.workspace
+            .update(cx, |workspace, _| workspace.terminal_key(session_id, input));
+        cx.stop_propagation();
+    }
+}
+
+/// OS text input (Pinyin, Japanese, Korean, dead keys) types here. Native
+/// composition previews reach this handler; finished text is written to the PTY.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let marked = self.marked.clone().unwrap_or_default();
+        let units: Vec<u16> = marked.encode_utf16().collect();
+        let range = range.start.min(units.len())..range.end.min(units.len());
+        *adjusted = Some(range.clone());
+        Some(String::from_utf16_lossy(&units[range]))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let len = self.marked.as_ref().map_or(0, |m| m.encode_utf16().count());
+        Some(UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked
+            .as_ref()
+            .filter(|m| !m.is_empty())
+            .map(|m| 0..m.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        self.write_text(text, cx);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _selected: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!text.is_empty()).then(|| text.to_owned());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _element: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let at = self.cursor_at.get();
+        let bounds = at.bounds?;
+        Some(Bounds::new(
+            bounds.origin + point(at.cell.0 * range.start as f32, px(0.)),
+            bounds.size,
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_theme(cx);
+        let theme = cx.theme();
+        let (font_family, font_px) = theme::term_font(cx);
+        let snapshot = self.snapshot.clone();
+        let marked = self.marked.clone();
+        let workspace = self.workspace.clone();
+        let session = self.session;
+        let sent = self.sent.clone();
+        let painted = self.painted.clone();
+        let cursor_at = self.cursor_at.clone();
+        let focused = self.focus.is_focused(window);
+        let input_focus = self.focus.clone();
+        let input_view = cx.entity();
+        let (mark, name, cwd) = header_identity(session, &snapshot, &self.workspace, cx);
+        let header = terminal_header(mark, name, cwd, header_note(&snapshot), theme);
+        let typeface = Typeface {
+            family: font_family,
+            size: font_px,
+        };
+        let typeface_layout = typeface.clone();
+        let typeface_paint = typeface;
+        let term_bg = paint_color(snapshot.bg);
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(term_bg)
+            .child(header)
+            .child(
+                div()
+                    .id("kumu-term")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .size_full()
+                    .track_focus(&self.focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.focus.focus(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        this.on_key(event, cx);
+                    }))
+                    .child(
+                        canvas(
+                            move |bounds, window, cx| {
+                                let (cell_w, cell_h) = cell_size(window, &typeface_layout);
+                                let scale = window.scale_factor();
+                                let cols = ((f32::from(bounds.size.width) - 2. * PAD_X)
+                                    / f32::from(cell_w))
+                                .floor()
+                                .max(2.) as u16;
+                                let rows = ((f32::from(bounds.size.height) - 2. * PAD_Y)
+                                    / f32::from(cell_h))
+                                .floor()
+                                .max(1.) as u16;
+                                let cell_px = (
+                                    (f32::from(cell_w) * scale).round().max(1.) as u32,
+                                    (f32::from(cell_h) * scale).round().max(1.) as u32,
+                                );
+                                let next = (cols, rows, cell_px.0, cell_px.1);
+                                if sent.get() != next {
+                                    sent.set(next);
+                                    if let Some(session_id) = session {
+                                        workspace.update(cx, |workspace, _| {
+                                            workspace.terminal_resize(
+                                                session_id, cols, rows, cell_px.0, cell_px.1,
+                                            )
+                                        });
+                                    }
+                                }
+                                (cell_w, cell_h)
+                            },
+                            move |bounds, cell, window, cx| {
+                                paint_grid(
+                                    GridPaint {
+                                        bounds,
+                                        snapshot: &snapshot,
+                                        cell,
+                                        focused,
+                                        marked: marked.as_deref(),
+                                        typeface: &typeface_paint,
+                                        painted: &painted,
+                                        cursor_at: &cursor_at,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                                if focused {
+                                    window.handle_input(
+                                        &input_focus,
+                                        ElementInputHandler::new(bounds, input_view.clone()),
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
+            )
+    }
+}
+
+#[derive(Clone)]
+struct Typeface {
+    family: SharedString,
+    size: f32,
+}
+
+/// Top bar like the reference pane chrome: mark, name, shortened cwd.
+fn terminal_header(
+    mark: AnyElement,
+    name: String,
+    cwd: String,
+    note: Option<String>,
+    theme: &Theme,
+) -> Div {
+    let path = short_cwd(&cwd);
+    let muted = theme.muted_foreground;
+    let fg = theme.foreground;
+
+    h_flex()
+        .flex_none()
+        .items_center()
+        .px_3()
+        .py_1p5()
+        .gap_2()
+        .min_w_0()
+        .child(div().size(px(14.)).flex_none().child(mark))
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_medium()
+                .text_color(fg)
+                .child(name),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(muted)
+                .truncate()
+                .child(path),
+        )
+        .when_some(note, |row, text| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(text),
+            )
+        })
+}
+
+fn header_identity(
+    session_id: Option<i64>,
+    snapshot: &Snapshot,
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> (AnyElement, String, String) {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let session = session_id.and_then(|id| workspace.read(cx).session(id).cloned());
+    let agent_id = session
+        .as_ref()
+        .map(|s| s.agent.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(snapshot.command.as_str());
+    let cwd = session
+        .as_ref()
+        .map(|s| s.cwd.clone())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| snapshot.cwd.clone());
+    if term::is_shell(agent_id) {
+        let name = if snapshot.command.is_empty() {
+            "终端".into()
+        } else {
+            snapshot.command.clone()
+        };
+        let mark = Icon::new(IconName::SquareTerminal)
+            .with_size(px(14.))
+            .text_color(muted)
+            .into_any_element();
+        return (mark, name, cwd);
+    }
+    let agent = AGENTS.iter().find(|a| a.id == agent_id);
+    let name = agent.map(|a| a.name.to_string()).unwrap_or_else(|| {
+        if snapshot.command.is_empty() {
+            "终端".into()
+        } else {
+            snapshot.command.clone()
+        }
+    });
+    (
+        agent_logo(agent.and_then(|a| a.logo), px(14.), muted),
+        name,
+        cwd,
+    )
+}
+
+fn header_note(snapshot: &Snapshot) -> Option<String> {
+    if let Some(error) = &snapshot.spawn_error {
+        return Some(format!("启动失败：{error}"));
+    }
+    if snapshot.exited && !snapshot.command.is_empty() {
+        return Some("已退出".into());
+    }
+    if snapshot.command.is_empty() {
+        return Some("还没有会话".into());
+    }
+    None
+}
+
+fn short_cwd(cwd: &str) -> String {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(home) = home.as_ref()
+        && let Ok(stripped) = std::path::Path::new(cwd).strip_prefix(home)
+    {
+        let rest = stripped.to_string_lossy();
+        if rest.is_empty() {
+            return "~".into();
+        }
+        return format!("~/{rest}");
+    }
+    cwd.to_string()
+}
+
+fn cell_size(window: &Window, typeface: &Typeface) -> (Pixels, Pixels) {
+    let font = cell_font(typeface, false, false);
+    let system = window.text_system();
+    let id = system.resolve_font(&font);
+    let size_px = px(typeface.size);
+    let width = system
+        .advance(id, size_px, 'M')
+        .map(|advance| advance.width)
+        .unwrap_or(size_px * 0.6);
+    let height = system.ascent(id, size_px) + system.descent(id, size_px).abs();
+    // Width stays the font advance; boxes snap to device pixels instead.
+    let scale = window.scale_factor();
+    (width, px((f32::from(height) * 1.15 * scale).ceil() / scale))
+}
+
+fn cell_font(typeface: &Typeface, bold: bool, italic: bool) -> Font {
+    let mut font = gpui::font(typeface.family.clone());
+    font.weight = if bold {
+        FontWeight::BOLD
+    } else {
+        FontWeight::MEDIUM
+    };
+    font.style = if italic {
+        FontStyle::Italic
+    } else {
+        FontStyle::Normal
+    };
+    font
+}
+
+fn paint_color(rgb: Rgb) -> Hsla {
+    Rgba {
+        r: rgb.0 as f32 / 255.,
+        g: rgb.1 as f32 / 255.,
+        b: rgb.2 as f32 / 255.,
+        a: 1.,
+    }
+    .into()
+}
+
+enum RowOp {
+    Bg { from: usize, to: usize, color: Hsla },
+    Text { x: usize, line: Box<ShapedLine> },
+}
+
+/// Backgrounds merged into runs, then text in same-style runs forced to the
+/// cell width so glyphs sit on the grid.
+fn row_ops(
+    row: &[TermCell],
+    cell_w: Pixels,
+    typeface: &Typeface,
+    window: &mut Window,
+) -> Vec<RowOp> {
+    let mut ops = Vec::new();
+    let mut x = 0;
+    while x < row.len() {
+        let Some(bg) = row[x].bg else {
+            x += 1;
+            continue;
+        };
+        let start = x;
+        while x < row.len() && row[x].bg == Some(bg) {
+            x += 1;
+        }
+        ops.push(RowOp::Bg {
+            from: start,
+            to: x,
+            color: paint_color(bg),
+        });
+    }
+    let mut x = 0;
+    while x < row.len() {
+        let start = x;
+        let c = &row[start];
+        x += 1;
+        if c.text.is_empty() && !c.underline && !c.strike {
+            continue;
+        }
+        let mut color = paint_color(c.fg);
+        if c.faint {
+            color.a = 0.6;
+        }
+        let text_font = cell_font(typeface, c.bold, c.italic);
+        let mut text = if c.text.is_empty() {
+            " ".to_owned()
+        } else {
+            c.text.clone()
+        };
+        if !c.wide {
+            while x < row.len() {
+                let d = &row[x];
+                let same = !d.wide
+                    && d.fg == c.fg
+                    && d.bg == c.bg
+                    && d.bold == c.bold
+                    && d.italic == c.italic
+                    && d.faint == c.faint
+                    && d.underline == c.underline
+                    && d.strike == c.strike;
+                if !same || (d.text.is_empty() && !d.underline && !d.strike) {
+                    break;
+                }
+                text.push_str(if d.text.is_empty() { " " } else { &d.text });
+                x += 1;
+            }
+        }
+        if text.trim().is_empty() && !c.underline && !c.strike {
+            continue;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: text_font,
+            color,
+            background_color: None,
+            underline: c.underline.then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(color),
+                wavy: false,
+            }),
+            strikethrough: c.strike.then(|| StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(color),
+            }),
+        };
+        let force = (!c.wide).then_some(cell_w);
+        let line = window
+            .text_system()
+            .shape_line(text.into(), px(typeface.size), &[run], force);
+        ops.push(RowOp::Text {
+            x: start,
+            line: Box::new(line),
+        });
+    }
+    ops
+}
+
+/// One frame's grid: what to draw and the caches it draws through.
+struct GridPaint<'a> {
+    bounds: Bounds<Pixels>,
+    snapshot: &'a Snapshot,
+    cell: (Pixels, Pixels),
+    focused: bool,
+    marked: Option<&'a str>,
+    typeface: &'a Typeface,
+    painted: &'a RefCell<PaintCache>,
+    cursor_at: &'a Cell<CursorAt>,
+}
+
+fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) {
+    let GridPaint {
+        bounds,
+        snapshot,
+        cell: (cell_w, cell_h),
+        focused,
+        marked,
+        typeface,
+        painted,
+        cursor_at,
+    } = grid;
+    window.paint_quad(fill(bounds, paint_color(snapshot.bg)));
+    let scale = window.scale_factor();
+    let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+    // Center leftover height between top and bottom padding, like herdr.
+    let spare =
+        (f32::from(bounds.size.height) - 2. * PAD_Y - f32::from(cell_h) * snapshot.rows as f32)
+            .max(0.);
+    let origin = point(
+        snap(bounds.origin.x + px(PAD_X)),
+        snap(bounds.origin.y + px(PAD_Y + (spare / 2.).floor())),
+    );
+    let at = |x: usize, y: usize| origin + point(cell_w * x as f32, cell_h * y as f32);
+    let snap_box = |b: Bounds<Pixels>| {
+        let (x0, x1) = (snap(b.origin.x), snap(b.origin.x + b.size.width));
+        let (y0, y1) = (snap(b.origin.y), snap(b.origin.y + b.size.height));
+        Bounds::new(point(x0, y0), size(x1 - x0, y1 - y0))
+    };
+    let cell = (cell_w, cell_h);
+    let font_key = (typeface.family.clone(), typeface.size.to_bits());
+
+    {
+        let mut cache = painted.borrow_mut();
+        // A full-dirty frame or font change means none of the previous ops keep.
+        if cache.cell != cell || cache.font != font_key || snapshot.all {
+            cache.rows.clear();
+        }
+        cache.cell = cell;
+        cache.font = font_key;
+        cache.rows.truncate(snapshot.cells.len());
+        for (y, row) in snapshot.cells.iter().enumerate() {
+            let reuse = cache
+                .rows
+                .get(y)
+                .is_some_and(|(cached, _)| Arc::ptr_eq(cached, row));
+            if reuse {
+                continue;
+            }
+            let ops = row_ops(row, cell_w, typeface, window);
+            if y < cache.rows.len() {
+                cache.rows[y] = (Arc::clone(row), ops);
+            } else {
+                cache.rows.push((Arc::clone(row), ops));
+            }
+        }
+    }
+
+    let cache = painted.borrow();
+    for (y, (_, ops)) in cache.rows.iter().enumerate() {
+        for op in ops {
+            if let RowOp::Bg { from, to, color } = op {
+                let b = Bounds::new(at(*from, y), size(cell_w * (*to - *from) as f32, cell_h));
+                window.paint_quad(fill(snap_box(b), *color));
+            }
+        }
+    }
+    for (y, (_, ops)) in cache.rows.iter().enumerate() {
+        for op in ops {
+            if let RowOp::Text { x, line } = op {
+                let _ = line.paint(at(*x, y), cell_h, TextAlign::Left, None, window, cx);
+            }
+        }
+    }
+    drop(cache);
+
+    let mut cursor_bounds = None;
+    if let Some(cur) = snapshot.cursor {
+        let (x, y) = (cur.x as usize, cur.y as usize);
+        let wide = snapshot
+            .cells
+            .get(y)
+            .and_then(|row| row.get(x))
+            .is_some_and(|c| c.wide);
+        let w = cell_w * if wide { 2.0 } else { 1.0 };
+        let color = paint_color(cur.color);
+        let p = at(x, y);
+        cursor_bounds = Some(Bounds::new(p, size(w, cell_h)));
+        match (focused, cur.shape) {
+            (true, CursorShape::Block) => {
+                window.paint_quad(fill(snap_box(Bounds::new(p, size(w, cell_h))), color));
+                if let Some(c) = snapshot
+                    .cells
+                    .get(y)
+                    .and_then(|row| row.get(x))
+                    .filter(|c| !c.text.is_empty())
+                {
+                    let run = TextRun {
+                        len: c.text.len(),
+                        font: cell_font(typeface, c.bold, c.italic),
+                        color: paint_color(snapshot.bg),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = window.text_system().shape_line(
+                        c.text.clone().into(),
+                        px(typeface.size),
+                        &[run],
+                        None,
+                    );
+                    let _ = line.paint(p, cell_h, TextAlign::Left, None, window, cx);
+                }
+            }
+            (true, CursorShape::Bar) => {
+                window.paint_quad(fill(snap_box(Bounds::new(p, size(px(2.0), cell_h))), color));
+            }
+            (true, CursorShape::Underline) => {
+                window.paint_quad(fill(
+                    snap_box(Bounds::new(
+                        p + point(px(0.0), cell_h - px(2.0)),
+                        size(w, px(2.0)),
+                    )),
+                    color,
+                ));
+            }
+            _ => {
+                window.paint_quad(outline(
+                    snap_box(Bounds::new(p, size(w, cell_h))),
+                    color,
+                    BorderStyle::Solid,
+                ));
+            }
+        }
+    } else if let Some((x, y)) = snapshot.cursor_cell {
+        // Hidden cursor still hosts the IME preview.
+        cursor_bounds = Some(Bounds::new(
+            at(x as usize, y as usize),
+            size(cell_w, cell_h),
+        ));
+    }
+
+    // Composition preview at the cursor, underlined on the terminal background.
+    if let (Some(bounds), Some(text)) = (cursor_bounds, marked.filter(|t| !t.is_empty())) {
+        let fg = paint_color(
+            snapshot
+                .cursor
+                .map(|c| c.color)
+                .unwrap_or(Rgb(0xdd, 0xdd, 0xdd)),
+        );
+        let run = TextRun {
+            len: text.len(),
+            font: cell_font(typeface, false, false),
+            color: fg,
+            background_color: None,
+            underline: Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(fg),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(text.into(), px(typeface.size), &[run], None);
+        window.paint_quad(fill(
+            snap_box(Bounds::new(bounds.origin, size(line.width, cell_h))),
+            paint_color(snapshot.bg),
+        ));
+        let _ = line.paint(bounds.origin, cell_h, TextAlign::Left, None, window, cx);
+    }
+
+    cursor_at.set(CursorAt {
+        bounds: cursor_bounds,
+        cell: (cell_w, cell_h),
+    });
+}

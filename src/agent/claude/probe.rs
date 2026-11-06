@@ -75,7 +75,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
             .models(convert::model_options(), None)
             // A session starts in the mode this machine configures and at the
             // effort it pins or saves: read from Claude Code's own settings so
-            // the chips say something concrete before the first message.
+            // the axes say something concrete before the first message.
             .modes(convert::mode_options(), Some(mode.clone()))
             .access(convert::access_options(), access.clone())
             .reasoning(convert::reasoning_options(), Some(effort))

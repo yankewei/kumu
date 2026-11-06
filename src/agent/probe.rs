@@ -38,7 +38,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 /// so the shape lives here once:
 ///
 ///   - its own thread, because a probe must not block whoever asked for it —
-///     the settings window and the composer both call this from the UI thread;
+///     the settings window calls this from the UI thread;
 ///   - its own tokio runtime, because the backends' transports are async and
 ///     there is no ambient one on that thread;
 ///   - a [`TIMEOUT`], because an agent that accepts the subprocess but never

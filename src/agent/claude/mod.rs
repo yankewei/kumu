@@ -42,8 +42,8 @@ use crate::agent::config::SessionPicks;
 /// configured through its own settings, and the protocol carries no per-session
 /// form for it (checked against 2.1.269 — every plausible control subtype is
 /// rejected). `mode` is therefore the session's permission mode as stored, which
-/// is the single value behind both composer chips: the work mode (`plan` /
-/// `default`) and the access policy (the approval ladder).
+/// is the single value behind both axes: the work mode (`plan` / `default`) and
+/// the access policy (the approval ladder).
 pub(super) fn session_args(picks: &SessionPicks) -> Vec<String> {
     let mut args = Vec::new();
     for (flag, value) in [
