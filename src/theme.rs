@@ -63,11 +63,17 @@ pub fn change_mode(mode: impl Into<ThemeMode>, window: Option<&mut Window>, cx: 
     install_text_view_style(cx);
 }
 
-/// Terminal typeface: theme mono family, sized with the UI font scale so the
-/// settings font-size control grows the grid with the rest of the app.
+/// Terminal typeface: theme mono family (JetBrains Mono by default), sized
+/// with the UI font scale so the settings font-size control grows the grid
+/// with the rest of the app.
 pub fn term_font(cx: &App) -> (SharedString, f32) {
     let theme = Theme::global(cx);
     let family = theme.mono_font_family.clone();
+    let family = if family.is_empty() {
+        SharedString::from(crate::fonts::TERM_FONT)
+    } else {
+        family
+    };
     let size = f32::from(theme.mono_font_size) * (f32::from(theme.font_size) / DEFAULT_FONT_SIZE);
     (family, size.max(10.))
 }

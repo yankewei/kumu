@@ -5,6 +5,8 @@
       "is_default": true,
       "name": "Zed Dark",
       "mode": "dark",
+      "mono_font.family": "JetBrains Mono",
+      "mono_font.size": 13,
       "colors": {
         "accent.background": "#2c313b",
         "accent.foreground": "#d7dadf",

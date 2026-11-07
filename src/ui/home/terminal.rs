@@ -1,9 +1,11 @@
 //! The right-hand pane: the selected session's own TUI.
 //!
-//! Painting follows the herdr/Zed path: merge same-color backgrounds and
-//! same-style text into runs, force glyphs onto the cell grid, and reuse a
-//! row's shaped ops while its [`Arc`] is unchanged. IME composition (Pinyin
-//! and friends) goes through [`EntityInputHandler`].
+//! Painting follows the herdr/Ghostty path: merge same-color backgrounds and
+//! same-style text into runs, force glyphs onto the cell grid, draw box /
+//! Powerline / braille as geometry ([`super::sprites`]), fall back to the
+//! bundled Nerd symbols font for missing icons, and reuse a row's shaped ops
+//! while its [`Arc`] is unchanged. IME composition (Pinyin and friends) goes
+//! through [`EntityInputHandler`].
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -522,9 +524,9 @@ fn cell_size(window: &Window, typeface: &Typeface) -> (Pixels, Pixels) {
         .map(|advance| advance.width)
         .unwrap_or(size_px * 0.6);
     let height = system.ascent(id, size_px) + system.descent(id, size_px).abs();
-    // Width stays the font advance; boxes snap to device pixels instead.
+    // Width stays the font advance; boxes snap edges to device pixels instead.
     let scale = window.scale_factor();
-    (width, px((f32::from(height) * 1.15 * scale).ceil() / scale))
+    (width, px((f32::from(height) * 1.2 * scale).ceil() / scale))
 }
 
 fn cell_font(typeface: &Typeface, bold: bool, italic: bool) -> Font {
@@ -552,16 +554,104 @@ fn paint_color(rgb: Rgb) -> Hsla {
     .into()
 }
 
+/// WCAG relative luminance of an sRGB cell color.
+fn luminance(rgb: Rgb) -> f32 {
+    let ch = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(rgb.0) + 0.7152 * ch(rgb.1) + 0.0722 * ch(rgb.2)
+}
+
+fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Ghostty `minimum-contrast`: keep intentional low-contrast sprites, else
+/// lift fg toward near-white / near-black when it would vanish into `bg`.
+fn readable_fg(fg: Rgb, bg: Rgb, text: &str) -> Rgb {
+    const MINIMUM: f32 = 1.1;
+    if super::sprites::is_sprite(text) || preserves_graphics_color(text) {
+        return fg;
+    }
+    if contrast_ratio(fg, bg) >= MINIMUM {
+        return fg;
+    }
+    let light = Rgb(0xf2, 0xf2, 0xf4);
+    let dark = Rgb(0x1b, 0x1b, 0x1e);
+    if contrast_ratio(light, bg) >= contrast_ratio(dark, bg) {
+        light
+    } else {
+        dark
+    }
+}
+
+fn preserves_graphics_color(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        matches!(
+            c as u32,
+            0x2500..=0x259f | 0xe0b0..=0xe0d7 | 0x1fb00..=0x1fbff | 0x1cc00..=0x1cebf
+        )
+    })
+}
+
+/// Force-width shaping moves glyph origins; it does not shrink fallback glyphs
+/// (emoji). Scale the font down when a non-wide cell overflows its column.
+fn fallback_size(
+    c: &TermCell,
+    font: &Font,
+    width: Pixels,
+    size: f32,
+    ts: &WindowTextSystem,
+) -> Option<Pixels> {
+    if c.wide || c.text.is_ascii() {
+        return None;
+    }
+    let first = c.text.chars().next()?;
+    let size_px = px(size);
+    let primary = ts.resolve_font(font);
+    if ts.advance(primary, size_px, first).is_ok() {
+        return None;
+    }
+    let run = TextRun {
+        len: c.text.len(),
+        font: font.clone(),
+        ..Default::default()
+    };
+    let line = ts.shape_line(c.text.clone().into(), size_px, &[run], None);
+    (line.width > width).then(|| size_px * f32::from(width) / f32::from(line.width))
+}
+
+fn nerd_icon(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    matches!(
+        c as u32,
+        0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
+    )
+    .then_some(c)
+}
+
 enum RowOp {
     Bg { from: usize, to: usize, color: Hsla },
+    Sprite { x: usize, text: String, color: Hsla },
     Text { x: usize, line: Box<ShapedLine> },
 }
 
-/// Backgrounds merged into runs, then text in same-style runs forced to the
-/// cell width so glyphs sit on the grid.
+/// Backgrounds merged into runs, then sprites / text: same-style runs forced
+/// onto the cell width so glyphs sit on the grid.
 fn row_ops(
     row: &[TermCell],
     cell_w: Pixels,
+    term_bg: Rgb,
     typeface: &Typeface,
     window: &mut Window,
 ) -> Vec<RowOp> {
@@ -590,17 +680,36 @@ fn row_ops(
         if c.text.is_empty() && !c.underline && !c.strike {
             continue;
         }
-        let mut color = paint_color(c.fg);
+        let cell_bg = c.bg.unwrap_or(term_bg);
+        let mut color = paint_color(readable_fg(c.fg, cell_bg, &c.text));
         if c.faint {
             color.a = 0.6;
         }
-        let text_font = cell_font(typeface, c.bold, c.italic);
+        if super::sprites::is_sprite(&c.text) {
+            ops.push(RowOp::Sprite {
+                x: start,
+                text: c.text.clone(),
+                color,
+            });
+            continue;
+        }
+        let mut text_font = cell_font(typeface, c.bold, c.italic);
+        let ts = window.text_system();
+        // Icons the mono face lacks: shape from the bundled Nerd symbols font.
+        if let Some(icon) = nerd_icon(&c.text) {
+            let primary = ts.resolve_font(&text_font);
+            if ts.advance(primary, px(typeface.size), icon).is_err() {
+                text_font = gpui::font(crate::fonts::SYMBOLS_FONT);
+                text_font.weight = FontWeight::NORMAL;
+            }
+        }
+        let fitted = fallback_size(c, &text_font, cell_w, typeface.size, ts);
         let mut text = if c.text.is_empty() {
             " ".to_owned()
         } else {
             c.text.clone()
         };
-        if !c.wide {
+        if !c.wide && fitted.is_none() {
             while x < row.len() {
                 let d = &row[x];
                 let same = !d.wide
@@ -611,7 +720,12 @@ fn row_ops(
                     && d.faint == c.faint
                     && d.underline == c.underline
                     && d.strike == c.strike;
-                if !same || (d.text.is_empty() && !d.underline && !d.strike) {
+                if !same
+                    || (d.text.is_empty() && !d.underline && !d.strike)
+                    || super::sprites::is_sprite(&d.text)
+                    || nerd_icon(&d.text).is_some()
+                    || fallback_size(d, &text_font, cell_w, typeface.size, ts).is_some()
+                {
                     break;
                 }
                 text.push_str(if d.text.is_empty() { " " } else { &d.text });
@@ -637,9 +751,12 @@ fn row_ops(
             }),
         };
         let force = (!c.wide).then_some(cell_w);
-        let line = window
-            .text_system()
-            .shape_line(text.into(), px(typeface.size), &[run], force);
+        let line = window.text_system().shape_line(
+            text.into(),
+            fitted.unwrap_or(px(typeface.size)),
+            &[run],
+            force,
+        );
         ops.push(RowOp::Text {
             x: start,
             line: Box::new(line),
@@ -708,7 +825,7 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) {
             if reuse {
                 continue;
             }
-            let ops = row_ops(row, cell_w, typeface, window);
+            let ops = row_ops(row, cell_w, snapshot.bg, typeface, window);
             if y < cache.rows.len() {
                 cache.rows[y] = (Arc::clone(row), ops);
             } else {
@@ -726,10 +843,22 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) {
             }
         }
     }
+    let cell_bounds = size(cell_w, cell_h);
     for (y, (_, ops)) in cache.rows.iter().enumerate() {
         for op in ops {
-            if let RowOp::Text { x, line } = op {
-                let _ = line.paint(at(*x, y), cell_h, TextAlign::Left, None, window, cx);
+            match op {
+                RowOp::Bg { .. } => {}
+                RowOp::Sprite { x, text, color } => {
+                    super::sprites::paint(
+                        text,
+                        Bounds::new(at(*x, y), cell_bounds),
+                        *color,
+                        window,
+                    );
+                }
+                RowOp::Text { x, line } => {
+                    let _ = line.paint(at(*x, y), cell_h, TextAlign::Left, None, window, cx);
+                }
             }
         }
     }

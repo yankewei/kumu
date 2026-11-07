@@ -322,6 +322,7 @@ impl ConversationView {
             }
             WorkspaceEvent::Changed => {}
             WorkspaceEvent::Frame(_) => {}
+            WorkspaceEvent::SessionClosed { .. } => {}
         })
         .detach();
         Self {

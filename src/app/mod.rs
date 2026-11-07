@@ -30,9 +30,6 @@ use crate::theme;
 use discovery::Discovery;
 use turn::{PendingPermission, Turn};
 
-/// The agent a new session starts with, until the user picks another.
-const DEFAULT_AGENT: &str = "omp";
-
 /// How many agent subprocesses may stay connected at once.
 ///
 /// A session whose connection is reclaimed reconnects on its next prompt and
@@ -67,6 +64,9 @@ pub enum WorkspaceEvent {
     HistoryChanged(i64),
     /// A session's terminal grid changed. Only the terminal pane draws it.
     Frame(i64),
+    /// A session was removed by the app (its shell exited). `next` is who to
+    /// show instead, computed before the row was gone.
+    SessionClosed { id: i64, next: Option<i64> },
 }
 
 /// Projects, sessions, and each session's live connection and turn.
@@ -188,7 +188,8 @@ impl Workspace {
     /// The session's screen, after making sure its process is running.
     ///
     /// Agent sessions launch that agent's interactive TUI; shell sessions
-    /// launch the user's `$SHELL`. An exited process starts again. A fifth
+    /// launch the user's `$SHELL`. An exited agent TUI starts again; an exited
+    /// shell is deleted instead (see [`Self::watch_terminal`]). A fifth
     /// running process stops the one shown least recently.
     pub fn show_terminal(&mut self, session_id: i64, cx: &mut Context<Self>) -> Snapshot {
         if self
@@ -308,7 +309,25 @@ impl Workspace {
             while wake.next().await.is_some() {
                 let watching = this
                     .update(cx, |workspace, cx| {
-                        if !workspace.terms.contains_key(&session_id) {
+                        let Some(term) = workspace.terms.get(&session_id) else {
+                            return false;
+                        };
+                        let snapshot = term.snapshot();
+                        // `exit` (or any clean shell death) ends the session
+                        // itself — leaving an "已退出" row around would just
+                        // restart `$SHELL` on the next focus. Spawn failures
+                        // keep the row so the header can show why.
+                        let shell_done = snapshot.exited
+                            && snapshot.spawn_error.is_none()
+                            && workspace
+                                .session(session_id)
+                                .is_some_and(|s| crate::term::is_shell(&s.agent));
+                        if shell_done {
+                            let next = workspace.delete_session(session_id, cx);
+                            cx.emit(WorkspaceEvent::SessionClosed {
+                                id: session_id,
+                                next,
+                            });
                             return false;
                         }
                         cx.emit(WorkspaceEvent::Frame(session_id));
@@ -360,10 +379,11 @@ impl Workspace {
         Some(id)
     }
 
-    /// Start an agent session in `project_id`, or in the first project when
-    /// none is given, returning its id.
+    /// Start a shell session in `project_id`, or in the first project when
+    /// none is given, returning its id. The home pane is a terminal, so a
+    /// new session is a login shell until the user opens an agent TUI.
     pub fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) -> Option<i64> {
-        self.insert_session(project_id, DEFAULT_AGENT, "会话", cx)
+        self.new_shell_session(project_id, cx)
     }
 
     /// Start a pure shell session in `project_id` (or the first project).
@@ -438,7 +458,11 @@ impl Workspace {
     /// Delete a session: settle anything it was waiting on, drop its live
     /// connection (which tears down the agent subprocess), forget its turn, then
     /// remove the row and its history.
-    pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
+    ///
+    /// Returns the neighbor to select next — computed before the row is gone —
+    /// so a caller that was looking at this session can land somewhere else.
+    pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<i64> {
+        let next = neighbor_session(&self.sessions, session_id);
         self.cancel_pending_permissions(session_id);
         self.forget_terminal(session_id);
         self.forget_connection(session_id);
@@ -450,6 +474,7 @@ impl Workspace {
         self.store.delete_session(session_id).ok();
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
+        next
     }
 
     /// Record that a session's connection was used just now, so a later
@@ -600,6 +625,27 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
     ProjectPick::New { name }
 }
 
+/// Which session to select after `id` is deleted.
+///
+/// The nearest sibling in the same project (the next one, else the previous),
+/// else the first session left anywhere, else none — so the right pane never
+/// goes blank while sessions remain.
+pub(crate) fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
+    let project = sessions.iter().find(|s| s.id == id)?.project_id;
+    let mut siblings: Vec<i64> = sessions
+        .iter()
+        .filter(|s| s.project_id == project)
+        .map(|s| s.id)
+        .collect();
+    siblings.sort_unstable();
+    siblings
+        .iter()
+        .copied()
+        .find(|&sid| sid > id)
+        .or_else(|| siblings.iter().rev().copied().find(|&sid| sid < id))
+        .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
+}
+
 /// Which idle connections to close to get back down to `cap`, least recently
 /// used first.
 ///
@@ -645,8 +691,10 @@ fn terminal_evictions(order: &[i64], cap: usize) -> Vec<i64> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{ProjectPick, idle_evictions, resolve_project_pick, terminal_evictions};
-    use crate::db::Project;
+    use super::{
+        ProjectPick, idle_evictions, neighbor_session, resolve_project_pick, terminal_evictions,
+    };
+    use crate::db::{Project, Session};
 
     fn project(id: i64, path: &str) -> Project {
         Project {
@@ -654,6 +702,55 @@ mod tests {
             name: format!("project-{id}"),
             path: path.into(),
         }
+    }
+
+    fn session(id: i64, project_id: i64) -> Session {
+        Session {
+            id,
+            project_id,
+            agent: "shell".into(),
+            title: format!("终端 {id}"),
+            cwd: "/tmp".into(),
+            resume_id: None,
+            model: None,
+            mode: None,
+            sandbox: None,
+            reasoning: None,
+            title_manual: false,
+            has_conversation: false,
+            usage: None,
+        }
+    }
+
+    /// Deleting the session the user is looking at must land them next door,
+    /// not on a blank pane.
+    #[test]
+    fn deletion_falls_back_to_the_nearest_sibling() {
+        let sessions = vec![session(1, 10), session(2, 10), session(3, 10)];
+
+        assert_eq!(neighbor_session(&sessions, 2), Some(3), "the next one");
+        assert_eq!(
+            neighbor_session(&sessions, 3),
+            Some(2),
+            "no next: the previous one"
+        );
+        assert_eq!(
+            neighbor_session(&sessions, 1),
+            Some(2),
+            "the first one skips forward too"
+        );
+    }
+
+    /// With no sibling left in the project, the other project's sessions still
+    /// beat the empty state; only a truly empty list returns `None`.
+    #[test]
+    fn deletion_falls_back_across_projects_then_to_nothing() {
+        let sessions = vec![session(1, 10), session(2, 20)];
+
+        assert_eq!(neighbor_session(&sessions, 1), Some(2), "another project");
+        assert_eq!(neighbor_session(&sessions, 2), Some(1), "and back");
+        assert_eq!(neighbor_session(&[session(1, 10)], 1), None, "the last one");
+        assert_eq!(neighbor_session(&[], 1), None, "unknown id");
     }
 
     #[test]

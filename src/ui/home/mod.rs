@@ -5,6 +5,7 @@ mod conversation;
 mod markdown_mermaid;
 mod mermaid_viewer;
 mod sidebar;
+mod sprites;
 mod terminal;
 
 // Shared column width for the conversation history.
@@ -26,27 +27,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-
-/// Which session to select after `id` is deleted.
-///
-/// The nearest sibling in the same project (the next one, else the previous),
-/// else the first session left anywhere, else none — so the right pane never
-/// goes blank while sessions remain.
-fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
-    let project = sessions.iter().find(|s| s.id == id)?.project_id;
-    let mut siblings: Vec<i64> = sessions
-        .iter()
-        .filter(|s| s.project_id == project)
-        .map(|s| s.id)
-        .collect();
-    siblings.sort_unstable();
-    siblings
-        .iter()
-        .copied()
-        .find(|&sid| sid > id)
-        .or_else(|| siblings.iter().rev().copied().find(|&sid| sid < id))
-        .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
-}
 
 pub struct KumuApp {
     /// Projects, sessions and their live agents; the home view draws it and
@@ -75,9 +55,13 @@ impl KumuApp {
         // Only what the home view itself draws: a streamed chunk is the
         // conversation's alone, and repainting the whole window per chunk is
         // what used to make it stutter. A terminal frame is the pane's own.
-        cx.subscribe(&workspace, |_, _, ev, cx| {
-            if matches!(ev, WorkspaceEvent::Changed) {
-                cx.notify();
+        cx.subscribe(&workspace, |this, _, ev, cx| {
+            match ev {
+                WorkspaceEvent::Changed => cx.notify(),
+                WorkspaceEvent::SessionClosed { id, next } => {
+                    this.on_session_closed(*id, *next, cx);
+                }
+                _ => {}
             }
         })
         .detach();
@@ -128,7 +112,7 @@ impl KumuApp {
             .update(cx, |terminal, cx| terminal.focus(window, cx));
     }
 
-    /// Start an agent session — in `project_id`, or the first project — and show it.
+    /// Start a shell session — in `project_id`, or the first project — and show it.
     fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
         let id = self
             .workspace
@@ -264,11 +248,15 @@ impl KumuApp {
 
     /// Delete a session, then land on its neighbor if it was the one on screen.
     fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
-        // Pick the fallback while the doomed row is still in the list.
-        let next = neighbor_session(self.workspace.read(cx).sessions(), session_id);
-        self.workspace
+        let next = self
+            .workspace
             .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
+        self.on_session_closed(session_id, next, cx);
+    }
 
+    /// After a session disappears — deleted by the user, or its shell exited —
+    /// keep the right pane on a neighbor when that session was selected.
+    fn on_session_closed(&mut self, session_id: i64, next: Option<i64>, cx: &mut Context<Self>) {
         if self.selected == Some(session_id) {
             match next.filter(|next| self.workspace.read(cx).session(*next).is_some()) {
                 Some(next) => self.select_session(next, cx),
@@ -419,61 +407,3 @@ impl Render for KumuApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
-    // scope through the glob, so the built-in one is imported explicitly.
-    use core::prelude::v1::test;
-
-    use super::neighbor_session;
-    use crate::db::Session;
-
-    fn session(id: i64, project_id: i64) -> Session {
-        Session {
-            id,
-            project_id,
-            agent: "omp".into(),
-            title: format!("会话 {id}"),
-            cwd: "/tmp".into(),
-            resume_id: None,
-            model: None,
-            mode: None,
-            sandbox: None,
-            reasoning: None,
-            title_manual: false,
-            has_conversation: false,
-            usage: None,
-        }
-    }
-
-    /// Deleting the session the user is looking at must land them next door,
-    /// not on a blank pane.
-    #[test]
-    fn deletion_falls_back_to_the_nearest_sibling() {
-        let sessions = vec![session(1, 10), session(2, 10), session(3, 10)];
-
-        assert_eq!(neighbor_session(&sessions, 2), Some(3), "the next one");
-        assert_eq!(
-            neighbor_session(&sessions, 3),
-            Some(2),
-            "no next: the previous one"
-        );
-        assert_eq!(
-            neighbor_session(&sessions, 1),
-            Some(2),
-            "the first one skips forward too"
-        );
-    }
-
-    /// With no sibling left in the project, the other project's sessions still
-    /// beat the empty state; only a truly empty list returns `None`.
-    #[test]
-    fn deletion_falls_back_across_projects_then_to_nothing() {
-        let sessions = vec![session(1, 10), session(2, 20)];
-
-        assert_eq!(neighbor_session(&sessions, 1), Some(2), "another project");
-        assert_eq!(neighbor_session(&sessions, 2), Some(1), "and back");
-        assert_eq!(neighbor_session(&[session(1, 10)], 1), None, "the last one");
-        assert_eq!(neighbor_session(&[], 1), None, "unknown id");
-    }
-}

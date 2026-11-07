@@ -24,6 +24,7 @@ mod app;
 mod assets;
 mod db;
 mod dock_icon;
+mod fonts;
 mod term;
 mod theme;
 mod ui;
@@ -37,6 +38,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);
         let mut window_options = TitleBar::window_options();
