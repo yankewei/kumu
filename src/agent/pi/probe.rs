@@ -237,8 +237,6 @@ mod tests {
                 command: "/nonexistent/kumu-pi-test".into(),
                 args: vec![],
                 env: vec![],
-                auto_prompt: None,
-                session: Default::default(),
             },
             tx,
         );

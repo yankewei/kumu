@@ -12,12 +12,11 @@
 //!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `app/`     what kumu does with agents, as data the UI draws: live turns;
-//!   - `db.rs`    local SQLite persistence (projects/sessions/messages);
-//!   - `agent/`   the agents kumu can drive (`registry`) and their backends on a
-//!     dedicated thread: a facade over one vocabulary (`event`), a per-agent
-//!     launch config, and one submodule per protocol. Settings probes agents
-//!     over it to discover their models; home sessions prompt them.
+//!   - `app/`     projects, sessions, live terminals, and agent discovery;
+//!   - `db.rs`    local SQLite persistence (projects/sessions);
+//!   - `term/`    PTY + VT for agent TUIs and shell sessions;
+//!   - `agent/`   registry, interactive launch helpers, and protocol adapters
+//!     Settings uses to probe installed agents for their model catalogues.
 
 mod agent;
 mod app;

@@ -1,67 +1,37 @@
-//! The application layer: what kumu does with agents, independent of how it is
-//! drawn. The UI renders and reads this; the agent layer below it speaks the
-//! protocols, and the store keeps what outlives a run.
+//! The application layer: projects, sessions, live terminals, and agent
+//! discovery — independent of how it is drawn.
 //!
-//!   - this module — [`Workspace`]: projects, sessions, and the entity that owns
-//!     them;
-//!   - `session`   — a session's flow: sending, connections, the events a live
-//!     agent reports, and permissions;
-//!   - `turn`      — a live turn as plain data, and how agent events fold into it;
+//!   - this module — [`Workspace`]: projects, sessions, and live terminals;
 //!   - `discovery` — what each agent offers, as its probe reports it.
 //!
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
-//! notify: a streamed chunk only concerns the conversation, and notifying the
-//! whole home view per chunk is what made the window stutter.
+//! notify: a terminal frame only concerns that pane.
 
 pub mod discovery;
-mod session;
-pub mod turn;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter};
 
 use crate::agent;
-use crate::db::{Message, Project, Session, Store, db_path};
+use crate::db::{Project, Session, Store, db_path};
 use crate::term::{KeyInput, Snapshot, Term, TermColors};
 use crate::theme;
 use discovery::Discovery;
-use turn::{PendingPermission, Turn};
-
-/// How many agent subprocesses may stay connected at once.
-///
-/// A session whose connection is reclaimed reconnects on its next prompt and
-/// resumes its agent-side context from the stored `resume_id`, so the cap
-/// trades a little latency for a bounded number of live processes. Only a
-/// session that can actually be restored that way is reclaimed: one whose agent
-/// cannot reopen it (see [`agent::Event::SessionReady`]'s `resumable`) is kept
-/// alive instead of being stranded, so the cap is a target rather than a
-/// guarantee when such a session is among the live ones.
-const MAX_LIVE_CONNECTIONS: usize = 3;
 
 /// How many native agent TUIs may stay running at once.
 ///
 /// A session past the cap is stopped, least recently shown first. Selecting it
-/// again starts a new process. There is no exception for a session that cannot
-/// be resumed: the TUI is the agent's own, and starting it over is the whole
-/// recovery.
+/// again starts a new process.
 const MAX_LIVE_TERMINALS: usize = 4;
 
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
-    /// Something the home view draws: the project or session list, a session's
-    /// title, a turn opening or closing, a permission prompt, what an agent
-    /// offers.
+    /// Something the home or settings view draws: the project or session list,
+    /// a session's title, what an agent offers.
     Changed,
-    /// A session's live turn changed — streamed text, reasoning, a tool update.
-    /// Only the conversation draws it.
-    TurnChanged(i64),
-    /// A session's live turn ended; anything cached to draw it can go.
-    TurnClosed { session_id: i64, turn_id: u64 },
-    /// A session's saved history changed: a prompt, a finished turn, a notice.
-    HistoryChanged(i64),
     /// A session's terminal grid changed. Only the terminal pane draws it.
     Frame(i64),
     /// A session was removed by the app (its shell exited). `next` is who to
@@ -69,49 +39,23 @@ pub enum WorkspaceEvent {
     SessionClosed { id: i64, next: Option<i64> },
 }
 
-/// Projects, sessions, and each session's live connection and turn.
+/// Projects, sessions, and each session's live terminal.
 ///
 /// One per app, owned by the home window and shared with the settings window.
-/// Nothing in here renders, and nothing in here names a protocol: agents are
-/// reached only through [`agent`]'s vocabulary.
+/// Nothing in here renders. Agent TUIs are launched through [`agent::interactive`];
+/// protocol probes go through [`agent::probe`].
 pub struct Workspace {
     store: Store,
     projects: Vec<Project>,
     sessions: Vec<Session>,
-    /// Live connections keyed by session id, reused across prompts.
-    conns: HashMap<i64, agent::Connection>,
-    /// Each live session's position in the reclamation order, least recently
-    /// used first. Kept in step with `conns` by [`Self::touch_connection`] and
-    /// [`Self::forget_connection`], and read by
-    /// [`Self::reclaim_idle_connections`].
-    conn_lru: Vec<i64>,
     /// Native TUI processes keyed by session id. A hidden session keeps
     /// reading, so its agent does not block on a full pty, until the cap
     /// stops it.
     terms: HashMap<i64, Term>,
     /// Least recently shown first. Only sessions whose process is still running.
     term_lru: Vec<i64>,
-    /// Sessions already told that their history cannot be resumed. A reclaimed
-    /// connection is opened again on the next prompt, and without this the
-    /// notice would be written into the conversation every time.
-    no_resume_notified: HashSet<i64>,
-    /// Sessions whose agent cannot reopen its conversation from the stored
-    /// `resume_id` (see [`agent::Event::SessionReady`]'s `resumable`). Their
-    /// live connection is the only copy of the agent-side session, so
-    /// [`Self::reclaim_idle_connections`] never closes it.
-    unresumable: HashSet<i64>,
-    /// Sessions already told that their connection was reclaimed. The notice
-    /// is worth writing once; a session that is cycled through the cap again
-    /// would otherwise pile up a copy per reclaim.
-    reclaim_notified: HashSet<i64>,
-    /// Each session's turn in flight: streaming reasoning, tool calls, and the
-    /// reply being built. Dropped when the turn ends.
-    turns: HashMap<i64, Turn>,
     /// What each agent offers in general, as probed.
     discovery: Discovery,
-    /// What each session's agent last reported about its context, decoded once
-    /// from the store at start and kept current by [`Self::record_usage`].
-    usage: HashMap<i64, agent::Usage>,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -123,26 +67,11 @@ impl Workspace {
             store,
             projects: Vec::new(),
             sessions: Vec::new(),
-            conns: HashMap::new(),
-            conn_lru: Vec::new(),
             terms: HashMap::new(),
             term_lru: Vec::new(),
-            no_resume_notified: HashSet::new(),
-            unresumable: HashSet::new(),
-            reclaim_notified: HashSet::new(),
-            turns: HashMap::new(),
             discovery: Discovery::default(),
-            usage: HashMap::new(),
         };
         workspace.bootstrap();
-        workspace.usage = workspace
-            .sessions
-            .iter()
-            .filter_map(|session| {
-                let usage = serde_json::from_str(session.usage.as_deref()?).ok()?;
-                Some((session.id, usage))
-            })
-            .collect();
         workspace.probe_missing(cx);
         workspace
     }
@@ -342,24 +271,6 @@ impl Workspace {
         .detach();
     }
 
-    /// A session's saved history, read from the store.
-    pub fn messages(&self, session_id: i64) -> Vec<Message> {
-        self.store.messages(session_id)
-    }
-
-    pub fn turn(&self, session_id: i64) -> Option<&Turn> {
-        self.turns.get(&session_id)
-    }
-
-    pub fn has_turn(&self, session_id: i64) -> bool {
-        self.turns.contains_key(&session_id)
-    }
-
-    /// The oldest permission prompt the session's agent is waiting on.
-    pub fn pending_permission(&self, session_id: i64) -> Option<&PendingPermission> {
-        self.turn(session_id)?.pending_permission()
-    }
-
     /// What each agent offers in general, and which probes are out.
     pub fn discovery(&self) -> &Discovery {
         &self.discovery
@@ -380,28 +291,8 @@ impl Workspace {
     }
 
     /// Start a shell session in `project_id`, or in the first project when
-    /// none is given, returning its id. The home pane is a terminal, so a
-    /// new session is a login shell until the user opens an agent TUI.
+    /// none is given, returning its id.
     pub fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) -> Option<i64> {
-        self.new_shell_session(project_id, cx)
-    }
-
-    /// Start a pure shell session in `project_id` (or the first project).
-    pub fn new_shell_session(
-        &mut self,
-        project_id: Option<i64>,
-        cx: &mut Context<Self>,
-    ) -> Option<i64> {
-        self.insert_session(project_id, crate::term::SHELL, "终端", cx)
-    }
-
-    fn insert_session(
-        &mut self,
-        project_id: Option<i64>,
-        agent: &str,
-        title_prefix: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<i64> {
         let project_id = match project_id.or_else(|| self.projects.first().map(|p| p.id)) {
             Some(id) => id,
             None => self
@@ -418,7 +309,7 @@ impl Workspace {
         let n = self.sessions.len() + 1;
         let id = self
             .store
-            .insert_session(project_id, agent, &format!("{title_prefix} {n}"), &cwd)
+            .insert_session(project_id, crate::term::SHELL, &format!("终端 {n}"), &cwd)
             .ok()?;
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
@@ -428,126 +319,24 @@ impl Workspace {
     /// Apply the name the user chose. It is marked as theirs, which is what
     /// keeps a title generated later from replacing it.
     pub fn rename_session(&mut self, session_id: i64, title: String, cx: &mut Context<Self>) {
-        self.store.rename_session(session_id, &title).ok();
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.title = title;
-            session.title_manual = true;
-        }
+        self.store
+            .rename_session(session_id, &title)
+            .ok();
+        self.refresh();
         cx.emit(WorkspaceEvent::Changed);
     }
 
-    /// Take a title generated for the session — kumu's fallback from the first
-    /// message, or the agent's own.
-    ///
-    /// The store decides whether it may replace the current name, and a name the
-    /// user chose wins; the in-memory list follows that verdict rather than
-    /// deciding for itself, so the two cannot drift apart.
-    fn apply_generated_title(&mut self, session_id: i64, title: &str) {
-        if !self
-            .store
-            .update_session_title(session_id, title)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.title = title.to_string();
-        }
-    }
-
-    /// Delete a session: settle anything it was waiting on, drop its live
-    /// connection (which tears down the agent subprocess), forget its turn, then
-    /// remove the row and its history.
+    /// Delete a session: drop its live terminal, then remove the row.
     ///
     /// Returns the neighbor to select next — computed before the row is gone —
     /// so a caller that was looking at this session can land somewhere else.
     pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<i64> {
         let next = neighbor_session(&self.sessions, session_id);
-        self.cancel_pending_permissions(session_id);
         self.forget_terminal(session_id);
-        self.forget_connection(session_id);
-        self.no_resume_notified.remove(&session_id);
-        self.unresumable.remove(&session_id);
-        self.reclaim_notified.remove(&session_id);
-        self.usage.remove(&session_id);
-        self.take_turn(session_id, cx);
         self.store.delete_session(session_id).ok();
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
         next
-    }
-
-    /// Record that a session's connection was used just now, so a later
-    /// reclamation keeps the most recently used ones. The only writer is
-    /// [`Self::ensure_connection`], which is the only place a connection is
-    /// opened or reused.
-    fn touch_connection(&mut self, session_id: i64) {
-        self.conn_lru.retain(|&id| id != session_id);
-        self.conn_lru.push(session_id);
-    }
-
-    /// Drop the session's live connection handle — which tears down its agent
-    /// subprocess — and forget its place in the reclamation order.
-    fn forget_connection(&mut self, session_id: i64) {
-        self.conns.remove(&session_id);
-        self.conn_lru.retain(|&id| id != session_id);
-    }
-
-    /// Close the least recently used idle connections once more than
-    /// [`MAX_LIVE_CONNECTIONS`] are open, so agent subprocesses do not
-    /// accumulate for the life of the app.
-    ///
-    /// A session with a turn in flight is never closed — its agent is running —
-    /// and neither is `active`, the session the caller is acting on: the one
-    /// being prompted, or the one whose turn just ended. A session whose agent
-    /// cannot load it back is never closed either: dropping its connection
-    /// would lose the conversation for good, not merely park it.
-    ///
-    /// A reclaimed session reconnects on its next prompt and resumes its
-    /// agent-side context from the stored `resume_id`. "Idle" here means only
-    /// that no turn is running; the agent process may still be holding things a
-    /// turn left behind — a background task it started, a session-scoped
-    /// approval — and those are lost with it, so the reclaim is announced.
-    fn reclaim_idle_connections(&mut self, active: i64, cx: &mut Context<Self>) {
-        let conns = &self.conns;
-        self.conn_lru.retain(|id| conns.contains_key(id));
-        let busy: HashSet<i64> = self.turns.keys().copied().collect();
-        let evictions = idle_evictions(
-            &self.conn_lru,
-            &busy,
-            &self.unresumable,
-            active,
-            MAX_LIVE_CONNECTIONS,
-        );
-        if evictions.is_empty() {
-            return;
-        }
-        for session_id in evictions {
-            self.cancel_pending_permissions(session_id);
-            self.forget_connection(session_id);
-            // What the agent was holding between turns goes with the process,
-            // and the user is not looking at this session, so say so — once,
-            // rather than writing the notice into the conversation on every
-            // reclaim.
-            if self.reclaim_notified.insert(session_id) {
-                self.system_message(
-                    session_id,
-                    format!(
-                        "连接已回收：同时连接的会话超过 {MAX_LIVE_CONNECTIONS} 个，已关闭这个会话的 \
-                         agent 进程以释放资源。下次发消息会重新连接并恢复上下文；agent 进程中的后台任务\
-                         和本会话内的授权不会恢复。"
-                    ),
-                    cx,
-                );
-            }
-        }
-        cx.emit(WorkspaceEvent::Changed);
-    }
-
-    /// Persist and show a system notice (unsupported agent, agent error…).
-    fn system_message(&mut self, session_id: i64, text: String, cx: &mut Context<Self>) {
-        self.store.insert_message(session_id, "system", &text).ok();
-        cx.emit(WorkspaceEvent::HistoryChanged(session_id));
     }
 
     /// Probe the agents nothing is known about yet — never probed, or probed
@@ -560,10 +349,6 @@ impl Workspace {
 
     /// Probe `agents` again, replacing what is cached as the answers arrive.
     /// An agent whose probe is already out is left to that one.
-    ///
-    /// This is the only way to refresh a catalog mid-run: an agent that was
-    /// updated, restarted, or pointed at another account is otherwise cached
-    /// for the life of the process.
     pub fn probe(&mut self, agents: &[&'static str], cx: &mut Context<Self>) {
         let launchable: Vec<(&'static str, agent::Config)> = agents
             .iter()
@@ -646,34 +431,6 @@ pub(crate) fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
         .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
 }
 
-/// Which idle connections to close to get back down to `cap`, least recently
-/// used first.
-///
-/// `order` is the reclamation order, least recently used first. The session
-/// being prompted (`active`), any session with a turn in flight (`busy`), and
-/// any session whose agent cannot load it back (`unresumable`) are skipped:
-/// their agent is not something to stop — and for the last, closing it would
-/// lose the conversation rather than park it.
-fn idle_evictions(
-    order: &[i64],
-    busy: &HashSet<i64>,
-    unresumable: &HashSet<i64>,
-    active: i64,
-    cap: usize,
-) -> Vec<i64> {
-    let mut evictions = Vec::new();
-    for &session_id in order {
-        if order.len() - evictions.len() <= cap {
-            break;
-        }
-        if session_id == active || busy.contains(&session_id) || unresumable.contains(&session_id) {
-            continue;
-        }
-        evictions.push(session_id);
-    }
-    evictions
-}
-
 /// Which running terminals to stop so one more fits under `cap`, least
 /// recently shown first. `order` does not include the session about to start.
 fn terminal_evictions(order: &[i64], cap: usize) -> Vec<i64> {
@@ -689,11 +446,7 @@ fn terminal_evictions(order: &[i64], cap: usize) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
-    use super::{
-        ProjectPick, idle_evictions, neighbor_session, resolve_project_pick, terminal_evictions,
-    };
+    use super::{ProjectPick, neighbor_session, resolve_project_pick, terminal_evictions};
     use crate::db::{Project, Session};
 
     fn project(id: i64, path: &str) -> Project {
@@ -792,53 +545,6 @@ mod tests {
             ProjectPick::New {
                 name: "/".to_string()
             }
-        );
-    }
-
-    /// Nothing is closed while the open connections are within the cap.
-    #[test]
-    fn nothing_is_evicted_under_the_cap() {
-        assert!(idle_evictions(&[1, 2], &HashSet::new(), &HashSet::new(), 2, 3).is_empty());
-        assert!(idle_evictions(&[1, 2, 3], &HashSet::new(), &HashSet::new(), 3, 3).is_empty());
-    }
-
-    /// Over the cap the least recently used connections go first.
-    #[test]
-    fn the_least_recently_used_idle_connections_are_evicted() {
-        assert_eq!(
-            idle_evictions(&[1, 2, 3, 4, 5], &HashSet::new(), &HashSet::new(), 5, 3),
-            vec![1, 2]
-        );
-    }
-
-    /// The session being prompted is kept even when it is the oldest.
-    #[test]
-    fn the_active_session_is_never_evicted() {
-        assert_eq!(
-            idle_evictions(&[1, 2, 3, 4], &HashSet::new(), &HashSet::new(), 1, 3),
-            vec![2]
-        );
-    }
-
-    /// A session with a turn in flight is skipped: its agent is running and
-    /// must not be stopped to make room.
-    #[test]
-    fn a_busy_session_is_never_evicted() {
-        let busy = HashSet::from([1_i64]);
-        assert_eq!(
-            idle_evictions(&[1, 2, 3, 4], &busy, &HashSet::new(), 4, 3),
-            vec![2]
-        );
-    }
-
-    /// A session whose agent cannot load it back is skipped too: closing its
-    /// connection would strand the conversation rather than let it reconnect.
-    #[test]
-    fn a_session_that_cannot_be_resumed_is_never_evicted() {
-        let unresumable = HashSet::from([1_i64]);
-        assert_eq!(
-            idle_evictions(&[1, 2, 3, 4], &HashSet::new(), &unresumable, 4, 3),
-            vec![2]
         );
     }
 }

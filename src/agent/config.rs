@@ -29,23 +29,8 @@ pub enum Backend {
     Opencode,
 }
 
-/// The session's saved selections and backend restore cursor.
-///
-/// They live here as well as on the command channel because a backend may need
-/// them at launch. Claude Code takes its model, effort and permission mode on
-/// the command line; ACP and Codex apply theirs after the handshake and ignore
-/// these. Sandbox policies are absent on purpose: no backend takes one at
-/// launch — Codex's is sent as a command, and Claude's lives in its own settings.
-#[derive(Clone, Default, Debug)]
-pub struct SessionPicks {
-    pub model: Option<String>,
-    pub mode: Option<String>,
-    pub reasoning: Option<String>,
-    /// Backend-owned restore cursor; its format never reaches UI logic.
-    pub resume_id: Option<String>,
-}
-
-/// How to launch the local agent subprocess.
+/// How to launch a local agent subprocess for probing (and the argv shape
+/// interactive TUIs share their binary with).
 pub struct Config {
     /// Static registry id this config was built for (used in events).
     pub agent: &'static str,
@@ -54,33 +39,9 @@ pub struct Config {
     pub args: Vec<String>,
     /// Extra env vars applied on top of the inherited environment.
     pub env: Vec<(String, String)>,
-    /// If set, send this prompt automatically once the session is ready.
-    pub auto_prompt: Option<String>,
-    /// The session's stored selections and restore cursor, empty until
-    /// [`Config::with_session`] is called.
-    pub session: SessionPicks,
 }
 
 impl Config {
-    /// Fold a session's stored picks into this launch config.
-    ///
-    /// Only Claude Code needs them on the command line; ACP and Codex take their
-    /// axes over the command channel after the handshake, so for them this only
-    /// records what the session was opened with.
-    ///
-    /// Nothing is sent for an axis the user has not chosen: an unset value means
-    /// the agent's own configuration decides, which is never kumu's to override.
-    pub fn with_session(mut self, session: SessionPicks) -> Self {
-        if matches!(self.backend, Backend::Claude) {
-            self.args.extend(super::claude::session_args(&session));
-            if let Some(id) = &session.resume_id {
-                self.args.extend(["--resume".to_string(), id.clone()]);
-            }
-        }
-        self.session = session;
-        self
-    }
-
     /// Build the config for a known agent id from the static registry.
     pub fn for_agent(id: &'static str) -> Option<Self> {
         match id {
@@ -108,8 +69,6 @@ impl Config {
             command: opencode_bin(),
             args: Vec::new(),
             env,
-            auto_prompt: auto_prompt_env(),
-            session: SessionPicks::default(),
         }
     }
 
@@ -121,8 +80,6 @@ impl Config {
             command: omp_bin(),
             args: vec!["acp".to_string()],
             env: Vec::new(),
-            auto_prompt: auto_prompt_env(),
-            session: SessionPicks::default(),
         }
     }
 
@@ -136,31 +93,13 @@ impl Config {
             command: codex_bin(),
             args: vec!["app-server".to_string()],
             env: Vec::new(),
-            auto_prompt: auto_prompt_env(),
-            session: SessionPicks::default(),
         }
     }
 
     /// `claude -p` speaking newline-delimited JSON in both directions.
     ///
-    /// One process per session, like the other backends: the flag combination
-    /// below keeps a single conversation alive across prompts rather than
-    /// answering one and exiting. `--verbose` is required by `claude` itself
-    /// alongside `stream-json`.
-    ///
-    /// `--include-partial-messages` is what makes a reply stream token by token
-    /// instead of arriving block by block, and `--permission-prompt-tool stdio`
-    /// is what makes the CLI ask *kumu* about a tool call — without it the very
-    /// same request comes back as a denial. Both were checked against claude
-    /// 2.1.269; see `schema/claude-stream-json/2.1.269/README.md`.
-    ///
-    /// Two flags are deliberately not passed. `--bare` is out because it stops
-    /// Claude Code reading OAuth credentials or the system keychain, which
-    /// would break a Pro/Max subscription login; and no `--permission-mode` or
-    /// `--model` is forced here — those arrive only through
-    /// [`Config::with_session`], so an untouched session inherits the user's own
-    /// Claude Code configuration instead of having kumu's defaults imposed on
-    /// it.
+    /// Used by the settings probe. `--verbose` is required by `claude` itself
+    /// alongside `stream-json`. See `schema/claude-stream-json/2.1.269/README.md`.
     fn claude(agent: &'static str) -> Self {
         Self {
             agent,
@@ -178,28 +117,13 @@ impl Config {
                 "stdio".to_string(),
             ],
             env: Vec::new(),
-            auto_prompt: auto_prompt_env(),
-            session: SessionPicks::default(),
         }
     }
 
     /// `pi --mode rpc`, Pi's own embedding protocol.
     ///
-    /// One process per session, like the other backends: RPC mode exists so an
-    /// external client can drive Pi through a whole conversation rather than a
-    /// single print-mode turn, and the process holds it across prompts.
-    ///
-    /// `--approve` stands in for an access posture Pi does not have. Pi has no
-    /// permission system — nothing asks, and nothing could be answered if it
-    /// did — so `--approve` is what lets it read the project's own files; there
-    /// is no supervised mode to degrade to, which is why kumu offers no access
-    /// axis for this agent at all.
-    ///
-    /// No env is injected: Pi resolves its own credentials, so the user's own
-    /// `pi auth` is what authenticates it. Its startup update check is not
-    /// suppressed either — 0.85.1 advertises `--offline` for that rather than
-    /// the `PI_SKIP_VERSION_CHECK` variable older builds honoured, and the check
-    /// does not sit in front of the RPC loop either way.
+    /// `--approve` lets the probe read the project's files; Pi has no
+    /// permission system of its own.
     fn pi(agent: &'static str) -> Self {
         Self {
             agent,
@@ -211,16 +135,8 @@ impl Config {
                 "--approve".to_string(),
             ],
             env: Vec::new(),
-            auto_prompt: auto_prompt_env(),
-            session: SessionPicks::default(),
         }
     }
-}
-
-fn auto_prompt_env() -> Option<String> {
-    std::env::var("KUMU_AUTO_PROMPT")
-        .ok()
-        .filter(|s| !s.is_empty())
 }
 
 /// The interactive TUI for an agent: the program itself, with no protocol

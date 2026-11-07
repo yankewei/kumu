@@ -1,22 +1,12 @@
-//! The Codex backend: OpenAI Codex's `app-server` JSON-RPC over stdio.
-//!
-//! A separate protocol from ACP, but the same contract with the rest of kumu:
-//! it produces [`Event`]s, consumes [`Cmd`]s, and answers approvals through the
-//! shared permission table, so nothing above `backend` knows which agent is
-//! talking.
+//! The Codex adapter: `app-server` JSON-RPC over stdio, used for settings probes.
 //!
 //! Layout:
 //!   - `protocol`  — the hand-written slice of the app-server schema we read;
-//!   - `transport` — the wire: newline-delimited JSON over the child's stdio;
-//!   - `convert`   — protocol -> app translation, where protocol types stop;
-//!   - `session`   — handshake, the single thread, and the command loop;
+//!   - `transport` — newline-delimited JSON over the child's stdio;
+//!   - `convert`   — protocol -> app translation;
 //!   - `probe`     — model and skill discovery (`model/list`, `skills/list`).
-//!
-//! [`Event`]: crate::agent::Event
-//! [`Cmd`]: crate::agent::Cmd
 
 pub(super) mod probe;
-pub(super) mod session;
 
 mod convert;
 mod protocol;

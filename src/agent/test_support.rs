@@ -1,5 +1,5 @@
-//! Test-only helpers shared by the end-to-end agent tests in `probe` and
-//! `session`, which both drive a real local agent binary.
+//! Test-only helpers shared by the end-to-end agent tests in `probe`, which
+//! drive a real local agent binary.
 //!
 //! Those tests are `#[ignore]`d. Driving a real agent reaches a service with the
 //! machine's own credentials, spends the user's quota, and writes history into

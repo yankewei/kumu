@@ -1,29 +1,22 @@
-//! The contract every backend's session loop implements.
+//! Shared shapes every protocol probe fills in the same way.
 //!
-//! Four protocols arrive at the same handful of shapes, and each one used to
-//! carry its own copy: the twelve-field options event, the order a settled turn
-//! is reported in, the permission round trip, and what teardown releases. Those
-//! live here so a convention is stated once instead of being cross-referenced
-//! between protocol modules by comment.
-//!
-//! What deliberately does *not* live here is everything the protocols really do
-//! differently: the transport, the handshake, and how a turn is waited on (ACP
-//! awaits its prompt, Codex and Claude park on a `turn_done` oneshot, Pi follows
-//! an event stream). Those stay in the module that owns them.
+//! The live session loops are gone; what remains is the options event builder
+//! probes use so Settings can show model catalogues without knowing which
+//! agent produced them.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use super::event::{AccessInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo};
 
-use super::connection::{PermissionTable, WeakPermissions};
-use super::event::{AccessInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo, emit};
+/// The stop reason that marks a turn the user cancelled.
+///
+/// Still used by protocol translators that map agent-specific abort words onto
+/// one spelling for Settings probes and leftover convert helpers.
+pub(super) const CANCELLED: &str = "cancelled";
 
-/// Assembles [`Event::SessionOptions`], whose twelve fields are the same for
-/// every agent; only the source of each list differs.
+/// Assembles [`Event::SessionOptions`], whose fields are the same for every
+/// agent; only the source of each list differs.
 ///
 /// Every axis starts empty, which is the established way to say "this agent has
-/// no such axis". A backend fills in only the axes it actually has, and saying
-/// nothing about an axis is how it reports not having one.
+/// no such axis". A probe fills in only the axes it actually has.
 pub(super) struct SessionOptionsBuilder {
     agent: &'static str,
     models: Vec<ModelInfo>,
@@ -99,97 +92,5 @@ impl SessionOptionsBuilder {
             reasoning: self.reasoning,
             current_reasoning: self.current_reasoning,
         }
-    }
-}
-
-/// The stop reason that marks a turn the user cancelled.
-///
-/// Every protocol has its own word for the same thing — ACP's
-/// `StopReason::Cancelled`, Codex's `interrupted`, Pi's `aborted` — and the UI
-/// must not have to know which agent it is talking to, so each backend reports
-/// this spelling instead of its own.
-pub(super) const CANCELLED: &str = "cancelled";
-
-/// The channel the UI asks for the turn in flight to be cancelled on.
-///
-/// Out of band, for the same reason permission answers are (see
-/// `super::connection`): the command loop is parked on the very turn being
-/// cancelled, so a command would not be read until that turn had already ended
-/// — which is the one moment a cancel is useless.
-pub(super) type CancelRequests = tokio::sync::mpsc::UnboundedReceiver<()>;
-
-/// Drop cancel requests that arrived after their turn had ended.
-///
-/// A cancel is only meaningful while a turn is open, and the UI cannot click
-/// pause once it is not; this only covers the race between the click and the
-/// turn ending, so the request cannot settle the *next* turn by mistake.
-pub(super) fn forget_stale_cancels(cancels: &mut CancelRequests) {
-    while cancels.try_recv().is_ok() {}
-}
-
-/// What a settled turn reports, in the one order that is correct for every
-/// backend: `Done` first, then the failure — if there was one — second.
-///
-/// The UI persists a turn's blocks when it ends, and an error ends it too, so
-/// reporting a failure ahead of the settle would throw away everything that did
-/// stream before the run failed.
-pub(super) fn settle(stop: impl Into<String>, failure: Option<String>) -> Vec<Event> {
-    let mut events = vec![Event::Done(stop.into())];
-    if let Some(detail) = failure {
-        events.push(Event::Error(detail));
-    }
-    events
-}
-
-/// Which tool call the UI is asked about before it runs.
-pub(super) struct PermissionQuestion {
-    pub tool_call_id: String,
-}
-
-/// Hand one approval question to the UI, and let `answer` reply to the agent
-/// with whatever the user chose — `None` when nobody answered.
-///
-/// Each protocol answers in its own shape, so only the wiring is shared and the
-/// response is the caller's closure. The UI answers by taking the sender out of
-/// the same table, so the upgraded handle is released before the task below is
-/// spawned: it never crosses an await, and it does not hold up teardown.
-pub(super) fn ask_user<F>(
-    table: Arc<PermissionTable>,
-    next_id: &AtomicU64,
-    ev_tx: &Sender<Event>,
-    question: PermissionQuestion,
-    answer: F,
-) where
-    F: FnOnce(Option<String>) + Send + 'static,
-{
-    // The agent does not give us an id of our own to correlate on.
-    let request_id = format!("perm-{}", next_id.fetch_add(1, Ordering::Relaxed));
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    table.lock().unwrap().insert(request_id.clone(), tx);
-    drop(table);
-    emit(
-        ev_tx,
-        Event::PermissionRequest {
-            tool_call_id: question.tool_call_id,
-            request_id,
-        },
-    );
-    // Waiting for the user here would stall the dispatch loop and every other
-    // message on this connection, so the responder moves into its own task.
-    tokio::spawn(async move {
-        let option_id = rx.await.ok().flatten();
-        answer(option_id);
-    });
-}
-
-/// Wake anything still waiting on a decision, so the agent is never left hanging
-/// on a connection that is going away.
-///
-/// Dropping the pending senders is what does it: the waiting task wakes with no
-/// answer and replies with the protocol's own "nobody replied" outcome. When the
-/// UI already dropped its handle the table is gone, and this is unnecessary.
-pub(super) fn release_pending_permissions(permissions: &WeakPermissions) {
-    if let Some(table) = permissions.upgrade() {
-        table.lock().unwrap().clear();
     }
 }

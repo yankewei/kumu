@@ -1,5 +1,5 @@
 # AGENTS.md
-A client that drives multiple local coding agents, each over its own protocol, behind one backend layer.
+A client that drives multiple local coding agents, each over its own protocol, behind one agent layer.
 
 ## Tech stack
 - gpui-kit, the entire UI: GPUI rendering engine (wgpu drawing, text layout), declarative element tree, component library (Button/Input/Switch/TitleBar/Root), theme system (ThemeRegistry + semantic tokens), multi-window management. Hover labels on app elements go through an overlay of the app's own (src/ui/tooltip.rs, mounted by src/ui/layers.rs::`window_layers`) because the one `Root` mounts is crate-private — the tooltip surface and the overlay are both public API, the trait that asks the overlay for a tooltip is not

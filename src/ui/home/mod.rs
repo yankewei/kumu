@@ -1,21 +1,13 @@
 //! Home window: projects → sessions tree on the left, the selected session's
 //! terminal on the right. Owns the settings window handle.
 
-mod conversation;
-mod markdown_mermaid;
-mod mermaid_viewer;
 mod sidebar;
 mod sprites;
 mod terminal;
 
-// Shared column width for the conversation history.
-const CONTENT_MAX_REM: f32 = 44.;
-const CONTENT_MIN_REM: f32 = 24.;
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use self::conversation::ConversationView;
 use super::SettingsWindow;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::db::Session;
@@ -23,7 +15,7 @@ use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Input, InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -36,12 +28,6 @@ pub struct KumuApp {
     selected: Option<i64>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
-    /// The selected session's history and every session's live turn. Its own
-    /// entity so streaming and animation repaint that column alone.
-    conversation: Entity<ConversationView>,
-    /// The chat input's text. The terminal is the visible pane now, but the
-    /// send path still reads this, so a composer can return without rewiring.
-    input_state: Entity<TextareaState>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
     /// Native-agent TUI for the selected session.
@@ -52,9 +38,8 @@ impl KumuApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(Workspace::new);
         let terminal_workspace = workspace.clone();
-        // Only what the home view itself draws: a streamed chunk is the
-        // conversation's alone, and repainting the whole window per chunk is
-        // what used to make it stutter. A terminal frame is the pane's own.
+        // Only what the home view itself draws. A terminal frame is the pane's
+        // own, subscribed inside [`TerminalView`].
         cx.subscribe(&workspace, |this, _, ev, cx| {
             match ev {
                 WorkspaceEvent::Changed => cx.notify(),
@@ -66,30 +51,13 @@ impl KumuApp {
         })
         .detach();
         let mut app = Self {
-            conversation: cx.new(|cx| ConversationView::new(workspace.clone(), cx)),
             workspace,
             settings_window: None,
             selected: None,
             collapsed_projects: HashSet::new(),
-            input_state: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .auto_grow(1, 6)
-                    .placeholder("输入消息…")
-                    // Chat composer semantics: plain Enter sends, Shift+Enter
-                    // inserts a newline (the textarea handles the newline).
-                    .submit_on_enter(true)
-            }),
             tooltips: cx.new(|cx| Tooltips::new(cx)),
             terminal: cx.new(|cx| terminal::TerminalView::new(terminal_workspace, window, cx)),
         };
-        // Enter in the chat input sends the prompt (Shift+Enter newline is
-        // handled by the textarea itself via submit_on_enter).
-        cx.subscribe_in(&app.input_state, window, |this, _, ev, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                this.send(window, cx);
-            }
-        })
-        .detach();
         if let Some(first) = app.workspace.read(cx).sessions().first().map(|s| s.id) {
             app.select_session(first, cx);
             app.focus_terminal(window, cx);
@@ -101,10 +69,6 @@ impl KumuApp {
         self.selected = Some(id);
         self.terminal
             .update(cx, |terminal, cx| terminal.show(id, cx));
-        let messages = self.workspace.read(cx).messages(id);
-        self.conversation.update(cx, |conversation, cx| {
-            conversation.show(Some(id), &messages, cx)
-        });
     }
 
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -117,16 +81,6 @@ impl KumuApp {
         let id = self
             .workspace
             .update(cx, |workspace, cx| workspace.new_session(project_id, cx));
-        if let Some(id) = id {
-            self.select_session(id, cx);
-        }
-    }
-
-    /// Start a pure shell session — in `project_id`, or the first project — and show it.
-    fn new_shell_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
-        let id = self.workspace.update(cx, |workspace, cx| {
-            workspace.new_shell_session(project_id, cx)
-        });
         if let Some(id) = id {
             self.select_session(id, cx);
         }
@@ -263,37 +217,10 @@ impl KumuApp {
                 None => {
                     self.selected = None;
                     self.terminal.update(cx, |terminal, cx| terminal.clear(cx));
-                    self.conversation
-                        .update(cx, |conversation, cx| conversation.show(None, &[], cx));
                 }
             }
         }
         cx.notify();
-    }
-
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.selected_session(cx) else {
-            return;
-        };
-        let text = self.input_state.read(cx).value().to_string();
-        let sent = self.workspace.update(cx, |workspace, cx| {
-            workspace.send(session.id, &text, Vec::new(), cx)
-        });
-        if !sent {
-            return;
-        }
-        self.conversation
-            .update(cx, |conversation, cx| conversation.scroll_to_end(cx));
-        self.input_state
-            .update(cx, |state, cx| state.set_value("", window, cx));
-    }
-
-    /// Whether any tool call in this session is still waiting on the user.
-    fn has_pending_permission(&self, session_id: i64, cx: &App) -> bool {
-        self.workspace
-            .read(cx)
-            .pending_permission(session_id)
-            .is_some()
     }
 
     /// The session on screen, as the workspace has it now.
@@ -341,7 +268,6 @@ impl KumuApp {
                         .py_2()
                         .child(div().text_sm().font_medium().child(session.title.clone())),
                 )
-                // Native-agent TUI fills the pane; chat composer is gone.
                 .child(
                     self.terminal.clone().cached(
                         StyleRefinement::default()
@@ -359,23 +285,14 @@ impl KumuApp {
                 .text_color(theme.muted_foreground)
                 .child(div().text_sm().child("还没有会话"))
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .child(Button::new("empty-new").ghost().label("新建会话").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.new_session(None, cx);
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            Button::new("empty-new-shell")
-                                .ghost()
-                                .label("新建终端")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.new_shell_session(None, cx);
-                                    cx.notify();
-                                })),
-                        ),
+                    Button::new("empty-new")
+                        .ghost()
+                        .label("新建终端")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_session(None, cx);
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        })),
                 ),
         };
 
@@ -406,4 +323,3 @@ impl Render for KumuApp {
         self.render_home(window, cx)
     }
 }
-

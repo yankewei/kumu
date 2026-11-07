@@ -199,8 +199,6 @@ mod tests {
                 command: "/nonexistent/kumu-agent-test".into(),
                 args: vec![],
                 env: vec![],
-                auto_prompt: None,
-                session: Default::default(),
             },
             tx,
         );

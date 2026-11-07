@@ -12,7 +12,7 @@ use crate::agent::config::Config;
 use crate::agent::event::{Event, emit};
 use crate::agent::probe::run;
 
-use super::session::load_catalog;
+use super::catalog::load_catalog;
 use super::transport::Server;
 
 /// Probe a local `opencode` far enough to read its catalogue, then report it.

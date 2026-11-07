@@ -2,30 +2,25 @@
 
 ## What it is
 
-A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → conversation). Built on GPUI (gpui-kit), with sessions and messages stored in local SQLite (`~/.kumu/kumu.db`).
+A macOS desktop shell for local coding agents: manage sessions of multiple local agents in one window (projects → session tree → each session's native TUI). Built on GPUI (gpui-kit), with projects and sessions stored in local SQLite (`~/.kumu/kumu.db`).
 
-Each agent is driven over its own protocol on a stdio subprocess — [Agent Client Protocol](https://agentclientprotocol.com/) for Oh My Pi (`omp`), opencode's own v2 API (a private `opencode serve` per session, on a local port) for opencode, `codex app-server` for Codex, `claude -p` stream-json for Claude Code, and `pi --mode rpc` for Pi — behind one agent layer that reduces them all to the same events. Nothing above that layer knows which agent is talking.
+Each session pane runs that agent's interactive TUI (or a plain `$SHELL`) inside an embedded terminal. Settings → 编码 Agent probes which agents are installed; launch paths come from `src/agent/config.rs` (`interactive`). The same agent layer still owns protocol adapters (`acp/`, `codex/`, `claude/`, `pi/`, `opencode/`) used for discovery probes over each agent's headless transport.
 
-Two windows: Home (session tree + conversation) and Settings (providers/general, dark mode). A prompt streams the agent's thinking, tool calls and markdown reply into the conversation, and the composer picks the session's agent and model, along with whichever of reasoning effort, access, mode and sandbox that agent offers. Typing `@` in the composer references a project file or folder (written into the message as `@path`, for the agent to read itself). Images can be pasted, dropped or picked with the paperclip; they are copied into `~/.kumu/attachments/` and sent inline, or as a local path for Codex. ACP agents that do not advertise image input refuse such a message rather than drop the image. When an agent asks for authorization, the choices appear in a card above the composer and are never auto-approved; the answer is passed back as the agent's own option id, and the tool row records what was chosen.
+Two windows: Home (session tree + terminal pane) and Settings (providers/general, dark mode).
 
 ## Layout
 
 ```text
-UI (src/ui/) → App (src/app/) → Agent (src/agent/) ── stdio ── agent process
+UI (src/ui/) → App (src/app/) → Agent (src/agent/) + Term (src/term/)
                      └──────→ Store (src/db.rs, SQLite)
 ```
 
-- `src/agent/` — the agent registry, one backend per protocol, and the `Event`/`Cmd` vocabulary they all speak. It knows nothing of the app, the store or the UI.
-- `src/app/` — the `Workspace` entity: projects, sessions, each session's connection and live turn, permission decisions, picks, and what each agent offers (probed once, shared by both windows). It tells the views what changed through `WorkspaceEvent`s, so a streamed chunk repaints only the conversation.
-- `src/ui/` — drawing and interaction only: selection, expansion, input, and the render caches (parsed markdown) for what the workspace holds.
+- `src/agent/` — the agent registry, interactive launch helpers, protocol adapters for probes, and the `Event`/`Cmd` vocabulary. It knows nothing of the app, the store or the UI.
+- `src/app/` — the `Workspace` entity: projects, sessions, live terminals, and what each agent offers (probed once, shared by both windows). It tells the views what changed through `WorkspaceEvent`s.
+- `src/ui/` — drawing and interaction only: selection, expansion, and the terminal pane for what the workspace holds.
+- `src/term/` — PTY + VT for agent TUIs and shell sessions.
 
-Adding an agent that speaks an existing protocol is an entry in `src/agent/registry.rs` plus a launch builder in `src/agent/config.rs`; a new protocol is a backend under `src/agent/`, and the exhaustive `Backend` matches list where to wire it in.
-
-## Session recovery
-
-Kumu saves each agent's restore cursor alongside the local conversation. After restarting the app or reconnecting, sending the next message reopens that agent conversation before starting a new turn: Codex uses `thread/resume`, Claude Code uses `--resume`, Pi loads its saved session file, opencode reopens its session by id (the ids it gave sessions over ACP still work), and ACP agents use `session/load` when they advertise support. The existing local messages stay visible without duplicating ACP's history replay. Recovery restores context; it does not restart an interrupted command.
-
-The agent's own session storage must still exist. If recovery fails or the current ACP agent does not support loading, Kumu reports the failure and does not send the prompt into a fresh conversation. Create a new Kumu session to start over. Conversations created before restore cursors were saved cannot recover their original agent context; Kumu shows a notice when starting a new agent conversation for that history. The SQLite schema upgrades automatically without removing messages.
+Adding an agent that speaks an existing protocol is an entry in `src/agent/registry.rs` plus a launch builder in `src/agent/config.rs`; a new protocol is an adapter module under `src/agent/`, wired into `Config`, `spawn`, and `probe`.
 
 ## Installation
 
@@ -37,7 +32,7 @@ cd kumu
 cargo run
 ```
 
-A new session starts on `omp`; pick another agent (and its model) from the composer's model chip before the first message. Settings → 编码 Agent shows which agents were found and re-probes them.
+A new session opens a login shell in the project folder. Settings → 编码 Agent shows which agents were found and re-probes them.
 
 To run as a real macOS app — a bundle whose Dock icon survives quitting, and that can be launched from Finder or `/Applications` — build one:
 

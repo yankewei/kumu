@@ -249,8 +249,6 @@ mod tests {
                 command: "/nonexistent/kumu-claude-test".into(),
                 args: vec![],
                 env: vec![],
-                auto_prompt: None,
-                session: Default::default(),
             },
             tx,
         );
