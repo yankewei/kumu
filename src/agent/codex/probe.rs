@@ -150,7 +150,6 @@ mod tests {
                     commands_seen = true;
                 }
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
     }

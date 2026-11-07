@@ -37,8 +37,6 @@ mod session;
 mod test_support;
 
 pub use config::{Config, interactive};
-pub use event::{
-    Event, ImageAttachment, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo,
-};
+pub use event::{Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo};
 pub use probe::probe;
 pub use registry::AGENTS;

@@ -71,10 +71,18 @@ fn blocks(c: char) -> Option<(Vec<[f32; 4]>, f32)> {
     let r = |x0: f32, y0: f32, x1: f32, y1: f32| [x0, y0, x1, y1];
     let quads = |ul: bool, ur: bool, ll: bool, lr: bool| {
         let mut v = Vec::new();
-        if ul { v.push(r(0.0, 0.0, 0.5, 0.5)) }
-        if ur { v.push(r(0.5, 0.0, 1.0, 0.5)) }
-        if ll { v.push(r(0.0, 0.5, 0.5, 1.0)) }
-        if lr { v.push(r(0.5, 0.5, 1.0, 1.0)) }
+        if ul {
+            v.push(r(0.0, 0.0, 0.5, 0.5))
+        }
+        if ur {
+            v.push(r(0.5, 0.0, 1.0, 0.5))
+        }
+        if ll {
+            v.push(r(0.0, 0.5, 0.5, 1.0))
+        }
+        if lr {
+            v.push(r(0.5, 0.5, 1.0, 1.0))
+        }
         v
     };
     Some(match c {
@@ -148,7 +156,16 @@ fn braille(c: char, width: i32, height: i32) -> Option<Vec<[i32; 4]>> {
         dot += 1;
     }
     let mut rects = Vec::new();
-    for (bit, col, row) in [(0, 0, 0), (1, 0, 1), (2, 0, 2), (3, 1, 0), (4, 1, 1), (5, 1, 2), (6, 0, 3), (7, 1, 3)] {
+    for (bit, col, row) in [
+        (0, 0, 0),
+        (1, 0, 1),
+        (2, 0, 2),
+        (3, 1, 0),
+        (4, 1, 1),
+        (5, 1, 2),
+        (6, 0, 3),
+        (7, 1, 3),
+    ] {
         if (c as u32) & (1 << bit) != 0 {
             let x = xm + col * (dot + xs);
             let y = ((2 * row + 1) * height - 4 * dot + 4) / 8;
@@ -165,7 +182,13 @@ const RECORD: char = '\u{23FA}';
 pub fn is_sprite(text: &str) -> bool {
     let mut chars = text.chars();
     match (chars.next(), chars.next()) {
-        (Some(c), None) => lines(c).is_some() || blocks(c).is_some() || ('\u{2800}'..='\u{28FF}').contains(&c) || ('\u{E0B0}'..='\u{E0BF}').contains(&c) || c == RECORD,
+        (Some(c), None) => {
+            lines(c).is_some()
+                || blocks(c).is_some()
+                || ('\u{2800}'..='\u{28FF}').contains(&c)
+                || ('\u{E0B0}'..='\u{E0BF}').contains(&c)
+                || c == RECORD
+        }
         _ => false,
     }
 }
@@ -175,27 +198,49 @@ pub fn paint(text: &str, cell: Bounds<Pixels>, color: Hsla, window: &mut Window)
     let Some(c) = text.chars().next() else { return };
     let scale = window.scale_factor();
     let snap = |v: f32| (v * scale).round() / scale;
-    let (x, y, w, h) = (f32::from(cell.origin.x), f32::from(cell.origin.y), f32::from(cell.size.width), f32::from(cell.size.height));
+    let (x, y, w, h) = (
+        f32::from(cell.origin.x),
+        f32::from(cell.origin.y),
+        f32::from(cell.size.width),
+        f32::from(cell.size.height),
+    );
     let mut rect = |x0: f32, y0: f32, x1: f32, y1: f32, color: Hsla| {
         let (x0, y0, x1, y1) = (snap(x0), snap(y0), snap(x1), snap(y1));
         if x1 > x0 && y1 > y0 {
-            window.paint_quad(fill(Bounds::new(point(px(x0), px(y0)), size(px(x1 - x0), px(y1 - y0))), color));
+            window.paint_quad(fill(
+                Bounds::new(point(px(x0), px(y0)), size(px(x1 - x0), px(y1 - y0))),
+                color,
+            ));
         }
     };
 
     let (dx, dy) = ((x * scale).round(), (y * scale).round());
-    let (dw, dh) = (((x + w) * scale).round() - dx, ((y + h) * scale).round() - dy);
+    let (dw, dh) = (
+        ((x + w) * scale).round() - dx,
+        ((y + h) * scale).round() - dy,
+    );
     if let Some(dots) = braille(c, dw as i32, dh as i32) {
         for [x0, y0, x1, y1] in dots {
-            rect((dx + x0 as f32) / scale, (dy + y0 as f32) / scale,
-                (dx + x1 as f32) / scale, (dy + y1 as f32) / scale, color);
+            rect(
+                (dx + x0 as f32) / scale,
+                (dy + y0 as f32) / scale,
+                (dx + x1 as f32) / scale,
+                (dy + y1 as f32) / scale,
+                color,
+            );
         }
         return;
     }
     if c == RECORD {
         let d = snap((w * 0.62).min(h * 0.5));
         let (x0, y0) = (snap(x + (w - d) / 2.0), snap(y + (h - d) / 2.0));
-        window.paint_quad(fill(Bounds::new(point(px(x0), px(y0)), size(px(d), px(d))), color).corner_radii(px(d / 2.0)));
+        window.paint_quad(
+            fill(
+                Bounds::new(point(px(x0), px(y0)), size(px(d), px(d))),
+                color,
+            )
+            .corner_radii(px(d / 2.0)),
+        );
         return;
     }
     if ('\u{E0B0}'..='\u{E0BF}').contains(&c) {
@@ -226,7 +271,11 @@ pub fn paint(text: &str, cell: Bounds<Pixels>, color: Hsla, window: &mut Window)
         let mut path = PathBuilder::stroke(px(x1 - x0));
         path.move_to(point(px(cx), px(ey)));
         path.line_to(point(px(cx), px(cy + sy * r)));
-        path.cubic_bezier_to(point(px(cx + sx * r), px(cy)), point(px(cx), px(cy + sy * k * r)), point(px(cx + sx * k * r), px(cy)));
+        path.cubic_bezier_to(
+            point(px(cx + sx * r), px(cy)),
+            point(px(cx), px(cy + sy * k * r)),
+            point(px(cx + sx * k * r), px(cy)),
+        );
         path.line_to(point(px(ex), px(cy)));
         if let Ok(path) = path.build() {
             window.paint_path(path, color);
@@ -266,24 +315,48 @@ pub fn paint(text: &str, cell: Bounds<Pixels>, color: Hsla, window: &mut Window)
         }
     };
     // Arms: (direction, sign along the axis, horizontal?).
-    for (i, sign, horizontal) in [(0usize, -1.0f32, false), (1, 1.0, true), (2, 1.0, false), (3, -1.0, true)] {
+    for (i, sign, horizontal) in [
+        (0usize, -1.0f32, false),
+        (1, 1.0, true),
+        (2, 1.0, false),
+        (3, -1.0, true),
+    ] {
         let k = dirs[i];
         if k == 0 {
             continue;
         }
         // The crossing arms on each side of this arm (up/down for a horizontal arm).
-        let (side_a, side_b) = if horizontal { (dirs[0], dirs[2]) } else { (dirs[3], dirs[1]) };
-        let lines: Vec<(f32, f32, u8, u8)> = if k == 3 {
-            vec![(-light, light, side_a, side_b), (light, light, side_b, side_a)]
+        let (side_a, side_b) = if horizontal {
+            (dirs[0], dirs[2])
         } else {
-            let (a, b) = if side_a >= side_b { (side_a, side_b) } else { (side_b, side_a) };
+            (dirs[3], dirs[1])
+        };
+        let lines: Vec<(f32, f32, u8, u8)> = if k == 3 {
+            vec![
+                (-light, light, side_a, side_b),
+                (light, light, side_b, side_a),
+            ]
+        } else {
+            let (a, b) = if side_a >= side_b {
+                (side_a, side_b)
+            } else {
+                (side_b, side_a)
+            };
             vec![(0.0, thick(k), a, b)]
         };
         for (off, t, before, after) in lines {
             let near = start(before, after, k == 3);
-            let (c, edge) = if horizontal { (cx, if sign > 0.0 { x + w } else { x }) } else { (cy, if sign > 0.0 { y + h } else { y }) };
+            let (c, edge) = if horizontal {
+                (cx, if sign > 0.0 { x + w } else { x })
+            } else {
+                (cy, if sign > 0.0 { y + h } else { y })
+            };
             let from = c + sign * near;
-            let (a0, a1) = if sign > 0.0 { (from, edge) } else { (edge, from) };
+            let (a0, a1) = if sign > 0.0 {
+                (from, edge)
+            } else {
+                (edge, from)
+            };
             if horizontal {
                 rect(a0, cy + off - t / 2.0, a1, cy + off + t / 2.0, color);
             } else {
@@ -297,18 +370,36 @@ pub fn paint(text: &str, cell: Bounds<Pixels>, color: Hsla, window: &mut Window)
 /// slants, drawn to fill the cell exactly as Ghostty does. Fonts that have
 /// them rarely match the cell, and fonts that don't fall back to whatever
 /// font has those codes (on Linux, sometimes digits).
-fn powerline(c: char, (x, y, w, h): (f32, f32, f32, f32), line: f32, color: Hsla, window: &mut Window) {
+fn powerline(
+    c: char,
+    (x, y, w, h): (f32, f32, f32, f32),
+    line: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
     let solid = (c as u32).is_multiple_of(2);
     // A solid shape reaches a device pixel past its cell's sides, so its flat
     // edge meets the neighbor's color without an anti-aliased seam.
-    let ext = if solid { 1.0 / window.scale_factor() } else { 0.0 };
+    let ext = if solid {
+        1.0 / window.scale_factor()
+    } else {
+        0.0
+    };
     let p = |px_: f32, py_: f32| point(px(x + px_ * w + (px_ - 0.5) * 2.0 * ext), px(y + py_ * h));
-    let mut path = if solid { PathBuilder::fill() } else { PathBuilder::stroke(px(line)) };
+    let mut path = if solid {
+        PathBuilder::fill()
+    } else {
+        PathBuilder::stroke(px(line))
+    };
     // Half an ellipse filling the cell: four quarter arcs as cubics.
     const K: f32 = 0.552_284_8;
     match c {
-        '\u{E0B0}' | '\u{E0B1}' => path.add_polygon(&[p(0.0, 0.0), p(1.0, 0.5), p(0.0, 1.0)], solid),
-        '\u{E0B2}' | '\u{E0B3}' => path.add_polygon(&[p(1.0, 0.0), p(0.0, 0.5), p(1.0, 1.0)], solid),
+        '\u{E0B0}' | '\u{E0B1}' => {
+            path.add_polygon(&[p(0.0, 0.0), p(1.0, 0.5), p(0.0, 1.0)], solid)
+        }
+        '\u{E0B2}' | '\u{E0B3}' => {
+            path.add_polygon(&[p(1.0, 0.0), p(0.0, 0.5), p(1.0, 1.0)], solid)
+        }
         '\u{E0B4}' | '\u{E0B5}' => {
             path.move_to(p(0.0, 0.0));
             path.cubic_bezier_to(p(1.0, 0.5), p(K, 0.0), p(1.0, 0.5 - K / 2.0));
@@ -346,13 +437,25 @@ mod tests {
         assert!(!is_sprite("\u{27FF}") && !is_sprite("\u{2900}"));
         assert!(!is_sprite("⠁⠂") && !is_sprite("⠁\u{FE0F}"));
         assert_eq!(braille('A', 8, 22), None);
-        let positions = [(1, 2), (1, 7), (1, 13), (5, 2), (5, 7), (5, 13), (1, 18), (5, 18)];
+        let positions = [
+            (1, 2),
+            (1, 7),
+            (1, 13),
+            (5, 2),
+            (5, 7),
+            (5, 13),
+            (1, 18),
+            (5, 18),
+        ];
         for pattern in 0u32..256 {
             let c = char::from_u32(0x2800 + pattern).unwrap();
             assert!(is_sprite(&c.to_string()));
-            let expected: Vec<_> = positions.iter().enumerate()
+            let expected: Vec<_> = positions
+                .iter()
+                .enumerate()
                 .filter(|(bit, _)| pattern & (1 << bit) != 0)
-                .map(|(_, &(x, y))| [x, y, x + 2, y + 2]).collect();
+                .map(|(_, &(x, y))| [x, y, x + 2, y + 2])
+                .collect();
             assert_eq!(braille(c, 8, 22).unwrap(), expected);
         }
         for w in 0..80 {
@@ -363,8 +466,16 @@ mod tests {
                     assert_eq!(x1 - x0, y1 - y0);
                 }
                 let dots = braille('⡇', w, h).unwrap();
-                let gaps = [dots[1][1] - dots[0][1], dots[2][1] - dots[1][1], dots[3][1] - dots[2][1], h + dots[0][1] - dots[3][1]];
-                assert!(gaps.iter().max().unwrap() - gaps.iter().min().unwrap() <= 1, "{w}x{h}: {gaps:?}");
+                let gaps = [
+                    dots[1][1] - dots[0][1],
+                    dots[2][1] - dots[1][1],
+                    dots[3][1] - dots[2][1],
+                    h + dots[0][1] - dots[3][1],
+                ];
+                assert!(
+                    gaps.iter().max().unwrap() - gaps.iter().min().unwrap() <= 1,
+                    "{w}x{h}: {gaps:?}"
+                );
             }
         }
     }
@@ -396,7 +507,8 @@ mod tests {
         for c in ['╭', '╮', '╯', '╰'] {
             assert!(arc(c).is_some() && is_sprite(&c.to_string()), "{c}");
         }
-        for c in ['┄', '┅', '┆', '┇', '┈', '┉', '┊', '┋', '╌', '╍', '╎', '╏'] {
+        for c in ['┄', '┅', '┆', '┇', '┈', '┉', '┊', '┋', '╌', '╍', '╎', '╏']
+        {
             assert!(dashes(c).is_some() && is_sprite(&c.to_string()), "{c}");
         }
         assert_eq!(arc('┌'), None);

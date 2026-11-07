@@ -1,16 +1,19 @@
-//! Home window: projects → sessions tree on the left, the selected session's
-//! terminal on the right. Owns the settings window handle.
+//! Home window: projects → sessions tree on the left, a splitable pane tree of
+//! terminals on the right. Owns the settings window handle.
+//!
+//! A pane shows one session; splitting is layout only — sessions stay owned by
+//! their project.
 
+mod panes;
 mod sidebar;
 mod sprites;
 mod terminal;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::SettingsWindow;
 use crate::app::{Workspace, WorkspaceEvent};
-use crate::db::Session;
 use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
@@ -19,61 +22,191 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use panes::{PaneId, PaneNode};
+use terminal::{TerminalEvent, TerminalView};
 
 pub struct KumuApp {
     /// Projects, sessions and their live agents; the home view draws it and
     /// hands it every user action.
     workspace: Entity<Workspace>,
     settings_window: Option<WindowHandle<Root>>,
+    /// Session highlighted in the sidebar — the focused pane's session.
     selected: Option<i64>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
-    /// Native-agent TUI for the selected session.
-    terminal: Entity<terminal::TerminalView>,
+    /// Terminal views keyed by pane id.
+    panes: HashMap<PaneId, Entity<TerminalView>>,
+    /// How the content area is split.
+    layout: PaneNode,
+    /// Pane that receives sidebar selection and keyboard focus.
+    focused: PaneId,
+    /// Focus this pane's terminal on the next paint (after a split / select).
+    pending_focus: Option<PaneId>,
+    next_pane: u64,
+    next_group: u64,
 }
 
 impl KumuApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(Workspace::new);
-        let terminal_workspace = workspace.clone();
+        let tooltips = cx.new(|cx| Tooltips::new(cx));
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
-        cx.subscribe(&workspace, |this, _, ev, cx| {
-            match ev {
-                WorkspaceEvent::Changed => cx.notify(),
-                WorkspaceEvent::SessionClosed { id, next } => {
-                    this.on_session_closed(*id, *next, cx);
-                }
-                _ => {}
+        cx.subscribe(&workspace, |this, _, ev, cx| match ev {
+            WorkspaceEvent::Changed => cx.notify(),
+            WorkspaceEvent::SessionClosed { id, next } => {
+                this.on_session_closed(*id, *next, cx);
             }
+            _ => {}
         })
         .detach();
+
+        let pane = PaneId(1);
+        let terminal =
+            cx.new(|cx| TerminalView::new(pane, workspace.clone(), tooltips.clone(), cx));
+        cx.subscribe(&terminal, move |this, _, ev, cx| {
+            this.on_terminal_event(pane, ev, cx);
+        })
+        .detach();
+
         let mut app = Self {
             workspace,
             settings_window: None,
             selected: None,
             collapsed_projects: HashSet::new(),
-            tooltips: cx.new(|cx| Tooltips::new(cx)),
-            terminal: cx.new(|cx| terminal::TerminalView::new(terminal_workspace, window, cx)),
+            tooltips,
+            panes: HashMap::from([(pane, terminal)]),
+            layout: PaneNode::leaf(pane),
+            focused: pane,
+            pending_focus: None,
+            next_pane: 2,
+            next_group: 1,
         };
         if let Some(first) = app.workspace.read(cx).sessions().first().map(|s| s.id) {
             app.select_session(first, cx);
             app.focus_terminal(window, cx);
         }
+        app.sync_pane_chrome(cx);
         app
     }
 
-    fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.selected = Some(id);
-        self.terminal
-            .update(cx, |terminal, cx| terminal.show(id, cx));
+    fn on_terminal_event(&mut self, pane: PaneId, ev: &TerminalEvent, cx: &mut Context<Self>) {
+        match ev {
+            TerminalEvent::Activated => self.focus_pane(pane, cx),
+            TerminalEvent::SplitRight => self.split_pane(pane, Axis::Horizontal, cx),
+            TerminalEvent::SplitDown => self.split_pane(pane, Axis::Vertical, cx),
+            TerminalEvent::Close => self.close_pane(pane, cx),
+        }
+    }
+
+    fn focus_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if !self.panes.contains_key(&pane) {
+            return;
+        }
+        self.focused = pane;
+        self.selected = self.panes.get(&pane).and_then(|t| t.read(cx).session_id());
+        self.sync_pane_chrome(cx);
+        cx.notify();
     }
 
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.terminal
-            .update(cx, |terminal, cx| terminal.focus(window, cx));
+        if let Some(terminal) = self.panes.get(&self.focused).cloned() {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+    }
+
+    fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
+        // A session already on screen: jump to its pane instead of duplicating.
+        if let Some((pane, _)) = self
+            .panes
+            .iter()
+            .find(|(_, t)| t.read(cx).session_id() == Some(id))
+        {
+            let pane = *pane;
+            self.focused = pane;
+            self.selected = Some(id);
+            self.sync_pane_chrome(cx);
+            cx.notify();
+            return;
+        }
+        self.selected = Some(id);
+        if let Some(terminal) = self.panes.get(&self.focused).cloned() {
+            terminal.update(cx, |terminal, cx| terminal.show(id, cx));
+        }
+        self.sync_pane_chrome(cx);
+        cx.notify();
+    }
+
+    /// Split `pane` along `axis`, open a new shell in the same project, and
+    /// focus the new pane.
+    fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
+        if !self.panes.contains_key(&pane) {
+            return;
+        }
+        let project_id = self
+            .panes
+            .get(&pane)
+            .and_then(|t| t.read(cx).session_id())
+            .and_then(|sid| self.workspace.read(cx).session(sid).map(|s| s.project_id));
+        let Some(session_id) = self
+            .workspace
+            .update(cx, |workspace, cx| workspace.new_session(project_id, cx))
+        else {
+            return;
+        };
+
+        let new_id = PaneId(self.next_pane);
+        self.next_pane += 1;
+        let group_id = self.next_group;
+        self.next_group += 1;
+        if !self.layout.split(pane, axis, new_id, group_id) {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        let tooltips = self.tooltips.clone();
+        let terminal = cx.new(|cx| TerminalView::new(new_id, workspace, tooltips, cx));
+        terminal.update(cx, |terminal, cx| terminal.show(session_id, cx));
+        cx.subscribe(&terminal, move |this, _, ev, cx| {
+            this.on_terminal_event(new_id, ev, cx);
+        })
+        .detach();
+        self.panes.insert(new_id, terminal);
+        self.focused = new_id;
+        self.selected = Some(session_id);
+        self.pending_focus = Some(new_id);
+        self.sync_pane_chrome(cx);
+        cx.notify();
+    }
+
+    fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(next) = self.layout.neighbor(pane) else {
+            return;
+        };
+        if !self.layout.remove(pane) {
+            return;
+        }
+        self.panes.remove(&pane);
+        self.focused = next;
+        self.selected = self.panes.get(&next).and_then(|t| t.read(cx).session_id());
+        self.pending_focus = Some(next);
+        self.sync_pane_chrome(cx);
+        cx.notify();
+    }
+
+    fn sync_pane_chrome(&mut self, cx: &mut Context<Self>) {
+        let can_close = self.panes.len() > 1;
+        let focused = self.focused;
+        for (id, terminal) in &self.panes {
+            let active = *id == focused;
+            terminal.update(cx, |terminal, cx| {
+                terminal.set_chrome(active, can_close, cx);
+            });
+        }
     }
 
     /// Start a shell session — in `project_id`, or the first project — and show it.
@@ -209,23 +342,47 @@ impl KumuApp {
     }
 
     /// After a session disappears — deleted by the user, or its shell exited —
-    /// keep the right pane on a neighbor when that session was selected.
+    /// drop any split pane that was showing it so a sibling fills the space.
+    /// The last remaining pane keeps the slot: show a neighbor session, or clear.
     fn on_session_closed(&mut self, session_id: i64, next: Option<i64>, cx: &mut Context<Self>) {
-        if self.selected == Some(session_id) {
-            match next.filter(|next| self.workspace.read(cx).session(*next).is_some()) {
-                Some(next) => self.select_session(next, cx),
-                None => {
-                    self.selected = None;
-                    self.terminal.update(cx, |terminal, cx| terminal.clear(cx));
+        let showing: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(_, t)| t.read(cx).session_id() == Some(session_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for pane in showing {
+            if self.panes.len() > 1 {
+                self.close_pane(pane, cx);
+                continue;
+            }
+            let replacement = next.filter(|n| self.workspace.read(cx).session(*n).is_some());
+            if let Some(terminal) = self.panes.get(&pane).cloned() {
+                match replacement {
+                    Some(id) if !self.pane_shows(id, cx) => {
+                        terminal.update(cx, |terminal, cx| terminal.show(id, cx));
+                    }
+                    _ => {
+                        terminal.update(cx, |terminal, cx| terminal.clear(cx));
+                    }
                 }
             }
         }
+        if self.selected == Some(session_id) {
+            self.selected = self
+                .panes
+                .get(&self.focused)
+                .and_then(|t| t.read(cx).session_id())
+                .or(next.filter(|n| self.workspace.read(cx).session(*n).is_some()));
+        }
+        self.sync_pane_chrome(cx);
         cx.notify();
     }
 
-    /// The session on screen, as the workspace has it now.
-    fn selected_session(&self, cx: &App) -> Option<Session> {
-        self.workspace.read(cx).session(self.selected?).cloned()
+    fn pane_shows(&self, session_id: i64, cx: &App) -> bool {
+        self.panes
+            .values()
+            .any(|t| t.read(cx).session_id() == Some(session_id))
     }
 
     /// Focus the settings window if it's open, else open a new one (resizable,
@@ -253,48 +410,62 @@ impl KumuApp {
         }
     }
 
+    fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
+        self.render_node(&self.layout, cx)
+    }
+
+    fn render_node(&self, node: &PaneNode, _cx: &Context<Self>) -> AnyElement {
+        match node {
+            PaneNode::Leaf(id) => {
+                let Some(terminal) = self.panes.get(id) else {
+                    return div().into_any_element();
+                };
+                terminal
+                    .clone()
+                    .cached(StyleRefinement::default().size_full().min_h_0().min_w_0())
+                    .into_any_element()
+            }
+            PaneNode::Group { id, axis, children } => {
+                let mut group = match axis {
+                    Axis::Horizontal => h_resizable(format!("pane-split-{id}")),
+                    Axis::Vertical => v_resizable(format!("pane-split-{id}")),
+                };
+                for child in children {
+                    group = group.child(resizable_panel().child(self.render_node(child, _cx)));
+                }
+                group.into_any_element()
+            }
+        }
+    }
+
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
-        let right = match self.selected_session(cx) {
-            Some(session) => v_flex()
-                .flex_1()
-                .h_full()
-                .min_w_0()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .px_4()
-                        .py_2()
-                        .child(div().text_sm().font_medium().child(session.title.clone())),
-                )
-                .child(
-                    self.terminal.clone().cached(
-                        StyleRefinement::default()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .w_full(),
-                    ),
-                ),
-            None => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_color(theme.muted_foreground)
-                .child(div().text_sm().child("还没有会话"))
-                .child(
-                    Button::new("empty-new")
-                        .ghost()
-                        .label("新建终端")
-                        .on_click(cx.listener(|this, _, window, cx| {
+        let has_sessions = !self.workspace.read(cx).sessions().is_empty();
+        let right =
+            if has_sessions {
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(self.render_panes(cx))
+            } else {
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_color(theme.muted_foreground)
+                    .child(div().text_sm().child("还没有会话"))
+                    .child(Button::new("empty-new").ghost().label("新建终端").on_click(
+                        cx.listener(|this, _, window, cx| {
                             this.new_session(None, cx);
                             this.focus_terminal(window, cx);
                             cx.notify();
-                        })),
-                ),
-        };
+                        }),
+                    ))
+            };
 
         // Full-width title bar strip: brand on the left (traffic lights float
         // to its left); the settings entry lives in the sidebar's bottom-left.
@@ -320,6 +491,11 @@ impl KumuApp {
 
 impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(pane) = self.pending_focus.take()
+            && let Some(terminal) = self.panes.get(&pane).cloned()
+        {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
         self.render_home(window, cx)
     }
 }

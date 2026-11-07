@@ -1,4 +1,4 @@
-//! The right-hand pane: the selected session's own TUI.
+//! One terminal pane: a session's TUI, with chrome for split / close.
 //!
 //! Painting follows the herdr/Ghostty path: merge same-color backgrounds and
 //! same-style text into runs, force glyphs onto the cell grid, draw box /
@@ -16,11 +16,25 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::panes::PaneId;
 use crate::agent::AGENTS;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::{self, Cell as TermCell, CursorShape, KeyInput, Rgb, Snapshot};
 use crate::theme::{self, ThemeRevision};
+use crate::ui::tooltip::{HoverLabel as _, Tooltips};
 use crate::ui::widgets::agent_logo;
+
+/// Chrome / focus messages from a pane up to the home window.
+pub enum TerminalEvent {
+    /// The user clicked into this pane; the home window should focus it.
+    Activated,
+    /// Split this pane to the right (new session beside it).
+    SplitRight,
+    /// Split this pane downward.
+    SplitDown,
+    /// Close this pane (layout only; the session stays).
+    Close,
+}
 
 /// Inset around the cell grid, matching the padded look of a pane TUI.
 const PAD_X: f32 = 14.;
@@ -41,10 +55,17 @@ struct CursorAt {
 }
 
 pub struct TerminalView {
+    pane: PaneId,
     workspace: Entity<Workspace>,
+    /// Hover labels for the pane chrome buttons.
+    tooltips: Entity<Tooltips>,
     session: Option<i64>,
     snapshot: Snapshot,
     focus: FocusHandle,
+    /// Whether the home window treats this pane as the focused one.
+    active: bool,
+    /// Close is only meaningful when more than one pane is open.
+    can_close: bool,
     /// Theme revision last pushed into the live terminals.
     theme_rev: u64,
     /// IME composition preview ("nihao" before 你好).
@@ -56,8 +77,15 @@ pub struct TerminalView {
     painted: Rc<RefCell<PaintCache>>,
 }
 
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
 impl TerminalView {
-    pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        pane: PaneId,
+        workspace: Entity<Workspace>,
+        tooltips: Entity<Tooltips>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.subscribe(&workspace, |this, _, ev, cx| {
             if let WorkspaceEvent::Frame(session_id) = ev
                 && this.session == Some(*session_id)
@@ -67,12 +95,15 @@ impl TerminalView {
         })
         .detach();
         let focus = cx.focus_handle();
-        focus.focus(window, cx);
         Self {
+            pane,
             workspace,
+            tooltips,
             session: None,
             snapshot: Snapshot::blank("", ""),
             focus,
+            active: true,
+            can_close: false,
             theme_rev: u64::MAX,
             marked: None,
             cursor_at: Rc::new(Cell::new(CursorAt {
@@ -86,6 +117,19 @@ impl TerminalView {
                 rows: Vec::new(),
             })),
         }
+    }
+
+    pub fn session_id(&self) -> Option<i64> {
+        self.session
+    }
+
+    pub fn set_chrome(&mut self, active: bool, can_close: bool, cx: &mut Context<Self>) {
+        if self.active == active && self.can_close == can_close {
+            return;
+        }
+        self.active = active;
+        self.can_close = can_close;
+        cx.notify();
     }
 
     fn sync_theme(&mut self, cx: &mut Context<Self>) {
@@ -294,7 +338,30 @@ impl Render for TerminalView {
         let input_focus = self.focus.clone();
         let input_view = cx.entity();
         let (mark, name, cwd) = header_identity(session, &snapshot, &self.workspace, cx);
-        let header = terminal_header(mark, name, cwd, header_note(&snapshot), theme);
+        let note = header_note(&snapshot);
+        let active = self.active;
+        let can_close = self.can_close;
+        let pane = self.pane;
+        let tooltips = self.tooltips.clone();
+        let border = if active {
+            theme.border
+        } else {
+            theme.transparent
+        };
+        let header_bg = if active {
+            theme.secondary.opacity(0.45)
+        } else {
+            theme.transparent
+        };
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let warning = theme.warning;
+        let radius = theme.radius;
+        let hover = theme.accent.opacity(0.5);
+        let header = terminal_header(
+            pane, mark, name, cwd, note, header_bg, can_close, muted, fg, warning, radius, hover,
+            &tooltips, cx,
+        );
         let typeface = Typeface {
             family: font_family,
             size: font_px,
@@ -302,14 +369,18 @@ impl Render for TerminalView {
         let typeface_layout = typeface.clone();
         let typeface_paint = typeface;
         let term_bg = paint_color(snapshot.bg);
+        let term_id = format!("kumu-term-{}", pane.0);
         v_flex()
             .size_full()
             .min_h_0()
+            .min_w_0()
+            .border_1()
+            .border_color(border)
             .bg(term_bg)
             .child(header)
             .child(
                 div()
-                    .id("kumu-term")
+                    .id(term_id)
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -319,6 +390,7 @@ impl Render for TerminalView {
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.focus.focus(window, cx);
+                            cx.emit(TerminalEvent::Activated);
                             cx.notify();
                         }),
                     )
@@ -391,25 +463,44 @@ struct Typeface {
     size: f32,
 }
 
-/// Top bar like the reference pane chrome: mark, name, shortened cwd.
+/// Top bar like the reference pane chrome: mark, name, shortened cwd, split /
+/// close actions.
+#[allow(clippy::too_many_arguments)]
 fn terminal_header(
+    pane: PaneId,
     mark: AnyElement,
     name: String,
     cwd: String,
     note: Option<String>,
-    theme: &Theme,
-) -> Div {
+    header_bg: Hsla,
+    can_close: bool,
+    muted: Hsla,
+    fg: Hsla,
+    warning: Hsla,
+    radius: Pixels,
+    hover: Hsla,
+    tooltips: &Entity<Tooltips>,
+    cx: &mut Context<TerminalView>,
+) -> impl IntoElement {
     let path = short_cwd(&cwd);
-    let muted = theme.muted_foreground;
-    let fg = theme.foreground;
 
     h_flex()
+        .id(format!("pane-head-{}", pane.0))
         .flex_none()
         .items_center()
         .px_3()
         .py_1p5()
         .gap_2()
         .min_w_0()
+        .bg(header_bg)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.focus.focus(window, cx);
+                cx.emit(TerminalEvent::Activated);
+                cx.notify();
+            }),
+        )
         .child(div().size(px(14.)).flex_none().child(mark))
         .child(
             div()
@@ -429,14 +520,77 @@ fn terminal_header(
                 .child(path),
         )
         .when_some(note, |row, text| {
-            row.child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.warning)
-                    .child(text),
-            )
+            row.child(div().flex_none().text_xs().text_color(warning).child(text))
         })
+        .child(chrome_button(
+            format!("split-right-{}", pane.0),
+            "split-right.svg",
+            "向右分屏",
+            muted,
+            radius,
+            hover,
+            tooltips,
+            cx.listener(|_, _, _, cx| {
+                cx.emit(TerminalEvent::SplitRight);
+                cx.stop_propagation();
+            }),
+        ))
+        .child(chrome_button(
+            format!("split-down-{}", pane.0),
+            "split-down.svg",
+            "向下分屏",
+            muted,
+            radius,
+            hover,
+            tooltips,
+            cx.listener(|_, _, _, cx| {
+                cx.emit(TerminalEvent::SplitDown);
+                cx.stop_propagation();
+            }),
+        ))
+        .when(can_close, |row| {
+            row.child(chrome_button(
+                format!("close-pane-{}", pane.0),
+                "icons/close.svg",
+                "关闭窗格",
+                muted,
+                radius,
+                hover,
+                tooltips,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(TerminalEvent::Close);
+                    cx.stop_propagation();
+                }),
+            ))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chrome_button(
+    id: String,
+    icon_path: &'static str,
+    label: &'static str,
+    muted: Hsla,
+    radius: Pixels,
+    hover: Hsla,
+    tooltips: &Entity<Tooltips>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .rounded(radius)
+        .p_0p5()
+        .cursor_pointer()
+        .text_color(muted)
+        .hover(move |style| style.bg(hover))
+        .hover_label(tooltips, label)
+        .on_click(on_click)
+        .child(
+            Icon::empty()
+                .path(icon_path)
+                .with_size(px(14.))
+                .text_color(muted),
+        )
 }
 
 fn header_identity(

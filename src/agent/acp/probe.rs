@@ -154,8 +154,8 @@ mod tests {
                     );
                     break;
                 }
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
         // The commands follow the axes, from the notification the agent sends
@@ -180,8 +180,8 @@ mod tests {
                     assert!(!commands.is_empty(), "{agent} advertised no commands");
                     break;
                 }
+                Event::SessionOptions { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
     }
@@ -194,7 +194,6 @@ mod tests {
         probe(
             "missing",
             Config {
-                agent: "missing",
                 backend: crate::agent::config::Backend::Acp,
                 command: "/nonexistent/kumu-agent-test".into(),
                 args: vec![],
@@ -210,11 +209,11 @@ mod tests {
                 .expect("probe ended without ProbeFailed")
             {
                 Event::SessionOptions { .. } => panic!("unexpected probe success"),
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => {
                     assert_eq!(agent, "missing");
                     break;
                 }
-                _ => {}
             }
         }
     }

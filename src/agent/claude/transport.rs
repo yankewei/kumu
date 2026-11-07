@@ -1,17 +1,11 @@
-//! The `stream-json` wire: newline-delimited JSON over the child's stdio.
+//! Newline-delimited JSON over the child's stdio, for the settings probe.
 //!
-//! Not JSON-RPC and not ACP. Lines are told apart by their `type` tag:
+//! Not JSON-RPC and not ACP. The probe sends one `control_request` (`initialize`)
+//! and waits for the `control_response` with the same `request_id`. Every other
+//! line is ignored: a probe never starts a turn, so there is no stream to
+//! render and no CLI request to answer.
 //!
-//!   - `control_request` — the CLI asking the host something, which **must** be
-//!     answered or the turn parks behind a prompt nobody sees;
-//!   - `control_response` — the answer to one of *our* control requests, matched
-//!     by `request_id`;
-//!   - anything else (`system`, `assistant`, `user`, `stream_event`, `result`) —
-//!     a stream line the session acts on.
-//!
-//! The CLI only asks the host for anything when it was launched with
-//! `--permission-prompt-tool stdio`; without it the same request comes back as a
-//! denial. See `schema/claude-stream-json/2.1.269/README.md`.
+//! See `schema/claude-stream-json/2.1.269/README.md`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,20 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use super::protocol::{ControlRequest, ControlRequestBody, ControlResponse};
-
-/// A line the CLI sent that the session has to act on.
-#[derive(Debug)]
-pub(super) enum Message {
-    /// A stream line.
-    Line(Value),
-    /// A request from the CLI; answer it with [`Transport::respond`] or
-    /// [`Transport::respond_error`].
-    Request {
-        request_id: String,
-        request: ControlRequestBody,
-    },
-}
+use super::protocol::ControlResponse;
 
 /// The control responses we are still waiting for, keyed by the id we sent.
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
@@ -50,18 +31,6 @@ pub(super) struct Transport {
 }
 
 impl Transport {
-    /// A transport with nowhere for its sends to go, for tests that drive the
-    /// session's message handlers directly and never expect a reply over the
-    /// wire — mirrors [`crate::agent::connection::Connection::detached_for_test`].
-    #[cfg(test)]
-    pub(super) fn detached_for_test() -> Self {
-        Self {
-            tx: mpsc::unbounded_channel().0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(0),
-        }
-    }
-
     /// Send a control request and wait for the CLI's `control_response`.
     pub(super) async fn control(&self, request: Value) -> Result<Value, String> {
         let request_id = request_id(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -82,46 +51,12 @@ impl Transport {
             Err(_) => Err("claude 没有回应控制请求（进程已退出？）".to_string()),
         }
     }
-
-    /// Send a line; nothing is awaited, because a stream line's answer is
-    /// another stream line (a `result`).
-    pub(super) fn send(&self, message: Value) {
-        let _ = self.tx.send(message);
-    }
-
-    /// Answer a CLI-initiated control request.
-    pub(super) fn respond(&self, request_id: &str, response: Value) {
-        let _ = self.tx.send(json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": response,
-            },
-        }));
-    }
-
-    /// Reject a CLI-initiated control request.
-    ///
-    /// Used for the request kinds this host does not implement. A protocol error
-    /// is the honest answer, and unlike silence it lets the turn fail cleanly
-    /// instead of waiting on an answer nobody will send.
-    pub(super) fn respond_error(&self, request_id: &str, message: &str) {
-        let _ = self.tx.send(json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "error",
-                "request_id": request_id,
-                "error": message,
-            },
-        }));
-    }
 }
 
 /// Launch the agent and start pumping its stdio.
 ///
-/// Returns the transport, the inbound stream of lines and requests, and the
-/// child — which the caller must keep, since dropping it kills the process.
+/// Returns the transport and the child — which the caller must keep, since
+/// dropping it kills the process.
 ///
 /// `cwd` is the child's working directory, and for this backend it *is* the
 /// session's working directory: unlike ACP and Codex, which name it in their
@@ -131,7 +66,7 @@ pub(super) fn spawn(
     args: &[String],
     env: &[(String, String)],
     cwd: &Path,
-) -> std::io::Result<(Transport, mpsc::UnboundedReceiver<Message>, Child)> {
+) -> std::io::Result<(Transport, Child)> {
     let mut child = Command::new(command)
         .args(args)
         .envs(env.iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -147,7 +82,6 @@ pub(super) fn spawn(
     let stdout = child.stdout.take().expect("stdout is piped");
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
-    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<Message>();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
     // Writer: owns stdin, so no lock is ever held across an await.
@@ -163,7 +97,7 @@ pub(super) fn spawn(
         }
     });
 
-    // Reader: fulfils our own control requests and forwards everything else.
+    // Reader: fulfils our own control requests and drops everything else.
     let reader_pending = pending.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -198,26 +132,7 @@ pub(super) fn spawn(
                     };
                     let _ = waiter.send(outcome);
                 }
-                "control_request" => {
-                    debug_log("control_request");
-                    let request: ControlRequest =
-                        serde_json::from_value(message).unwrap_or_default();
-                    if msg_tx
-                        .send(Message::Request {
-                            request_id: request.request_id,
-                            request: request.request,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                other => {
-                    debug_log(other);
-                    if msg_tx.send(Message::Line(message)).is_err() {
-                        break;
-                    }
-                }
+                other => debug_log(other),
             }
         }
         // The pipe closed, so nothing else can be answered. Releasing the
@@ -232,7 +147,7 @@ pub(super) fn spawn(
         pending,
         next_id: AtomicU64::new(1),
     };
-    Ok((transport, msg_rx, child))
+    Ok((transport, child))
 }
 
 /// A request id shaped like the ones the Agent SDK sends.

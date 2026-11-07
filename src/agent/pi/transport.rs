@@ -74,11 +74,6 @@ impl Transport {
             }
         }
     }
-
-    /// Send a line that expects no reply (an extension UI response).
-    pub(super) fn send(&self, message: Value) {
-        let _ = self.tx.send(message);
-    }
 }
 
 /// Launch Pi and start pumping its stdio.

@@ -1,5 +1,5 @@
-//! The opencode v2 wire: a private `opencode serve` per session, spoken to over
-//! HTTP on a local port, with its events on a server-sent event stream.
+//! The opencode v2 wire: a private `opencode serve` per probe, spoken to over
+//! HTTP on a local port.
 //!
 //! The server is launched the way opencode's own CLI launches one for
 //! `--standalone`: `serve --stdio --port 0` with a random password in
@@ -26,15 +26,13 @@ use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
 
 /// How long the server may take to report its URL. Its first start on a
 /// machine migrates storage and loads plugins, which is slow but bounded.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long an ordinary request may take. Every call kumu makes answers as soon
-/// as it is accepted — a prompt is an enqueue — so one that has not answered by
-/// now is not going to.
+/// How long a catalogue read may take. The server answers as soon as it has
+/// the data, so a read that has not answered by now is not going to.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A running `opencode serve`, and the client that talks to it.
@@ -128,11 +126,6 @@ impl Server {
             .map(Option::unwrap_or_default)
     }
 
-    /// POST a JSON body; `None` for the `204` most actions answer with.
-    pub(super) async fn post(&self, path: &str, body: Value) -> Result<Option<Value>, String> {
-        self.request(Method::POST, path, Some(body)).await
-    }
-
     async fn request(
         &self,
         method: Method,
@@ -180,49 +173,6 @@ impl Server {
             .map(Some)
             .map_err(|error| format!("{label}: 响应无法解析：{error}"))
     }
-
-    /// Subscribe to the server's event stream. Each event's JSON arrives on the
-    /// returned channel; the channel closes when the stream does.
-    ///
-    /// Opened before anything is asked of a session, so nothing it reports can
-    /// be missed: the stream carries no history.
-    pub(super) async fn events(&self) -> Result<mpsc::UnboundedReceiver<Value>, String> {
-        let request = Request::builder()
-            .uri(format!("{}/api/event", self.base))
-            .header(header::AUTHORIZATION, &self.auth)
-            .header(header::ACCEPT, "text/event-stream")
-            .body(Full::new(Bytes::new()))
-            .map_err(|error| format!("GET /api/event: {error}"))?;
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, self.client.request(request))
-            .await
-            .map_err(|_| "GET /api/event: 响应超时".to_string())?
-            .map_err(|error| format!("GET /api/event: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("GET /api/event: HTTP {}", response.status()));
-        }
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut body = response.into_body();
-        tokio::spawn(async move {
-            let mut parser = SseParser::default();
-            while let Some(Ok(frame)) = body.frame().await {
-                let Ok(chunk) = frame.into_data() else {
-                    continue;
-                };
-                for data in parser.push(&chunk) {
-                    match serde_json::from_str::<Value>(&data) {
-                        Ok(event) => {
-                            if tx.send(event).is_err() {
-                                return;
-                            }
-                        }
-                        Err(error) => debug_log(&format!("unparsable event ({error})")),
-                    }
-                }
-            }
-            debug_log("event stream closed");
-        });
-        Ok(rx)
-    }
 }
 
 /// A password the way opencode's CLI makes one: 32 random bytes, base64url.
@@ -251,40 +201,6 @@ fn error_message(status: u16, body: &[u8]) -> String {
         .unwrap_or_else(|| format!("HTTP {status} {}", text.trim()))
 }
 
-/// Splits a server-sent event stream into the `data` of each event.
-///
-/// Only what this server sends is handled: events are separated by a blank
-/// line, and payload lines start with `data:`. Heartbeats are comment lines
-/// (`: heartbeat`) and carry no data, so they produce nothing. Chunks may split
-/// anywhere — mid-line, mid-event, mid-character — which is why raw bytes are
-/// buffered and only a complete event is decoded.
-#[derive(Default)]
-struct SseParser {
-    buffer: Vec<u8>,
-}
-
-impl SseParser {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        // A payload never holds a raw `\r` (JSON escapes it), so dropping them
-        // turns `\r\n` into `\n` even when a chunk splits the pair.
-        self.buffer.extend(chunk.iter().filter(|&&b| b != b'\r'));
-        let mut out = Vec::new();
-        while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
-            let event: Vec<u8> = self.buffer.drain(..end + 2).collect();
-            let event = String::from_utf8_lossy(&event);
-            let data: Vec<&str> = event
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(|data| data.strip_prefix(' ').unwrap_or(data))
-                .collect();
-            if !data.is_empty() {
-                out.push(data.join("\n"));
-            }
-        }
-        out
-    }
-}
-
 /// Echo the wire traffic to stderr when KUMU_DEBUG is set, for headless
 /// verification (mirrors the shared `emit` convention).
 pub(super) fn debug_log(message: &str) {
@@ -295,22 +211,7 @@ pub(super) fn debug_log(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SseParser, error_message, server_url};
-
-    /// Events split across chunks come out whole, and heartbeats come out as
-    /// nothing.
-    #[test]
-    fn sse_events_survive_arbitrary_chunking() {
-        let mut parser = SseParser::default();
-        assert!(parser.push(b": heartbeat\n\ndata: {\"type\":").is_empty());
-        assert_eq!(parser.push(b"\"a\"}\n\ndata: {}\n"), ["{\"type\":\"a\"}"]);
-        assert_eq!(parser.push(b"\n"), ["{}"]);
-        assert!(parser.push(b": heartbeat\r\n\r\n").is_empty());
-        // A character split between chunks comes out whole.
-        let event = "data: \"你好\"\n\n".as_bytes();
-        assert!(parser.push(&event[..8]).is_empty());
-        assert_eq!(parser.push(&event[8..]), ["\"你好\""]);
-    }
+    use super::{error_message, server_url};
 
     #[test]
     fn the_first_line_names_the_server() {

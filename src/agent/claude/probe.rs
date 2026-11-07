@@ -107,7 +107,7 @@ pub fn probe(agent: &'static str, cfg: Config, ev_tx: Sender<Event>) {
 /// dropped when this returns, and `kill_on_drop` takes it from there.
 async fn command_catalogue(cfg: &Config) -> Result<Vec<CommandInfo>, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let (transport, _messages, _child) = transport::spawn(&cfg.command, &cfg.args, &cfg.env, &cwd)
+    let (transport, _child) = transport::spawn(&cfg.command, &cfg.args, &cfg.env, &cwd)
         .map_err(|error| format!("failed to launch {}: {error}", cfg.command))?;
     let reported: protocol::InitializeResponse = transport
         .control(serde_json::json!({"subtype": "initialize", "hooks": null}))
@@ -210,8 +210,8 @@ mod tests {
                     assert!(current_sandbox.is_none());
                     break;
                 }
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
         // The catalogue follows the axes — it comes from the handshake the probe
@@ -229,8 +229,8 @@ mod tests {
                     );
                     break;
                 }
+                Event::SessionOptions { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
         std::fs::remove_dir_all(&home).ok();
@@ -244,7 +244,6 @@ mod tests {
         probe(
             "missing",
             Config {
-                agent: "missing",
                 backend: crate::agent::config::Backend::Claude,
                 command: "/nonexistent/kumu-claude-test".into(),
                 args: vec![],
@@ -260,11 +259,11 @@ mod tests {
                 .expect("probe ended without ProbeFailed")
             {
                 Event::SessionOptions { .. } => panic!("unexpected probe success"),
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => {
                     assert_eq!(agent, "missing");
                     break;
                 }
-                _ => {}
             }
         }
     }

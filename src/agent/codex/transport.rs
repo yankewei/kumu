@@ -5,12 +5,11 @@
 //! JSON-RPC implementation rejects its messages. Shapes are told apart instead:
 //!
 //!   - `method` with no `id` — a notification;
-//!   - `method` with an `id` — a server-initiated request, which **must** be
-//!     answered or the turn parks forever;
+//!   - `method` with an `id` — a server-initiated request;
 //!   - `id` with `result`/`error` — the response to one of our requests.
 //!
-//! Request ids we generate are integers, but a server request's id can be a
-//! string as well, so it travels as a raw [`Value`] and is echoed back verbatim.
+//! Request ids we generate are integers. A server request's id can be a string
+//! as well; the probe does not answer those requests.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -22,17 +21,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-/// A message the server sent that the session has to act on.
+/// A message the server sent. The probe holds the stream so the reader stays
+/// up, and does not match these fields.
 #[derive(Debug)]
 pub(super) enum Message {
     /// No response expected.
-    Notification { method: String, params: Value },
-    /// A server-initiated request; answer it with [`Transport::respond`] or
-    /// [`Transport::respond_error`].
+    Notification { _method: String, _params: Value },
+    /// A server-initiated request.
     Request {
-        id: Value,
-        method: String,
-        params: Value,
+        _id: Value,
+        _method: String,
+        _params: Value,
     },
 }
 
@@ -47,19 +46,6 @@ pub(super) struct Transport {
 }
 
 impl Transport {
-    /// A transport with nowhere for its sends to go, for tests that drive the
-    /// session's notification/request handlers directly and never expect a
-    /// reply over the wire — mirrors the Claude backend's
-    /// `Transport::detached_for_test` and `Connection::detached_for_test`.
-    #[cfg(test)]
-    pub(super) fn detached_for_test() -> Self {
-        Self {
-            tx: mpsc::unbounded_channel().0,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicI64::new(0),
-        }
-    }
-
     /// Send a request and wait for its response.
     pub(super) async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -79,23 +65,6 @@ impl Transport {
     /// Send a notification; no response is expected.
     pub(super) fn notify(&self, method: &str, params: Value) {
         let _ = self.tx.send(json!({ "method": method, "params": params }));
-    }
-
-    /// Answer a server-initiated request.
-    pub(super) fn respond(&self, id: Value, result: Value) {
-        let _ = self.tx.send(json!({ "id": id, "result": result }));
-    }
-
-    /// Reject a server-initiated request.
-    ///
-    /// Used for the methods this backend does not implement: a protocol error
-    /// is the honest answer, and unlike silence it lets the turn proceed or
-    /// fail cleanly instead of waiting on a prompt nobody will ever answer.
-    pub(super) fn respond_error(&self, id: Value, message: &str) {
-        let _ = self.tx.send(json!({
-            "id": id,
-            "error": { "code": -32601, "message": message },
-        }));
     }
 }
 
@@ -161,13 +130,13 @@ pub(super) fn spawn(
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 let incoming = match message.get("id").cloned() {
                     Some(id) => Message::Request {
-                        id,
-                        method: method.to_string(),
-                        params,
+                        _id: id,
+                        _method: method.to_string(),
+                        _params: params,
                     },
                     None => Message::Notification {
-                        method: method.to_string(),
-                        params,
+                        _method: method.to_string(),
+                        _params: params,
                     },
                 };
                 if msg_tx.send(incoming).is_err() {

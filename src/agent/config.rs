@@ -32,8 +32,6 @@ pub enum Backend {
 /// How to launch a local agent subprocess for probing (and the argv shape
 /// interactive TUIs share their binary with).
 pub struct Config {
-    /// Static registry id this config was built for (used in events).
-    pub agent: &'static str,
     pub backend: Backend,
     pub command: String,
     pub args: Vec<String>,
@@ -45,11 +43,11 @@ impl Config {
     /// Build the config for a known agent id from the static registry.
     pub fn for_agent(id: &'static str) -> Option<Self> {
         match id {
-            "opencode" => Some(Self::opencode(id)),
-            "omp" => Some(Self::omp(id)),
-            "codex" => Some(Self::codex(id)),
-            "claude" => Some(Self::claude(id)),
-            "pi" => Some(Self::pi(id)),
+            "opencode" => Some(Self::opencode()),
+            "omp" => Some(Self::omp()),
+            "codex" => Some(Self::codex()),
+            "claude" => Some(Self::claude()),
+            "pi" => Some(Self::pi()),
             _ => None,
         }
     }
@@ -58,13 +56,12 @@ impl Config {
     /// so the server can reach a model even when launched from a GUI app. The
     /// server's own arguments (`--stdio --port 0`) and its password are the
     /// transport's to choose, so `args` stays empty.
-    fn opencode(agent: &'static str) -> Self {
+    fn opencode() -> Self {
         let mut env = Vec::new();
         if let Some(key) = opencode_api_key() {
             env.push(("OPENCODE_API_KEY".to_string(), key));
         }
         Self {
-            agent,
             backend: Backend::Opencode,
             command: opencode_bin(),
             args: Vec::new(),
@@ -73,9 +70,8 @@ impl Config {
     }
 
     /// `omp acp` (Oh My Pi); uses its own stored model config.
-    fn omp(agent: &'static str) -> Self {
+    fn omp() -> Self {
         Self {
-            agent,
             backend: Backend::Acp,
             command: omp_bin(),
             args: vec!["acp".to_string()],
@@ -86,9 +82,8 @@ impl Config {
     /// `codex app-server` (stdio transport, the default). No env is injected:
     /// Codex resolves its own credentials, so the user's `codex login` is what
     /// authenticates it.
-    fn codex(agent: &'static str) -> Self {
+    fn codex() -> Self {
         Self {
-            agent,
             backend: Backend::Codex,
             command: codex_bin(),
             args: vec!["app-server".to_string()],
@@ -100,9 +95,8 @@ impl Config {
     ///
     /// Used by the settings probe. `--verbose` is required by `claude` itself
     /// alongside `stream-json`. See `schema/claude-stream-json/2.1.269/README.md`.
-    fn claude(agent: &'static str) -> Self {
+    fn claude() -> Self {
         Self {
-            agent,
             backend: Backend::Claude,
             command: claude_bin(),
             args: vec![
@@ -124,9 +118,8 @@ impl Config {
     ///
     /// `--approve` lets the probe read the project's files; Pi has no
     /// permission system of its own.
-    fn pi(agent: &'static str) -> Self {
+    fn pi() -> Self {
         Self {
-            agent,
             backend: Backend::Pi,
             command: pi_bin(),
             args: vec![

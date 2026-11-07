@@ -6,7 +6,7 @@ A macOS desktop shell for local coding agents: manage sessions of multiple local
 
 Each session pane runs that agent's interactive TUI (or a plain `$SHELL`) inside an embedded terminal. Settings → 编码 Agent probes which agents are installed; launch paths come from `src/agent/config.rs` (`interactive`). The same agent layer still owns protocol adapters (`acp/`, `codex/`, `claude/`, `pi/`, `opencode/`) used for discovery probes over each agent's headless transport.
 
-Two windows: Home (session tree + terminal pane) and Settings (providers/general, dark mode).
+Two windows: Home (session tree + splitable terminal panes) and Settings (providers/general, dark mode). Pane chrome can split right / down (each new pane opens a shell in the same project); closing a pane only removes the layout slot, not the session.
 
 ## Layout
 
@@ -17,7 +17,7 @@ UI (src/ui/) → App (src/app/) → Agent (src/agent/) + Term (src/term/)
 
 - `src/agent/` — the agent registry, interactive launch helpers, protocol adapters for probes, and the `Event`/`Cmd` vocabulary. It knows nothing of the app, the store or the UI.
 - `src/app/` — the `Workspace` entity: projects, sessions, live terminals, and what each agent offers (probed once, shared by both windows). It tells the views what changed through `WorkspaceEvent`s.
-- `src/ui/` — drawing and interaction only: selection, expansion, and the terminal pane for what the workspace holds.
+- `src/ui/` — drawing and interaction only: selection, expansion, and the pane tree (split layout + terminals) for what the workspace holds.
 - `src/term/` — PTY + VT for agent TUIs and shell sessions.
 
 Adding an agent that speaks an existing protocol is an entry in `src/agent/registry.rs` plus a launch builder in `src/agent/config.rs`; a new protocol is an adapter module under `src/agent/`, wired into `Config`, `spawn`, and `probe`.

@@ -25,7 +25,7 @@ use discovery::Discovery;
 ///
 /// A session past the cap is stopped, least recently shown first. Selecting it
 /// again starts a new process.
-const MAX_LIVE_TERMINALS: usize = 4;
+const MAX_LIVE_TERMINALS: usize = 12;
 
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
@@ -319,9 +319,7 @@ impl Workspace {
     /// Apply the name the user chose. It is marked as theirs, which is what
     /// keeps a title generated later from replacing it.
     pub fn rename_session(&mut self, session_id: i64, title: String, cx: &mut Context<Self>) {
-        self.store
-            .rename_session(session_id, &title)
-            .ok();
+        self.store.rename_session(session_id, &title).ok();
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
     }
@@ -464,14 +462,6 @@ mod tests {
             agent: "shell".into(),
             title: format!("终端 {id}"),
             cwd: "/tmp".into(),
-            resume_id: None,
-            model: None,
-            mode: None,
-            sandbox: None,
-            reasoning: None,
-            title_manual: false,
-            has_conversation: false,
-            usage: None,
         }
     }
 

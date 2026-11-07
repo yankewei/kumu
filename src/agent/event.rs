@@ -1,71 +1,20 @@
-//! The vocabulary crossing the backend boundary: what the UI sends down
-//! ([`Cmd`]) and what comes back up ([`Event`]), plus the value types they
+//! The vocabulary probes report upward ([`Event`]), plus the value types they
 //! carry.
 //!
-//! Everything the UI sees is defined here, so no protocol type leaks out of
+//! Everything Settings sees is defined here, so no protocol type leaks out of
 //! this module tree — and nothing here names a protocol either.
 
 use std::sync::mpsc::Sender;
 
-/// Events flowing from the backend thread up to the app.
+/// Events flowing from a probe thread up to the app.
+///
+/// `SessionOptions` carries several catalogues at once; boxing it would only
+/// complicate every probe match for events that cross the channel a handful of
+/// times per settings open.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
-    /// Log / connection chatter (grey text).
-    Log(String),
-    /// A chunk of agent reply text; append to the current agent row.
-    Agent(String),
-    /// A chunk of the agent's internal reasoning; transient (not persisted).
-    ///
-    /// `message` is the agent's own label for the piece of reasoning the chunk
-    /// belongs to, when it gives one: chunks that share a label are one piece,
-    /// and a chunk labelled differently starts another. The UI groups its rows
-    /// by it rather than by what came before, because what comes between two
-    /// chunks of one piece is not always reasoning — an agent working a
-    /// background task reports its progress while it goes on thinking, and
-    /// those reports arrive on this same channel.
-    ///
-    /// An agent that labels nothing (Pi sends no id on a streamed message)
-    /// leaves it `None`, and then consecutive chunks simply run together.
-    Thought {
-        text: String,
-        message: Option<String>,
-    },
-    /// A tool call started or changed. `title`/`status` are empty when the
-    /// update didn't touch them; `status` is one of pending/running/done/failed.
-    /// `content` is the flattened text output (empty when none).
-    ToolCall {
-        id: String,
-        title: String,
-        status: &'static str,
-        content: String,
-    },
-    /// The agent named the session (session/info update with a title).
-    SessionTitle { title: String },
-    /// The backend opened a conversation and supplied its durable restore cursor.
-    ///
-    /// `resumable` says whether that cursor can actually reopen the conversation
-    /// in a later connection. An ACP agent that does not advertise `load_session`
-    /// still hands back an id for the session it just created, but will refuse
-    /// to load it, so dropping that connection loses the conversation for good;
-    /// the flag is `false` there, and `true` everywhere a reconnect can restore
-    /// the session from `resume_id`.
-    SessionReady { resume_id: String, resumable: bool },
-    /// The prompt turn ended with this stop reason.
-    Done(String),
-    /// The agent is asking for authorization before running a tool call, so
-    /// the matching tool row can be marked as waiting; the answer travels back
-    /// via [`crate::agent::Connection::resolve_permission`].
-    PermissionRequest {
-        /// Tool call this request belongs to, so the UI can attach the prompt
-        /// to the row it already rendered.
-        tool_call_id: String,
-        /// Stable id used by the UI to answer this request.
-        request_id: String,
-    },
-    /// A fatal error occurred.
-    Error(String),
     /// The options an agent exposes for a session — models, modes and sandbox
-    /// policy — each with the value the agent reports as active. Sent by both
-    /// probes and live connections.
+    /// policy — each with the value the agent reports as active.
     ///
     /// Agents differ in which axes they have: modes are an ACP config option,
     /// the sandbox is Codex's own setting, and reasoning is an ACP config
@@ -113,55 +62,6 @@ pub enum Event {
     },
     /// A probe connection failed (agent missing / handshake error).
     ProbeFailed { agent: &'static str },
-    /// How full the session's context is, and what it has cost so far.
-    Usage(Usage),
-}
-
-/// How full a session's context is, as the agent last reported it.
-///
-/// Every field is optional because the protocols disagree on what they report:
-/// ACP's cost is optional, Codex reports no cost at all, and Pi forgets how full
-/// the context is right after a compaction until the next reply measures it.
-/// Each report replaces the last one, except that a report which does not know
-/// the window leaves the last known one standing: a Claude Code process only
-/// learns it at the end of its first turn, and the model rarely changes.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Usage {
-    /// Tokens in the context now: what the next request will send.
-    pub used: Option<u64>,
-    /// The model's context window, in tokens.
-    pub window: Option<u64>,
-    /// What the session has cost so far.
-    pub cost: Option<Cost>,
-}
-
-impl Usage {
-    /// A report as an agent gives it, with zero read as "not known": no agent
-    /// has a context window of zero, and a context or cost of zero is what one
-    /// reports before it has measured anything.
-    pub(super) fn reported(used: Option<u64>, window: Option<u64>, cost: Option<Cost>) -> Self {
-        Self {
-            used: used.filter(|used| *used > 0),
-            window: window.filter(|window| *window > 0),
-            cost: cost.filter(|cost| cost.amount > 0.),
-        }
-    }
-}
-
-/// An amount of money in an ISO 4217 currency ("USD").
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Cost {
-    pub amount: f64,
-    pub currency: String,
-}
-
-impl Cost {
-    pub fn usd(amount: f64) -> Self {
-        Self {
-            amount,
-            currency: "USD".to_string(),
-        }
-    }
 }
 
 /// One selectable model as exposed by an agent.
@@ -246,99 +146,12 @@ pub struct SandboxInfo {
     pub name: String,
 }
 
-/// What the user sends as one prompt: the text, and the images attached to it.
-///
-/// Images travel as files rather than bytes. Codex's app-server takes a local
-/// path and reads the file itself, while the other protocols want the bytes
-/// inline — so each backend reads the file only if its wire needs it, and a
-/// prompt stays cheap to move across the channel.
-///
-/// A file the user references by name is not an attachment: it is written into
-/// the text as `@path`, and the agent reads it with its own tools from the
-/// project directory it runs in.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Prompt {
-    pub text: String,
-    pub images: Vec<ImageAttachment>,
-}
-
-impl From<&str> for Prompt {
-    fn from(text: &str) -> Self {
-        text.to_string().into()
-    }
-}
-
-impl From<String> for Prompt {
-    fn from(text: String) -> Self {
-        Self {
-            text,
-            images: Vec::new(),
-        }
-    }
-}
-
-/// An image attached to a prompt: a file on disk and its MIME type.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ImageAttachment {
-    pub path: std::path::PathBuf,
-    pub mime: String,
-}
-
-impl ImageAttachment {
-    /// The file's bytes as base64, for the protocols that carry images inline;
-    /// the error is the message the user is shown.
-    pub(super) fn base64(&self) -> Result<String, String> {
-        use base64::Engine as _;
-        std::fs::read(&self.path)
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
-            .map_err(|error| format!("读取图片 {} 失败：{error}", self.path.display()))
-    }
-}
-
-/// UI -> backend commands on the channel returned by [`crate::agent::spawn`].
-pub enum Cmd {
-    Prompt(Prompt),
-    /// Select the session's model by its config-option value.
-    SetModel(String),
-    /// Select the session's mode by its config-option value.
-    SetMode(String),
-    /// Select the session's sandbox policy by its value.
-    SetSandbox(String),
-    /// Select the session's reasoning effort by its value.
-    SetReasoning(String),
-}
-
 /// Send an event to the UI, echoing to stderr when KUMU_DEBUG is set (handy
 /// for headless verification). The prefix is the layer, not a protocol: every
 /// backend reports through here.
 pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
     if std::env::var("KUMU_DEBUG").is_ok() {
         match &ev {
-            Event::Agent(t) => eprintln!("[agent] agent: {t}"),
-            Event::Thought { text, .. } => eprintln!("[agent] thought: {text}"),
-            Event::ToolCall {
-                id,
-                title,
-                status,
-                content,
-            } => {
-                eprintln!(
-                    "[agent] tool {id}: {title} ({status}) content={} chars",
-                    content.len()
-                )
-            }
-            Event::SessionTitle { title } => eprintln!("[agent] title: {title}"),
-            Event::SessionReady {
-                resume_id,
-                resumable,
-            } => eprintln!("[agent] session ready: {resume_id} (resumable: {resumable})"),
-            Event::Done(s) => eprintln!("[agent] done: {s}"),
-            Event::PermissionRequest {
-                tool_call_id,
-                request_id,
-            } => eprintln!("[agent] permission {request_id} for tool {tool_call_id}"),
-            Event::Error(s) => eprintln!("[agent] error: {s}"),
-            Event::Log(s) => eprintln!("[agent] log: {s}"),
             Event::SessionOptions {
                 agent,
                 models,
@@ -392,7 +205,6 @@ pub(super) fn emit(tx: &Sender<Event>, ev: Event) {
                     .join(", "),
             ),
             Event::ProbeFailed { agent } => eprintln!("[agent] probe {agent} failed"),
-            Event::Usage(usage) => eprintln!("[agent] usage: {usage:?}"),
         }
     }
     let _ = tx.send(ev);

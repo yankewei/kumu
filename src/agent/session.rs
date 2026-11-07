@@ -6,12 +6,6 @@
 
 use super::event::{AccessInfo, Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo};
 
-/// The stop reason that marks a turn the user cancelled.
-///
-/// Still used by protocol translators that map agent-specific abort words onto
-/// one spelling for Settings probes and leftover convert helpers.
-pub(super) const CANCELLED: &str = "cancelled";
-
 /// Assembles [`Event::SessionOptions`], whose fields are the same for every
 /// agent; only the source of each list differs.
 ///

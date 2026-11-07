@@ -1,16 +1,16 @@
-//! Protocol -> app translation. What Claude Code reports about a session over
-//! the handshake (its model catalogue, its commands) is mapped here; everything
-//! else is a fixed vocabulary — the values `claude` accepts on its own flags,
-//! which a session can therefore be offered before it exists.
+//! Protocol -> app translation for the settings probe.
+//!
+//! The axes are a fixed vocabulary — the values `claude` accepts on its own
+//! flags, which the probe can offer before a session exists. The command
+//! catalogue is the one list read off the `initialize` handshake.
 //!
 //! The labels are kumu's own where the concept is kumu's to name (as with
 //! Codex's sandbox policies) and the agent's own where they are a scale the
 //! user types and reads in Claude Code itself.
 
 use crate::agent::event::{AccessInfo, CommandInfo, ModeInfo, ModelInfo, ReasoningInfo};
-use serde_json::Value;
 
-use super::protocol::{CommandEntry, ModelEntry};
+use super::protocol::CommandEntry;
 
 /// The provider label Claude Code's models are filed under.
 ///
@@ -104,22 +104,6 @@ pub(super) fn access_options() -> Vec<AccessInfo> {
     .collect()
 }
 
-/// The work mode in force: `plan` while the session is planning, `default`
-/// (the value behind 构建) otherwise.
-///
-/// The CLI reports one value for both axes, so this is a projection: anything
-/// that is not plan is the normal working mode.
-pub(super) fn current_mode(reported: Option<&str>) -> Option<String> {
-    let value = reported?.trim();
-    (!value.is_empty()).then(|| {
-        if value == "plan" {
-            "plan".to_string()
-        } else {
-            "default".to_string()
-        }
-    })
-}
-
 /// The access policy in force, or `None` while nothing on that axis is in charge
 /// — plan mode is the case that matters: it governs the session on its own, and
 /// kumu has asked for no particular approval policy underneath it.
@@ -178,59 +162,6 @@ pub(super) fn default_effort(model: Option<&str>) -> &'static str {
     }
 }
 
-/// A live session's catalogue catalogue, as the `initialize` response reports it,
-/// falling back to the fixed vocabulary above when the report was empty — an
-/// older CLI, or a shape this backend does not recognise, should still leave
-/// the user something to pick.
-pub(super) fn session_models(reported: &[ModelEntry]) -> Vec<ModelInfo> {
-    if reported.is_empty() {
-        return model_options();
-    }
-    reported
-        .iter()
-        .filter(|model| !model.value.is_empty())
-        .map(|model| ModelInfo {
-            value: model.value.clone(),
-            // The CLI's label for the entry, else the model it resolves to: a
-            // gateway points several values at one model, and naming that is
-            // more use than repeating the value.
-            name: model
-                .display_name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .or_else(|| model.resolved_model.clone().filter(|name| !name.is_empty()))
-                .unwrap_or_else(|| model.value.clone()),
-            provider: PROVIDER.to_string(),
-        })
-        .collect()
-}
-
-/// The efforts a live session offers: the union of what its models advertise,
-/// in first-seen order.
-///
-/// One list is safe because an unsupported level clamps down to the highest one
-/// at or below it rather than failing. An empty report falls back to the
-/// documented levels.
-pub(super) fn session_reasoning(reported: &[ModelEntry]) -> Vec<ReasoningInfo> {
-    let mut efforts: Vec<ReasoningInfo> = Vec::new();
-    for model in reported.iter().filter(|model| model.supports_effort) {
-        for level in &model.supported_effort_levels {
-            if level.is_empty() || efforts.iter().any(|effort| effort.value == *level) {
-                continue;
-            }
-            efforts.push(ReasoningInfo {
-                value: level.clone(),
-                name: level.clone(),
-            });
-        }
-    }
-    if efforts.is_empty() {
-        reasoning_options()
-    } else {
-        efforts
-    }
-}
-
 /// The commands a live session will run, as the `initialize` response lists
 /// them, minus the ones that only run in an interactive terminal.
 ///
@@ -259,58 +190,9 @@ pub(super) fn command_catalog(
         .collect()
 }
 
-/// The row title for a tool call: Claude Code's tool name plus whatever makes
-/// the call recognisable.
-///
-/// The name leads, unlike the Codex rows where the command is self-describing:
-/// `Write` and `Read` differ by a name the user recognises from Claude Code
-/// itself, not by the path they take.
-pub(super) fn tool_title(name: &str, input: &Value) -> String {
-    let field = |key: &str| {
-        input
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-    };
-    let detail = match name {
-        "Bash" => field("command"),
-        "Read" | "Write" | "Edit" => field("file_path"),
-        "NotebookEdit" => field("notebook_path"),
-        "Glob" | "Grep" => field("pattern"),
-        "WebFetch" => field("url"),
-        "WebSearch" => return format!("搜索：{}", field("query").unwrap_or("")),
-        "Task" => field("description").or_else(|| field("subagent_type")),
-        _ => None,
-    };
-    match detail {
-        Some(detail) => format!("{name} · {detail}"),
-        None => name.to_string(),
-    }
-}
-
-/// A tool result's text. The CLI sends a string for most tools and an array of
-/// content blocks for a few (and nothing at all for the rest), so all three
-/// shapes flatten into the row's body.
-pub(super) fn tool_content(content: &Value) -> String {
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
-/// The id the backend compares an answer against to mean "allow once".
-pub(super) const ALLOW_OPTION: &str = "allow-once";
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     /// Every alias must be offered with a value `--model` accepts and a label
     /// distinct from the raw value, and they must all share one provider so the
@@ -386,30 +268,20 @@ mod tests {
         );
     }
 
-    /// One reported value projects onto both axes: it is the work mode, and —
-    /// unless it is plan, which governs on its own — the access policy in force.
+    /// Plan mode leaves no approval policy in charge. Any other reported value,
+    /// including one the menu does not offer, is the policy in force.
     #[test]
-    fn one_reported_mode_projects_onto_both_axes() {
-        assert_eq!(current_mode(Some("plan")).as_deref(), Some("plan"));
+    fn current_access_is_the_policy_in_force() {
         assert_eq!(
             current_access(Some("plan")),
             None,
             "plan mode leaves no approval policy in charge"
         );
-
-        assert_eq!(
-            current_mode(Some("acceptEdits")).as_deref(),
-            Some("default"),
-            "anything that is not plan is the normal working mode"
-        );
         assert_eq!(
             current_access(Some("acceptEdits")).as_deref(),
             Some("acceptEdits")
         );
-
-        // A mode the menu does not offer is still reported rather than dropped.
         assert_eq!(current_access(Some("dontAsk")).as_deref(), Some("dontAsk"));
-        assert_eq!(current_mode(None), None);
         assert_eq!(current_access(None), None);
         assert_eq!(current_access(Some("  ")), None);
     }
@@ -445,51 +317,6 @@ mod tests {
             "Opus 4.7 is the one model whose default is not high"
         );
         assert_eq!(default_effort(None), "high", "a probe knows no model");
-    }
-
-    fn reported_model(value: &str, resolved: &str, levels: &[&str]) -> ModelEntry {
-        ModelEntry {
-            value: value.into(),
-            resolved_model: Some(resolved.into()),
-            display_name: Some(resolved.into()),
-            supports_effort: !levels.is_empty(),
-            supported_effort_levels: levels.iter().map(|l| l.to_string()).collect(),
-        }
-    }
-
-    /// A session's own report replaces the fixed vocabulary: the values are the
-    /// ones the account accepts, and their labels are the resolved models.
-    #[test]
-    fn a_session_reports_its_own_model_catalogue() {
-        let models = session_models(&[
-            reported_model("default", "gateway-model", &["low", "high"]),
-            reported_model("haiku", "gateway-fast", &["low"]),
-        ]);
-        assert_eq!(
-            models.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(),
-            ["default", "haiku"]
-        );
-        assert_eq!(models[0].name, "gateway-model");
-        assert!(models.iter().all(|m| m.provider == PROVIDER));
-    }
-
-    /// An empty report is not an empty catalogue: the documented aliases stand in.
-    #[test]
-    fn an_empty_report_falls_back_to_the_documented_vocabulary() {
-        assert_eq!(
-            session_models(&[])
-                .iter()
-                .map(|m| m.value.as_str())
-                .collect::<Vec<_>>(),
-            ["sonnet", "opus", "haiku"]
-        );
-        assert_eq!(
-            session_reasoning(&[])
-                .iter()
-                .map(|e| e.value.as_str())
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high", "xhigh", "max"]
-        );
     }
 
     /// The catalogue is what the CLI will run: a name it left empty is not an
@@ -531,56 +358,5 @@ mod tests {
             ["compact", "clear"],
             "a terminal-only command cannot be sent over this wire"
         );
-    }
-
-    /// The efforts are the union across models, in the order they were
-    /// advertised, without duplicates — a model that supports fewer levels does
-    /// not shrink the list.
-    #[test]
-    fn session_efforts_are_the_union_across_models() {
-        let efforts = session_reasoning(&[
-            reported_model("default", "m", &["low", "high"]),
-            reported_model("haiku", "f", &["high", "max"]),
-            reported_model("plain", "p", &[]),
-        ]);
-        assert_eq!(
-            efforts.iter().map(|e| e.value.as_str()).collect::<Vec<_>>(),
-            ["low", "high", "max"]
-        );
-    }
-
-    /// Tool rows lead with the tool's name and then the recognisable part of
-    /// the call, and a call with nothing to add is just the name.
-    #[test]
-    fn tool_titles_name_the_tool_and_its_subject() {
-        assert_eq!(
-            tool_title("Bash", &json!({"command": "ls -la"})),
-            "Bash · ls -la"
-        );
-        assert_eq!(
-            tool_title("Write", &json!({"file_path": "/tmp/a.txt", "content": "x"})),
-            "Write · /tmp/a.txt"
-        );
-        assert_eq!(
-            tool_title("WebSearch", &json!({"query": "rust"})),
-            "搜索：rust"
-        );
-        assert_eq!(
-            tool_title("Task", &json!({"description": "find it"})),
-            "Task · find it"
-        );
-        assert_eq!(tool_title("TodoWrite", &json!({"todos": []})), "TodoWrite");
-    }
-
-    /// A result arrives as a string, as blocks, or not at all.
-    #[test]
-    fn tool_results_flatten_every_shape() {
-        assert_eq!(tool_content(&json!("done")), "done");
-        assert_eq!(
-            tool_content(&json!([{"type": "text", "text": "a"}, {"type": "image"}])),
-            "a"
-        );
-        assert_eq!(tool_content(&Value::Null), "");
-        assert_eq!(tool_content(&json!(42)), "42");
     }
 }

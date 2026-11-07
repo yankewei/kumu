@@ -1,19 +1,16 @@
-//! Protocol -> app translation. Everything the UI consumes is a plain value
-//! produced here, so protocol shapes (`SessionUpdate`, tool-call content of
-//! four different forms, permission option kinds) stop at this boundary.
+//! Protocol -> app translation for the settings probe.
 //!
-//! The mapping constants matter: unknown variants are mapped to neutral values
-//! rather than being mistaken for a rejection or a running tool call.
+//! Session config options and the command catalogue become plain values here.
+//! A select shape this build does not know is skipped rather than offered as
+//! an empty catalogue.
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandInput, ContentBlock, RequestPermissionOutcome,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
+    AvailableCommand, AvailableCommandInput, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions,
 };
 
 use crate::agent::event::{CommandInfo, ModeInfo, ModelInfo, ReasoningInfo};
-use crate::agent::session::CANCELLED;
 
 /// A select session config option, located by [`select`].
 struct Select<'a> {
@@ -219,101 +216,10 @@ fn strip_provider_prefix(name: &str, provider: &str) -> String {
     }
 }
 
-/// Stable lowercase names for tool call statuses (used by the UI rows).
-pub(super) fn status_name(status: &ToolCallStatus) -> &'static str {
-    match status {
-        ToolCallStatus::Pending => "pending",
-        ToolCallStatus::InProgress => "running",
-        ToolCallStatus::Completed => "done",
-        ToolCallStatus::Failed => "failed",
-        _ => "pending",
-    }
-}
-
-/// How a turn ended, in the one spelling the boundary uses.
-///
-/// The protocol has a dedicated stop reason for a turn the client cancelled —
-/// the one an agent is required to return after `session/cancel` — and it is
-/// reported as [`CANCELLED`] so the UI can tell a stopped turn from a finished
-/// one without knowing this protocol. Every other reason is passed through by
-/// name, which is what the log has always shown.
-pub(super) fn stop_reason(reason: &StopReason) -> String {
-    match reason {
-        StopReason::Cancelled => CANCELLED.to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Turn the user's choice into the protocol outcome. `None` means the turn
-/// ended (or was abandoned) before the user decided, which the spec requires
-/// clients to answer with `Cancelled`.
-pub(super) fn permission_outcome(option_id: Option<String>) -> RequestPermissionOutcome {
-    match option_id {
-        Some(id) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
-        None => RequestPermissionOutcome::Cancelled,
-    }
-}
-
-/// Flatten a tool call's content blocks into one text string, falling back to
-/// the pretty-printed raw output when there are no text blocks.
-pub(super) fn tool_call_content(
-    content: &[ToolCallContent],
-    raw_output: &Option<serde_json::Value>,
-) -> String {
-    let mut parts = Vec::new();
-    for c in content {
-        if let ToolCallContent::Content(c) = c
-            && let ContentBlock::Text(t) = &c.content
-        {
-            parts.push(t.text.clone());
-        }
-    }
-    if !parts.is_empty() {
-        return parts.join("\n");
-    }
-    raw_output
-        .as_ref()
-        .and_then(|v| serde_json::to_string_pretty(v).ok())
-        .unwrap_or_default()
-}
-
-/// Name an update variant for logging.
-pub(super) fn variant_name(u: &SessionUpdate) -> &'static str {
-    match u {
-        SessionUpdate::UserMessageChunk(_) => "user_message_chunk",
-        SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
-        SessionUpdate::AgentThoughtChunk(_) => "agent_thought_chunk",
-        SessionUpdate::ToolCall(_) => "tool_call",
-        SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
-        SessionUpdate::Plan(_) => "plan",
-        SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
-        SessionUpdate::CurrentModeUpdate(_) => "current_mode_update",
-        SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
-        SessionUpdate::UsageUpdate(_) => "usage_update",
-        _ => "other",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::SessionConfigSelectGroup;
-
-    /// A pick becomes a `Selected` outcome; no pick must become `Cancelled`,
-    /// which the spec requires once the turn is over.
-    #[test]
-    fn permission_outcome_reflects_the_choice() {
-        match permission_outcome(Some("allow-once".into())) {
-            RequestPermissionOutcome::Selected(selected) => {
-                assert_eq!(selected.option_id.0.as_ref(), "allow-once");
-            }
-            other => panic!("expected Selected, got {other:?}"),
-        }
-        assert_eq!(
-            permission_outcome(None),
-            RequestPermissionOutcome::Cancelled
-        );
-    }
 
     /// Build an ungrouped select option from `(value, name, description)`.
     fn select_option(

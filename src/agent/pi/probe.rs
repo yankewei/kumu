@@ -191,8 +191,8 @@ mod tests {
                     assert!(current_sandbox.is_none());
                     break;
                 }
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
         // The catalogue follows the axes, and it is what a fresh session's `/`
@@ -217,8 +217,8 @@ mod tests {
                     assert!(!commands.is_empty(), "pi reported no commands");
                     break;
                 }
+                Event::SessionOptions { .. } => {}
                 Event::ProbeFailed { agent } => panic!("probe failed: {agent}"),
-                _ => {}
             }
         }
     }
@@ -232,7 +232,6 @@ mod tests {
         probe(
             "missing",
             Config {
-                agent: "missing",
                 backend: crate::agent::config::Backend::Pi,
                 command: "/nonexistent/kumu-pi-test".into(),
                 args: vec![],
@@ -248,11 +247,11 @@ mod tests {
                 .expect("probe ended without ProbeFailed")
             {
                 Event::SessionOptions { .. } => panic!("unexpected probe success"),
+                Event::Commands { .. } => {}
                 Event::ProbeFailed { agent } => {
                     assert_eq!(agent, "missing");
                     break;
                 }
-                _ => {}
             }
         }
     }
