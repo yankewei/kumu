@@ -13,9 +13,15 @@
 # runtime; if one is not on the GUI-launched PATH, set OMP_BIN / OPENCODE_BIN /
 # CODEX_BIN / CLAUDE_BIN / PI_BIN (src/agent/config.rs).
 #
+# Signing: set CODESIGN_IDENTITY to a "Developer ID Application: …" identity
+# for release builds (hardened runtime). Unset / "-" keeps an ad-hoc seal for
+# local use. For cloud signing, follow packaging/RELEASING.md.
+#
 # Usage: packaging/make-app.sh [release|debug] [--open]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=lib.sh
+source packaging/lib.sh
 
 profile=release
 open_after=false
@@ -51,10 +57,7 @@ version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist" >/dev/null
 
-# Ad-hoc sign the bundle as a unit. Rust already ad-hoc signs the arm64
-# executable; sealing the whole bundle keeps LaunchServices and the TCC prompts
-# (network, files) consistent across rebuilds.
-codesign --force --sign - "$bundle"
+sign_app_bundle "$bundle"
 
 echo "Built $bundle"
 if [[ "$open_after" == true ]]; then
