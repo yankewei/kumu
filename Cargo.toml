@@ -8,6 +8,9 @@ agent-client-protocol = "2.1"
 futures = "0.3"
 ghostty-sys = { path = "crates/ghostty-sys" }
 gpui-kit = "0.6"
+# gpui-kit 0.6 and its updater must share this compatible GPUI backend.
+gpui = { package = "gpui-pre", version = "=0.3.4" }
+gpui-updater = { package = "gpui-updater-pre", version = "0.4.4" }
 portable-pty = "=0.9.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8"

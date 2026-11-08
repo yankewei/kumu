@@ -27,6 +27,7 @@ mod fonts;
 mod term;
 mod theme;
 mod ui;
+mod updates;
 
 use gpui_kit::component::*;
 use gpui_kit::*;

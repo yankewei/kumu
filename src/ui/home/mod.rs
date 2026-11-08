@@ -22,6 +22,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use gpui_updater::Updater;
 use panes::{PaneId, PaneNode};
 use terminal::{TerminalEvent, TerminalView};
 
@@ -29,6 +30,8 @@ pub struct KumuApp {
     /// Projects, sessions and their live agents; the home view draws it and
     /// hands it every user action.
     workspace: Entity<Workspace>,
+    /// Owned by the home window so closing Settings does not interrupt an update.
+    updater: Entity<Updater>,
     settings_window: Option<WindowHandle<Root>>,
     /// Session highlighted in the sidebar — the focused pane's session.
     selected: Option<i64>,
@@ -71,8 +74,12 @@ impl KumuApp {
         })
         .detach();
 
+        let updater = crate::updates::init(cx);
+        cx.observe(&updater, |_, _, cx| cx.notify()).detach();
+
         let mut app = Self {
             workspace,
+            updater,
             settings_window: None,
             selected: None,
             collapsed_projects: HashSet::new(),
@@ -387,11 +394,15 @@ impl KumuApp {
 
     /// Focus the settings window if it's open, else open a new one (resizable,
     /// opens at its minimum size).
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
+        let activate = |root: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            if show_updates && let Ok(settings) = root.view().clone().downcast::<SettingsWindow>() {
+                settings.update(cx, |settings, cx| settings.show_updates(window, cx));
+            }
+            window.activate_window();
+        };
         if let Some(handle) = &self.settings_window
-            && handle
-                .update(cx, |_, window, _| window.activate_window())
-                .is_ok()
+            && handle.update(cx, activate).is_ok()
         {
             return;
         }
@@ -399,13 +410,12 @@ impl KumuApp {
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let workspace = self.workspace.clone();
+        let updater = self.updater.clone();
         if let Ok(handle) = cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| SettingsWindow::new(workspace, window, cx));
+            let view = cx.new(|cx| SettingsWindow::new(workspace, updater, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         }) {
-            handle
-                .update(cx, |_, window, _| window.activate_window())
-                .ok();
+            handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
         }
     }

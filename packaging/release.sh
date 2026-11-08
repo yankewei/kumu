@@ -58,6 +58,12 @@ if [[ ! -f "$dmg" ]]; then
     exit 1
 fi
 
+(
+    cd "$(dirname "$dmg")"
+    shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256"
+    cp "$(basename "$dmg").sha256" SHA256SUMS
+)
+
 if [[ "$dry_run" == true ]]; then
     echo "Dry run: left $dmg (not tagged / not uploaded)"
     exit 0
@@ -71,7 +77,7 @@ fi
 git tag -a "$tag" -m "Release $tag"
 git push origin HEAD "refs/tags/$tag"
 
-gh release create "$tag" "$dmg" \
+gh release create "$tag" "$dmg" "${dmg}.sha256" target/release/SHA256SUMS \
     --title "$tag" \
     --generate-notes
 

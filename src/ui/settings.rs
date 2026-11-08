@@ -10,6 +10,8 @@ use crate::db;
 use crate::theme;
 use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -17,6 +19,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use gpui_updater::{ErrorKind, UpdateStatus, Updater};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsPage {
@@ -69,6 +72,7 @@ impl SearchableListItem for FontSizeItem {
 pub struct SettingsWindow {
     settings_page: SettingsPage,
     search_state: Entity<InputState>,
+    content_scroll: ScrollHandle,
     /// UI font picker over the system's installed families.
     font_select: Entity<SelectState<SearchableVec<FontItem>>>,
     /// UI font-size picker over the app's type scale.
@@ -78,16 +82,30 @@ pub struct SettingsWindow {
     /// the home window owns it, and closing that window must still tear its
     /// agents down while this one stays open.
     workspace: WeakEntity<Workspace>,
+    updater: Entity<Updater>,
     /// The window's overlay for hover labels; mounted by `window_layers`.
     tooltips: Entity<Tooltips>,
 }
 
 impl SettingsWindow {
-    pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: Entity<Workspace>,
+        updater: Entity<Updater>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.subscribe(&workspace, |_, _, ev, cx| {
             if matches!(ev, WorkspaceEvent::Changed) {
                 cx.notify();
             }
+        })
+        .detach();
+
+        cx.observe(&updater, |_, updater, cx| {
+            if let UpdateStatus::Errored(error) = updater.read(cx).status() {
+                eprintln!("[updates] {error}");
+            }
+            cx.notify();
         })
         .detach();
 
@@ -136,11 +154,26 @@ impl SettingsWindow {
         Self {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
+            content_scroll: ScrollHandle::new(),
             font_select,
             font_size_select,
             workspace: workspace.downgrade(),
+            updater,
             tooltips: cx.new(|cx| Tooltips::new(cx)),
         }
+    }
+
+    /// Open the update card from the main window's persistent notice.
+    /// A ready-to-restart notice also opens the existing confirmation dialog.
+    pub fn show_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page = SettingsPage::General;
+        self.search_state
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.content_scroll.scroll_to_bottom();
+        if matches!(self.updater.read(cx).status(), UpdateStatus::Staged(_)) {
+            self.update_action(window, cx);
+        }
+        cx.notify();
     }
 
     /// Commit a font pick: persist the family and apply it app-wide.
@@ -243,6 +276,7 @@ impl SettingsWindow {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_page = page;
+                        this.content_scroll.set_offset(point(px(0.), px(0.)));
                         cx.notify();
                     }))
                     .child(Icon::new(icon).with_size(px(15.)).text_color(if active {
@@ -279,7 +313,10 @@ impl SettingsWindow {
 
         let cards: Vec<AnyElement> = match self.settings_page {
             SettingsPage::Providers => vec![self.render_providers_card(cx, dark, theme)],
-            SettingsPage::General => vec![self.render_general_card(dark, theme)],
+            SettingsPage::General => vec![
+                self.render_general_card(dark, theme),
+                self.render_updates_card(dark, theme, cx),
+            ],
         };
 
         let right = v_flex()
@@ -296,6 +333,7 @@ impl SettingsWindow {
                     .flex_1()
                     .id("settings-content")
                     .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
                     .px_8()
                     .pt_4()
                     .pb_8()
@@ -480,6 +518,129 @@ impl SettingsWindow {
             )
             .child(v_flex().mt_1().children(rows))
             .into_any_element()
+    }
+
+    fn update_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.updater.read(cx).status().clone() {
+            UpdateStatus::Available(_) => {
+                self.updater
+                    .update(cx, |updater, cx| updater.download_and_install(cx));
+            }
+            UpdateStatus::Downloading { .. } => {
+                self.updater.update(cx, |updater, cx| updater.cancel(cx));
+            }
+            UpdateStatus::Staged(_) => {
+                let updater = self.updater.clone();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let updater = updater.clone();
+                    alert
+                        .title("重启以完成更新")
+                        .description(
+                            "重启将结束当前所有终端进程，请确认 Agent 任务已完成或已保存。",
+                        )
+                        .button_props(
+                            DialogButtonProps::default()
+                                .ok_text("重启更新")
+                                .cancel_text("取消")
+                                .show_cancel(true),
+                        )
+                        .on_ok(move |_, _, cx| {
+                            updater.update(cx, |updater, cx| updater.restart(cx));
+                            true
+                        })
+                });
+            }
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Errored(_) => {
+                self.updater.update(cx, |updater, cx| updater.check(cx));
+            }
+            _ => {}
+        }
+    }
+
+    fn render_updates_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let status = self.updater.read(cx).status();
+        let (message, label) = match status {
+            UpdateStatus::Idle => ("启动时自动检查更新。".to_string(), "检查更新"),
+            UpdateStatus::Checking => ("正在检查新版本…".to_string(), "检查中"),
+            UpdateStatus::UpToDate => ("当前已是最新版本。".to_string(), "检查更新"),
+            UpdateStatus::Available(version) => (format!("发现新版本 {version}。"), "下载并安装"),
+            UpdateStatus::Downloading { downloaded, total } => {
+                let message = match total {
+                    Some(total) if *total > 0 => {
+                        format!("正在下载：{}%", downloaded.saturating_mul(100) / total)
+                    }
+                    _ => format!("正在下载：{:.1} MB", *downloaded as f64 / 1_048_576.),
+                };
+                (message, "取消下载")
+            }
+            UpdateStatus::Installing => ("正在验证并安装更新…".to_string(), "安装中"),
+            UpdateStatus::Staged(version) => {
+                (format!("版本 {version} 已安装，重启后生效。"), "重启更新")
+            }
+            UpdateStatus::Errored(error) => {
+                let message = match error.kind() {
+                    ErrorKind::Network => "连接更新服务失败，请稍后重试。",
+                    ErrorKind::Metadata => "暂时没有适用于此设备的更新，请查看发布页面。",
+                    ErrorKind::Verification => "更新校验未通过，请从发布页面下载安装。",
+                    ErrorKind::Location => "请先将 Kumu 安装到应用程序目录，再进行更新。",
+                    ErrorKind::Permission => "没有替换应用的权限，请手动下载安装。",
+                    _ => "更新失败，请重试或从发布页面下载安装。",
+                };
+                (message.to_string(), "重试")
+            }
+            _ => ("暂时无法检查更新。".to_string(), "检查更新"),
+        };
+        let busy = matches!(status, UpdateStatus::Checking | UpdateStatus::Installing);
+        self.card(if dark {
+            theme.muted
+        } else {
+            gpui_kit::gpui::white()
+        })
+        .child(
+            h_flex()
+                .items_center()
+                .gap_4()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_medium().child("软件更新"))
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("当前版本 {}", env!("CARGO_PKG_VERSION"))),
+                        ),
+                )
+                .child(
+                    Button::new("app-update")
+                        .small()
+                        .label(label)
+                        .loading(busy)
+                        .disabled(busy)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.update_action(window, cx)),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .mt_2()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(message),
+        )
+        .child(
+            Button::new("release-page")
+                .small()
+                .ghost()
+                .label("发布页面")
+                .on_click(|_, _, cx| {
+                    cx.open_url("https://github.com/yankewei/kumu/releases/latest")
+                }),
+        )
+        .into_any_element()
     }
 
     fn render_general_card(&self, dark: bool, theme: &Theme) -> AnyElement {

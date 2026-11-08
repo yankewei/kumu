@@ -231,11 +231,16 @@ for kind in ('app', 'dmg'):
                  out / f'Kumu-{os.environ["KUMU_VERSION"]}-{kind}-notarization.json')
 checksum = hashlib.sha256((out / dmg.name).read_bytes()).hexdigest()
 (out / f'{dmg.name}.sha256').write_text(f'{checksum}  {dmg.name}\n')
+(out / 'SHA256SUMS').write_text(f'{checksum}  {dmg.name}\n')
 print(f'可分发产物：{(out / dmg.name).resolve()}')
 PY
 ```
 
-最终交付 `target/release/Kumu-<version>-<arch>.dmg` 和对应 `.dmg.sha256`，保留应用及 DMG 的公证日志。成功后可删除这次创建的临时工作目录。用户安装后仍需自行安装、登录要使用的编码 Agent。
+最终交付 `target/release/Kumu-<version>-<arch>.dmg`、对应 `.dmg.sha256` 和 `SHA256SUMS`，保留应用及 DMG 的公证日志。成功后可删除这次创建的临时工作目录。用户安装后仍需自行安装、登录要使用的编码 Agent。
+
+应用内更新器通过 GitHub Releases 读取最新正式版本，按 `Kumu-<version>-<arch>.dmg` 匹配安装包。每次发布都必须附带固定名称的 `SHA256SUMS`，不能只上传带版本号的 `.sha256` 文件。更新器要求 SHA256 匹配，并验证整个 `.app` 的版本号和签名团队 `3BUD4GCZCQ`；缺少校验文件或验证失败时不安装。若发布多个架构，需要将它们的校验行合并到同一个 `SHA256SUMS`。
+
+当前使用 `gpui-updater-pre` 的原生 DMG 安装后端，安装位置必须可写；只读磁盘映像、App Translocation 和没有写权限的安装位置会提示手动安装。首次带更新器的版本仍需手动安装，旧版不会自动获得更新功能。开发依赖固定 `gpui-pre = 0.3.4`，已验证与 gpui-kit 0.6 兼容；升级这个版本时应先重新验证编译。
 
 ## 上传 GitHub Releases
 
@@ -249,6 +254,7 @@ git push origin HEAD "refs/tags/v$KUMU_VERSION"
 gh release create "v$KUMU_VERSION" \
   "target/release/$(basename "$KUMU_DMG")" \
   "target/release/$(basename "$KUMU_DMG").sha256" \
+  "target/release/SHA256SUMS" \
   --title "v$KUMU_VERSION" --generate-notes --verify-tag
 ```
 

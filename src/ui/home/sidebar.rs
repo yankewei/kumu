@@ -1,9 +1,11 @@
 //! Left column: projects, sessions, and settings entry.
 
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use gpui_updater::UpdateStatus;
 
 use super::KumuApp;
 use crate::agent::AGENTS;
@@ -22,6 +24,27 @@ impl KumuApp {
         let (sidebar_accent, sidebar_accent_fg) =
             (theme.sidebar_accent, theme.sidebar_accent_foreground);
         let selected = self.selected;
+        let updater = self.updater.read(cx);
+        let update_notice = match updater.status() {
+            UpdateStatus::Available(version) => {
+                Some((IconName::ArrowUp, format!("新版本 {version}")))
+            }
+            UpdateStatus::Downloading { downloaded, total } => {
+                let label = match total {
+                    Some(total) if *total > 0 => {
+                        format!("正在下载 {}%", downloaded.saturating_mul(100) / total)
+                    }
+                    _ => "正在下载更新…".to_string(),
+                };
+                Some((IconName::LoaderCircle, label))
+            }
+            UpdateStatus::Installing => Some((IconName::LoaderCircle, "正在安装更新…".to_string())),
+            UpdateStatus::Staged(_) => Some((IconName::Check, "重启以完成更新".to_string())),
+            UpdateStatus::Errored(_) if updater.available().is_some() => {
+                Some((IconName::TriangleAlert, "更新失败，查看详情".to_string()))
+            }
+            _ => None,
+        };
         // Row context menus outlive this render, so they reach the view
         // through a weak handle.
         let weak = cx.entity().downgrade();
@@ -227,22 +250,41 @@ impl KumuApp {
                     .children(tree),
             )
             .child(
-                div()
+                v_flex()
                     .px_3()
                     .py_1p5()
-                    .flex()
+                    .gap_1()
                     .border_t_1()
                     .border_color(sidebar_border)
+                    .when_some(update_notice, |footer, (icon, label)| {
+                        footer.child(
+                            Button::new("sidebar-update")
+                                .small()
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .text_color(theme.link)
+                                .icon(icon)
+                                .label(label)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_settings(true, cx);
+                                })),
+                        )
+                    })
                     .child(
-                        div()
-                            .id("open-settings")
-                            .rounded(radius)
-                            .p_1()
-                            .cursor_pointer()
-                            .text_color(muted_fg)
-                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)))
-                            .child(Icon::new(IconName::Settings).small()),
+                        h_flex().child(
+                            div()
+                                .id("open-settings")
+                                .rounded(radius)
+                                .p_1()
+                                .cursor_pointer()
+                                .text_color(muted_fg)
+                                .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_settings(false, cx)),
+                                )
+                                .child(Icon::new(IconName::Settings).small()),
+                        ),
                     ),
             )
     }
