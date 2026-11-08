@@ -82,7 +82,9 @@ impl Discovery {
     }
 
     /// Registry agents with no catalog and no probe out: never probed, or
-    /// probed and failed — which is what makes a failure retryable.
+    /// probed and failed — which is what makes a failure retryable. Whether one
+    /// is installed is the caller's filter, not this list's: see
+    /// [`Workspace::probe`](crate::app::Workspace::probe).
     pub(super) fn missing(&self) -> Vec<&'static str> {
         agent::AGENTS
             .iter()

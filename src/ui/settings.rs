@@ -131,7 +131,7 @@ impl SettingsWindow {
 
         // Ask for whatever this process has not discovered yet — including an
         // agent whose last probe failed. The refresh control on the providers
-        // card re-runs the same fan-out over every agent.
+        // card re-runs the same fan-out over every installed agent.
         workspace.update(cx, |workspace, cx| workspace.probe_missing(cx));
         Self {
             settings_page: SettingsPage::Providers,
@@ -353,7 +353,14 @@ impl SettingsWindow {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let status_pill = if let Some(catalog) = discovery.and_then(|d| d.catalog(a.id)) {
+                // The registry is what kumu supports; this is the one fact the
+                // list takes from the machine. An agent that is not installed
+                // is still shown — so it is discoverable and its absence is
+                // visible — but never probed.
+                let installed = crate::agent::installed(a.id);
+                let status_pill = if !installed {
+                    pill(false, "未安装", radius, primary, link, muted, muted_fg).into_any_element()
+                } else if let Some(catalog) = discovery.and_then(|d| d.catalog(a.id)) {
                     let providers = catalog
                         .models
                         .iter()
@@ -394,13 +401,23 @@ impl SettingsWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(agent_logo(a.logo, px(16.), muted_fg)),
+                            .child(
+                                div()
+                                    .when(!installed, |d| d.opacity(0.45))
+                                    .child(agent_logo(a.logo, px(16.), muted_fg)),
+                            ),
                     )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_xs().font_medium().child(a.name))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .when(!installed, |d| d.text_color(muted_fg))
+                                    .child(a.name),
+                            )
                             .child(
                                 div()
                                     .mt_0p5()
@@ -449,8 +466,11 @@ impl SettingsWindow {
                             .text_color(link)
                             .hover(move |style| style.bg(muted))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let all: Vec<&'static str> =
-                                    AGENTS.iter().map(|agent| agent.id).collect();
+                                let all: Vec<&'static str> = AGENTS
+                                    .iter()
+                                    .map(|agent| agent.id)
+                                    .filter(|id| crate::agent::installed(id))
+                                    .collect();
                                 let _ = this
                                     .workspace
                                     .update(cx, |workspace, cx| workspace.probe(&all, cx));

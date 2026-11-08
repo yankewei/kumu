@@ -19,7 +19,10 @@ use gpui_kit::*;
 use super::panes::PaneId;
 use crate::agent::AGENTS;
 use crate::app::{Workspace, WorkspaceEvent};
-use crate::term::{self, Cell as TermCell, CursorShape, KeyInput, Rgb, Snapshot};
+use crate::term::{
+    self, Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
+    MouseInput, MouseMods, Rgb, SelectStep, Snapshot,
+};
 use crate::theme::{self, ThemeRevision};
 use crate::ui::tooltip::{HoverLabel as _, Tooltips};
 use crate::ui::widgets::agent_logo;
@@ -54,6 +57,16 @@ struct CursorAt {
     cell: (Pixels, Pixels),
 }
 
+/// Grid geometry from the last paint, for mapping pointer → cell.
+#[derive(Clone, Copy)]
+struct GridAt {
+    origin: Point<Pixels>,
+    cell: (Pixels, Pixels),
+    /// Visible grid height in pixels (cell_h * rows), for selection geometry.
+    height: f32,
+    scale: f32,
+}
+
 pub struct TerminalView {
     pane: PaneId,
     workspace: Entity<Workspace>,
@@ -71,6 +84,15 @@ pub struct TerminalView {
     /// IME composition preview ("nihao" before 你好).
     marked: Option<String>,
     cursor_at: Rc<Cell<CursorAt>>,
+    grid_at: Rc<Cell<GridAt>>,
+    /// Left-button selection drag in progress.
+    selecting: bool,
+    /// Buttons the mouse-tracking program was told about and has not released.
+    /// A gesture is decided when the button goes down, so a modifier or mode
+    /// change mid-drag cannot drop its Release.
+    reported: Vec<gpui::MouseButton>,
+    /// Accumulated scroll remainder (touchpad line fractions).
+    scrolled: f32,
     /// The last size sent to the process on screen, so a repaint does not
     /// resize again. Cleared when the session changes.
     sent: Rc<Cell<(u16, u16, u32, u32)>>,
@@ -110,6 +132,15 @@ impl TerminalView {
                 bounds: None,
                 cell: (px(0.), px(0.)),
             })),
+            grid_at: Rc::new(Cell::new(GridAt {
+                origin: point(px(0.), px(0.)),
+                cell: (px(0.), px(0.)),
+                height: 0.,
+                scale: 1.,
+            })),
+            selecting: false,
+            reported: Vec::new(),
+            scrolled: 0.,
             sent: Rc::new(Cell::new((0, 0, 0, 0))),
             painted: Rc::new(RefCell::new(PaintCache {
                 cell: (px(0.), px(0.)),
@@ -151,6 +182,7 @@ impl TerminalView {
 
     /// Show `session_id`, starting its TUI if it is not already running.
     pub fn show(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        self.reset_gesture();
         self.session = Some(session_id);
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
@@ -163,12 +195,24 @@ impl TerminalView {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.reset_gesture();
         self.session = None;
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
         self.painted.borrow_mut().rows.clear();
         self.snapshot = Snapshot::blank("", "");
         cx.notify();
+    }
+
+    /// A pane that changes session abandons whatever mouse gesture was in
+    /// flight. Left alone, `selecting` would make the next plain move end a
+    /// selection that belonged to the old session, and a `reported` button
+    /// whose release never arrived (a drag that switched panes or lost focus)
+    /// would keep this pane from taking any click again.
+    fn reset_gesture(&mut self) {
+        self.selecting = false;
+        self.reported.clear();
+        self.scrolled = 0.;
     }
 
     fn pull(&mut self, cx: &mut Context<Self>) {
@@ -208,7 +252,27 @@ impl TerminalView {
         if event.prefer_character_input {
             return;
         }
-        if event.keystroke.modifiers.platform {
+        let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if mods.platform && !mods.control && !mods.alt && !mods.shift {
+            match key {
+                "c" => {
+                    if self.copy(cx) {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                "v" => {
+                    self.paste(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                // Select-all is not wired yet; don't send ⌘A into the PTY.
+                "a" => return,
+                _ => return,
+            }
+        }
+        if mods.platform {
             return;
         }
         let Some(session_id) = self.session else {
@@ -217,14 +281,286 @@ impl TerminalView {
         let input = KeyInput {
             key: event.keystroke.key.clone(),
             key_char: event.keystroke.key_char.clone(),
-            shift: event.keystroke.modifiers.shift,
-            control: event.keystroke.modifiers.control,
-            alt: event.keystroke.modifiers.alt,
+            shift: mods.shift,
+            control: mods.control,
+            alt: mods.alt,
         };
         self.workspace
             .update(cx, |workspace, _| workspace.terminal_key(session_id, input));
         cx.stop_propagation();
     }
+
+    /// Copy the current selection. The text lives on the session thread, so the
+    /// read happens on a background task instead of blocking event dispatch.
+    fn copy(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.session else {
+            return false;
+        };
+        let Some(term) = self.workspace.read(cx).terminal_handle(session_id) else {
+            return false;
+        };
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_spawn(async move { term.selection_text() })
+                .await;
+            let Some(text) = text.filter(|text| !text.is_empty()) else {
+                return;
+            };
+            let _ = this.update(cx, |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_paste(session_id, text)
+        });
+    }
+
+    /// Whether the running program owns the pointer for a new gesture.
+    fn takes_mouse(&self, mods: &Modifiers) -> bool {
+        self.session.is_some() && self.snapshot.mouse_tracking && !mods.shift
+    }
+
+    /// Hand a button press to the program, latching it until its Release.
+    fn press_mouse(
+        &mut self,
+        button: gpui::MouseButton,
+        pos: Point<Pixels>,
+        mods: &Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.reported.contains(&button) || !self.takes_mouse(mods) {
+            return false;
+        }
+        self.reported.push(button);
+        self.send_mouse(MouseAction::Press, Some(button), pos, mods, cx);
+        true
+    }
+
+    /// Release a button the program was told about, whatever the modifiers are
+    /// now, so a modifier change mid-drag cannot leave it stuck down.
+    fn release_mouse(
+        &mut self,
+        button: gpui::MouseButton,
+        pos: Point<Pixels>,
+        mods: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.reported.contains(&button) {
+            return;
+        }
+        self.reported.retain(|held| *held != button);
+        self.send_mouse(MouseAction::Release, Some(button), pos, mods, cx);
+    }
+
+    fn send_mouse(
+        &mut self,
+        action: MouseAction,
+        button: Option<gpui::MouseButton>,
+        pos: Point<Pixels>,
+        mods: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let grid = self.grid_at.get();
+        let (x, y) = local_pos(grid, pos);
+        let input = MouseInput {
+            action,
+            button: button.and_then(map_mouse_button),
+            x: x * grid.scale,
+            y: y * grid.scale,
+            cell_w: f32::from(grid.cell.0) * grid.scale,
+            cell_h: f32::from(grid.cell.1) * grid.scale,
+            any_pressed: !self.reported.is_empty(),
+            mods: mouse_mods(mods),
+        };
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_mouse(session_id, input)
+        });
+    }
+
+    fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selecting = true;
+        self.apply_select(SelectStep::Press, pos, cx);
+    }
+
+    /// End a selection drag: copy what the gesture selected. The Release step
+    /// and the text both live on the session thread, so it runs off-thread.
+    fn finish_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selecting = false;
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let Some(point) = self.select_point(pos) else {
+            return;
+        };
+        let Some(term) = self.workspace.read(cx).terminal_handle(session_id) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let text = cx
+                .background_spawn(async move {
+                    term.select(
+                        SelectStep::Release,
+                        point.col,
+                        point.row,
+                        point.x,
+                        point.y,
+                        point.cell_w,
+                        point.height,
+                    )
+                })
+                .await;
+            let Some(text) = text.filter(|text| !text.is_empty()) else {
+                return;
+            };
+            let _ = this.update(cx, |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            });
+        })
+        .detach();
+    }
+
+    fn apply_select(&mut self, step: SelectStep, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        let Some(point) = self.select_point(pos) else {
+            return;
+        };
+        if let Some(term) = self.workspace.read(cx).terminal_handle(session_id) {
+            // Press and Drag never wait on the session thread.
+            let _ = term.select(
+                step,
+                point.col,
+                point.row,
+                point.x,
+                point.y,
+                point.cell_w,
+                point.height,
+            );
+        }
+        cx.notify();
+    }
+
+    fn select_point(&self, pos: Point<Pixels>) -> Option<SelectPoint> {
+        let grid = self.grid_at.get();
+        let (x, y) = local_pos(grid, pos);
+        let (cw, ch) = (f32::from(grid.cell.0), f32::from(grid.cell.1));
+        if cw <= 0. || ch <= 0. {
+            return None;
+        }
+        Some(SelectPoint {
+            col: (x / cw) as u16,
+            row: (y / ch) as u16,
+            x,
+            y,
+            cell_w: cw,
+            height: grid.height.max(ch),
+        })
+    }
+
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session else {
+            return;
+        };
+        cx.stop_propagation();
+        let grid = self.grid_at.get();
+        let (cw, ch) = (f32::from(grid.cell.0), f32::from(grid.cell.1));
+        if ch <= 0. {
+            return;
+        }
+        let lines = match event.delta {
+            ScrollDelta::Lines(p) => {
+                if cfg!(target_os = "macos") {
+                    macos_wheel_steps(p.y)
+                } else {
+                    p.y as i32
+                }
+            }
+            ScrollDelta::Pixels(p) => {
+                // Whole lines go to the terminal; the sub-line remainder stays
+                // in the accumulator so a slow trackpad still scrolls.
+                self.scrolled += f32::from(p.y) / ch;
+                let lines = self.scrolled.trunc() as i32;
+                self.scrolled -= lines as f32;
+                lines
+            }
+        };
+        if lines == 0 {
+            return;
+        }
+        // GPUI: positive y is content moving down = scroll up in terminal terms.
+        let delta = -(lines as isize);
+        let (x, y) = local_pos(grid, event.position);
+        let mods = mouse_mods(&event.modifiers);
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_scroll(
+                session_id,
+                delta,
+                x * grid.scale,
+                y * grid.scale,
+                cw * grid.scale,
+                ch * grid.scale,
+                mods,
+            )
+        });
+        cx.notify();
+    }
+}
+
+/// One gesture position in grid-local logical pixels.
+#[derive(Clone, Copy)]
+struct SelectPoint {
+    col: u16,
+    row: u16,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    height: f32,
+}
+
+fn mouse_mods(mods: &Modifiers) -> MouseMods {
+    MouseMods {
+        shift: mods.shift,
+        control: mods.control,
+        alt: mods.alt,
+    }
+}
+
+fn local_pos(grid: GridAt, pos: Point<Pixels>) -> (f32, f32) {
+    (
+        f32::from(pos.x - grid.origin.x).max(0.),
+        f32::from(pos.y - grid.origin.y).max(0.),
+    )
+}
+
+fn map_mouse_button(button: gpui::MouseButton) -> Option<TermMouseButton> {
+    match button {
+        gpui::MouseButton::Left => Some(TermMouseButton::Left),
+        gpui::MouseButton::Right => Some(TermMouseButton::Right),
+        gpui::MouseButton::Middle => Some(TermMouseButton::Middle),
+        _ => None,
+    }
+}
+
+fn macos_wheel_steps(ticks: f32) -> i32 {
+    if ticks == 0. {
+        return 0;
+    }
+    (ticks.signum() * ticks.abs().max(1.) * 3.).trunc() as i32
 }
 
 /// OS text input (Pinyin, Japanese, Korean, dead keys) types here. Native
@@ -334,9 +670,11 @@ impl Render for TerminalView {
         let sent = self.sent.clone();
         let painted = self.painted.clone();
         let cursor_at = self.cursor_at.clone();
+        let grid_at = self.grid_at.clone();
         let focused = self.focus.is_focused(window);
         let input_focus = self.focus.clone();
         let input_view = cx.entity();
+        let mouse_view = cx.entity().downgrade();
         let (mark, name, cwd) = header_identity(session, &snapshot, &self.workspace, cx);
         let note = header_note(&snapshot);
         let active = self.active;
@@ -388,12 +726,42 @@ impl Render for TerminalView {
                     .track_focus(&self.focus)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                             this.focus.focus(window, cx);
                             cx.emit(TerminalEvent::Activated);
+                            if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
+                                if let Some(id) = this.session {
+                                    this.workspace.update(cx, |workspace, _| {
+                                        workspace.terminal_clear_selection(id);
+                                    });
+                                }
+                            } else if !this.reported.contains(&ev.button) {
+                                this.start_selection(ev.position, cx);
+                            }
                             cx.notify();
                         }),
                     )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                            this.focus.focus(window, cx);
+                            cx.emit(TerminalEvent::Activated);
+                            if !this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
+                                this.paste(cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                            this.focus.focus(window, cx);
+                            cx.emit(TerminalEvent::Activated);
+                            this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                        this.on_scroll(ev, cx);
+                    }))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         this.on_key(event, cx);
                     }))
@@ -428,7 +796,7 @@ impl Render for TerminalView {
                                 (cell_w, cell_h)
                             },
                             move |bounds, cell, window, cx| {
-                                paint_grid(
+                                let origin = paint_grid(
                                     GridPaint {
                                         bounds,
                                         snapshot: &snapshot,
@@ -442,6 +810,61 @@ impl Render for TerminalView {
                                     window,
                                     cx,
                                 );
+                                grid_at.set(GridAt {
+                                    origin,
+                                    cell,
+                                    height: f32::from(cell.1) * snapshot.rows as f32,
+                                    scale: window.scale_factor(),
+                                });
+                                let view = mouse_view.clone();
+                                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.selecting {
+                                            if ev.pressed_button == Some(MouseButton::Left) {
+                                                this.apply_select(
+                                                    SelectStep::Drag,
+                                                    ev.position,
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.finish_selection(ev.position, cx);
+                                            }
+                                            return;
+                                        }
+                                        if let Some(button) = ev.pressed_button
+                                            && this.reported.contains(&button)
+                                        {
+                                            this.send_mouse(
+                                                MouseAction::Motion,
+                                                Some(button),
+                                                ev.position,
+                                                &ev.modifiers,
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                });
+                                let view = mouse_view.clone();
+                                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.release_mouse(
+                                            ev.button,
+                                            ev.position,
+                                            &ev.modifiers,
+                                            cx,
+                                        );
+                                        if this.selecting && ev.button == MouseButton::Left {
+                                            this.finish_selection(ev.position, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    });
+                                });
                                 if focused {
                                     window.handle_input(
                                         &input_focus,
@@ -931,7 +1354,7 @@ struct GridPaint<'a> {
     cursor_at: &'a Cell<CursorAt>,
 }
 
-fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) {
+fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<Pixels> {
     let GridPaint {
         bounds,
         snapshot,
@@ -1118,4 +1541,5 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) {
         bounds: cursor_bounds,
         cell: (cell_w, cell_h),
     });
+    origin
 }

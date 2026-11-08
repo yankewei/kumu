@@ -22,6 +22,10 @@ pub struct Session {
     pub agent: String,
     pub title: String,
     pub cwd: String,
+    /// Agent-side session id, when we have latched onto one (`agent:id`).
+    pub resume_id: Option<String>,
+    /// The user typed this title; generated names must not replace it.
+    pub title_manual: bool,
 }
 
 pub struct Store {
@@ -151,7 +155,10 @@ impl Store {
     pub fn sessions(&self) -> Vec<Session> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, project_id, agent, title, cwd FROM sessions ORDER BY id")
+            .prepare(
+                "SELECT id, project_id, agent, title, cwd, resume_id, title_manual
+                 FROM sessions ORDER BY id",
+            )
             .unwrap();
         stmt.query_map([], |row| {
             Ok(Session {
@@ -160,6 +167,8 @@ impl Store {
                 agent: row.get(2)?,
                 title: row.get(3)?,
                 cwd: row.get(4)?,
+                resume_id: row.get(5)?,
+                title_manual: row.get::<_, i64>(6)? != 0,
             })
         })
         .unwrap()
@@ -190,6 +199,39 @@ impl Store {
         tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()
+    }
+
+    /// Store a generated title — typically one read from an agent's own session
+    /// store — and report whether it was applied.
+    ///
+    /// A session the user has renamed refuses it: [`Store::rename_session`]
+    /// makes the title the user's, and a generated one must not overwrite a
+    /// name they typed out.
+    pub fn update_session_title(&self, id: i64, title: &str) -> Result<bool> {
+        let applied = self.conn.execute(
+            "UPDATE sessions SET title = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND title_manual = 0",
+            params![title, id],
+        )?;
+        Ok(applied > 0)
+    }
+
+    /// Remember which agent-side session this row is bound to (`agent:id`).
+    pub fn set_session_resume_id(&self, id: i64, resume_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET resume_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![resume_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a resume binding (the agent process is gone or was never ours).
+    pub fn clear_session_resume_id(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET resume_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// Rename a session to a name the user chose. From here on the name is the
@@ -327,6 +369,27 @@ mod tests {
             .unwrap();
 
         store.rename_session(session, "重构 backend").unwrap();
+        assert_eq!(store.sessions()[0].title, "重构 backend");
+        assert!(store.sessions()[0].title_manual);
+    }
+
+    /// A generated title fills an unnamed session, but once the user renames
+    /// it every later generated title is refused — the name they typed stands.
+    #[test]
+    fn a_manual_title_outranks_generated_ones() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let session = store
+            .insert_session(project, "omp", "会话 1", "/tmp")
+            .unwrap();
+
+        assert!(store.update_session_title(session, "首条消息").unwrap());
+        assert_eq!(store.sessions()[0].title, "首条消息");
+
+        store.rename_session(session, "重构 backend").unwrap();
+        assert!(!store
+            .update_session_title(session, "agent 起的名字")
+            .unwrap());
         assert_eq!(store.sessions()[0].title, "重构 backend");
     }
 

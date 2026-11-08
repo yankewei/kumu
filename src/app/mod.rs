@@ -9,17 +9,21 @@
 
 pub mod discovery;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter};
 
 use crate::agent;
 use crate::db::{Project, Session, Store, db_path};
-use crate::term::{KeyInput, Snapshot, Term, TermColors};
+use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors};
 use crate::theme;
 use discovery::Discovery;
+
+/// How often to re-read agent session stores for sidebar titles.
+const TITLE_SYNC_EVERY: Duration = Duration::from_secs(2);
 
 /// How many native agent TUIs may stay running at once.
 ///
@@ -73,6 +77,7 @@ impl Workspace {
         };
         workspace.bootstrap();
         workspace.probe_missing(cx);
+        workspace.watch_agent_titles(cx);
         workspace
     }
 
@@ -186,6 +191,46 @@ impl Workspace {
     pub fn terminal_write(&self, session_id: i64, bytes: impl Into<Vec<u8>>) {
         if let Some(term) = self.terms.get(&session_id) {
             term.write(bytes);
+        }
+    }
+
+    pub fn terminal_paste(&self, session_id: i64, text: impl Into<Vec<u8>>) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.paste(text);
+        }
+    }
+
+    /// A handle to the session's terminal, for work that must not run on the UI
+    /// thread (the selection round trips block).
+    pub fn terminal_handle(&self, session_id: i64) -> Option<Term> {
+        self.terms.get(&session_id).cloned()
+    }
+
+    pub fn terminal_mouse(&self, session_id: i64, input: MouseInput) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.mouse(input);
+        }
+    }
+
+    pub fn terminal_clear_selection(&self, session_id: i64) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.clear_selection();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn terminal_scroll(
+        &self,
+        session_id: i64,
+        lines: isize,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        cell_h: f32,
+        mods: MouseMods,
+    ) {
+        if let Some(term) = self.terms.get(&session_id) {
+            term.scroll(lines, x, y, cell_w, cell_h, mods);
         }
     }
 
@@ -324,6 +369,153 @@ impl Workspace {
         cx.emit(WorkspaceEvent::Changed);
     }
 
+    /// Poll each agent's on-disk session store for titles, so a shell that
+    /// launched `claude` picks up the name that agent wrote. Only agents whose
+    /// store records a pid can be claimed by a shell — currently Claude alone;
+    /// `agent::disk_title` says why.
+    ///
+    /// The scan is file and process work — one `ps` snapshot per live terminal
+    /// and a walk of the agents' stores — so it runs on the background executor
+    /// and only its findings are applied on the UI thread. With no live
+    /// terminal there is nothing to look up, and the round trip is skipped.
+    fn watch_agent_titles(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TITLE_SYNC_EVERY).await;
+                let queries = match this.update(cx, |workspace, _| workspace.title_queries()) {
+                    Ok(queries) => queries,
+                    Err(_) => break,
+                };
+                if queries.is_empty() {
+                    continue;
+                }
+                let scans = cx
+                    .background_executor()
+                    .spawn(async move { queries.into_iter().map(scan_title).collect::<Vec<_>>() })
+                    .await;
+                let changed =
+                    match this.update(cx, |workspace, _| workspace.apply_title_scan(scans)) {
+                        Ok(changed) => changed,
+                        Err(_) => break,
+                    };
+                if changed {
+                    let _ = this.update(cx, |_workspace, cx| {
+                        cx.emit(WorkspaceEvent::Changed);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// What a title poll needs to look at: live terminals whose titles the user
+    /// has not set, with what the scan needs to ask the agents' stores. Gathered
+    /// here because the PTY handles live in this struct.
+    fn title_queries(&self) -> Vec<TitleQuery> {
+        let mut live: Vec<(i64, Option<u32>)> = self
+            .terms
+            .iter()
+            .filter(|(_, term)| !term.snapshot().exited)
+            .map(|(id, term)| (*id, term.process_id()))
+            .collect();
+        // Stable order so two shells in the same cwd claim distinct agent
+        // sessions instead of racing on HashMap iteration.
+        live.sort_by_key(|(id, _)| *id);
+        live.into_iter()
+            .filter_map(|(session_id, pid)| {
+                let session = self.sessions.iter().find(|s| s.id == session_id)?;
+                if session.title_manual {
+                    return None;
+                }
+                Some(TitleQuery {
+                    session_id,
+                    cwd: session.cwd.clone(),
+                    pid,
+                    agent_id: session.agent.clone(),
+                    shell: crate::term::is_shell(&session.agent),
+                    resume_id: session.resume_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Fold a batch of scans into the sessions, returning whether anything the
+    /// sidebar shows changed.
+    fn apply_title_scan(&mut self, scans: Vec<TitleScan>) -> bool {
+        let mut claimed: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.resume_id.clone())
+            .collect();
+        let mut changed = false;
+        for scan in scans {
+            let TitleScan {
+                session_id,
+                binding_alive,
+                bound_title,
+                mut candidates,
+            } = scan;
+            let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+                continue;
+            };
+            // A binding whose agent has exited is dropped so a later agent
+            // session under the same shell can be claimed. The title stays: it
+            // is still what this terminal is showing, and rewriting it to
+            // "终端 N" would also lose every agent-assigned name on restart,
+            // when the process is gone but the session row is not.
+            if binding_alive == Some(false) {
+                let _ = self.store.clear_session_resume_id(session_id);
+                if let Some(resume) = session.resume_id.as_deref() {
+                    claimed.remove(resume);
+                }
+                if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    row.resume_id = None;
+                }
+                changed = true;
+                continue;
+            }
+            let next = if let Some(resume) = session.resume_id.as_deref() {
+                bound_title.map(|title| (resume.to_string(), title))
+            } else {
+                candidates.retain(|c| !claimed.contains(&c.resume_id));
+                candidates
+                    .into_iter()
+                    .max_by_key(|c| c.score)
+                    .map(|c| (c.resume_id, c.title))
+            };
+            let Some((resume_id, title)) = next else {
+                continue;
+            };
+            if session.resume_id.as_deref() != Some(resume_id.as_str()) {
+                if self
+                    .store
+                    .set_session_resume_id(session_id, &resume_id)
+                    .is_ok()
+                {
+                    claimed.insert(resume_id.clone());
+                    if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        row.resume_id = Some(resume_id);
+                    }
+                    changed = true;
+                }
+            } else {
+                claimed.insert(resume_id);
+            }
+            if session.title != title
+                && self
+                    .store
+                    .update_session_title(session_id, &title)
+                    .unwrap_or(false)
+            {
+                if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    row.title = title;
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Delete a session: drop its live terminal, then remove the row.
     ///
     /// Returns the neighbor to select next — computed before the row is gone —
@@ -339,18 +531,20 @@ impl Workspace {
 
     /// Probe the agents nothing is known about yet — never probed, or probed
     /// and failed — so the settings window has a catalogue before any session
-    /// has connected.
+    /// has connected. Not-installed agents are dropped in [`Self::probe`].
     pub fn probe_missing(&mut self, cx: &mut Context<Self>) {
         let missing = self.discovery.missing();
         self.probe(&missing, cx);
     }
 
     /// Probe `agents` again, replacing what is cached as the answers arrive.
-    /// An agent whose probe is already out is left to that one.
+    /// An agent whose probe is already out is left to that one, and an agent
+    /// that is not installed here is skipped: there is nothing to ask.
     pub fn probe(&mut self, agents: &[&'static str], cx: &mut Context<Self>) {
         let launchable: Vec<(&'static str, agent::Config)> = agents
             .iter()
             .filter_map(|&id| Some((id, agent::Config::for_agent(id)?)))
+            .filter(|(_, cfg)| cfg.installed())
             .collect();
         let ids: Vec<&'static str> = launchable.iter().map(|(id, _)| *id).collect();
         let started = self.discovery.start(&ids);
@@ -408,6 +602,69 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
     ProjectPick::New { name }
 }
 
+/// One live session as a title poll sees it: everything the off-thread scan
+/// needs, copied off the [`Workspace`] so the scan can run on the background
+/// executor.
+struct TitleQuery {
+    session_id: i64,
+    cwd: String,
+    pid: Option<u32>,
+    agent_id: String,
+    shell: bool,
+    resume_id: Option<String>,
+}
+
+/// What a scan found for one query: the verdict on a stored binding, or the
+/// candidates an unbound session could claim.
+struct TitleScan {
+    session_id: i64,
+    /// `Some(false)` when the stored binding no longer belongs to the terminal.
+    binding_alive: Option<bool>,
+    /// The title a live binding resolves to.
+    bound_title: Option<String>,
+    candidates: Vec<agent::DiskTitle>,
+}
+
+/// Read one session's agent stores. Runs on the background executor: it shells
+/// out to `ps` and walks the agents' session files, which is far too slow for
+/// the UI thread's two-second poll.
+fn scan_title(query: TitleQuery) -> TitleScan {
+    let TitleQuery {
+        session_id,
+        cwd,
+        pid,
+        agent_id,
+        shell,
+        resume_id,
+    } = query;
+    let mut scan = TitleScan {
+        session_id,
+        binding_alive: None,
+        bound_title: None,
+        candidates: Vec::new(),
+    };
+    match resume_id.as_deref() {
+        // A shell's binding has to be re-proved every poll: the agent it names
+        // may have exited, and a cwd-only match must not let this terminal keep
+        // someone else's name.
+        Some(resume) if shell => {
+            let alive = agent::resume_belongs_to_terminal(resume, pid);
+            scan.binding_alive = Some(alive);
+            if alive {
+                scan.bound_title = agent::lookup_disk_title(resume);
+            }
+        }
+        // A non-shell session is the agent itself; its own store answers, and
+        // there is no process to re-check.
+        Some(resume) => scan.bound_title = agent::lookup_disk_title(resume),
+        None => {
+            let prefer = (!shell).then_some(agent_id.as_str());
+            scan.candidates = agent::discover_disk_title(&cwd, pid, prefer, shell);
+        }
+    }
+    scan
+}
+
 /// Which session to select after `id` is deleted.
 ///
 /// The nearest sibling in the same project (the next one, else the previous),
@@ -462,6 +719,8 @@ mod tests {
             agent: "shell".into(),
             title: format!("终端 {id}"),
             cwd: "/tmp".into(),
+            resume_id: None,
+            title_manual: false,
         }
     }
 

@@ -26,6 +26,7 @@ mod acp;
 mod claude;
 mod codex;
 mod config;
+mod disk_title;
 mod event;
 mod opencode;
 mod pi;
@@ -36,7 +37,11 @@ mod session;
 #[cfg(test)]
 mod test_support;
 
-pub use config::{Config, interactive};
+pub use config::{Config, installed, interactive};
+pub use disk_title::{
+    DiskTitle, discover as discover_disk_title, lookup as lookup_disk_title,
+    resume_belongs_to_terminal,
+};
 pub use event::{Event, ModeInfo, ModelInfo, ReasoningInfo, SandboxInfo};
 pub use probe::probe;
 pub use registry::AGENTS;

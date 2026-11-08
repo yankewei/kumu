@@ -10,7 +10,10 @@ mod session;
 mod vt;
 
 pub use session::Term;
-pub use vt::{Cell, CursorShape, KeyInput, Rgb, Snapshot, TermColors};
+pub use vt::{
+    Cell, CursorShape, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb, SelectStep,
+    Snapshot, TermColors,
+};
 
 /// Stored on [`crate::db::Session::agent`] for a pure shell session — not an
 /// agent, and not listed in [`crate::agent::AGENTS`].

@@ -101,6 +101,7 @@ pub fn term_colors(cx: &App) -> TermColors {
         fg,
         bg,
         cursor: rgb(theme.caret),
+        selection: rgb(theme.accent),
         palette: [
             ansi_black,
             rgb(theme.red),

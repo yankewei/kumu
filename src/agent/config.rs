@@ -6,7 +6,7 @@
 //! everything downstream is shared, so a new agent is a registry entry plus a
 //! builder here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The protocol a subprocess speaks. [`spawn`] and [`probe`] dispatch on it.
 ///
@@ -129,6 +129,56 @@ impl Config {
             ],
             env: Vec::new(),
         }
+    }
+
+    /// Whether this agent can actually be launched here. A resolved path is
+    /// checked directly and a bare name is looked up on PATH — exactly what
+    /// `Command::new` does when the probe spawns it — so a config that reports
+    /// installed is one whose probe stands a chance of starting.
+    pub fn installed(&self) -> bool {
+        is_executable(&self.command)
+    }
+}
+
+/// Whether the agent `id`'s executable is present on this machine.
+///
+/// The registry says what kumu supports, not what is installed: this asks the
+/// same resolver [`Config::for_agent`] launches through (env override, install
+/// locations, then PATH), so the settings list can tell the two apart without
+/// spawning anything.
+pub fn installed(id: &'static str) -> bool {
+    Config::for_agent(id).is_some_and(|cfg| cfg.installed())
+}
+
+/// Whether `command` names something launchable: a file at a path, or a bare
+/// name that resolves on this process's PATH.
+fn is_executable(command: &str) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(Path::new(command));
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(command)))
+    })
+}
+
+/// A file the OS will actually run. A directory or a non-executable file that
+/// happens to carry the agent's name must not count, or the row would claim
+/// the agent is installed while every probe spawn-fails.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -272,15 +322,33 @@ fn opencode_api_key() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::interactive;
+    use super::{Config, installed, interactive, is_executable};
+    use crate::agent::AGENTS;
 
     #[test]
     fn interactive_launch_is_the_tui() {
-        for agent in ["opencode", "omp", "codex", "claude", "pi"] {
+        for agent in AGENTS.iter().map(|a| a.id) {
             let (command, args) = interactive(agent).expect(agent);
             assert!(!command.is_empty(), "{agent}");
             assert!(args.is_empty(), "{agent} args were {args:?}");
+            // Every registry entry must also be launchable as a probe, or the
+            // settings row could never show a catalogue.
+            assert!(Config::for_agent(agent).is_some(), "{agent}");
         }
         assert!(interactive("nope").is_none());
+    }
+
+    /// Detection must not take a path's word for it: a stale override or a
+    /// binary the user uninstalled would otherwise be listed as installed and
+    /// probe-fail on every refresh.
+    #[test]
+    fn a_missing_or_unrunnable_command_is_not_installed() {
+        assert!(!is_executable("/nonexistent/kumu-agent"));
+        assert!(!installed("nope"));
+        #[cfg(unix)]
+        {
+            assert!(is_executable("/bin/sh"));
+            assert!(!is_executable("/tmp"), "a directory is not a command");
+        }
     }
 }

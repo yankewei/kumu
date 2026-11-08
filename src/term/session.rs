@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -10,12 +10,14 @@ use futures::channel::mpsc::UnboundedReceiver;
 use portable_pty::PtySize;
 
 use super::pty::{self, Pty};
-use super::vt::{KeyInput, Snapshot, TermColors, Vt};
+use super::vt::{KeyInput, MouseInput, MouseMods, SelectStep, Snapshot, TermColors, Vt};
 
 struct Live {
     screen: Mutex<Snapshot>,
     generation: AtomicU64,
     queued: AtomicBool,
+    /// PTY child pid, or 0 before spawn / when the platform does not report one.
+    pid: AtomicU32,
     wake: futures::channel::mpsc::UnboundedSender<()>,
 }
 
@@ -31,9 +33,36 @@ impl Live {
 
 enum Msg {
     Bytes(Vec<u8>),
-    /// Bytes to write to the PTY (IME commit, paste).
+    /// Bytes to write to the PTY (IME commit).
     Write(Vec<u8>),
+    /// Clipboard text, encoded for the program's paste mode.
+    Paste(Vec<u8>),
     Key(KeyInput),
+    /// Mouse report for a program that tracks the mouse.
+    Mouse(MouseInput),
+    /// Selection gesture; optional reply carries the selected text after Release.
+    Select {
+        step: SelectStep,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+        reply: Option<Sender<Option<String>>>,
+    },
+    ClearSelection,
+    SelectionText(Sender<Option<String>>),
+    /// Scroll the viewport (primary screen) or send arrows / mouse wheel.
+    Scroll {
+        lines: isize,
+        /// Local pixel position inside the grid, for mouse-wheel reports.
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        cell_h: f32,
+        mods: MouseMods,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -84,6 +113,7 @@ impl Term {
             screen: Mutex::new(Snapshot::blank_with(&command, &cwd_text, colors.bg)),
             generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
+            pid: AtomicU32::new(0),
             wake,
         });
         let thread_tx = tx.clone();
@@ -112,6 +142,14 @@ impl Term {
         self.live.generation.load(Ordering::Acquire)
     }
 
+    /// The PTY child's process id, when the platform reported one.
+    pub fn process_id(&self) -> Option<u32> {
+        match self.live.pid.load(Ordering::Acquire) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
     /// The UI has started handling a wake. A publish that arrives after this
     /// sends another one.
     pub fn wake_handled(&self) {
@@ -122,12 +160,90 @@ impl Term {
         let _ = self.tx.send(Msg::Key(input));
     }
 
-    /// Write raw bytes to the PTY (finished IME text, paste).
+    /// Write raw bytes to the PTY (finished IME text).
     pub fn write(&self, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
         if !bytes.is_empty() {
             let _ = self.tx.send(Msg::Write(bytes));
         }
+    }
+
+    /// Paste clipboard text, framed for the program's bracketed paste mode.
+    pub fn paste(&self, text: impl Into<Vec<u8>>) {
+        let text = text.into();
+        if !text.is_empty() {
+            let _ = self.tx.send(Msg::Paste(text));
+        }
+    }
+
+    pub fn mouse(&self, input: MouseInput) {
+        let _ = self.tx.send(Msg::Mouse(input));
+    }
+
+    /// Drive a selection gesture. On [`SelectStep::Release`], returns the
+    /// selected text (copy-on-select) once the session thread applies it.
+    ///
+    /// This blocks until the session thread replies (or 200ms), so call it
+    /// from a background task, not from event dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select(
+        &self,
+        step: SelectStep,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+    ) -> Option<String> {
+        let (reply, wait) = if matches!(step, SelectStep::Release) {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let _ = self.tx.send(Msg::Select {
+            step,
+            col,
+            row,
+            x,
+            y,
+            cell_w,
+            height,
+            reply,
+        });
+        wait.and_then(|rx| rx.recv().ok()).flatten()
+    }
+
+    pub fn clear_selection(&self) {
+        let _ = self.tx.send(Msg::ClearSelection);
+    }
+
+    /// Currently selected plain text, if any.
+    ///
+    /// Blocks until the session thread answers. Callers run on the background
+    /// executor, and a busy session thread (a paste, a flood of output) must not
+    /// turn ⌘C into a silent no-op: a short timeout here just drops the copy.
+    /// The channel disconnecting is the one thing that ends the wait early,
+    /// which is the session thread being gone.
+    pub fn selection_text(&self) -> Option<String> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::SelectionText(tx));
+        rx.recv().ok().flatten()
+    }
+
+    pub fn scroll(&self, lines: isize, x: f32, y: f32, cell_w: f32, cell_h: f32, mods: MouseMods) {
+        if lines == 0 {
+            return;
+        }
+        let _ = self.tx.send(Msg::Scroll {
+            lines,
+            x,
+            y,
+            cell_w,
+            cell_h,
+            mods,
+        });
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
@@ -180,6 +296,9 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
             return;
         }
     };
+    if let Some(pid) = portable_pty::Child::process_id(pty.child.as_ref()) {
+        live.pid.store(pid, Ordering::Release);
+    }
     let mut session = Running {
         pty,
         vt: Vt::with_colors(80, 24, colors),
@@ -257,6 +376,9 @@ impl Running {
                     self.publish();
                 }
                 Some(Msg::Key(input)) => {
+                    if self.vt.clear_selection() {
+                        self.publish();
+                    }
                     let bytes = self.vt.encode_input(&input);
                     if !bytes.is_empty() {
                         let _ = self.pty.writer.write_all(&bytes);
@@ -264,8 +386,94 @@ impl Running {
                     }
                 }
                 Some(Msg::Write(bytes)) => {
+                    if self.vt.clear_selection() {
+                        self.publish();
+                    }
                     let _ = self.pty.writer.write_all(&bytes);
                     let _ = self.pty.writer.flush();
+                }
+                Some(Msg::Paste(text)) => {
+                    if self.vt.clear_selection() {
+                        self.publish();
+                    }
+                    let bytes = self.vt.encode_paste(&text);
+                    if !bytes.is_empty() {
+                        let _ = self.pty.writer.write_all(&bytes);
+                        let _ = self.pty.writer.flush();
+                    }
+                }
+                Some(Msg::Mouse(input)) => {
+                    let bytes = self.vt.encode_mouse(input);
+                    if !bytes.is_empty() {
+                        let _ = self.pty.writer.write_all(&bytes);
+                        let _ = self.pty.writer.flush();
+                    }
+                }
+                Some(Msg::Select {
+                    step,
+                    col,
+                    row,
+                    x,
+                    y,
+                    cell_w,
+                    height,
+                    reply,
+                }) => {
+                    self.vt.select(step, col, row, x, y, cell_w, height);
+                    self.publish();
+                    if let Some(reply) = reply {
+                        let _ = reply.send(self.vt.selection_text());
+                    }
+                }
+                Some(Msg::ClearSelection) => {
+                    if self.vt.clear_selection() {
+                        self.publish();
+                    }
+                }
+                Some(Msg::SelectionText(reply)) => {
+                    let _ = reply.send(self.vt.selection_text());
+                }
+                Some(Msg::Scroll {
+                    lines,
+                    x,
+                    y,
+                    cell_w,
+                    cell_h,
+                    mods,
+                }) => {
+                    if self.vt.mouse_tracking() {
+                        let button = if lines < 0 {
+                            super::vt::MouseButton::WheelUp
+                        } else {
+                            super::vt::MouseButton::WheelDown
+                        };
+                        let mut out = Vec::new();
+                        for _ in 0..lines.unsigned_abs() {
+                            out.extend(self.vt.encode_mouse(MouseInput {
+                                action: super::vt::MouseAction::Press,
+                                button: Some(button),
+                                x,
+                                y,
+                                cell_w,
+                                cell_h,
+                                any_pressed: false,
+                                mods,
+                            }));
+                        }
+                        if !out.is_empty() {
+                            let _ = self.pty.writer.write_all(&out);
+                            let _ = self.pty.writer.flush();
+                        }
+                    } else if self.vt.alt_screen() {
+                        let bytes = self.vt.encode_scroll_keys(lines < 0, lines.unsigned_abs());
+                        if !bytes.is_empty() {
+                            let _ = self.pty.writer.write_all(&bytes);
+                            let _ = self.pty.writer.flush();
+                        }
+                    } else {
+                        self.vt.scroll_viewport(lines);
+                        self.publish();
+                    }
                 }
                 Some(Msg::Resize {
                     cols,

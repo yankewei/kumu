@@ -22,6 +22,8 @@ pub struct TermColors {
     pub fg: Rgb,
     pub bg: Rgb,
     pub cursor: Rgb,
+    /// Background for the mouse selection highlight.
+    pub selection: Rgb,
     pub palette: [Rgb; 16],
 }
 
@@ -31,6 +33,7 @@ impl Default for TermColors {
             fg: Rgb(0xdd, 0xdd, 0xdd),
             bg: Rgb(0x1e, 0x1e, 0x1e),
             cursor: Rgb(0xf5, 0xf5, 0xf5),
+            selection: Rgb(0x3a, 0x5f, 0x8a),
             palette: [
                 Rgb(0x1e, 0x1e, 0x1e),
                 Rgb(0xe0, 0x4b, 0x4b),
@@ -51,6 +54,51 @@ impl Default for TermColors {
             ],
         }
     }
+}
+
+/// One step of a mouse selection gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectStep {
+    Press,
+    Drag,
+    Release,
+}
+
+/// Keyboard modifiers held during a mouse event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseMods {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+}
+
+/// A mouse event for a program that tracks the mouse.
+#[derive(Clone, Copy, Debug)]
+pub struct MouseInput {
+    pub action: MouseAction,
+    pub button: Option<MouseButton>,
+    pub x: f32,
+    pub y: f32,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub any_pressed: bool,
+    pub mods: MouseMods,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    WheelUp,
+    WheelDown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +150,8 @@ pub struct Snapshot {
     pub cwd: String,
     pub exited: bool,
     pub spawn_error: Option<String>,
+    /// The program asked for mouse reports (click goes to it unless Shift).
+    pub mouse_tracking: bool,
 }
 
 impl Snapshot {
@@ -122,6 +172,7 @@ impl Snapshot {
             cwd: cwd.to_string(),
             exited: false,
             spawn_error: None,
+            mouse_tracking: false,
         }
     }
 
@@ -214,6 +265,13 @@ unsafe extern "C" fn on_size(
     true
 }
 
+/// A cached row: its cells plus the row-local selection they were read with.
+type SeenRow = (Arc<Vec<Cell>>, Option<(u16, u16)>);
+
+/// DEC private mode 2004. The C header spells it `GHOSTTY_MODE_BRACKETED_PASTE`,
+/// but that macro is built by an inline helper bindgen does not emit.
+const MODE_BRACKETED_PASTE: GhosttyMode = 2004;
+
 pub struct Vt {
     term: GhosttyTerminal,
     shared: Box<Shared>,
@@ -221,11 +279,18 @@ pub struct Vt {
     cells_it: GhosttyRenderStateRowCells,
     keys: GhosttyKeyEncoder,
     key_event: GhosttyKeyEvent,
+    mouse: GhosttyMouseEncoder,
+    mouse_event: GhosttyMouseEvent,
+    last_mouse_report: Vec<u8>,
+    gesture: GhosttySelectionGesture,
+    press: GhosttySelectionGestureEvent,
+    drag: GhosttySelectionGestureEvent,
+    release: GhosttySelectionGestureEvent,
     cols: u16,
     rows: u16,
     colors: TermColors,
-    /// Rows read last frame by libghostty's row id. A clean id reuses the Arc.
-    seen: HashMap<[u64; 2], Arc<Vec<Cell>>>,
+    /// Rows read last frame by libghostty's row id, with their selection range.
+    seen: HashMap<[u64; 2], SeenRow>,
     /// Width and default colors those rows were read with.
     seen_with: (u16, Rgb, Rgb),
 }
@@ -278,6 +343,34 @@ impl Vt {
             ok(
                 ghostty_key_event_new(std::ptr::null(), &mut key_event),
                 "key_event_new",
+            );
+            let mut mouse = std::ptr::null_mut();
+            ok(
+                ghostty_mouse_encoder_new(std::ptr::null(), &mut mouse),
+                "mouse_encoder_new",
+            );
+            let mut mouse_event = std::ptr::null_mut();
+            ok(
+                ghostty_mouse_event_new(std::ptr::null(), &mut mouse_event),
+                "mouse_event_new",
+            );
+            let mut gesture = std::ptr::null_mut();
+            ok(
+                ghostty_selection_gesture_new(std::ptr::null(), &mut gesture),
+                "selection_gesture_new",
+            );
+            let gesture_event = |kind| {
+                let mut event = std::ptr::null_mut();
+                ok(
+                    ghostty_selection_gesture_event_new(std::ptr::null(), &mut event, kind),
+                    "gesture_event_new",
+                );
+                event
+            };
+            let (press, drag, release) = (
+                gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS),
+                gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG),
+                gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE),
             );
 
             let mut shared = Box::new(Shared {
@@ -335,6 +428,13 @@ impl Vt {
                 cells_it,
                 keys,
                 key_event,
+                mouse,
+                mouse_event,
+                last_mouse_report: Vec::new(),
+                gesture,
+                press,
+                drag,
+                release,
                 cols,
                 rows,
                 colors,
@@ -479,6 +579,16 @@ impl Vt {
                 &mut self.rows_it as *mut _ as *mut c_void,
             );
             while ghostty_render_state_row_iterator_next(self.rows_it) {
+                let mut sel = GhosttyRenderStateRowSelection {
+                    size: std::mem::size_of::<GhosttyRenderStateRowSelection>(),
+                    ..Default::default()
+                };
+                let selected = ghostty_render_state_row_get(
+                    self.rows_it,
+                    GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+                    &mut sel as *mut _ as *mut c_void,
+                ) == GHOSTTY_SUCCESS;
+                let selection = selected.then_some((sel.start_x, sel.end_x));
                 let mut id = GhosttyRenderStateRowId::default();
                 let known = ghostty_render_state_row_get(
                     self.rows_it,
@@ -493,12 +603,12 @@ impl Vt {
                         &mut row_dirty as *mut _ as *mut c_void,
                     );
                 }
-                let row = if known && !row_dirty {
-                    self.seen.get(&id.bits).cloned()
-                } else {
-                    None
-                };
-                let row = match row {
+                let reuse = (known && !row_dirty)
+                    .then(|| self.seen.get(&id.bits))
+                    .flatten()
+                    .filter(|(_, prev)| *prev == selection)
+                    .map(|(row, _)| Arc::clone(row));
+                let row = match reuse {
                     Some(row) => row,
                     None => {
                         ghostty_render_state_row_get(
@@ -507,15 +617,18 @@ impl Vt {
                             &mut self.cells_it as *mut _ as *mut c_void,
                         );
                         let mut row = Vec::with_capacity(self.cols as usize);
+                        let mut x: u16 = 0;
                         while ghostty_render_state_row_cells_next(self.cells_it) {
-                            row.push(self.read_cell(fg_default));
+                            let in_sel = selected && x >= sel.start_x && x <= sel.end_x;
+                            row.push(self.read_cell(fg_default, in_sel));
+                            x = x.saturating_add(1);
                         }
                         row.resize(self.cols as usize, blank_cell(fg_default));
                         Arc::new(row)
                     }
                 };
                 if known {
-                    seen.insert(id.bits, Arc::clone(&row));
+                    seen.insert(id.bits, (Arc::clone(&row), selection));
                 }
                 rows.push(row);
             }
@@ -564,11 +677,12 @@ impl Vt {
                 cwd: cwd.to_string(),
                 exited,
                 spawn_error: None,
+                mouse_tracking: self.mouse_tracking(),
             }
         }
     }
 
-    unsafe fn read_cell(&mut self, fg_default: Rgb) -> Cell {
+    unsafe fn read_cell(&mut self, fg_default: Rgb, selected: bool) -> Cell {
         unsafe {
             let cells = self.cells_it;
             let mut raw: GhosttyCell = Default::default();
@@ -616,6 +730,9 @@ impl Vt {
                 bg = Some(fg);
                 fg = inverted;
             }
+            if selected {
+                bg = Some(self.colors.selection);
+            }
             let mut text = String::new();
             if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
                 && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD
@@ -649,6 +766,358 @@ impl Vt {
                 wide: wide == GHOSTTY_CELL_WIDE_WIDE,
             }
         }
+    }
+
+    pub fn mouse_tracking(&self) -> bool {
+        let mut value = false;
+        unsafe {
+            ghostty_terminal_get(
+                self.term,
+                GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                &mut value as *mut _ as *mut c_void,
+            );
+        }
+        value
+    }
+
+    pub fn alt_screen(&self) -> bool {
+        let mut screen: GhosttyTerminalScreen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+        unsafe {
+            ghostty_terminal_get(
+                self.term,
+                GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                &mut screen as *mut _ as *mut c_void,
+            );
+        }
+        screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+    }
+
+    pub fn scroll_viewport(&mut self, delta: isize) {
+        let mut scroll = GhosttyTerminalScrollViewport {
+            tag: GHOSTTY_SCROLL_VIEWPORT_DELTA,
+            ..Default::default()
+        };
+        scroll.value.delta = delta;
+        unsafe { ghostty_terminal_scroll_viewport(self.term, scroll) };
+    }
+
+    /// Whether the terminal currently owns a selection.
+    pub fn has_selection(&self) -> bool {
+        let mut selection = GhosttySelection {
+            size: std::mem::size_of::<GhosttySelection>(),
+            ..Default::default()
+        };
+        unsafe {
+            ghostty_terminal_get(
+                self.term,
+                GHOSTTY_TERMINAL_DATA_SELECTION,
+                &mut selection as *mut _ as *mut c_void,
+            ) == GHOSTTY_SUCCESS
+        }
+    }
+
+    /// Clear the selection, reporting whether there was one. Callers draw only
+    /// on a change, so typing in a terminal with nothing selected must not
+    /// produce a new snapshot.
+    pub fn clear_selection(&mut self) -> bool {
+        if !self.has_selection() {
+            return false;
+        }
+        unsafe {
+            ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null());
+        }
+        true
+    }
+
+    /// Selected plain text, if any.
+    pub fn selection_text(&self) -> Option<String> {
+        unsafe {
+            let opts = GhosttyTerminalSelectionFormatOptions {
+                size: std::mem::size_of::<GhosttyTerminalSelectionFormatOptions>(),
+                emit: GHOSTTY_FORMATTER_FORMAT_PLAIN,
+                unwrap: true,
+                trim: true,
+                ..Default::default()
+            };
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut len = 0usize;
+            if ghostty_terminal_selection_format_alloc(
+                self.term,
+                std::ptr::null(),
+                opts,
+                &mut ptr,
+                &mut len,
+            ) != GHOSTTY_SUCCESS
+            {
+                return None;
+            }
+            if ptr.is_null() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned();
+            ghostty_free(std::ptr::null(), ptr, len);
+            (!text.is_empty()).then_some(text)
+        }
+    }
+
+    /// One mouse step of a selection gesture. Positions are in grid-local pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select(
+        &mut self,
+        step: SelectStep,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+    ) {
+        unsafe {
+            let mut grid = GhosttyGridRef {
+                size: std::mem::size_of::<GhosttyGridRef>(),
+                ..Default::default()
+            };
+            let mut point = GhosttyPoint {
+                tag: GHOSTTY_POINT_TAG_VIEWPORT,
+                ..Default::default()
+            };
+            point.value.coordinate = GhosttyPointCoordinate {
+                x: col.min(self.cols.saturating_sub(1)),
+                y: u32::from(row.min(self.rows.saturating_sub(1))),
+            };
+            if ghostty_terminal_grid_ref(self.term, point, &mut grid) != GHOSTTY_SUCCESS {
+                return;
+            }
+            let pos = GhosttySurfacePosition {
+                x: f64::from(x),
+                y: f64::from(y),
+            };
+            let event = match step {
+                SelectStep::Press => self.press,
+                SelectStep::Drag => self.drag,
+                SelectStep::Release => self.release,
+            };
+            ghostty_selection_gesture_event_set(
+                event,
+                GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                &grid as *const _ as *const c_void,
+            );
+            ghostty_selection_gesture_event_set(
+                event,
+                GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                &pos as *const _ as *const c_void,
+            );
+            match step {
+                SelectStep::Press => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    ghostty_selection_gesture_event_set(
+                        event,
+                        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS,
+                        &now as *const _ as *const c_void,
+                    );
+                    let interval = 500_000_000u64;
+                    let distance = 4.0f64;
+                    ghostty_selection_gesture_event_set(
+                        event,
+                        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS,
+                        &interval as *const _ as *const c_void,
+                    );
+                    ghostty_selection_gesture_event_set(
+                        event,
+                        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE,
+                        &distance as *const _ as *const c_void,
+                    );
+                }
+                SelectStep::Drag => {
+                    let geometry = GhosttySelectionGestureGeometry {
+                        columns: u32::from(self.cols),
+                        cell_width: cell_w.max(1.0).round() as u32,
+                        padding_left: 0,
+                        screen_height: height.max(1.0).round() as u32,
+                    };
+                    ghostty_selection_gesture_event_set(
+                        event,
+                        GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
+                        &geometry as *const _ as *const c_void,
+                    );
+                }
+                SelectStep::Release => {}
+            }
+            let mut selection = GhosttySelection {
+                size: std::mem::size_of::<GhosttySelection>(),
+                ..Default::default()
+            };
+            match ghostty_selection_gesture_event(self.gesture, self.term, event, &mut selection) {
+                GHOSTTY_SUCCESS => {
+                    ghostty_terminal_set(
+                        self.term,
+                        GHOSTTY_TERMINAL_OPT_SELECTION,
+                        &selection as *const _ as *const c_void,
+                    );
+                }
+                _ if matches!(step, SelectStep::Press) => {
+                    ghostty_terminal_set(
+                        self.term,
+                        GHOSTTY_TERMINAL_OPT_SELECTION,
+                        std::ptr::null(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Encode a mouse event for a program that tracks the mouse.
+    pub fn encode_mouse(&mut self, input: MouseInput) -> Vec<u8> {
+        let action = match input.action {
+            MouseAction::Press => GHOSTTY_MOUSE_ACTION_PRESS,
+            MouseAction::Release => GHOSTTY_MOUSE_ACTION_RELEASE,
+            MouseAction::Motion => GHOSTTY_MOUSE_ACTION_MOTION,
+        };
+        let button = input.button.map(|b| match b {
+            MouseButton::Left => GHOSTTY_MOUSE_BUTTON_LEFT,
+            MouseButton::Right => GHOSTTY_MOUSE_BUTTON_RIGHT,
+            MouseButton::Middle => GHOSTTY_MOUSE_BUTTON_MIDDLE,
+            MouseButton::WheelUp => GHOSTTY_MOUSE_BUTTON_FOUR,
+            MouseButton::WheelDown => GHOSTTY_MOUSE_BUTTON_FIVE,
+        });
+        let (cw, ch) = (input.cell_w.round().max(1.0), input.cell_h.round().max(1.0));
+        let (x, y) = (
+            input.x / input.cell_w.max(1.0) * cw,
+            input.y / input.cell_h.max(1.0) * ch,
+        );
+        unsafe {
+            ghostty_mouse_encoder_setopt_from_terminal(self.mouse, self.term);
+            let size = GhosttyMouseEncoderSize {
+                size: std::mem::size_of::<GhosttyMouseEncoderSize>(),
+                screen_width: u32::from(self.cols) * cw as u32,
+                screen_height: u32::from(self.rows) * ch as u32,
+                cell_width: cw as u32,
+                cell_height: ch as u32,
+                ..Default::default()
+            };
+            ghostty_mouse_encoder_setopt(
+                self.mouse,
+                GHOSTTY_MOUSE_ENCODER_OPT_SIZE,
+                &size as *const _ as *const c_void,
+            );
+            ghostty_mouse_encoder_setopt(
+                self.mouse,
+                GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
+                &input.any_pressed as *const _ as *const c_void,
+            );
+            let event = self.mouse_event;
+            ghostty_mouse_event_set_action(event, action);
+            match button {
+                Some(b) => ghostty_mouse_event_set_button(event, b),
+                None => ghostty_mouse_event_clear_button(event),
+            }
+            let mut mods: GhosttyMods = 0;
+            if input.mods.shift {
+                mods |= GHOSTTY_MODS_SHIFT as GhosttyMods;
+            }
+            if input.mods.control {
+                mods |= GHOSTTY_MODS_CTRL as GhosttyMods;
+            }
+            if input.mods.alt {
+                mods |= GHOSTTY_MODS_ALT as GhosttyMods;
+            }
+            ghostty_mouse_event_set_mods(event, mods);
+            ghostty_mouse_event_set_position(event, GhosttyMousePosition { x, y });
+            let mut buf = [0u8; 64];
+            let mut len = 0usize;
+            let status = ghostty_mouse_encoder_encode(
+                self.mouse,
+                event,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                &mut len,
+            );
+            if status != GHOSTTY_SUCCESS || len == 0 {
+                return Vec::new();
+            }
+            if action == GHOSTTY_MOUSE_ACTION_MOTION && self.last_mouse_report == buf[..len] {
+                return Vec::new();
+            }
+            self.last_mouse_report.clear();
+            self.last_mouse_report.extend_from_slice(&buf[..len]);
+            buf[..len].to_vec()
+        }
+    }
+
+    /// Arrow-key scroll for alternate-screen programs that don't take the mouse.
+    pub fn encode_scroll_keys(&mut self, up: bool, n: usize) -> Vec<u8> {
+        let key = if up {
+            GHOSTTY_KEY_ARROW_UP
+        } else {
+            GHOSTTY_KEY_ARROW_DOWN
+        };
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.extend(self.encode_key(key, 0, 0, None, None));
+        }
+        out
+    }
+
+    /// Whether the program asked for bracketed paste (DEC private mode 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        let mut mode = GhosttyTerminalModeConfig {
+            mode: MODE_BRACKETED_PASTE,
+            value: false,
+        };
+        let ok = unsafe {
+            ghostty_terminal_get(
+                self.term,
+                GHOSTTY_TERMINAL_DATA_MODE,
+                &mut mode as *mut _ as *mut c_void,
+            ) == GHOSTTY_SUCCESS
+        };
+        ok && mode.value
+    }
+
+    /// Pasting text for the PTY: control bytes stripped, wrapped in bracketed
+    /// paste markers when the program asked for them.
+    ///
+    /// Without the markers a multi-line paste is indistinguishable from typing,
+    /// so every newline is executed — which is why programs enable mode 2004.
+    pub fn encode_paste(&self, text: &[u8]) -> Vec<u8> {
+        let bracketed = self.bracketed_paste();
+        let mut data = text.to_vec();
+        // Bracketed paste adds `ESC[200~` and `ESC[201~`; everything else in
+        // the encoding keeps the input length.
+        let mut buf = vec![0u8; data.len() + 12];
+        let mut written = 0usize;
+        let mut status = unsafe {
+            ghostty_paste_encode(
+                data.as_mut_ptr() as *mut ::std::os::raw::c_char,
+                data.len(),
+                bracketed,
+                buf.as_mut_ptr() as *mut ::std::os::raw::c_char,
+                buf.len(),
+                &mut written,
+            )
+        };
+        if status == GHOSTTY_OUT_OF_SPACE {
+            buf = vec![0u8; written];
+            status = unsafe {
+                ghostty_paste_encode(
+                    data.as_mut_ptr() as *mut ::std::os::raw::c_char,
+                    data.len(),
+                    bracketed,
+                    buf.as_mut_ptr() as *mut ::std::os::raw::c_char,
+                    buf.len(),
+                    &mut written,
+                )
+            };
+        }
+        if status != GHOSTTY_SUCCESS || written == 0 {
+            return Vec::new();
+        }
+        buf.truncate(written);
+        buf
     }
 
     pub fn encode_input(&mut self, input: &KeyInput) -> Vec<u8> {
@@ -806,6 +1275,12 @@ fn map_key(key: &str) -> Option<(GhosttyKey, bool, Option<char>)> {
 impl Drop for Vt {
     fn drop(&mut self) {
         unsafe {
+            ghostty_selection_gesture_event_free(self.press);
+            ghostty_selection_gesture_event_free(self.drag);
+            ghostty_selection_gesture_event_free(self.release);
+            ghostty_selection_gesture_free(self.gesture, self.term);
+            ghostty_mouse_event_free(self.mouse_event);
+            ghostty_mouse_encoder_free(self.mouse);
             ghostty_key_event_free(self.key_event);
             ghostty_key_encoder_free(self.keys);
             ghostty_render_state_row_cells_free(self.cells_it);
@@ -873,5 +1348,51 @@ mod tests {
             alt: false,
         });
         assert_eq!(bytes, b"a");
+    }
+
+    #[test]
+    fn a_drag_selects_plain_text() {
+        let mut vt = Vt::new(16, 4);
+        vt.write(b"hello");
+        vt.select(SelectStep::Press, 0, 0, 1.0, 5.0, 10.0, 40.0);
+        vt.select(SelectStep::Drag, 5, 0, 50.0, 5.0, 10.0, 40.0);
+        vt.select(SelectStep::Release, 5, 0, 50.0, 5.0, 10.0, 40.0);
+        assert_eq!(vt.selection_text().as_deref(), Some("hello"));
+        assert!(vt.clear_selection(), "a selection was there to clear");
+        assert_eq!(vt.selection_text(), None);
+        assert!(!vt.clear_selection(), "clearing again changes nothing");
+    }
+
+    #[test]
+    fn a_paste_is_framed_when_the_program_asks_for_it() {
+        let mut vt = Vt::new(16, 4);
+        // No mode 2004: typing, so a newline is a carriage return.
+        assert_eq!(vt.encode_paste(b"echo hi\n"), b"echo hi\r");
+        vt.write(b"\x1b[?2004h");
+        assert_eq!(
+            vt.encode_paste(b"echo hi\nls\n"),
+            b"\x1b[200~echo hi\nls\n\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn a_mouse_report_carries_modifiers() {
+        let mut vt = Vt::new(16, 4);
+        vt.write(b"\x1b[?1002h\x1b[?1006h");
+        let bytes = vt.encode_mouse(MouseInput {
+            action: MouseAction::Press,
+            button: Some(MouseButton::Left),
+            x: 5.0,
+            y: 5.0,
+            cell_w: 10.0,
+            cell_h: 20.0,
+            any_pressed: true,
+            mods: MouseMods {
+                shift: false,
+                control: true,
+                alt: false,
+            },
+        });
+        assert_eq!(bytes, b"\x1b[<16;1;1M");
     }
 }
