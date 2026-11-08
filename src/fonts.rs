@@ -2,6 +2,10 @@
 //! Font for icons prompts and agent TUIs print. Bundled so every machine gets
 //! the same look; GPUI falls back to proportional system fonts otherwise and
 //! the cell grid breaks.
+//!
+//! Four static faces (Medium / Bold / Medium Italic / Bold Italic) so
+//! `font_kit` can match cell bold/italic to real glyphs — a single Variable
+//! file only exposes one default weight and bold looks identical to medium.
 
 use std::borrow::Cow;
 
@@ -13,8 +17,10 @@ pub const TERM_FONT: &str = "JetBrains Mono";
 pub const SYMBOLS_FONT: &str = "Symbols Nerd Font";
 
 const BUNDLED: &[&[u8]] = &[
-    include_bytes!("../assets/fonts/JetBrainsMono-Variable.ttf"),
-    include_bytes!("../assets/fonts/JetBrainsMono-Italic-Variable.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-MediumItalic.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf"),
     include_bytes!("../assets/fonts/SymbolsNerdFont-Regular.ttf"),
 ];
 
