@@ -4009,7 +4009,7 @@ dependencies = [
 
 [[package]]
 name = "kumu"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "base64 0.22.1",

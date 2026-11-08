@@ -31,11 +31,11 @@ use crate::ui::widgets::agent_logo;
 pub enum TerminalEvent {
     /// The user clicked into this pane; the home window should focus it.
     Activated,
-    /// Split this pane to the right (new session beside it).
+    /// Split this pane to the right (another shell under the same session).
     SplitRight,
     /// Split this pane downward.
     SplitDown,
-    /// Close this pane (layout only; the session stays).
+    /// Close this pane and its shell; the session row goes when it was the last pane.
     Close,
 }
 
@@ -109,8 +109,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&workspace, |this, _, ev, cx| {
-            if let WorkspaceEvent::Frame(session_id) = ev
-                && this.session == Some(*session_id)
+            if let WorkspaceEvent::Frame(pane) = ev
+                && *pane == this.pane.0
             {
                 this.pull(cx);
             }
@@ -188,13 +188,18 @@ impl TerminalView {
         self.marked = None;
         self.painted.borrow_mut().rows.clear();
         self.sync_theme(cx);
-        self.snapshot = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.show_terminal(session_id, cx));
+        let pane = self.pane.0;
+        self.snapshot = self.workspace.update(cx, |workspace, cx| {
+            workspace.show_terminal(pane, session_id, cx)
+        });
         cx.notify();
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        let pane = self.pane.0;
+        self.workspace.update(cx, |workspace, _| {
+            workspace.drop_terminal(pane);
+        });
         self.reset_gesture();
         self.session = None;
         self.sent.set((0, 0, 0, 0));
@@ -216,19 +221,20 @@ impl TerminalView {
     }
 
     fn pull(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
+        let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_wake_handled(session_id)
+            workspace.terminal_wake_handled(pane)
         });
         loop {
-            let generation = self.workspace.read(cx).terminal_generation(session_id);
-            let Some(snapshot) = self.workspace.read(cx).terminal_snapshot(session_id) else {
+            let generation = self.workspace.read(cx).terminal_generation(pane);
+            let Some(snapshot) = self.workspace.read(cx).terminal_snapshot(pane) else {
                 return;
             };
             self.snapshot = snapshot;
-            if self.workspace.read(cx).terminal_generation(session_id) == generation {
+            if self.workspace.read(cx).terminal_generation(pane) == generation {
                 break;
             }
         }
@@ -236,14 +242,12 @@ impl TerminalView {
     }
 
     fn write_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(session_id) = self.session else {
-            return;
-        };
-        if text.is_empty() {
+        if self.session.is_none() || text.is_empty() {
             return;
         }
+        let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_write(session_id, text.as_bytes().to_vec())
+            workspace.terminal_write(pane, text.as_bytes().to_vec())
         });
     }
 
@@ -275,9 +279,10 @@ impl TerminalView {
         if mods.platform {
             return;
         }
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
+        let pane = self.pane.0;
         let input = KeyInput {
             key: event.keystroke.key.clone(),
             key_char: event.keystroke.key_char.clone(),
@@ -286,17 +291,17 @@ impl TerminalView {
             alt: mods.alt,
         };
         self.workspace
-            .update(cx, |workspace, _| workspace.terminal_key(session_id, input));
+            .update(cx, |workspace, _| workspace.terminal_key(pane, input));
         cx.stop_propagation();
     }
 
     /// Copy the current selection. The text lives on the session thread, so the
     /// read happens on a background task instead of blocking event dispatch.
     fn copy(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return false;
-        };
-        let Some(term) = self.workspace.read(cx).terminal_handle(session_id) else {
+        }
+        let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
             return false;
         };
         cx.spawn(async move |this, cx| {
@@ -315,14 +320,15 @@ impl TerminalView {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_paste(session_id, text)
+            workspace.terminal_paste(pane, text)
         });
     }
 
@@ -371,9 +377,10 @@ impl TerminalView {
         mods: &Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
+        let pane = self.pane.0;
         let grid = self.grid_at.get();
         let (x, y) = local_pos(grid, pos);
         let input = MouseInput {
@@ -387,7 +394,7 @@ impl TerminalView {
             mods: mouse_mods(mods),
         };
         self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_mouse(session_id, input)
+            workspace.terminal_mouse(pane, input)
         });
     }
 
@@ -400,13 +407,13 @@ impl TerminalView {
     /// and the text both live on the session thread, so it runs off-thread.
     fn finish_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         self.selecting = false;
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
         let Some(point) = self.select_point(pos) else {
             return;
         };
-        let Some(term) = self.workspace.read(cx).terminal_handle(session_id) else {
+        let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -434,13 +441,13 @@ impl TerminalView {
     }
 
     fn apply_select(&mut self, step: SelectStep, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
         let Some(point) = self.select_point(pos) else {
             return;
         };
-        if let Some(term) = self.workspace.read(cx).terminal_handle(session_id) {
+        if let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) {
             // Press and Drag never wait on the session thread.
             let _ = term.select(
                 step,
@@ -473,9 +480,10 @@ impl TerminalView {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let Some(session_id) = self.session else {
+        if self.session.is_none() {
             return;
-        };
+        }
+        let pane = self.pane.0;
         cx.stop_propagation();
         let grid = self.grid_at.get();
         let (cw, ch) = (f32::from(grid.cell.0), f32::from(grid.cell.1));
@@ -508,7 +516,7 @@ impl TerminalView {
         let mods = mouse_mods(&event.modifiers);
         self.workspace.update(cx, |workspace, _| {
             workspace.terminal_scroll(
-                session_id,
+                pane,
                 delta,
                 x * grid.scale,
                 y * grid.scale,
@@ -667,6 +675,8 @@ impl Render for TerminalView {
         let marked = self.marked.clone();
         let workspace = self.workspace.clone();
         let session = self.session;
+        let pane_term = self.pane.0;
+        let has_session = session.is_some();
         let sent = self.sent.clone();
         let painted = self.painted.clone();
         let cursor_at = self.cursor_at.clone();
@@ -730,9 +740,10 @@ impl Render for TerminalView {
                             this.focus.focus(window, cx);
                             cx.emit(TerminalEvent::Activated);
                             if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
-                                if let Some(id) = this.session {
+                                if this.session.is_some() {
+                                    let pane = this.pane.0;
                                     this.workspace.update(cx, |workspace, _| {
-                                        workspace.terminal_clear_selection(id);
+                                        workspace.terminal_clear_selection(pane);
                                     });
                                 }
                             } else if !this.reported.contains(&ev.button) {
@@ -785,10 +796,10 @@ impl Render for TerminalView {
                                 let next = (cols, rows, cell_px.0, cell_px.1);
                                 if sent.get() != next {
                                     sent.set(next);
-                                    if let Some(session_id) = session {
+                                    if has_session {
                                         workspace.update(cx, |workspace, _| {
                                             workspace.terminal_resize(
-                                                session_id, cols, rows, cell_px.0, cell_px.1,
+                                                pane_term, cols, rows, cell_px.0, cell_px.1,
                                             )
                                         });
                                     }

@@ -36,28 +36,31 @@ pub enum WorkspaceEvent {
     /// Something the home or settings view draws: the project or session list,
     /// a session's title, what an agent offers.
     Changed,
-    /// A session's terminal grid changed. Only the terminal pane draws it.
-    Frame(i64),
-    /// A session was removed by the app (its shell exited). `next` is who to
-    /// show instead, computed before the row was gone.
-    SessionClosed { id: i64, next: Option<i64> },
+    /// A pane's terminal grid changed. Only that pane draws it.
+    Frame(u64),
+    /// A pane's shell exited cleanly. The home window closes that pane; the
+    /// session row is removed only when no pane still belongs to it.
+    PaneExited { pane: u64, session: i64 },
 }
 
-/// Projects, sessions, and each session's live terminal.
+/// Projects, sessions, and each pane's live terminal.
 ///
 /// One per app, owned by the home window and shared with the settings window.
 /// Nothing in here renders. Agent TUIs are launched through [`agent::interactive`];
 /// protocol probes go through [`agent::probe`].
+///
+/// A sidebar session may occupy several panes; each pane has its own PTY,
+/// keyed by pane id.
 pub struct Workspace {
     store: Store,
     projects: Vec<Project>,
     sessions: Vec<Session>,
-    /// Native TUI processes keyed by session id. A hidden session keeps
-    /// reading, so its agent does not block on a full pty, until the cap
-    /// stops it.
-    terms: HashMap<i64, Term>,
-    /// Least recently shown first. Only sessions whose process is still running.
-    term_lru: Vec<i64>,
+    /// Native TUI processes keyed by pane id.
+    terms: HashMap<u64, Term>,
+    /// Which sidebar session each live pane belongs to.
+    term_session: HashMap<u64, i64>,
+    /// Least recently shown first. Only panes whose process is still running.
+    term_lru: Vec<u64>,
     /// What each agent offers in general, as probed.
     discovery: Discovery,
 }
@@ -72,6 +75,7 @@ impl Workspace {
             projects: Vec::new(),
             sessions: Vec::new(),
             terms: HashMap::new(),
+            term_session: HashMap::new(),
             term_lru: Vec::new(),
             discovery: Discovery::default(),
         };
@@ -119,24 +123,30 @@ impl Workspace {
         self.sessions.iter().find(|s| s.id == id)
     }
 
-    /// The session's screen, after making sure its process is running.
+    /// The pane's screen, after making sure its process is running for
+    /// `session_id`.
     ///
     /// Agent sessions launch that agent's interactive TUI; shell sessions
     /// launch the user's `$SHELL`. An exited agent TUI starts again; an exited
-    /// shell is deleted instead (see [`Self::watch_terminal`]). A fifth
+    /// shell closes the pane (see [`Self::watch_terminal`]). A thirteenth
     /// running process stops the one shown least recently.
-    pub fn show_terminal(&mut self, session_id: i64, cx: &mut Context<Self>) -> Snapshot {
-        if self
-            .terms
-            .get(&session_id)
-            .is_some_and(|term| !term.snapshot().exited)
+    pub fn show_terminal(
+        &mut self,
+        pane: u64,
+        session_id: i64,
+        cx: &mut Context<Self>,
+    ) -> Snapshot {
+        if self.term_session.get(&pane) == Some(&session_id)
+            && self
+                .terms
+                .get(&pane)
+                .is_some_and(|term| !term.snapshot().exited)
         {
-            self.touch_terminal(session_id);
-            self.terminal_wake_handled(session_id);
-            return self.terms[&session_id].snapshot();
+            self.touch_terminal(pane);
+            self.terminal_wake_handled(pane);
+            return self.terms[&pane].snapshot();
         }
-        self.terms.remove(&session_id);
-        self.term_lru.retain(|&id| id != session_id);
+        self.drop_terminal(pane);
         self.reclaim_terminals();
         let Some(session) = self.session(session_id).cloned() else {
             return Snapshot::blank("", "");
@@ -155,9 +165,10 @@ impl Workspace {
         };
         let (term, wake) = Term::launch(program, args, PathBuf::from(&session.cwd), colors);
         let snapshot = term.snapshot();
-        self.terms.insert(session_id, term);
-        self.touch_terminal(session_id);
-        self.watch_terminal(session_id, wake, cx);
+        self.terms.insert(pane, term);
+        self.term_session.insert(pane, session_id);
+        self.touch_terminal(pane);
+        self.watch_terminal(pane, session_id, wake, cx);
         snapshot
     }
 
@@ -168,52 +179,52 @@ impl Workspace {
         }
     }
 
-    pub fn terminal_snapshot(&self, session_id: i64) -> Option<Snapshot> {
-        self.terms.get(&session_id).map(Term::snapshot)
+    pub fn terminal_snapshot(&self, pane: u64) -> Option<Snapshot> {
+        self.terms.get(&pane).map(Term::snapshot)
     }
 
-    pub fn terminal_generation(&self, session_id: i64) -> Option<u64> {
-        self.terms.get(&session_id).map(Term::generation)
+    pub fn terminal_generation(&self, pane: u64) -> Option<u64> {
+        self.terms.get(&pane).map(Term::generation)
     }
 
-    pub fn terminal_wake_handled(&self, session_id: i64) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_wake_handled(&self, pane: u64) {
+        if let Some(term) = self.terms.get(&pane) {
             term.wake_handled();
         }
     }
 
-    pub fn terminal_key(&self, session_id: i64, input: KeyInput) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_key(&self, pane: u64, input: KeyInput) {
+        if let Some(term) = self.terms.get(&pane) {
             term.key(input);
         }
     }
 
-    pub fn terminal_write(&self, session_id: i64, bytes: impl Into<Vec<u8>>) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_write(&self, pane: u64, bytes: impl Into<Vec<u8>>) {
+        if let Some(term) = self.terms.get(&pane) {
             term.write(bytes);
         }
     }
 
-    pub fn terminal_paste(&self, session_id: i64, text: impl Into<Vec<u8>>) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_paste(&self, pane: u64, text: impl Into<Vec<u8>>) {
+        if let Some(term) = self.terms.get(&pane) {
             term.paste(text);
         }
     }
 
-    /// A handle to the session's terminal, for work that must not run on the UI
+    /// A handle to the pane's terminal, for work that must not run on the UI
     /// thread (the selection round trips block).
-    pub fn terminal_handle(&self, session_id: i64) -> Option<Term> {
-        self.terms.get(&session_id).cloned()
+    pub fn terminal_handle(&self, pane: u64) -> Option<Term> {
+        self.terms.get(&pane).cloned()
     }
 
-    pub fn terminal_mouse(&self, session_id: i64, input: MouseInput) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_mouse(&self, pane: u64, input: MouseInput) {
+        if let Some(term) = self.terms.get(&pane) {
             term.mouse(input);
         }
     }
 
-    pub fn terminal_clear_selection(&self, session_id: i64) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_clear_selection(&self, pane: u64) {
+        if let Some(term) = self.terms.get(&pane) {
             term.clear_selection();
         }
     }
@@ -221,7 +232,7 @@ impl Workspace {
     #[allow(clippy::too_many_arguments)]
     pub fn terminal_scroll(
         &self,
-        session_id: i64,
+        pane: u64,
         lines: isize,
         x: f32,
         y: f32,
@@ -229,52 +240,67 @@ impl Workspace {
         cell_h: f32,
         mods: MouseMods,
     ) {
-        if let Some(term) = self.terms.get(&session_id) {
+        if let Some(term) = self.terms.get(&pane) {
             term.scroll(lines, x, y, cell_w, cell_h, mods);
         }
     }
 
-    pub fn terminal_resize(&self, session_id: i64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
-        if let Some(term) = self.terms.get(&session_id) {
+    pub fn terminal_resize(&self, pane: u64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+        if let Some(term) = self.terms.get(&pane) {
             term.resize(cols, rows, cell_w, cell_h);
         }
     }
 
-    fn touch_terminal(&mut self, session_id: i64) {
-        self.term_lru.retain(|&id| id != session_id);
-        self.term_lru.push(session_id);
+    /// Stop the process in `pane`, if any.
+    pub fn drop_terminal(&mut self, pane: u64) {
+        self.terms.remove(&pane);
+        self.term_session.remove(&pane);
+        self.term_lru.retain(|&id| id != pane);
     }
 
-    fn forget_terminal(&mut self, session_id: i64) {
-        self.terms.remove(&session_id);
-        self.term_lru.retain(|&id| id != session_id);
+    fn touch_terminal(&mut self, pane: u64) {
+        self.term_lru.retain(|&id| id != pane);
+        self.term_lru.push(pane);
+    }
+
+    fn drop_session_terminals(&mut self, session_id: i64) {
+        let panes: Vec<u64> = self
+            .term_session
+            .iter()
+            .filter(|(_, sid)| **sid == session_id)
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in panes {
+            self.drop_terminal(pane);
+        }
     }
 
     /// Drop exited processes, then stop the least recently shown ones until
     /// one more process fits under the cap.
     fn reclaim_terminals(&mut self) {
-        let dead: Vec<i64> = self
+        let dead: Vec<u64> = self
             .terms
             .iter()
             .filter(|(_, term)| term.snapshot().exited)
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
-            self.forget_terminal(id);
+            self.drop_terminal(id);
         }
-        let alive: Vec<i64> = self
+        let alive: Vec<u64> = self
             .term_lru
             .iter()
             .copied()
             .filter(|id| self.terms.contains_key(id))
             .collect();
         for id in terminal_evictions(&alive, MAX_LIVE_TERMINALS) {
-            self.forget_terminal(id);
+            self.drop_terminal(id);
         }
     }
 
     fn watch_terminal(
         &self,
+        pane: u64,
         session_id: i64,
         mut wake: futures::channel::mpsc::UnboundedReceiver<()>,
         cx: &mut Context<Self>,
@@ -283,28 +309,28 @@ impl Workspace {
             while wake.next().await.is_some() {
                 let watching = this
                     .update(cx, |workspace, cx| {
-                        let Some(term) = workspace.terms.get(&session_id) else {
+                        let Some(term) = workspace.terms.get(&pane) else {
                             return false;
                         };
                         let snapshot = term.snapshot();
-                        // `exit` (or any clean shell death) ends the session
-                        // itself — leaving an "已退出" row around would just
-                        // restart `$SHELL` on the next focus. Spawn failures
-                        // keep the row so the header can show why.
+                        // `exit` (or any clean shell death) closes this pane.
+                        // The session row stays while another pane still shows
+                        // it; spawn failures keep the pane so the header can
+                        // show why.
                         let shell_done = snapshot.exited
                             && snapshot.spawn_error.is_none()
                             && workspace
                                 .session(session_id)
                                 .is_some_and(|s| crate::term::is_shell(&s.agent));
                         if shell_done {
-                            let next = workspace.delete_session(session_id, cx);
-                            cx.emit(WorkspaceEvent::SessionClosed {
-                                id: session_id,
-                                next,
+                            workspace.drop_terminal(pane);
+                            cx.emit(WorkspaceEvent::PaneExited {
+                                pane,
+                                session: session_id,
                             });
                             return false;
                         }
-                        cx.emit(WorkspaceEvent::Frame(session_id));
+                        cx.emit(WorkspaceEvent::Frame(pane));
                         true
                     })
                     .unwrap_or(false);
@@ -413,17 +439,24 @@ impl Workspace {
     /// has not set, with what the scan needs to ask the agents' stores. Gathered
     /// here because the PTY handles live in this struct.
     fn title_queries(&self) -> Vec<TitleQuery> {
-        let mut live: Vec<(i64, Option<u32>)> = self
+        // One query per sidebar session. Several panes may share a session;
+        // pick a stable pane (lowest id) so title claims stay deterministic.
+        let mut live: Vec<(i64, u64, Option<u32>)> = self
             .terms
             .iter()
             .filter(|(_, term)| !term.snapshot().exited)
-            .map(|(id, term)| (*id, term.process_id()))
+            .filter_map(|(pane, term)| {
+                let session_id = *self.term_session.get(pane)?;
+                Some((session_id, *pane, term.process_id()))
+            })
             .collect();
-        // Stable order so two shells in the same cwd claim distinct agent
-        // sessions instead of racing on HashMap iteration.
-        live.sort_by_key(|(id, _)| *id);
+        live.sort_by_key(|(session_id, pane, _)| (*session_id, *pane));
+        let mut seen = HashSet::new();
         live.into_iter()
-            .filter_map(|(session_id, pid)| {
+            .filter_map(|(session_id, _, pid)| {
+                if !seen.insert(session_id) {
+                    return None;
+                }
                 let session = self.sessions.iter().find(|s| s.id == session_id)?;
                 if session.title_manual {
                     return None;
@@ -517,13 +550,13 @@ impl Workspace {
         changed
     }
 
-    /// Delete a session: drop its live terminal, then remove the row.
+    /// Delete a session: drop every pane terminal bound to it, then remove the row.
     ///
     /// Returns the neighbor to select next — computed before the row is gone —
     /// so a caller that was looking at this session can land somewhere else.
     pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<i64> {
         let next = neighbor_session(&self.sessions, session_id);
-        self.forget_terminal(session_id);
+        self.drop_session_terminals(session_id);
         self.store.delete_session(session_id).ok();
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
@@ -689,13 +722,13 @@ pub(crate) fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
 
 /// Which running terminals to stop so one more fits under `cap`, least
 /// recently shown first. `order` does not include the session about to start.
-fn terminal_evictions(order: &[i64], cap: usize) -> Vec<i64> {
+fn terminal_evictions(order: &[u64], cap: usize) -> Vec<u64> {
     let mut evictions = Vec::new();
-    for &session_id in order {
+    for &pane in order {
         if order.len() - evictions.len() < cap {
             break;
         }
-        evictions.push(session_id);
+        evictions.push(pane);
     }
     evictions
 }

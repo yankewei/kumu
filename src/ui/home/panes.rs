@@ -1,8 +1,8 @@
 //! Pane layout tree: leaves hold a pane id; groups split along an axis.
 //!
-//! A pane shows one session. Splitting is a view-layout change only — sessions
-//! stay owned by their project. Same-axis splits reuse the parent; otherwise
-//! the target is wrapped (herdr / Zed style).
+//! Several panes may belong to one sidebar session. Splitting is layout plus a
+//! new shell under that session — not a new sidebar row. Same-axis splits reuse
+//! the parent; otherwise the target is wrapped (herdr / Zed style).
 
 use gpui_kit::Axis;
 

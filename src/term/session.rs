@@ -581,4 +581,37 @@ mod tests {
         let text = wait_text(&term, "12 40");
         assert!(text.contains("12 40"), "grid was:\n{text}");
     }
+
+    #[test]
+    fn exiting_one_shell_leaves_the_other() {
+        let (program, args) = crate::term::default_shell();
+        let (a, _wa) = Term::launch(
+            program.clone(),
+            args.clone(),
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        let (b, _wb) = Term::launch(
+            program,
+            args,
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!a.snapshot().exited);
+        assert!(!b.snapshot().exited);
+        a.write(b"exit\n");
+        let start = Instant::now();
+        while !a.snapshot().exited && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.snapshot().exited, "A should have exited");
+        drop(a);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !b.snapshot().exited,
+            "B must stay alive; grid:\n{}",
+            b.snapshot().plain_text()
+        );
+    }
 }

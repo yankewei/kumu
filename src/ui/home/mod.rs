@@ -1,8 +1,9 @@
 //! Home window: projects → sessions tree on the left, a splitable pane tree of
 //! terminals on the right. Owns the settings window handle.
 //!
-//! A pane shows one session; splitting is layout only — sessions stay owned by
-//! their project.
+//! A session belongs to a project and may occupy several panes. Splitting adds
+//! another pane (and its own shell) under the same session — the sidebar lists
+//! sessions, not panes.
 
 mod panes;
 mod sidebar;
@@ -59,8 +60,8 @@ impl KumuApp {
         // own, subscribed inside [`TerminalView`].
         cx.subscribe(&workspace, |this, _, ev, cx| match ev {
             WorkspaceEvent::Changed => cx.notify(),
-            WorkspaceEvent::SessionClosed { id, next } => {
-                this.on_session_closed(*id, *next, cx);
+            WorkspaceEvent::PaneExited { pane, session } => {
+                this.on_pane_exited(PaneId(*pane), *session, cx);
             }
             _ => {}
         })
@@ -146,20 +147,17 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// Split `pane` along `axis`, open a new shell in the same project, and
-    /// focus the new pane.
+    /// Split `pane` along `axis`, open another shell under the same session,
+    /// and focus the new pane. No new sidebar row.
     fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
         if !self.panes.contains_key(&pane) {
             return;
         }
-        let project_id = self
+        let Some(session_id) = self
             .panes
             .get(&pane)
             .and_then(|t| t.read(cx).session_id())
-            .and_then(|sid| self.workspace.read(cx).session(sid).map(|s| s.project_id));
-        let Some(session_id) = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.new_session(project_id, cx))
+            .filter(|&sid| self.workspace.read(cx).session(sid).is_some())
         else {
             return;
         };
@@ -169,8 +167,6 @@ impl KumuApp {
         let group_id = self.next_group;
         self.next_group += 1;
         if !self.layout.split(pane, axis, new_id, group_id) {
-            self.workspace
-                .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
             return;
         }
 
@@ -191,16 +187,86 @@ impl KumuApp {
     }
 
     fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let session_id = self.panes.get(&pane).and_then(|t| t.read(cx).session_id());
         let Some(next) = self.layout.neighbor(pane) else {
             return;
         };
         if !self.layout.remove(pane) {
             return;
         }
+        self.workspace.update(cx, |workspace, _| {
+            workspace.drop_terminal(pane.0);
+        });
         self.panes.remove(&pane);
         self.focused = next;
         self.selected = self.panes.get(&next).and_then(|t| t.read(cx).session_id());
         self.pending_focus = Some(next);
+        // Last pane for this session: drop the sidebar row so Close does not
+        // leave an orphan "终端".
+        if let Some(sid) = session_id
+            && !self.pane_shows(sid, cx)
+            && self.workspace.read(cx).session(sid).is_some()
+        {
+            self.workspace.update(cx, |workspace, cx| {
+                workspace.delete_session(sid, cx);
+            });
+            if self.selected == Some(sid) {
+                self.selected = self
+                    .panes
+                    .get(&self.focused)
+                    .and_then(|t| t.read(cx).session_id());
+            }
+        }
+        self.sync_pane_chrome(cx);
+        cx.notify();
+    }
+
+    /// A pane's shell exited: close that pane (or clear the last one), then
+    /// drop the session row when no pane still belongs to it.
+    fn on_pane_exited(&mut self, pane: PaneId, session_id: i64, cx: &mut Context<Self>) {
+        if self.panes.len() > 1 {
+            if self.panes.contains_key(&pane) {
+                // Term already dropped by the watcher; avoid a second kill.
+                let Some(next) = self.layout.neighbor(pane) else {
+                    return;
+                };
+                if self.layout.remove(pane) {
+                    self.panes.remove(&pane);
+                    self.focused = next;
+                    self.selected = self.panes.get(&next).and_then(|t| t.read(cx).session_id());
+                    self.pending_focus = Some(next);
+                }
+            }
+        } else if let Some(terminal) = self.panes.get(&pane).cloned() {
+            terminal.update(cx, |terminal, cx| terminal.clear(cx));
+        }
+
+        if !self.pane_shows(session_id, cx)
+            && self.workspace.read(cx).session(session_id).is_some()
+        {
+            let next = self
+                .workspace
+                .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
+            if self.panes.len() == 1
+                && let Some(terminal) = self.panes.values().next().cloned()
+                && terminal.read(cx).session_id().is_none()
+            {
+                let replacement = next
+                    .filter(|n| self.workspace.read(cx).session(*n).is_some())
+                    .filter(|n| !self.pane_shows(*n, cx));
+                match replacement {
+                    Some(id) => terminal.update(cx, |terminal, cx| terminal.show(id, cx)),
+                    None => {}
+                }
+            }
+            if self.selected == Some(session_id) {
+                self.selected = self
+                    .panes
+                    .get(&self.focused)
+                    .and_then(|t| t.read(cx).session_id())
+                    .or(next.filter(|n| self.workspace.read(cx).session(*n).is_some()));
+            }
+        }
         self.sync_pane_chrome(cx);
         cx.notify();
     }
@@ -358,19 +424,33 @@ impl KumuApp {
             .filter(|(_, t)| t.read(cx).session_id() == Some(session_id))
             .map(|(id, _)| *id)
             .collect();
-        for pane in showing {
-            if self.panes.len() > 1 {
+        // Siblings that were not on this session must stay put. Closing only
+        // the panes that showed it keeps a two-pane exit from wiping the other.
+        let siblings_remain = self.panes.len() > showing.len();
+        if siblings_remain {
+            for pane in showing {
                 self.close_pane(pane, cx);
-                continue;
             }
-            let replacement = next.filter(|n| self.workspace.read(cx).session(*n).is_some());
-            if let Some(terminal) = self.panes.get(&pane).cloned() {
-                match replacement {
-                    Some(id) if !self.pane_shows(id, cx) => {
-                        terminal.update(cx, |terminal, cx| terminal.show(id, cx));
-                    }
-                    _ => {
-                        terminal.update(cx, |terminal, cx| terminal.clear(cx));
+        } else {
+            // Every pane was tied to this session: collapse extras, then put a
+            // neighbor (or a blank) in the last slot.
+            for pane in showing.iter().skip(1).copied().collect::<Vec<_>>() {
+                if self.panes.len() > 1 {
+                    self.close_pane(pane, cx);
+                }
+            }
+            if let Some(pane) = showing.first().copied() {
+                let replacement = next
+                    .filter(|n| self.workspace.read(cx).session(*n).is_some())
+                    .filter(|n| !self.pane_shows(*n, cx));
+                if let Some(terminal) = self.panes.get(&pane).cloned() {
+                    match replacement {
+                        Some(id) => {
+                            terminal.update(cx, |terminal, cx| terminal.show(id, cx));
+                        }
+                        None => {
+                            terminal.update(cx, |terminal, cx| terminal.clear(cx));
+                        }
                     }
                 }
             }
@@ -451,7 +531,18 @@ impl KumuApp {
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
-        let has_sessions = !self.workspace.read(cx).sessions().is_empty();
+        // Keep the pane tree if a pane still points at a live session — do not
+        // blank the whole split just because the exited session was removed.
+        let pane_sessions: Vec<Option<i64>> = self
+            .panes
+            .values()
+            .map(|t| t.read(cx).session_id())
+            .collect();
+        let workspace = self.workspace.read(cx);
+        let has_sessions = !workspace.sessions().is_empty()
+            || pane_sessions
+                .iter()
+                .any(|id| id.is_some_and(|id| workspace.session(id).is_some()));
         let right =
             if has_sessions {
                 v_flex()
