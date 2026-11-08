@@ -16,31 +16,31 @@ pub const AGENTS: [AgentDef; 5] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
-        desc: "opencode serve · v2 API",
+        desc: "开源终端编码 Agent",
         logo: Some("opencode.png"),
     },
     AgentDef {
         id: "omp",
         name: "Oh My Pi",
-        desc: "omp · ACP v1",
+        desc: "个人 AI 终端编码 Agent",
         logo: Some("omp.png"),
     },
     AgentDef {
         id: "codex",
         name: "Codex",
-        desc: "codex app-server",
+        desc: "OpenAI 的终端编码 Agent",
         logo: Some("codex.svg"),
     },
     AgentDef {
         id: "claude",
         name: "Claude Code",
-        desc: "claude -p · stream-json",
+        desc: "Anthropic 的终端编码 Agent",
         logo: Some("claude.png"),
     },
     AgentDef {
         id: "pi",
         name: "Pi",
-        desc: "pi --mode rpc",
+        desc: "轻量终端编码 Agent",
         logo: Some("pi.png"),
     },
 ];

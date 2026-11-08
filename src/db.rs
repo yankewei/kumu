@@ -1,10 +1,14 @@
-//! Local SQLite persistence for projects and sessions.
+//! Local SQLite persistence for projects, sessions, and the home window's last
+//! layout.
 //!
-//! Accessed synchronously on the UI (main) thread. Schema is created on open;
-//! tables and columns left over from the removed in-app chat path are dropped
-//! there too, so an older database keeps working with the current one.
+//! Accessed synchronously on the UI (main) thread. Schema is created and
+//! upgraded on open through `PRAGMA user_version`; tables and columns left over
+//! from the removed in-app chat path are dropped there too, so an older
+//! database keeps working with the current one.
 
-use rusqlite::{Connection, Result, params};
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, Result, params};
 
 /// A project: a workspace the user groups sessions under.
 #[derive(Clone, Debug)]
@@ -23,7 +27,8 @@ pub struct Session {
     pub title: String,
     pub cwd: String,
     /// Agent-side session id, when we have latched onto one (`agent:id`).
-    pub resume_id: Option<String>,
+    /// Currently used to look the title up; it is not a resume cursor yet.
+    pub agent_session_id: Option<String>,
     /// The user typed this title; generated names must not replace it.
     pub title_manual: bool,
 }
@@ -32,18 +37,61 @@ pub struct Store {
     conn: Connection,
 }
 
+/// How long a write waits for another connection's write to finish.
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Schema version stored in `PRAGMA user_version`. Bump it with a new
+/// `migrate_vN` step; opening an older database applies the steps it is
+/// missing exactly once.
+const SCHEMA_VERSION: i64 = 3;
+
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(path)?;
+        prepare(&conn)?;
+        let store = Self { conn };
+        store.init()?;
+        Ok(store)
+    }
+
+    /// An empty store that lives only for this process. Used when the on-disk
+    /// database cannot be opened, so the window still works for the session
+    /// even though nothing is saved.
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        prepare(&conn)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
     }
 
     fn init(&self) -> Result<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 1 {
+            self.migrate_v1()?;
+        }
+        if version < 2 {
+            self.migrate_v2()?;
+        }
+        if version < 3 {
+            self.migrate_v3()?;
+        }
+        if version < SCHEMA_VERSION {
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+
+    /// The project/session/settings schema, plus the cleanup of the removed
+    /// in-app chat path. Existing databases have `user_version = 0` and already
+    /// contain most of this, so every step here is idempotent.
+    fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +144,61 @@ impl Store {
         Ok(())
     }
 
+    /// The home window's last layout: pane tree, pane → session mapping,
+    /// focused pane, and collapsed projects, as one JSON document.
+    fn migrate_v2(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workspace_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                layout_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Session recency, used to order the sidebar, plus the rename of the old
+    /// `resume_id` column to `agent_session_id`. Existing rows start their
+    /// recency clock at their creation time, so the first upgrade does not
+    /// shuffle them into an arbitrary order.
+    fn migrate_v3(&self) -> Result<()> {
+        // The field only ever held the agent-side session id used for title
+        // lookup; `agent_session_id` says that instead of promising a resume.
+        let has_old: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_new: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'agent_session_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_old && !has_new {
+            self.conn.execute(
+                "ALTER TABLE sessions RENAME COLUMN resume_id TO agent_session_id",
+                [],
+            )?;
+        } else if !has_new {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT", [])?;
+        }
+        self.conn
+            .execute("ALTER TABLE sessions ADD COLUMN last_used_at TEXT", [])
+            .ok();
+        self.conn.execute(
+            "UPDATE sessions
+             SET last_used_at = COALESCE(last_used_at, created_at, datetime('now'))",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS sessions_last_used
+             ON sessions(project_id, last_used_at DESC)",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub fn projects(&self) -> Vec<Project> {
         let mut stmt = self
             .conn
@@ -121,12 +224,32 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Rename a project without moving it or touching its sessions.
+    pub fn rename_project(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a project. Its sessions go with it through the schema's
+    /// `ON DELETE CASCADE`; callers must stop their terminals first.
+    pub fn delete_project(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Sessions in sidebar order: most recently used first within a project,
+    /// newest first as the tie-break. Title updates do not touch this clock.
     pub fn sessions(&self) -> Vec<Session> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, agent, title, cwd, resume_id, title_manual
-                 FROM sessions ORDER BY id",
+                "SELECT id, project_id, agent, title, cwd, agent_session_id, title_manual
+                 FROM sessions
+                 ORDER BY project_id, last_used_at DESC, id DESC",
             )
             .unwrap();
         stmt.query_map([], |row| {
@@ -136,7 +259,7 @@ impl Store {
                 agent: row.get(2)?,
                 title: row.get(3)?,
                 cwd: row.get(4)?,
-                resume_id: row.get(5)?,
+                agent_session_id: row.get(5)?,
                 title_manual: row.get::<_, i64>(6)? != 0,
             })
         })
@@ -153,10 +276,23 @@ impl Store {
         cwd: &str,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (project_id, agent, title, cwd) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO sessions (project_id, agent, title, cwd, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
             params![project_id, agent, title, cwd],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Mark a session as used now, without touching its title bookkeeping.
+    ///
+    /// This is the sidebar's recency clock; it deliberately runs on selection
+    /// rather than on every write, so generated titles cannot reorder the tree.
+    pub fn touch_session(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET last_used_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// Delete a session.
@@ -182,18 +318,21 @@ impl Store {
     }
 
     /// Remember which agent-side session this row is bound to (`agent:id`).
-    pub fn set_session_resume_id(&self, id: i64, resume_id: &str) -> Result<()> {
+    pub fn set_session_agent_session_id(&self, id: i64, agent_session_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET resume_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![resume_id, id],
+            "UPDATE sessions SET agent_session_id = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            params![agent_session_id, id],
         )?;
         Ok(())
     }
 
-    /// Drop a resume binding (the agent process is gone or was never ours).
-    pub fn clear_session_resume_id(&self, id: i64) -> Result<()> {
+    /// Drop the agent-session binding (the agent process is gone or was never
+    /// ours).
+    pub fn clear_session_agent_session_id(&self, id: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET resume_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE sessions SET agent_session_id = NULL, updated_at = datetime('now')
+             WHERE id = ?1",
             params![id],
         )?;
         Ok(())
@@ -209,6 +348,40 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// The layout JSON the home window saved last, when there is one.
+    pub fn workspace_state(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT layout_json FROM workspace_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Replace the saved layout. One row; the home window owns the JSON shape.
+    pub fn save_workspace_state(&self, json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspace_state (id, layout_json, updated_at)
+             VALUES (1, ?1, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+                 layout_json = excluded.layout_json,
+                 updated_at = datetime('now')",
+            params![json],
+        )?;
+        Ok(())
+    }
+}
+
+/// Connection settings shared by the store and its in-memory fallback: WAL lets
+/// the settings window's short-lived connections share the file with the
+/// UI-owned store, and the busy timeout covers the writes that still collide.
+fn prepare(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
 }
 
 /// Setting key holding the UI font family chosen in settings.
@@ -216,6 +389,17 @@ pub const SETTING_FONT: &str = "font_family";
 
 /// Setting key holding the UI font size chosen in settings, in px.
 pub const SETTING_FONT_SIZE: &str = "font_size";
+
+/// Setting key holding the last light/dark choice: `"light"` or `"dark"`.
+pub const SETTING_THEME_MODE: &str = "theme_mode";
+
+/// Setting key marking that the first-run project/session were seeded. It stays
+/// after the user deletes them, so an intentionally empty workspace is not
+/// refilled on the next launch.
+pub const SETTING_SEEDED: &str = "seeded";
+
+/// Setting key holding the main window's last geometry as JSON.
+pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 
 /// Settings use a short-lived connection instead of the UI-owned Store: they
 /// are read once at startup (before any window exists) and written rarely
@@ -256,11 +440,38 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        let store = Store {
-            conn: Connection::open_in_memory().unwrap(),
-        };
-        store.init().unwrap();
-        store
+        Store::in_memory().unwrap()
+    }
+
+    /// The on-disk store must be the one connection the whole process writes
+    /// through, shared with Settings' short-lived connections: WAL and the busy
+    /// timeout are what keep those writes from failing under each other.
+    #[test]
+    fn an_on_disk_store_uses_wal_and_enforces_foreign_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "kumu-db-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("kumu.db")).unwrap();
+
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let foreign_keys: i64 = store
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Deleting one session leaves its siblings alone.
@@ -318,10 +529,113 @@ mod tests {
         assert_eq!(store.sessions()[0].title, "首条消息");
 
         store.rename_session(session, "重构 backend").unwrap();
-        assert!(!store
-            .update_session_title(session, "agent 起的名字")
-            .unwrap());
+        assert!(
+            !store
+                .update_session_title(session, "agent 起的名字")
+                .unwrap()
+        );
         assert_eq!(store.sessions()[0].title, "重构 backend");
+    }
+
+    /// Renaming a project keeps its sessions; deleting it takes them with it
+    /// through the schema's cascade, which `foreign_keys=ON` makes real.
+    #[test]
+    fn project_rename_and_delete_keep_the_right_sessions() {
+        let store = store();
+        let kept_project = store.insert_project("keep", "/keep").unwrap();
+        let doomed_project = store.insert_project("doomed", "/doomed").unwrap();
+        let kept = store
+            .insert_session(kept_project, "shell", "终端 1", "/keep")
+            .unwrap();
+        store
+            .insert_session(doomed_project, "shell", "终端 2", "/doomed")
+            .unwrap();
+
+        store.rename_project(doomed_project, "renamed").unwrap();
+        assert!(
+            store
+                .projects()
+                .iter()
+                .any(|p| p.id == doomed_project && p.name == "renamed")
+        );
+
+        store.delete_project(doomed_project).unwrap();
+        assert_eq!(store.projects().len(), 1);
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 1, "the other project's session survives");
+        assert_eq!(sessions[0].id, kept);
+    }
+
+    /// The sidebar's order comes from `last_used_at`, and generated-title
+    /// bookkeeping must not move a session.
+    #[test]
+    fn sessions_order_by_recent_use_not_title_updates() {
+        let store = store();
+        let project = store.insert_project("kumu", "/tmp").unwrap();
+        let (a, b, c) = (
+            store.insert_session(project, "shell", "a", "/tmp").unwrap(),
+            store.insert_session(project, "shell", "b", "/tmp").unwrap(),
+            store.insert_session(project, "shell", "c", "/tmp").unwrap(),
+        );
+        for (id, at) in [
+            (a, "2024-01-01 00:00:00"),
+            (b, "2024-01-02 00:00:00"),
+            (c, "2024-01-03 00:00:00"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET last_used_at = ?1 WHERE id = ?2",
+                    rusqlite::params![at, id],
+                )
+                .unwrap();
+        }
+        let ids = || {
+            store
+                .sessions()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), vec![c, b, a]);
+
+        store.touch_session(a).unwrap();
+        assert_eq!(ids(), vec![a, c, b], "using a session moves it up");
+
+        store.update_session_title(a, "agent title").unwrap();
+        assert_eq!(
+            ids(),
+            vec![a, c, b],
+            "a generated title must not reorder the sidebar"
+        );
+    }
+
+    /// The layout is one replaceable row; reading it back is what lets the
+    /// home window restore its panes on the next launch.
+    #[test]
+    fn a_workspace_state_round_trips_and_replaces_the_previous_one() {
+        let store = store();
+        assert_eq!(store.workspace_state().unwrap(), None);
+
+        store.save_workspace_state(r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            store.workspace_state().unwrap().as_deref(),
+            Some(r#"{"version":1}"#)
+        );
+
+        store
+            .save_workspace_state(r#"{"version":1,"focused":7}"#)
+            .unwrap();
+        assert_eq!(
+            store.workspace_state().unwrap().as_deref(),
+            Some(r#"{"version":1,"focused":7}"#),
+            "saving replaces rather than appends"
+        );
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM workspace_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     /// A database from the chat era keeps its rows but loses that era's table
@@ -381,6 +695,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chat_table, 0, "the chat table is gone");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "the upgrade is recorded once");
+        let workspace_table: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'workspace_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workspace_table, 1, "the workspace table is added");
+        let last_used: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT last_used_at FROM sessions WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            last_used.is_some(),
+            "the recency clock starts at the existing row's creation time"
+        );
+        let renamed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('sessions')
+                 WHERE name = 'agent_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(renamed, 1, "resume_id is renamed to agent_session_id");
         for column in ["model", "mode", "sandbox", "reasoning", "usage"] {
             let left: i64 = store
                 .conn
@@ -392,5 +742,8 @@ mod tests {
                 .unwrap();
             assert_eq!(left, 0, "{column} is gone");
         }
+
+        // Opening it again must be a no-op rather than re-running the upgrade.
+        store.init().unwrap();
     }
 }

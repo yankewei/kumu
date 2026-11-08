@@ -1,16 +1,11 @@
-//! The application layer: projects, sessions, live terminals, and agent
-//! discovery — independent of how it is drawn.
-//!
-//!   - this module — [`Workspace`]: projects, sessions, and live terminals;
-//!   - `discovery` — what each agent offers, as its probe reports it.
+//! The application layer: projects, sessions, and live terminals —
+//! independent of how it is drawn.
 //!
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
 //! notify: a terminal frame only concerns that pane.
 
-pub mod discovery;
-
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -20,22 +15,26 @@ use crate::agent;
 use crate::db::{Project, Session, Store, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors};
 use crate::theme;
-use discovery::Discovery;
 
 /// How often to re-read agent session stores for sidebar titles.
 const TITLE_SYNC_EVERY: Duration = Duration::from_secs(2);
 
 /// How many native agent TUIs may stay running at once.
 ///
-/// A session past the cap is stopped, least recently shown first. Selecting it
-/// again starts a new process.
+/// A session past the cap is stopped, least recently shown first — but only a
+/// parked one: a terminal a pane is showing is never stopped, so the cap is
+/// soft when every process is on screen. Selecting a stopped session again
+/// starts a new process.
 const MAX_LIVE_TERMINALS: usize = 12;
 
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
     /// Something the home or settings view draws: the project or session list,
-    /// a session's title, what an agent offers.
+    /// or a session's title.
     Changed,
+    /// A persistence write failed. The home window shows the message until the
+    /// user dismisses it, instead of leaving the action looking like a no-op.
+    Failed(String),
     /// A pane's terminal grid changed. Only that pane draws it.
     Frame(u64),
     /// A pane's shell exited cleanly. The home window closes that pane; the
@@ -56,15 +55,17 @@ struct LiveTerm {
 
 /// Projects, sessions, and each live terminal.
 ///
-/// One per app, owned by the home window and shared with the settings window.
-/// Nothing in here renders. Agent TUIs are launched through [`agent::interactive`];
-/// protocol probes go through [`agent::probe`].
+/// One per app, owned by the home window. Nothing in here renders. Agent TUIs
+/// are launched through [`agent::interactive`].
 ///
 /// A sidebar session may occupy several panes; each pane has its own PTY. A
 /// pane switching sessions parks its process rather than killing it, so a
 /// hidden agent keeps its state until the cap stops it.
 pub struct Workspace {
     store: Store,
+    /// Whether `store` is the on-disk database. An in-memory fallback still
+    /// gets its first-run project and shell, because nothing else persists.
+    persistent: bool,
     projects: Vec<Project>,
     sessions: Vec<Session>,
     /// Native TUI processes keyed by a stable terminal id.
@@ -74,50 +75,104 @@ pub struct Workspace {
     /// Least recently shown first. Only terminals whose process is still running.
     term_lru: Vec<u64>,
     next_term: u64,
-    /// What each agent offers in general, as probed.
-    discovery: Discovery,
+    /// A database failure from before any view could subscribe. The home window
+    /// reads it once at construction and shows it like a later [`WorkspaceEvent::Failed`].
+    startup_error: Option<String>,
+    /// The home window's last layout JSON, handed to the view once at startup.
+    saved_workspace: Option<String>,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let store = Store::open(&db_path()).expect("failed to open sqlite db");
+        // A database that cannot be opened must not take the window down with
+        // it: keep working from memory for this run, and say that nothing will
+        // be saved rather than dying before there is anywhere to say it.
+        let (store, mut startup_error, persistent) = match Store::open(&db_path()) {
+            Ok(store) => (store, None, true),
+            Err(error) => (
+                Store::in_memory().expect("in-memory sqlite db"),
+                Some(format!("无法打开本地数据库：{error}。本次更改不会保存。")),
+                false,
+            ),
+        };
+        let saved_workspace = match store.workspace_state() {
+            Ok(state) => state,
+            Err(error) => {
+                startup_error.get_or_insert_with(|| format!("读取工作区布局失败：{error}。"));
+                None
+            }
+        };
         let mut workspace = Self {
             store,
+            persistent,
             projects: Vec::new(),
             sessions: Vec::new(),
             terms: HashMap::new(),
             pane_term: HashMap::new(),
             term_lru: Vec::new(),
             next_term: 1,
-            discovery: Discovery::default(),
+            startup_error,
+            saved_workspace,
         };
         workspace.bootstrap();
-        workspace.probe_missing(cx);
         workspace.watch_agent_titles(cx);
         workspace
     }
 
+    /// Report a persistence failure to whichever view is showing this
+    /// workspace. The action itself is left as it was.
+    fn failed(cx: &mut Context<Self>, action: &str, error: impl std::fmt::Display) {
+        cx.emit(WorkspaceEvent::Failed(format!("{action}：{error}")));
+    }
+
+    /// Take the failure recorded before any view subscribed.
+    pub fn take_startup_error(&mut self) -> Option<String> {
+        self.startup_error.take()
+    }
+
+    /// Take the layout JSON loaded before the home view existed.
+    pub fn take_saved_workspace(&mut self) -> Option<String> {
+        self.saved_workspace.take()
+    }
+
+    /// Replace the saved layout, reporting a write failure to the home window.
+    pub fn save_workspace_state(&self, json: &str, cx: &mut Context<Self>) -> bool {
+        match self.store.save_workspace_state(json) {
+            Ok(()) => true,
+            Err(error) => {
+                Self::failed(cx, "保存工作区布局失败", error);
+                false
+            }
+        }
+    }
+
     /// A first run gets a project for the current directory and a shell in
-    /// it, so the window never opens onto nothing.
+    /// it, so the window never opens onto nothing. The seeded flag keeps an
+    /// intentionally emptied workspace empty on later launches.
     fn bootstrap(&mut self) {
-        if self.store.projects().is_empty() {
-            let cwd = std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .to_string_lossy()
-                .into_owned();
-            self.store.insert_project("kumu", &cwd).ok();
+        let seeded = self.persistent && crate::db::get_setting(crate::db::SETTING_SEEDED).is_some();
+        if !seeded {
+            let mut seeded_ok = true;
+            if self.store.projects().is_empty() {
+                seeded_ok = insert_bootstrap_project(&self.store).is_some();
+            }
+            self.refresh();
+            if seeded_ok
+                && self.sessions.is_empty()
+                && let Some(project) = self.projects.first().cloned()
+            {
+                seeded_ok = self
+                    .store
+                    .insert_session(project.id, crate::term::SHELL, "终端 1", &project.path)
+                    .is_ok();
+            }
+            if seeded_ok && self.persistent {
+                let _ = crate::db::set_setting(crate::db::SETTING_SEEDED, "1");
+            }
         }
         self.refresh();
-        if self.sessions.is_empty()
-            && let Some(project) = self.projects.first().cloned()
-        {
-            self.store
-                .insert_session(project.id, crate::term::SHELL, "终端 1", &project.path)
-                .ok();
-            self.refresh();
-        }
     }
 
     fn refresh(&mut self) {
@@ -137,6 +192,13 @@ impl Workspace {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// Mark a session as used for the sidebar's recency order. The in-memory
+    /// order is deliberately left alone, so rows do not jump under the pointer
+    /// while the user is working; the next launch shows the new order.
+    pub fn touch_session(&self, session_id: i64) {
+        self.store.touch_session(session_id).ok();
+    }
+
     /// The pane's screen, after making sure its process is running for
     /// `session_id`.
     ///
@@ -144,8 +206,8 @@ impl Workspace {
     /// launch the user's `$SHELL`. An exited agent TUI starts again; an exited
     /// shell closes the pane (see [`Self::watch_terminal`]). Switching the pane
     /// to another session parks the old process and reattaches it when that
-    /// session is shown again. A thirteenth running process stops the one
-    /// shown least recently.
+    /// session is shown again. Starting a process past the cap stops the parked
+    /// one shown least recently; a pane's visible terminal is never stopped.
     pub fn show_terminal(
         &mut self,
         pane: u64,
@@ -163,11 +225,12 @@ impl Workspace {
             return term.snapshot();
         }
         self.park_terminal(pane);
-        self.reclaim_terminals();
         let Some(session) = self.session(session_id).cloned() else {
             return Snapshot::blank("", "");
         };
-        // This session was shown before: reattach its process and screen.
+        // This session was shown before: reattach its process and screen. Try
+        // this before reclaiming, because a reattach starts no new process and
+        // must not cost some other terminal its process — least of all its own.
         if let Some(term_id) = self.parked_terminal(session_id) {
             self.terms.get_mut(&term_id).unwrap().pane = Some(pane);
             self.pane_term.insert(pane, term_id);
@@ -176,6 +239,7 @@ impl Workspace {
             term.wake_handled();
             return term.snapshot();
         }
+        self.reclaim_terminals();
         let colors = theme::term_colors(cx);
         let launch = if crate::term::is_shell(&session.agent) {
             Some(crate::term::default_shell())
@@ -344,9 +408,7 @@ impl Workspace {
     fn parked_terminal(&self, session_id: i64) -> Option<u64> {
         self.term_lru.iter().rev().copied().find(|id| {
             self.terms.get(id).is_some_and(|live| {
-                live.pane.is_none()
-                    && live.session == session_id
-                    && !live.term.snapshot().exited
+                live.pane.is_none() && live.session == session_id && !live.term.snapshot().exited
             })
         })
     }
@@ -379,8 +441,13 @@ impl Workspace {
         }
     }
 
-    /// Drop exited processes, then stop the least recently shown ones until
-    /// one more process fits under the cap.
+    /// Drop exited processes, then stop parked ones until one more process fits
+    /// under the cap.
+    ///
+    /// Only parked terminals are candidates. Dropping a visible one would
+    /// remove its pane's mapping and leave a pane that still believes it has a
+    /// session while nothing answers its input; the cap is soft when every
+    /// running process is on screen.
     fn reclaim_terminals(&mut self) {
         let dead: Vec<u64> = self
             .terms
@@ -397,7 +464,12 @@ impl Workspace {
             .copied()
             .filter(|id| self.terms.contains_key(id))
             .collect();
-        for id in terminal_evictions(&alive, MAX_LIVE_TERMINALS) {
+        let parked: Vec<u64> = alive
+            .iter()
+            .copied()
+            .filter(|id| self.terms.get(id).is_some_and(|live| live.pane.is_none()))
+            .collect();
+        for id in terminal_evictions(&parked, alive.len(), MAX_LIVE_TERMINALS) {
             self.drop_term(id);
         }
     }
@@ -455,11 +527,6 @@ impl Workspace {
         .detach();
     }
 
-    /// What each agent offers in general, and which probes are out.
-    pub fn discovery(&self) -> &Discovery {
-        &self.discovery
-    }
-
     /// Add the folder at `path` as a project, named after the folder itself —
     /// or, when it already is one, return that project instead of inserting a
     /// duplicate row.
@@ -468,10 +535,59 @@ impl Workspace {
             ProjectPick::Existing(id) => return Some(id),
             ProjectPick::New { name } => name,
         };
-        let id = self.store.insert_project(&name, path).ok()?;
+        let id = match self.store.insert_project(&name, path) {
+            Ok(id) => id,
+            Err(error) => {
+                Self::failed(cx, "添加项目失败", error);
+                return None;
+            }
+        };
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
         Some(id)
+    }
+
+    /// Rename a project without moving it or its sessions.
+    pub fn rename_project(&mut self, project_id: i64, name: String, cx: &mut Context<Self>) {
+        if let Err(error) = self.store.rename_project(project_id, &name) {
+            Self::failed(cx, "重命名项目失败", error);
+            return;
+        }
+        self.refresh();
+        cx.emit(WorkspaceEvent::Changed);
+    }
+
+    /// Delete a project and every session in it. Terminals are stopped only
+    /// after the row is gone, so a failed write leaves the workspace untouched.
+    ///
+    /// Returns the first session left in another project, for the panes that
+    /// were showing the deleted project to land on.
+    pub fn delete_project(
+        &mut self,
+        project_id: i64,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<i64>, ()> {
+        let sessions: Vec<i64> = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .map(|session| session.id)
+            .collect();
+        let next = self
+            .sessions
+            .iter()
+            .find(|session| session.project_id != project_id)
+            .map(|session| session.id);
+        if let Err(error) = self.store.delete_project(project_id) {
+            Self::failed(cx, "删除项目失败", error);
+            return Err(());
+        }
+        for session_id in sessions {
+            self.drop_session_terminals(session_id);
+        }
+        self.refresh();
+        cx.emit(WorkspaceEvent::Changed);
+        Ok(next)
     }
 
     /// Start a shell session in `project_id`, or in the first project when
@@ -479,10 +595,16 @@ impl Workspace {
     pub fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) -> Option<i64> {
         let project_id = match project_id.or_else(|| self.projects.first().map(|p| p.id)) {
             Some(id) => id,
-            None => self
-                .store
-                .insert_project("kumu", "cwd-not-set")
-                .unwrap_or(1),
+            None => {
+                // The row was just inserted, so pick up its path before reading
+                // the cwd below.
+                let Some(id) = insert_bootstrap_project(&self.store) else {
+                    cx.emit(WorkspaceEvent::Failed("无法创建默认项目".to_string()));
+                    return None;
+                };
+                self.refresh();
+                id
+            }
         };
         let cwd = self
             .projects
@@ -491,10 +613,18 @@ impl Workspace {
             .map(|p| p.path.clone())
             .unwrap_or_default();
         let n = self.sessions.len() + 1;
-        let id = self
-            .store
-            .insert_session(project_id, crate::term::SHELL, &format!("终端 {n}"), &cwd)
-            .ok()?;
+        let id = match self.store.insert_session(
+            project_id,
+            crate::term::SHELL,
+            &format!("终端 {n}"),
+            &cwd,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                Self::failed(cx, "新建会话失败", error);
+                return None;
+            }
+        };
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
         Some(id)
@@ -503,7 +633,10 @@ impl Workspace {
     /// Apply the name the user chose. It is marked as theirs, which is what
     /// keeps a title generated later from replacing it.
     pub fn rename_session(&mut self, session_id: i64, title: String, cx: &mut Context<Self>) {
-        self.store.rename_session(session_id, &title).ok();
+        if let Err(error) = self.store.rename_session(session_id, &title) {
+            Self::failed(cx, "重命名会话失败", error);
+            return;
+        }
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
     }
@@ -585,7 +718,7 @@ impl Workspace {
                     pid,
                     agent_id: session.agent.clone(),
                     shell: crate::term::is_shell(&session.agent),
-                    resume_id: session.resume_id.clone(),
+                    agent_session_id: session.agent_session_id.clone(),
                 })
             })
             .collect()
@@ -597,7 +730,7 @@ impl Workspace {
         let mut claimed: HashSet<String> = self
             .sessions
             .iter()
-            .filter_map(|s| s.resume_id.clone())
+            .filter_map(|s| s.agent_session_id.clone())
             .collect();
         let mut changed = false;
         for scan in scans {
@@ -616,42 +749,42 @@ impl Workspace {
             // "终端 N" would also lose every agent-assigned name on restart,
             // when the process is gone but the session row is not.
             if binding_alive == Some(false) {
-                let _ = self.store.clear_session_resume_id(session_id);
-                if let Some(resume) = session.resume_id.as_deref() {
+                let _ = self.store.clear_session_agent_session_id(session_id);
+                if let Some(resume) = session.agent_session_id.as_deref() {
                     claimed.remove(resume);
                 }
                 if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    row.resume_id = None;
+                    row.agent_session_id = None;
                 }
                 changed = true;
                 continue;
             }
-            let next = if let Some(resume) = session.resume_id.as_deref() {
+            let next = if let Some(resume) = session.agent_session_id.as_deref() {
                 bound_title.map(|title| (resume.to_string(), title))
             } else {
-                candidates.retain(|c| !claimed.contains(&c.resume_id));
+                candidates.retain(|c| !claimed.contains(&c.agent_session_id));
                 candidates
                     .into_iter()
                     .max_by_key(|c| c.score)
-                    .map(|c| (c.resume_id, c.title))
+                    .map(|c| (c.agent_session_id, c.title))
             };
-            let Some((resume_id, title)) = next else {
+            let Some((agent_session_id, title)) = next else {
                 continue;
             };
-            if session.resume_id.as_deref() != Some(resume_id.as_str()) {
+            if session.agent_session_id.as_deref() != Some(agent_session_id.as_str()) {
                 if self
                     .store
-                    .set_session_resume_id(session_id, &resume_id)
+                    .set_session_agent_session_id(session_id, &agent_session_id)
                     .is_ok()
                 {
-                    claimed.insert(resume_id.clone());
+                    claimed.insert(agent_session_id.clone());
                     if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        row.resume_id = Some(resume_id);
+                        row.agent_session_id = Some(agent_session_id);
                     }
                     changed = true;
                 }
             } else {
-                claimed.insert(resume_id);
+                claimed.insert(agent_session_id);
             }
             if session.title != title
                 && self
@@ -668,67 +801,27 @@ impl Workspace {
         changed
     }
 
-    /// Delete a session: drop every pane terminal bound to it, then remove the row.
+    /// Delete a session: remove the row, then drop every pane terminal bound to
+    /// it.
     ///
     /// Returns the neighbor to select next — computed before the row is gone —
     /// so a caller that was looking at this session can land somewhere else.
-    pub fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) -> Option<i64> {
+    /// The row goes first: if the write fails, nothing is torn down and the
+    /// session can be retried.
+    pub fn delete_session(
+        &mut self,
+        session_id: i64,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<i64>, ()> {
         let next = neighbor_session(&self.sessions, session_id);
+        if let Err(error) = self.store.delete_session(session_id) {
+            Self::failed(cx, "删除会话失败", error);
+            return Err(());
+        }
         self.drop_session_terminals(session_id);
-        self.store.delete_session(session_id).ok();
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
-        next
-    }
-
-    /// Probe the agents nothing is known about yet — never probed, or probed
-    /// and failed — so the settings window has a catalogue before any session
-    /// has connected. Not-installed agents are dropped in [`Self::probe`].
-    pub fn probe_missing(&mut self, cx: &mut Context<Self>) {
-        let missing = self.discovery.missing();
-        self.probe(&missing, cx);
-    }
-
-    /// Probe `agents` again, replacing what is cached as the answers arrive.
-    /// An agent whose probe is already out is left to that one, and an agent
-    /// that is not installed here is skipped: there is nothing to ask.
-    pub fn probe(&mut self, agents: &[&'static str], cx: &mut Context<Self>) {
-        let launchable: Vec<(&'static str, agent::Config)> = agents
-            .iter()
-            .filter_map(|&id| Some((id, agent::Config::for_agent(id)?)))
-            .filter(|(_, cfg)| cfg.installed())
-            .collect();
-        let ids: Vec<&'static str> = launchable.iter().map(|(id, _)| *id).collect();
-        let started = self.discovery.start(&ids);
-        if started.is_empty() {
-            return;
-        }
-        let mut reports = discovery::probe(
-            launchable
-                .into_iter()
-                .filter(|(id, _)| started.contains(id))
-                .collect(),
-        );
-        cx.emit(WorkspaceEvent::Changed);
-        cx.spawn(async move |this, cx| {
-            use futures::StreamExt;
-            while let Some(ev) = reports.next().await {
-                let updated = this.update(cx, |workspace, cx| {
-                    if workspace.discovery.record(ev) {
-                        cx.emit(WorkspaceEvent::Changed);
-                    }
-                });
-                if updated.is_err() {
-                    return;
-                }
-            }
-            // A probe that ended without a word is over all the same.
-            let _ = this.update(cx, |workspace, cx| {
-                workspace.discovery.finish(&started);
-                cx.emit(WorkspaceEvent::Changed);
-            });
-        })
-        .detach();
+        Ok(next)
     }
 }
 
@@ -754,6 +847,41 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
     ProjectPick::New { name }
 }
 
+/// The directory a first-run project opens in.
+///
+/// `current_dir()` alone is not enough on macOS: a Finder-launched `.app`
+/// starts with `/` as its working directory, and opening the first project
+/// there would put its shell at the filesystem root. Fall back to the home
+/// directory instead.
+fn first_run_dir() -> PathBuf {
+    first_run_dir_from(
+        std::env::current_dir().ok(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn first_run_dir_from(cwd: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    cwd.filter(|dir| dir.as_path() != Path::new("/"))
+        .or(home)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The project name a first-run directory gets: its own folder name.
+fn project_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "kumu".to_string())
+}
+
+/// Insert the first-run project, or return `None` when the row cannot be
+/// written.
+fn insert_bootstrap_project(store: &Store) -> Option<i64> {
+    let dir = first_run_dir();
+    let path = dir.to_string_lossy().into_owned();
+    store.insert_project(&project_name(&dir), &path).ok()
+}
+
 /// One live session as a title poll sees it: everything the off-thread scan
 /// needs, copied off the [`Workspace`] so the scan can run on the background
 /// executor.
@@ -763,7 +891,7 @@ struct TitleQuery {
     pid: Option<u32>,
     agent_id: String,
     shell: bool,
-    resume_id: Option<String>,
+    agent_session_id: Option<String>,
 }
 
 /// What a scan found for one query: the verdict on a stored binding, or the
@@ -787,7 +915,7 @@ fn scan_title(query: TitleQuery) -> TitleScan {
         pid,
         agent_id,
         shell,
-        resume_id,
+        agent_session_id,
     } = query;
     let mut scan = TitleScan {
         session_id,
@@ -795,7 +923,7 @@ fn scan_title(query: TitleQuery) -> TitleScan {
         bound_title: None,
         candidates: Vec::new(),
     };
-    match resume_id.as_deref() {
+    match agent_session_id.as_deref() {
         // A shell's binding has to be re-proved every poll: the agent it names
         // may have exited, and a cwd-only match must not let this terminal keep
         // someone else's name.
@@ -819,41 +947,45 @@ fn scan_title(query: TitleQuery) -> TitleScan {
 
 /// Which session to select after `id` is deleted.
 ///
-/// The nearest sibling in the same project (the next one, else the previous),
-/// else the first session left anywhere, else none — so the right pane never
-/// goes blank while sessions remain.
+/// The nearest sibling in the same project in sidebar order (the next one, else
+/// the previous), else the first session left anywhere, else none — so the
+/// right pane never goes blank while sessions remain.
 pub(crate) fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
     let project = sessions.iter().find(|s| s.id == id)?.project_id;
-    let mut siblings: Vec<i64> = sessions
+    let siblings: Vec<i64> = sessions
         .iter()
         .filter(|s| s.project_id == project)
         .map(|s| s.id)
         .collect();
-    siblings.sort_unstable();
-    siblings
-        .iter()
-        .copied()
-        .find(|&sid| sid > id)
-        .or_else(|| siblings.iter().rev().copied().find(|&sid| sid < id))
+    let position = siblings.iter().position(|&sid| sid == id);
+    position
+        .and_then(|i| siblings.get(i + 1).copied())
+        .or_else(|| {
+            position
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| siblings.get(i).copied())
+        })
         .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
 }
 
-/// Which running terminals to stop so one more fits under `cap`, least
-/// recently shown first. `order` does not include the session about to start.
-fn terminal_evictions(order: &[u64], cap: usize) -> Vec<u64> {
-    let mut evictions = Vec::new();
-    for &pane in order {
-        if order.len() - evictions.len() < cap {
-            break;
-        }
-        evictions.push(pane);
-    }
-    evictions
+/// Which parked terminals to stop so one more process fits under `cap`, least
+/// recently shown first. `order` holds only parked terminals; `alive` is every
+/// running process, including those a pane shows. Returning nothing is correct
+/// when no parked terminal is left: the cap is soft rather than letting a
+/// visible pane lose its process.
+fn terminal_evictions(order: &[u64], alive: usize, cap: usize) -> Vec<u64> {
+    let needed = (alive + 1).saturating_sub(cap);
+    order.iter().copied().take(needed).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectPick, neighbor_session, resolve_project_pick, terminal_evictions};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        ProjectPick, first_run_dir_from, neighbor_session, project_name, resolve_project_pick,
+        terminal_evictions,
+    };
     use crate::db::{Project, Session};
 
     fn project(id: i64, path: &str) -> Project {
@@ -871,7 +1003,7 @@ mod tests {
             agent: "shell".into(),
             title: format!("终端 {id}"),
             cwd: "/tmp".into(),
-            resume_id: None,
+            agent_session_id: None,
             title_manual: false,
         }
     }
@@ -895,6 +1027,15 @@ mod tests {
         );
     }
 
+    /// The sidebar orders sessions by recency, so the neighbor after a delete
+    /// has to follow that order rather than numeric ids.
+    #[test]
+    fn deletion_follows_sidebar_order_not_id_order() {
+        let sessions = vec![session(3, 10), session(1, 10), session(2, 10)];
+        assert_eq!(neighbor_session(&sessions, 1), Some(2), "the next row");
+        assert_eq!(neighbor_session(&sessions, 2), Some(1), "the previous row");
+    }
+
     /// With no sibling left in the project, the other project's sessions still
     /// beat the empty state; only a truly empty list returns `None`.
     #[test]
@@ -908,10 +1049,49 @@ mod tests {
     }
 
     #[test]
-    fn a_fifth_terminal_stops_the_least_recently_shown() {
-        assert!(terminal_evictions(&[1, 2, 3], 4).is_empty());
-        assert_eq!(terminal_evictions(&[1, 2, 3, 4], 4), vec![1]);
-        assert_eq!(terminal_evictions(&[1, 2, 3, 4, 5], 4), vec![1, 2]);
+    fn a_fifth_terminal_stops_the_least_recently_shown_parked_one() {
+        assert!(terminal_evictions(&[1, 2, 3], 3, 4).is_empty());
+        assert_eq!(terminal_evictions(&[1, 2, 3, 4], 4, 4), vec![1]);
+        assert_eq!(terminal_evictions(&[1, 2, 3, 4, 5], 5, 4), vec![1, 2]);
+    }
+
+    /// With every process on screen there is no parked candidate; the cap has
+    /// to give way, because stopping a visible pane's terminal would leave the
+    /// pane alive but dead to input.
+    #[test]
+    fn a_visible_pane_is_never_evicted() {
+        assert!(terminal_evictions(&[], 12, 12).is_empty());
+        assert!(terminal_evictions(&[], 40, 12).is_empty());
+        // One parked terminal is stopped even when many visible ones put the
+        // total far over the cap.
+        assert_eq!(terminal_evictions(&[7], 40, 12), vec![7]);
+    }
+
+    /// A Finder-launched `.app` starts in `/`; the first project must not open
+    /// its shell at the filesystem root when a home directory exists.
+    #[test]
+    fn a_first_run_never_opens_at_the_filesystem_root() {
+        let home = PathBuf::from("/Users/kumu");
+        assert_eq!(
+            first_run_dir_from(Some(PathBuf::from("/")), Some(home.clone())),
+            home
+        );
+        assert_eq!(first_run_dir_from(None, Some(home.clone())), home);
+        assert_eq!(
+            first_run_dir_from(Some(PathBuf::from("/repo/kumu")), Some(home)),
+            PathBuf::from("/repo/kumu"),
+            "a real working directory still wins"
+        );
+        assert_eq!(
+            first_run_dir_from(Some(PathBuf::from("/")), None),
+            PathBuf::from("/")
+        );
+    }
+
+    #[test]
+    fn a_first_run_project_is_named_after_its_folder() {
+        assert_eq!(project_name(Path::new("/repo/kumu")), "kumu");
+        assert_eq!(project_name(Path::new("/")), "kumu", "no folder name");
     }
 
     /// Picking a folder that is already a project selects it rather than

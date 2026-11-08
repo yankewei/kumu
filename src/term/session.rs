@@ -591,12 +591,7 @@ mod tests {
             std::env::temp_dir(),
             TermColors::default(),
         );
-        let (b, _wb) = Term::launch(
-            program,
-            args,
-            std::env::temp_dir(),
-            TermColors::default(),
-        );
+        let (b, _wb) = Term::launch(program, args, std::env::temp_dir(), TermColors::default());
         std::thread::sleep(Duration::from_millis(200));
         assert!(!a.snapshot().exited);
         assert!(!b.snapshot().exited);

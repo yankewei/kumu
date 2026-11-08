@@ -1,11 +1,8 @@
 //! Settings window, Waku-style: sidebar (back row + search + icon nav) on the
 //! left; a centered content column with card-grouped rows on the right.
 
-use std::collections::HashSet;
-
 use super::widgets::{agent_logo, pill};
 use crate::agent::AGENTS;
-use crate::app::{Workspace, WorkspaceEvent};
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -13,6 +10,7 @@ use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
@@ -77,30 +75,13 @@ pub struct SettingsWindow {
     font_select: Entity<SelectState<SearchableVec<FontItem>>>,
     /// UI font-size picker over the app's type scale.
     font_size_select: Entity<SelectState<SearchableVec<FontSizeItem>>>,
-    /// The home window's workspace, whose probes this window shows and
-    /// refreshes; a probe either window starts is the other's too. Held weakly:
-    /// the home window owns it, and closing that window must still tear its
-    /// agents down while this one stays open.
-    workspace: WeakEntity<Workspace>,
     updater: Entity<Updater>,
     /// The window's overlay for hover labels; mounted by `window_layers`.
     tooltips: Entity<Tooltips>,
 }
 
 impl SettingsWindow {
-    pub fn new(
-        workspace: Entity<Workspace>,
-        updater: Entity<Updater>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        cx.subscribe(&workspace, |_, _, ev, cx| {
-            if matches!(ev, WorkspaceEvent::Changed) {
-                cx.notify();
-            }
-        })
-        .detach();
-
+    pub fn new(updater: Entity<Updater>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe(&updater, |_, updater, cx| {
             if let UpdateStatus::Errored(error) = updater.read(cx).status() {
                 eprintln!("[updates] {error}");
@@ -123,8 +104,8 @@ impl SettingsWindow {
                 .map(IndexPath::new);
             SelectState::new(SearchableVec::from(items), selected, window, cx).searchable(true)
         });
-        cx.subscribe_in(&font_select, window, |this, _, ev, _, cx| {
-            this.on_font_selected(ev, cx);
+        cx.subscribe_in(&font_select, window, |this, _, ev, window, cx| {
+            this.on_font_selected(ev, window, cx);
         })
         .detach();
 
@@ -142,22 +123,17 @@ impl SettingsWindow {
                 .map(IndexPath::new);
             SelectState::new(SearchableVec::from(items), selected, window, cx)
         });
-        cx.subscribe_in(&font_size_select, window, |this, _, ev, _, cx| {
-            this.on_font_size_selected(ev, cx);
+        cx.subscribe_in(&font_size_select, window, |this, _, ev, window, cx| {
+            this.on_font_size_selected(ev, window, cx);
         })
         .detach();
 
-        // Ask for whatever this process has not discovered yet — including an
-        // agent whose last probe failed. The refresh control on the providers
-        // card re-runs the same fan-out over every installed agent.
-        workspace.update(cx, |workspace, cx| workspace.probe_missing(cx));
         Self {
             settings_page: SettingsPage::Providers,
             search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
             content_scroll: ScrollHandle::new(),
             font_select,
             font_size_select,
-            workspace: workspace.downgrade(),
             updater,
             tooltips: cx.new(|cx| Tooltips::new(cx)),
         }
@@ -180,6 +156,7 @@ impl SettingsWindow {
     fn on_font_selected(
         &mut self,
         ev: &SelectEvent<SearchableVec<FontItem>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let SelectEvent::Confirm(Some(family)) = ev else {
@@ -188,7 +165,11 @@ impl SettingsWindow {
         if cx.theme().font_family.as_ref() == family.as_ref() {
             return;
         }
-        db::set_setting(db::SETTING_FONT, family).ok();
+        if let Err(error) = db::set_setting(db::SETTING_FONT, family) {
+            window.push_notification(Notification::error(format!("保存字体失败：{error}")), cx);
+        }
+        // The choice still applies for this run; the notice says it will not
+        // survive a restart.
         theme::set_font_family(cx, family);
     }
 
@@ -197,6 +178,7 @@ impl SettingsWindow {
     fn on_font_size_selected(
         &mut self,
         ev: &SelectEvent<SearchableVec<FontSizeItem>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let SelectEvent::Confirm(Some(size)) = ev else {
@@ -205,7 +187,9 @@ impl SettingsWindow {
         if px(*size as f32) == cx.theme().font_size {
             return;
         }
-        db::set_setting(db::SETTING_FONT_SIZE, &size.to_string()).ok();
+        if let Err(error) = db::set_setting(db::SETTING_FONT_SIZE, &size.to_string()) {
+            window.push_notification(Notification::error(format!("保存字号失败：{error}")), cx);
+        }
         theme::set_font_size(cx, *size as f32);
     }
 
@@ -312,7 +296,7 @@ impl SettingsWindow {
         };
 
         let cards: Vec<AnyElement> = match self.settings_page {
-            SettingsPage::Providers => vec![self.render_providers_card(cx, dark, theme)],
+            SettingsPage::Providers => vec![self.render_providers_card(dark, theme)],
             SettingsPage::General => vec![
                 self.render_general_card(dark, theme),
                 self.render_updates_card(dark, theme, cx),
@@ -371,7 +355,7 @@ impl SettingsWindow {
         div().w_full().px_5().py_4().rounded_lg().bg(bg)
     }
 
-    fn render_providers_card(&self, cx: &Context<Self>, dark: bool, theme: &Theme) -> AnyElement {
+    fn render_providers_card(&self, dark: bool, theme: &Theme) -> AnyElement {
         let (base_bg, radius, primary, link, muted, muted_fg, border) = (
             theme.background,
             theme.radius,
@@ -385,43 +369,24 @@ impl SettingsWindow {
         let card_bg = if dark { muted } else { gpui_kit::gpui::white() };
         // Icon tiles flip to muted so they still contrast against the white card.
         let tile_bg = if dark { base_bg } else { muted };
-        let workspace = self.workspace.upgrade();
-        let discovery = workspace.as_ref().map(|w| w.read(cx).discovery());
         let rows = AGENTS
             .iter()
             .enumerate()
             .map(|(i, a)| {
                 // The registry is what kumu supports; this is the one fact the
                 // list takes from the machine. An agent that is not installed
-                // is still shown — so it is discoverable and its absence is
-                // visible — but never probed.
+                // is still shown, so its absence is visible.
                 let installed = crate::agent::installed(a.id);
-                let status_pill = if !installed {
-                    pill(false, "未安装", radius, primary, link, muted, muted_fg).into_any_element()
-                } else if let Some(catalog) = discovery.and_then(|d| d.catalog(a.id)) {
-                    let providers = catalog
-                        .models
-                        .iter()
-                        .map(|m| m.provider.as_str())
-                        .collect::<HashSet<_>>()
-                        .len();
-                    pill(
-                        false,
-                        format!("{} 模型 · {} 服务商", catalog.models.len(), providers),
-                        radius,
-                        primary,
-                        link,
-                        muted,
-                        muted_fg,
-                    )
-                    .into_any_element()
-                } else if discovery.is_some_and(|d| d.is_probing(a.id)) {
-                    pill(false, "检测模型…", radius, primary, link, muted, muted_fg)
-                        .into_any_element()
-                } else {
-                    pill(false, "模型未知", radius, primary, link, muted, muted_fg)
-                        .into_any_element()
-                };
+                let status_pill = pill(
+                    installed,
+                    if installed { "已安装" } else { "未安装" },
+                    radius,
+                    primary,
+                    link,
+                    muted,
+                    muted_fg,
+                )
+                .into_any_element();
                 h_flex()
                     .items_center()
                     .gap_3()
@@ -471,49 +436,15 @@ impl SettingsWindow {
 
         self.card(card_bg)
             .child(
-                h_flex()
-                    .items_start()
-                    .gap_6()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(div().text_xs().font_medium().child("编码 Agent"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child("探测本机 agent 的模型与可用选项"),
-                            ),
-                    )
-                    // Plain text, like every other action here: the agent's own
-                    // probe is what fills the model pickers, so re-running it is
-                    // how a catalogue changed on this machine is picked up —
-                    // otherwise it stays cached for the life of the process. The
-                    // rows' own pills show which agents are being asked.
+                v_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().text_xs().font_medium().child("编码 Agent"))
                     .child(
                         div()
-                            .id("refresh-agents")
-                            .flex_none()
-                            .cursor_pointer()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(radius)
                             .text_xs()
-                            .text_color(link)
-                            .hover(move |style| style.bg(muted))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let all: Vec<&'static str> = AGENTS
-                                    .iter()
-                                    .map(|agent| agent.id)
-                                    .filter(|id| crate::agent::installed(id))
-                                    .collect();
-                                let _ = this
-                                    .workspace
-                                    .update(cx, |workspace, cx| workspace.probe(&all, cx));
-                            }))
-                            .child("刷新"),
+                            .text_color(muted_fg)
+                            .child("检测本机安装的编码 Agent；Kumu 会直接打开它们自己的终端界面。"),
                     ),
             )
             .child(v_flex().mt_1().children(rows))
@@ -728,7 +659,7 @@ impl SettingsWindow {
             ))
             .child(row(
                 "本地数据",
-                "会话与消息保存在 ~/.kumu/kumu.db。",
+                "项目与会话记录保存在 ~/.kumu/kumu.db。",
                 pill(false, "SQLite", radius, primary, link, muted, muted_fg).into_any_element(),
                 border,
                 true,

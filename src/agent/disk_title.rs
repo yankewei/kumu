@@ -23,7 +23,8 @@ use serde_json::Value;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskTitle {
     pub agent: &'static str,
-    pub resume_id: String,
+    /// The `agent:id` binding used to look this title up again.
+    pub agent_session_id: String,
     pub title: String,
     /// Higher wins: an exact PID hit outranks a cwd-only match, and within the
     /// same tier a more recently updated agent session wins.
@@ -33,16 +34,18 @@ pub struct DiskTitle {
     pub updated: i64,
 }
 
-/// Resume ids we persist are `agent:id` so a later lookup knows which store to
-/// open even when the kumu session is still a plain shell that launched the
-/// agent by hand.
+/// Agent session ids we persist are `agent:id` so a later lookup knows which
+/// store to open even when the kumu session is still a plain shell that
+/// launched the agent by hand.
 pub fn encode_resume(agent: &str, id: &str) -> String {
     format!("{agent}:{id}")
 }
 
 pub fn decode_resume(resume: &str) -> Option<(&str, &str)> {
     resume.split_once(':').filter(|(agent, id)| {
-        !agent.is_empty() && !id.is_empty() && matches!(*agent, "claude" | "codex" | "opencode" | "pi")
+        !agent.is_empty()
+            && !id.is_empty()
+            && matches!(*agent, "claude" | "codex" | "opencode" | "pi")
     })
 }
 
@@ -116,6 +119,14 @@ fn process_bound_titles(cwd: &str, pid: Option<u32>) -> Vec<DiskTitle> {
         return Vec::new();
     };
     let tree = process_tree(&process_snapshot(), pid);
+    // No child process and no agent at the root: nothing can be running under
+    // this terminal, so every agent store would only be walked to find
+    // nothing. This is the common case for an idle shell, which is polled every
+    // two seconds. (The root still counts as the agent when the shell `exec`s
+    // one directly.)
+    if tree.pids.len() == 1 && tree.agents.is_empty() {
+        return Vec::new();
+    }
     let mut found = claude_discover_under(cwd, Some(&tree), true);
     for &(agent, started) in &tree.agents {
         // Claude already answered above by pid; a looser cwd-tier candidate
@@ -156,8 +167,9 @@ pub fn resume_belongs_to_terminal(resume: &str, term_pid: Option<u32>) -> bool {
         return false;
     };
     match agent {
-        "claude" => claude_pid_for(id)
-            .is_some_and(|pid| process_tree_pids(term_pid).contains(&pid)),
+        "claude" => {
+            claude_pid_for(id).is_some_and(|pid| process_tree_pids(term_pid).contains(&pid))
+        }
         "codex" | "opencode" | "pi" => {
             let Some(started) = agent_started_under(term_pid, agent) else {
                 return false;
@@ -266,6 +278,7 @@ fn claude_discover_under(
     let Some(dir) = claude_sessions_dir() else {
         return Vec::new();
     };
+    let cwd = normalize_cwd(cwd);
     let mut found = Vec::new();
     let Ok(entries) = fs::read_dir(&dir) else {
         return found;
@@ -284,14 +297,10 @@ fn claude_discover_under(
         let Some(session_cwd) = value.get("cwd").and_then(Value::as_str) else {
             continue;
         };
-        if normalize_cwd(session_cwd) != normalize_cwd(cwd) {
+        if normalize_cwd(session_cwd) != cwd {
             continue;
         }
-        let Some(title) = value
-            .get("name")
-            .and_then(Value::as_str)
-            .and_then(title_of)
-        else {
+        let Some(title) = value.get("name").and_then(Value::as_str).and_then(title_of) else {
             continue;
         };
         let Some(id) = value
@@ -316,7 +325,7 @@ fn claude_discover_under(
         }
         found.push(DiskTitle {
             agent: "claude",
-            resume_id: encode_resume("claude", id),
+            agent_session_id: encode_resume("claude", id),
             title,
             score,
             updated,
@@ -415,8 +424,7 @@ fn parse_proc_line(line: &str, now: i64) -> Option<Proc> {
 fn process_tree(procs: &[Proc], root: u32) -> ProcessTree {
     let mut pids = std::collections::HashSet::new();
     pids.insert(root);
-    let mut children: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     for proc_ in procs {
         children.entry(proc_.ppid).or_default().push(proc_.pid);
     }
@@ -497,10 +505,7 @@ fn parse_elapsed(text: &str) -> Option<i64> {
 
 fn claude_by_id(id: &str) -> Option<String> {
     if let Some((_, value)) = claude_live_session(id) {
-        return value
-            .get("name")
-            .and_then(Value::as_str)
-            .and_then(title_of);
+        return value.get("name").and_then(Value::as_str).and_then(title_of);
     }
     // Fall back to the project transcript's first user line when the live
     // pid file is gone — still better than leaving "终端 N".
@@ -527,9 +532,8 @@ fn claude_transcript_title(id: &str) -> Option<String> {
         if value.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let content = value
-            .pointer("/message/content")
-            .and_then(|c| c.as_str().map(|s| s.to_string()).or_else(|| {
+        let content = value.pointer("/message/content").and_then(|c| {
+            c.as_str().map(|s| s.to_string()).or_else(|| {
                 c.as_array().and_then(|parts| {
                     parts.iter().find_map(|part| {
                         part.get("text")
@@ -537,7 +541,8 @@ fn claude_transcript_title(id: &str) -> Option<String> {
                             .map(|s| s.to_string())
                     })
                 })
-            }))?;
+            })
+        })?;
         return first_line_title(&content);
     }
     None
@@ -570,6 +575,7 @@ fn codex_discover(cwd: &str) -> Vec<DiskTitle> {
     if names.is_empty() {
         return Vec::new();
     }
+    let cwd = normalize_cwd(cwd);
     let mut found = Vec::new();
     let sessions = root.join("sessions");
     for path in recent_files(&sessions, 80) {
@@ -579,7 +585,7 @@ fn codex_discover(cwd: &str) -> Vec<DiskTitle> {
         let Some(session_cwd) = meta.get("cwd").and_then(Value::as_str) else {
             continue;
         };
-        if normalize_cwd(session_cwd) != normalize_cwd(cwd) {
+        if normalize_cwd(session_cwd) != cwd {
             continue;
         }
         let Some(id) = codex_meta_id(&meta) else {
@@ -591,7 +597,7 @@ fn codex_discover(cwd: &str) -> Vec<DiskTitle> {
         let updated = mtime_score(&path);
         found.push(DiskTitle {
             agent: "codex",
-            resume_id: encode_resume("codex", &id),
+            agent_session_id: encode_resume("codex", &id),
             title,
             score: updated,
             updated,
@@ -725,7 +731,7 @@ fn opencode_discover(cwd: &str) -> Vec<DiskTitle> {
             let updated = updated / 1000;
             Some(DiskTitle {
                 agent: "opencode",
-                resume_id: encode_resume("opencode", &id),
+                agent_session_id: encode_resume("opencode", &id),
                 title,
                 score: updated,
                 updated,
@@ -736,11 +742,9 @@ fn opencode_discover(cwd: &str) -> Vec<DiskTitle> {
 
 fn opencode_by_id(id: &str) -> Option<String> {
     let conn = opencode_connection()?;
-    conn.query_row(
-        "SELECT title FROM session_v2 WHERE id = ?1",
-        [id],
-        |row| row.get::<_, Option<String>>(0),
-    )
+    conn.query_row("SELECT title FROM session_v2 WHERE id = ?1", [id], |row| {
+        row.get::<_, Option<String>>(0)
+    })
     .ok()
     .flatten()
     .and_then(|t| title_of(&t))
@@ -803,7 +807,7 @@ fn pi_discover(cwd: &str) -> Vec<DiskTitle> {
         let updated = mtime_score(&path);
         found.push(DiskTitle {
             agent: "pi",
-            resume_id: encode_resume("pi", &id),
+            agent_session_id: encode_resume("pi", &id),
             title,
             score: updated,
             updated,
@@ -867,10 +871,7 @@ fn pi_file_title(path: &Path) -> Option<(String, String)> {
             Some("session_info") => {
                 // An empty name clears the title; keep scanning so a later
                 // non-empty entry can restore one.
-                name = value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .and_then(title_of);
+                name = value.get("name").and_then(Value::as_str).and_then(title_of);
             }
             _ => {}
         }
@@ -884,7 +885,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn resume_ids_round_trip_with_known_agents() {
+    fn agent_session_ids_round_trip_with_known_agents() {
         let encoded = encode_resume("claude", "abc");
         assert_eq!(decode_resume(&encoded), Some(("claude", "abc")));
         assert!(decode_resume("nope:x").is_none());
@@ -1023,11 +1024,7 @@ mod tests {
             serde_json::to_string(&cwd).unwrap()
         )
         .unwrap();
-        writeln!(
-            file,
-            r#"{{"type":"session_info","id":"a","name":"first"}}"#
-        )
-        .unwrap();
+        writeln!(file, r#"{{"type":"session_info","id":"a","name":"first"}}"#).unwrap();
         writeln!(
             file,
             r#"{{"type":"session_info","id":"b","name":"refactor auth"}}"#
@@ -1037,7 +1034,7 @@ mod tests {
         let found = pi_discover(&cwd);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].title, "refactor auth");
-        assert_eq!(found[0].resume_id, "pi:sess-1");
+        assert_eq!(found[0].agent_session_id, "pi:sess-1");
     }
 
     #[test]

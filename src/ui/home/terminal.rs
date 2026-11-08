@@ -225,9 +225,8 @@ impl TerminalView {
             return;
         }
         let pane = self.pane.0;
-        self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_wake_handled(pane)
-        });
+        self.workspace
+            .update(cx, |workspace, _| workspace.terminal_wake_handled(pane));
         loop {
             let generation = self.workspace.read(cx).terminal_generation(pane);
             let Some(snapshot) = self.workspace.read(cx).terminal_snapshot(pane) else {
@@ -327,9 +326,8 @@ impl TerminalView {
             return;
         };
         let pane = self.pane.0;
-        self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_paste(pane, text)
-        });
+        self.workspace
+            .update(cx, |workspace, _| workspace.terminal_paste(pane, text));
     }
 
     /// Whether the running program owns the pointer for a new gesture.
@@ -393,9 +391,8 @@ impl TerminalView {
             any_pressed: !self.reported.is_empty(),
             mods: mouse_mods(mods),
         };
-        self.workspace.update(cx, |workspace, _| {
-            workspace.terminal_mouse(pane, input)
-        });
+        self.workspace
+            .update(cx, |workspace, _| workspace.terminal_mouse(pane, input));
     }
 
     fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {

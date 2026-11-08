@@ -1,8 +1,8 @@
 //! Theme loading: themes/*.json into the ThemeRegistry ("Kumu Light" / "Zed
-//! Dark" as the light/dark defaults), then apply the light theme. App code
-//! only reads semantic tokens from `cx.theme()`. Also owns the user's UI font
-//! choices (family and size), which sit on top of the loaded theme and must be
-//! re-applied whenever the theme is re-applied from its JSON.
+//! Dark" as the light/dark defaults), then apply the saved light/dark choice.
+//! App code only reads semantic tokens from `cx.theme()`. Also owns the user's
+//! UI font choices (family and size), which sit on top of the loaded theme and
+//! must be re-applied whenever the theme is re-applied from its JSON.
 
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -51,12 +51,31 @@ pub fn load_kumu_themes(cx: &mut App) {
             theme.dark_theme = t;
         }
     }
-    change_mode(ThemeMode::Light, None, cx);
+    let mode =
+        theme_mode_from_setting(crate::db::get_setting(crate::db::SETTING_THEME_MODE).as_deref());
+    change_mode(mode, None, cx);
 }
 
-/// Switch light/dark, then restore the persisted font choices: `Theme::change`
-/// re-applies what the theme JSON defines, which would drop the family.
+/// The light/dark choice saved by Settings, defaulting to light.
+fn theme_mode_from_setting(value: Option<&str>) -> ThemeMode {
+    match value {
+        Some("dark") => ThemeMode::Dark,
+        _ => ThemeMode::Light,
+    }
+}
+
+/// Switch light/dark, remember the choice, then restore the persisted font
+/// choices: `Theme::change` re-applies what the theme JSON defines, which
+/// would drop the family.
 pub fn change_mode(mode: impl Into<ThemeMode>, window: Option<&mut Window>, cx: &mut App) {
+    let mode = mode.into();
+    // The startup call writes the value it just read; that is harmless and
+    // keeps this the one place a mode change becomes persistent.
+    crate::db::set_setting(
+        crate::db::SETTING_THEME_MODE,
+        if mode.is_dark() { "dark" } else { "light" },
+    )
+    .ok();
     Theme::change(mode, window, cx);
     cx.default_global::<ThemeRevision>().0 += 1;
     apply_saved_font(cx);
@@ -157,7 +176,7 @@ pub fn apply_saved_font(cx: &mut App) {
     set_font_size(cx, size);
 }
 
-/// Markdown look for chat replies: the component theme's colors plus a wider
+/// Shared text view defaults: the component theme's colors plus a wider
 /// paragraph gap. Installed after every theme/base sync because gpui-component
 /// resets the global defaults whenever it re-applies the theme.
 fn install_text_view_style(cx: &mut App) {
@@ -197,7 +216,7 @@ mod tests {
     // scope through the glob, so the built-in one is imported explicitly.
     use core::prelude::v1::test;
 
-    use super::{DEFAULT_FONT_SIZE, FONT_SIZES};
+    use super::{DEFAULT_FONT_SIZE, FONT_SIZES, theme_mode_from_setting};
 
     /// The settings picker preselects by matching the size in force against an
     /// offered one, so the default has to be on the list or it would open with
@@ -205,5 +224,15 @@ mod tests {
     #[test]
     fn the_default_font_size_is_offered_by_the_picker() {
         assert!(FONT_SIZES.contains(&(DEFAULT_FONT_SIZE as u32)));
+    }
+
+    /// The stored value is the only way the dark choice survives a restart, so
+    /// it must map back exactly; anything unknown falls back to light.
+    #[test]
+    fn a_saved_mode_maps_back_to_its_theme() {
+        assert!(theme_mode_from_setting(Some("dark")).is_dark());
+        assert!(!theme_mode_from_setting(Some("light")).is_dark());
+        assert!(!theme_mode_from_setting(None).is_dark());
+        assert!(!theme_mode_from_setting(Some("future-mode")).is_dark());
     }
 }

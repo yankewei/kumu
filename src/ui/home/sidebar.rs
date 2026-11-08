@@ -71,8 +71,33 @@ impl KumuApp {
                         if !this.collapsed_projects.remove(&project_id) {
                             this.collapsed_projects.insert(project_id);
                         }
+                        this.persist_workspace(cx);
                         cx.notify();
                     }))
+                    // Right-click the project for its own actions; deleting it
+                    // takes every session under it, so it confirms first.
+                    .context_menu({
+                        let weak = weak.clone();
+                        move |menu, _, _| {
+                            let rename = PopupMenuItem::new("重命名").on_click({
+                                let weak = weak.clone();
+                                move |_, window, cx| {
+                                    let _ = weak.update(cx, move |app, cx| {
+                                        app.prompt_rename_project(project_id, window, cx)
+                                    });
+                                }
+                            });
+                            let delete = PopupMenuItem::new("删除").on_click({
+                                let weak = weak.clone();
+                                move |_, window, cx| {
+                                    let _ = weak.update(cx, move |app, cx| {
+                                        app.confirm_delete_project(project_id, window, cx)
+                                    });
+                                }
+                            });
+                            menu.item(rename).item(delete)
+                        }
+                    })
                     .child(
                         Icon::new(if collapsed {
                             IconName::Folder

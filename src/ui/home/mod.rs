@@ -24,8 +24,13 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::Updater;
-use panes::{PaneId, PaneNode};
+use panes::{PaneId, PaneNode, SavedPane, SavedWorkspace, WORKSPACE_STATE_VERSION};
 use terminal::{TerminalEvent, TerminalView};
+
+/// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
+/// ratios. Only the relative values matter: the group rescales them to the
+/// container's real size on its first paint.
+const RATIO_SCALE: f32 = 10_000.;
 
 pub struct KumuApp {
     /// Projects, sessions and their live agents; the home view draws it and
@@ -36,6 +41,9 @@ pub struct KumuApp {
     settings_window: Option<WindowHandle<Root>>,
     /// Session highlighted in the sidebar — the focused pane's session.
     selected: Option<i64>,
+    /// A persistence failure the workspace reported, shown above the panes
+    /// until dismissed.
+    store_error: Option<String>,
     /// Projects collapsed in the sidebar tree.
     collapsed_projects: HashSet<i64>,
     /// Hover labels for the sidebar tree (see [`Tooltips`]).
@@ -44,22 +52,34 @@ pub struct KumuApp {
     panes: HashMap<PaneId, Entity<TerminalView>>,
     /// How the content area is split.
     layout: PaneNode,
+    /// Resizable state per split group, so drag sizes can be saved and restored.
+    group_states: HashMap<u64, Entity<ResizableState>>,
     /// Pane that receives sidebar selection and keyboard focus.
     focused: PaneId,
     /// Focus this pane's terminal on the next paint (after a split / select).
     pending_focus: Option<PaneId>,
     next_pane: u64,
     next_group: u64,
+    /// The JSON last written for this layout, so repeated focus/select calls do
+    /// not rewrite identical state.
+    last_saved_layout: Option<String>,
 }
 
 impl KumuApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(Workspace::new);
+        let startup_error = workspace.update(cx, |workspace, _| workspace.take_startup_error());
+        let saved_workspace = workspace.update(cx, |workspace, _| workspace.take_saved_workspace());
+        let last_saved_layout = saved_workspace.clone();
         let tooltips = cx.new(|cx| Tooltips::new(cx));
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
         cx.subscribe(&workspace, |this, _, ev, cx| match ev {
             WorkspaceEvent::Changed => cx.notify(),
+            WorkspaceEvent::Failed(message) => {
+                this.store_error = Some(message.clone());
+                cx.notify();
+            }
             WorkspaceEvent::PaneExited { pane, session } => {
                 this.on_pane_exited(PaneId(*pane), *session, cx);
             }
@@ -67,37 +87,210 @@ impl KumuApp {
         })
         .detach();
 
-        let pane = PaneId(1);
-        let terminal =
-            cx.new(|cx| TerminalView::new(pane, workspace.clone(), tooltips.clone(), cx));
-        cx.subscribe(&terminal, move |this, _, ev, cx| {
-            this.on_terminal_event(pane, ev, cx);
-        })
-        .detach();
-
         let updater = crate::updates::init(cx);
         cx.observe(&updater, |_, _, cx| cx.notify()).detach();
+
+        // Save the window's geometry when it closes. The app-quit path does not
+        // hand the callback a window, so it reads the same bounds through the
+        // handle; either path can fire first and they write the same value.
+        window.on_window_should_close(cx, |window, _cx| {
+            crate::window_state::save(window);
+            true
+        });
+        let window_handle = window.window_handle();
+        cx.on_app_quit(move |_, cx| {
+            if let Ok(bounds) = window_handle.update(cx, |_, window, _| window.window_bounds()) {
+                crate::window_state::save_bounds(bounds);
+            }
+            async {}
+        })
+        .detach();
 
         let mut app = Self {
             workspace,
             updater,
             settings_window: None,
             selected: None,
+            store_error: startup_error,
             collapsed_projects: HashSet::new(),
             tooltips,
-            panes: HashMap::from([(pane, terminal)]),
-            layout: PaneNode::leaf(pane),
-            focused: pane,
+            panes: HashMap::new(),
+            layout: PaneNode::leaf(PaneId(1)),
+            group_states: HashMap::new(),
+            focused: PaneId(1),
             pending_focus: None,
             next_pane: 2,
             next_group: 1,
+            last_saved_layout,
         };
-        if let Some(first) = app.workspace.read(cx).sessions().first().map(|s| s.id) {
-            app.select_session(first, cx);
-            app.focus_terminal(window, cx);
+        if !app.restore_workspace(saved_workspace.as_deref(), cx) {
+            app.start_default(cx);
         }
+        app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
+        app.persist_workspace(cx);
         app
+    }
+
+    /// Show the first session in a single pane — the first run, and the
+    /// fallback whenever a saved layout cannot be used.
+    fn start_default(&mut self, cx: &mut Context<Self>) {
+        let pane = PaneId(1);
+        self.install_pane(pane, cx);
+        self.layout = PaneNode::leaf(pane);
+        self.focused = pane;
+        self.next_pane = 2;
+        self.next_group = 1;
+        if let Some(first) = self.workspace.read(cx).sessions().first().map(|s| s.id) {
+            self.selected = Some(first);
+            if let Some(terminal) = self.panes.get(&pane).cloned() {
+                terminal.update(cx, |terminal, cx| terminal.show(first, cx));
+            }
+        }
+    }
+
+    /// Recreate the saved pane tree and terminals, or return false so the
+    /// caller falls back to [`Self::start_default`]. A layout is accepted only
+    /// when its JSON and version are known and every pane still has a session:
+    /// a stale row, a corrupt document, or an absurd pane count must never
+    /// prevent the window from opening.
+    fn restore_workspace(&mut self, saved: Option<&str>, cx: &mut Context<Self>) -> bool {
+        let Some(saved) = saved else {
+            return false;
+        };
+        let workspace = self.workspace.clone();
+        let Some(restored) = SavedWorkspace::restore(
+            saved,
+            |session| workspace.read(cx).session(session).is_some(),
+            |project| {
+                workspace
+                    .read(cx)
+                    .projects()
+                    .iter()
+                    .any(|p| p.id == project)
+            },
+        ) else {
+            return false;
+        };
+
+        let panes::RestoredWorkspace {
+            layout,
+            sessions,
+            focused,
+            collapsed_projects,
+            group_sizes,
+            next_pane,
+            next_group,
+        } = restored;
+        self.layout = layout;
+        self.next_pane = next_pane;
+        self.next_group = next_group;
+        self.collapsed_projects = collapsed_projects.into_iter().collect();
+        self.group_states.clear();
+        for (group, ratios) in group_sizes {
+            let state = Self::new_group_state(&ratios, cx);
+            self.group_states.insert(group, state);
+        }
+        for pane in self.layout.panes() {
+            let Some(session) = sessions.get(&pane.0).copied() else {
+                continue;
+            };
+            let terminal = self.install_pane(pane, cx);
+            terminal.update(cx, |terminal, cx| terminal.show(session, cx));
+        }
+        self.focused = focused;
+        self.selected = self
+            .panes
+            .get(&self.focused)
+            .and_then(|terminal| terminal.read(cx).session_id());
+        true
+    }
+
+    /// Create and subscribe one pane's terminal view.
+    fn install_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Entity<TerminalView> {
+        let workspace = self.workspace.clone();
+        let tooltips = self.tooltips.clone();
+        let terminal = cx.new(|cx| TerminalView::new(pane, workspace, tooltips, cx));
+        cx.subscribe(&terminal, move |this, _, ev, cx| {
+            this.on_terminal_event(pane, ev, cx);
+        })
+        .detach();
+        self.panes.insert(pane, terminal.clone());
+        terminal
+    }
+
+    /// A resizable state for one split group, optionally seeded with ratios.
+    /// Seeding before the first paint is what makes `adopt_sizes` — which is
+    /// private upstream — unnecessary: the group rescales these values to the
+    /// container on its first prepaint.
+    fn new_group_state(ratios: &[f32], cx: &mut Context<Self>) -> Entity<ResizableState> {
+        let state = cx.new(|_| ResizableState::default());
+        if !ratios.is_empty() {
+            state.update(cx, |state, cx| {
+                for ratio in ratios {
+                    state.insert_panel(Some(px(ratio * RATIO_SCALE)), None, cx);
+                }
+            });
+        }
+        state
+    }
+
+    /// Write the pane tree, its sessions, the focused pane and the collapsed
+    /// projects for the next launch. Identical state is not rewritten, so
+    /// selecting or clicking around does not turn into a stream of writes.
+    fn persist_workspace(&mut self, cx: &mut Context<Self>) {
+        // A group that was closed or collapsed must not keep its state around.
+        let live_groups: HashSet<u64> = self.layout.group_ids().into_iter().collect();
+        self.group_states
+            .retain(|group, _| live_groups.contains(group));
+
+        let mut panes: Vec<SavedPane> = self
+            .panes
+            .iter()
+            .filter_map(|(pane, terminal)| {
+                terminal.read(cx).session_id().map(|session| SavedPane {
+                    pane: pane.0,
+                    session,
+                })
+            })
+            .collect();
+        panes.sort_by_key(|pane| pane.pane);
+        let ratios: HashMap<u64, Vec<f32>> = self
+            .group_states
+            .iter()
+            .filter_map(|(group, state)| {
+                let sizes = state.read(cx).sizes();
+                let total: f32 = sizes.iter().map(|size| f32::from(*size)).sum();
+                if sizes.is_empty() || !total.is_finite() || total <= 0. {
+                    return None;
+                }
+                let ratios: Vec<f32> = sizes.iter().map(|size| f32::from(*size) / total).collect();
+                ratios
+                    .iter()
+                    .all(|ratio| ratio.is_finite() && *ratio > 0.)
+                    .then_some((*group, ratios))
+            })
+            .collect();
+        let mut collapsed: Vec<i64> = self.collapsed_projects.iter().copied().collect();
+        collapsed.sort_unstable();
+        let state = SavedWorkspace {
+            version: WORKSPACE_STATE_VERSION,
+            layout: self.layout.to_saved(&ratios),
+            panes,
+            focused: self.focused.0,
+            collapsed_projects: collapsed,
+        };
+        let Ok(json) = serde_json::to_string(&state) else {
+            return;
+        };
+        if self.last_saved_layout.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        if self.workspace.update(cx, |workspace, cx| {
+            workspace.save_workspace_state(&json, cx)
+        }) {
+            self.last_saved_layout = Some(json);
+        }
     }
 
     fn on_terminal_event(&mut self, pane: PaneId, ev: &TerminalEvent, cx: &mut Context<Self>) {
@@ -115,7 +308,11 @@ impl KumuApp {
         }
         self.focused = pane;
         self.selected = self.panes.get(&pane).and_then(|t| t.read(cx).session_id());
+        if let Some(session) = self.selected {
+            self.workspace.read(cx).touch_session(session);
+        }
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -135,15 +332,19 @@ impl KumuApp {
             let pane = *pane;
             self.focused = pane;
             self.selected = Some(id);
+            self.workspace.read(cx).touch_session(id);
             self.sync_pane_chrome(cx);
+            self.persist_workspace(cx);
             cx.notify();
             return;
         }
         self.selected = Some(id);
+        self.workspace.read(cx).touch_session(id);
         if let Some(terminal) = self.panes.get(&self.focused).cloned() {
             terminal.update(cx, |terminal, cx| terminal.show(id, cx));
         }
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -169,20 +370,18 @@ impl KumuApp {
         if !self.layout.split(pane, axis, new_id, group_id) {
             return;
         }
+        if self.layout.contains_group(group_id) {
+            let state = Self::new_group_state(&[], cx);
+            self.group_states.insert(group_id, state);
+        }
 
-        let workspace = self.workspace.clone();
-        let tooltips = self.tooltips.clone();
-        let terminal = cx.new(|cx| TerminalView::new(new_id, workspace, tooltips, cx));
+        let terminal = self.install_pane(new_id, cx);
         terminal.update(cx, |terminal, cx| terminal.show(session_id, cx));
-        cx.subscribe(&terminal, move |this, _, ev, cx| {
-            this.on_terminal_event(new_id, ev, cx);
-        })
-        .detach();
-        self.panes.insert(new_id, terminal);
         self.focused = new_id;
         self.selected = Some(session_id);
         self.pending_focus = Some(new_id);
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -208,7 +407,7 @@ impl KumuApp {
             && self.workspace.read(cx).session(sid).is_some()
         {
             self.workspace.update(cx, |workspace, cx| {
-                workspace.delete_session(sid, cx);
+                let _ = workspace.delete_session(sid, cx);
             });
             if self.selected == Some(sid) {
                 self.selected = self
@@ -218,6 +417,7 @@ impl KumuApp {
             }
         }
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -241,12 +441,13 @@ impl KumuApp {
             terminal.update(cx, |terminal, cx| terminal.clear(cx));
         }
 
-        if !self.pane_shows(session_id, cx)
-            && self.workspace.read(cx).session(session_id).is_some()
+        if !self.pane_shows(session_id, cx) && self.workspace.read(cx).session(session_id).is_some()
         {
             let next = self
                 .workspace
-                .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
+                .update(cx, |workspace, cx| workspace.delete_session(session_id, cx))
+                .ok()
+                .flatten();
             if self.panes.len() == 1
                 && let Some(terminal) = self.panes.values().next().cloned()
                 && terminal.read(cx).session_id().is_none()
@@ -254,9 +455,8 @@ impl KumuApp {
                 let replacement = next
                     .filter(|n| self.workspace.read(cx).session(*n).is_some())
                     .filter(|n| !self.pane_shows(*n, cx));
-                match replacement {
-                    Some(id) => terminal.update(cx, |terminal, cx| terminal.show(id, cx)),
-                    None => {}
+                if let Some(id) = replacement {
+                    terminal.update(cx, |terminal, cx| terminal.show(id, cx));
                 }
             }
             if self.selected == Some(session_id) {
@@ -268,6 +468,7 @@ impl KumuApp {
             }
         }
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -324,11 +525,129 @@ impl KumuApp {
             .update(cx, |workspace, cx| workspace.add_project(&path, cx));
         if let Some(id) = id {
             self.collapsed_projects.remove(&id);
+            self.persist_workspace(cx);
             cx.notify();
         }
     }
 
-    /// Ask before deleting: the session and its whole history go away for good.
+    /// Rename a project: the dialog starts on the current name, like the
+    /// session dialog.
+    fn prompt_rename_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .workspace
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let weak = cx.weak_entity();
+        let dialog_input = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("重命名项目")
+                .child(Input::new(&dialog_input).small())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("保存")
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok({
+                    let weak = weak.clone();
+                    let input = dialog_input.clone();
+                    move |_, _, cx| {
+                        let name = input.read(cx).value().trim().to_string();
+                        if !name.is_empty() {
+                            let _ = weak.update(cx, move |app, cx| {
+                                app.workspace.update(cx, |workspace, cx| {
+                                    workspace.rename_project(project_id, name, cx)
+                                })
+                            });
+                        }
+                        true
+                    }
+                })
+        });
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+    }
+
+    /// Ask before deleting a project and every session under it.
+    fn confirm_delete_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let (name, count) = {
+            let workspace = self.workspace.read(cx);
+            let name = workspace
+                .projects()
+                .iter()
+                .find(|project| project.id == project_id)
+                .map(|project| project.name.clone())
+                .unwrap_or_default();
+            let count = workspace
+                .sessions()
+                .iter()
+                .filter(|session| session.project_id == project_id)
+                .count();
+            (name, count)
+        };
+        let description = if count == 0 {
+            format!("「{name}」将被删除，此操作无法撤销。")
+        } else {
+            format!("「{name}」下的 {count} 个会话及其终端将被关闭，此操作无法撤销。")
+        };
+        // The dialog outlives this call, so it reaches the view weakly.
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let weak = weak.clone();
+            alert
+                .title("删除项目")
+                .description(description.clone())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("删除")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = weak.update(cx, move |app, cx| app.delete_project(project_id, cx));
+                    true
+                })
+        });
+    }
+
+    /// Delete a project and close every pane that was showing one of its
+    /// sessions, landing them on a session that survived.
+    fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        let sessions: Vec<i64> = self
+            .workspace
+            .read(cx)
+            .sessions()
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .map(|session| session.id)
+            .collect();
+        let Ok(next) = self
+            .workspace
+            .update(cx, |workspace, cx| workspace.delete_project(project_id, cx))
+        else {
+            // The failure is already on its way to the banner; leave the
+            // project and its panes exactly where they are.
+            return;
+        };
+        self.collapsed_projects.remove(&project_id);
+        for session_id in sessions {
+            self.on_session_closed(session_id, next, cx);
+        }
+        self.persist_workspace(cx);
+        cx.notify();
+    }
+
+    /// Ask before deleting: the session and the terminals bound to it go away
+    /// for good.
     fn confirm_delete_session(&self, session_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         // The dialog outlives this call, so it reaches the view weakly.
         let weak = cx.weak_entity();
@@ -342,9 +661,7 @@ impl KumuApp {
             let weak = weak.clone();
             alert
                 .title("删除会话")
-                .description(format!(
-                    "「{title}」的全部消息将被永久删除，此操作无法撤销。"
-                ))
+                .description(format!("「{title}」及其终端将被永久删除，此操作无法撤销。"))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("删除")
@@ -408,9 +725,14 @@ impl KumuApp {
 
     /// Delete a session, then land on its neighbor if it was the one on screen.
     fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
-        let next = self
+        let Ok(next) = self
             .workspace
-            .update(cx, |workspace, cx| workspace.delete_session(session_id, cx));
+            .update(cx, |workspace, cx| workspace.delete_session(session_id, cx))
+        else {
+            // The failure is already on its way to the banner; leave the
+            // session and its panes exactly where they are.
+            return;
+        };
         self.on_session_closed(session_id, next, cx);
     }
 
@@ -463,6 +785,7 @@ impl KumuApp {
                 .or(next.filter(|n| self.workspace.read(cx).session(*n).is_some()));
         }
         self.sync_pane_chrome(cx);
+        self.persist_workspace(cx);
         cx.notify();
     }
 
@@ -489,10 +812,9 @@ impl KumuApp {
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
-        let workspace = self.workspace.clone();
         let updater = self.updater.clone();
         if let Ok(handle) = cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| SettingsWindow::new(workspace, updater, window, cx));
+            let view = cx.new(|cx| SettingsWindow::new(updater, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         }) {
             handle.update(cx, activate).ok();
@@ -504,7 +826,7 @@ impl KumuApp {
         self.render_node(&self.layout, cx)
     }
 
-    fn render_node(&self, node: &PaneNode, _cx: &Context<Self>) -> AnyElement {
+    fn render_node(&self, node: &PaneNode, cx: &Context<Self>) -> AnyElement {
         match node {
             PaneNode::Leaf(id) => {
                 let Some(terminal) = self.panes.get(id) else {
@@ -520,9 +842,20 @@ impl KumuApp {
                     Axis::Horizontal => h_resizable(format!("pane-split-{id}")),
                     Axis::Vertical => v_resizable(format!("pane-split-{id}")),
                 };
-                for child in children {
-                    group = group.child(resizable_panel().child(self.render_node(child, _cx)));
+                if let Some(state) = self.group_states.get(id) {
+                    group = group.with_state(state);
                 }
+                for child in children {
+                    group = group.child(resizable_panel().child(self.render_node(child, cx)));
+                }
+                // A drag ends here: write the new fractions before another
+                // change can replace them.
+                group = group.on_resize({
+                    let weak = cx.entity().downgrade();
+                    move |_, _, cx| {
+                        let _ = weak.update(cx, |app, cx| app.persist_workspace(cx));
+                    }
+                });
                 group.into_any_element()
             }
         }
@@ -531,6 +864,7 @@ impl KumuApp {
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
+        let warning = theme.warning;
         // Keep the pane tree if a pane still points at a live session — do not
         // blank the whole split just because the exited session was removed.
         let pane_sessions: Vec<Option<i64>> = self
@@ -578,6 +912,31 @@ impl KumuApp {
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(title_bar)
+            .children(self.store_error.clone().map(|message| {
+                h_flex()
+                    .flex_none()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .bg(warning.opacity(0.12))
+                    .text_color(warning)
+                    .child(div().flex_1().min_w_0().text_xs().child(message))
+                    .child(
+                        div()
+                            .id("dismiss-store-error")
+                            .flex_none()
+                            .rounded(theme.radius)
+                            .p_0p5()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(warning.opacity(0.25)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store_error = None;
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::Close).small().text_color(warning)),
+                    )
+            }))
             .child(
                 h_flex()
                     .flex_1()

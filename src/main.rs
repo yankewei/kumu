@@ -12,11 +12,11 @@
 //!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `app/`     projects, sessions, live terminals, and agent discovery;
-//!   - `db.rs`    local SQLite persistence (projects/sessions);
+//!   - `app/`     projects, sessions, and live terminals;
+//!   - `db.rs`    local SQLite persistence (projects/sessions/workspace);
 //!   - `term/`    PTY + VT for agent TUIs and shell sessions;
-//!   - `agent/`   registry, interactive launch helpers, and protocol adapters
-//!     Settings uses to probe installed agents for their model catalogues.
+//!   - `agent/`   registry, executable lookup, and on-disk title lookup;
+//!   - `window_state.rs` the main window's saved geometry.
 
 mod agent;
 mod app;
@@ -28,6 +28,7 @@ mod term;
 mod theme;
 mod ui;
 mod updates;
+mod window_state;
 
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -42,8 +43,14 @@ fn main() {
         dock_icon::install();
         theme::load_kumu_themes(cx);
         let mut window_options = TitleBar::window_options();
-        window_options.window_bounds = Some(WindowBounds::centered(size(px(1360.), px(900.)), cx));
-        window_options.window_min_size = Some(size(px(960.), px(640.)));
+        window_options.window_bounds = Some(
+            window_state::load(cx)
+                .unwrap_or_else(|| WindowBounds::centered(size(px(1360.), px(900.)), cx)),
+        );
+        window_options.window_min_size = Some(size(
+            px(window_state::MIN_WIDTH),
+            px(window_state::MIN_HEIGHT),
+        ));
 
         cx.spawn(async move |cx| {
             match cx.open_window(window_options, |window, cx| {
