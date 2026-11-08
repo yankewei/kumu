@@ -25,9 +25,10 @@ pub fn is_shell(agent: &str) -> bool {
 }
 
 /// The user's login shell: `$SHELL`, falling back to `/bin/sh`.
+/// Load login profiles so Finder-launched terminals get the user's tool paths.
 pub fn default_shell() -> (String, Vec<String>) {
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    (program, Vec::new())
+    (program, vec!["-l".into()])
 }
 
 #[cfg(test)]
@@ -43,8 +44,34 @@ mod tests {
 
     #[test]
     fn default_shell_has_a_program() {
-        let (program, args) = default_shell();
+        let (program, _) = default_shell();
         assert!(!program.is_empty());
-        assert!(args.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_startup_loads_login_environment() {
+        let home = std::env::temp_dir().join(format!("kumu-login-shell-{}", std::process::id()));
+        std::fs::create_dir(&home).expect("create login shell fixture");
+        std::fs::write(
+            home.join(".zprofile"),
+            "export KUMU_LOGIN_PROFILE_LOADED=1\n",
+        )
+        .expect("write login profile");
+
+        let (_, args) = default_shell();
+        let output = std::process::Command::new("/bin/zsh")
+            .args(args)
+            .args(["-c", "printf '%s' \"$KUMU_LOGIN_PROFILE_LOADED\""])
+            .env_clear()
+            .env("HOME", &home)
+            .env("ZDOTDIR", &home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output();
+        std::fs::remove_dir_all(&home).expect("remove login shell fixture");
+
+        let output = output.expect("launch zsh with default shell arguments");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"1");
     }
 }
