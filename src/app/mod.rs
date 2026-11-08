@@ -43,24 +43,37 @@ pub enum WorkspaceEvent {
     PaneExited { pane: u64, session: i64 },
 }
 
-/// Projects, sessions, and each pane's live terminal.
+/// One native TUI process and where it is drawn.
+struct LiveTerm {
+    term: Term,
+    /// Sidebar session this process belongs to.
+    session: i64,
+    /// The pane showing it, or `None` while parked: its pane switched to
+    /// another session, and the process keeps running (and reading) so
+    /// switching back reattaches the same TUI instead of restarting it.
+    pane: Option<u64>,
+}
+
+/// Projects, sessions, and each live terminal.
 ///
 /// One per app, owned by the home window and shared with the settings window.
 /// Nothing in here renders. Agent TUIs are launched through [`agent::interactive`];
 /// protocol probes go through [`agent::probe`].
 ///
-/// A sidebar session may occupy several panes; each pane has its own PTY,
-/// keyed by pane id.
+/// A sidebar session may occupy several panes; each pane has its own PTY. A
+/// pane switching sessions parks its process rather than killing it, so a
+/// hidden agent keeps its state until the cap stops it.
 pub struct Workspace {
     store: Store,
     projects: Vec<Project>,
     sessions: Vec<Session>,
-    /// Native TUI processes keyed by pane id.
-    terms: HashMap<u64, Term>,
-    /// Which sidebar session each live pane belongs to.
-    term_session: HashMap<u64, i64>,
-    /// Least recently shown first. Only panes whose process is still running.
+    /// Native TUI processes keyed by a stable terminal id.
+    terms: HashMap<u64, LiveTerm>,
+    /// Which terminal each pane shows right now.
+    pane_term: HashMap<u64, u64>,
+    /// Least recently shown first. Only terminals whose process is still running.
     term_lru: Vec<u64>,
+    next_term: u64,
     /// What each agent offers in general, as probed.
     discovery: Discovery,
 }
@@ -75,8 +88,9 @@ impl Workspace {
             projects: Vec::new(),
             sessions: Vec::new(),
             terms: HashMap::new(),
-            term_session: HashMap::new(),
+            pane_term: HashMap::new(),
             term_lru: Vec::new(),
+            next_term: 1,
             discovery: Discovery::default(),
         };
         workspace.bootstrap();
@@ -128,29 +142,40 @@ impl Workspace {
     ///
     /// Agent sessions launch that agent's interactive TUI; shell sessions
     /// launch the user's `$SHELL`. An exited agent TUI starts again; an exited
-    /// shell closes the pane (see [`Self::watch_terminal`]). A thirteenth
-    /// running process stops the one shown least recently.
+    /// shell closes the pane (see [`Self::watch_terminal`]). Switching the pane
+    /// to another session parks the old process and reattaches it when that
+    /// session is shown again. A thirteenth running process stops the one
+    /// shown least recently.
     pub fn show_terminal(
         &mut self,
         pane: u64,
         session_id: i64,
         cx: &mut Context<Self>,
     ) -> Snapshot {
-        if self.term_session.get(&pane) == Some(&session_id)
-            && self
-                .terms
-                .get(&pane)
-                .is_some_and(|term| !term.snapshot().exited)
+        if let Some(term_id) = self.pane_term.get(&pane).copied()
+            && let Some(live) = self.terms.get(&term_id)
+            && live.session == session_id
+            && !live.term.snapshot().exited
         {
-            self.touch_terminal(pane);
-            self.terminal_wake_handled(pane);
-            return self.terms[&pane].snapshot();
+            let term = live.term.clone();
+            self.touch_terminal(term_id);
+            term.wake_handled();
+            return term.snapshot();
         }
-        self.drop_terminal(pane);
+        self.park_terminal(pane);
         self.reclaim_terminals();
         let Some(session) = self.session(session_id).cloned() else {
             return Snapshot::blank("", "");
         };
+        // This session was shown before: reattach its process and screen.
+        if let Some(term_id) = self.parked_terminal(session_id) {
+            self.terms.get_mut(&term_id).unwrap().pane = Some(pane);
+            self.pane_term.insert(pane, term_id);
+            self.touch_terminal(term_id);
+            let term = self.terms[&term_id].term.clone();
+            term.wake_handled();
+            return term.snapshot();
+        }
         let colors = theme::term_colors(cx);
         let launch = if crate::term::is_shell(&session.agent) {
             Some(crate::term::default_shell())
@@ -165,67 +190,80 @@ impl Workspace {
         };
         let (term, wake) = Term::launch(program, args, PathBuf::from(&session.cwd), colors);
         let snapshot = term.snapshot();
-        self.terms.insert(pane, term);
-        self.term_session.insert(pane, session_id);
-        self.touch_terminal(pane);
-        self.watch_terminal(pane, session_id, wake, cx);
+        let term_id = self.next_term;
+        self.next_term += 1;
+        self.terms.insert(
+            term_id,
+            LiveTerm {
+                term,
+                session: session_id,
+                pane: Some(pane),
+            },
+        );
+        self.pane_term.insert(pane, term_id);
+        self.touch_terminal(term_id);
+        self.watch_terminal(term_id, session_id, wake, cx);
         snapshot
     }
 
     /// Push the UI theme's colors into every live terminal.
     pub fn set_terminal_colors(&self, colors: TermColors) {
-        for term in self.terms.values() {
-            term.set_colors(colors);
+        for live in self.terms.values() {
+            live.term.set_colors(colors);
         }
     }
 
+    fn shown_term(&self, pane: u64) -> Option<&LiveTerm> {
+        self.terms.get(self.pane_term.get(&pane)?)
+    }
+
     pub fn terminal_snapshot(&self, pane: u64) -> Option<Snapshot> {
-        self.terms.get(&pane).map(Term::snapshot)
+        self.shown_term(pane).map(|live| live.term.snapshot())
     }
 
     pub fn terminal_generation(&self, pane: u64) -> Option<u64> {
-        self.terms.get(&pane).map(Term::generation)
+        self.shown_term(pane).map(|live| live.term.generation())
     }
 
     pub fn terminal_wake_handled(&self, pane: u64) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.wake_handled();
+        if let Some(live) = self.shown_term(pane) {
+            live.term.wake_handled();
         }
     }
 
     pub fn terminal_key(&self, pane: u64, input: KeyInput) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.key(input);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.key(input);
         }
     }
 
     pub fn terminal_write(&self, pane: u64, bytes: impl Into<Vec<u8>>) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.write(bytes);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.write(bytes);
         }
     }
 
     pub fn terminal_paste(&self, pane: u64, text: impl Into<Vec<u8>>) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.paste(text);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.paste(text);
         }
     }
 
     /// A handle to the pane's terminal, for work that must not run on the UI
     /// thread (the selection round trips block).
     pub fn terminal_handle(&self, pane: u64) -> Option<Term> {
-        self.terms.get(&pane).cloned()
+        self.shown_term(pane).map(|live| live.term.clone())
     }
 
     pub fn terminal_mouse(&self, pane: u64, input: MouseInput) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.mouse(input);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.mouse(input);
         }
     }
 
     pub fn terminal_clear_selection(&self, pane: u64) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.clear_selection();
+        if let Some(live) = self.shown_term(pane) {
+            live.term.clear_selection();
         }
     }
 
@@ -240,38 +278,104 @@ impl Workspace {
         cell_h: f32,
         mods: MouseMods,
     ) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.scroll(lines, x, y, cell_w, cell_h, mods);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.scroll(lines, x, y, cell_w, cell_h, mods);
         }
     }
 
     pub fn terminal_resize(&self, pane: u64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
-        if let Some(term) = self.terms.get(&pane) {
-            term.resize(cols, rows, cell_w, cell_h);
+        if let Some(live) = self.shown_term(pane) {
+            live.term.resize(cols, rows, cell_w, cell_h);
         }
     }
 
-    /// Stop the process in `pane`, if any.
+    /// Stop the process shown in `pane`, and any parked ones for the session it
+    /// was showing — closing the last pane of a session ends the terminal.
     pub fn drop_terminal(&mut self, pane: u64) {
-        self.terms.remove(&pane);
-        self.term_session.remove(&pane);
-        self.term_lru.retain(|&id| id != pane);
+        let Some(term_id) = self.pane_term.remove(&pane) else {
+            return;
+        };
+        let session = self.terms.get(&term_id).map(|live| live.session);
+        self.drop_term(term_id);
+        let Some(session) = session else {
+            return;
+        };
+        // Another pane still shows the session; its parked siblings belong to
+        // this pane's shell and go with it.
+        let parked: Vec<u64> = self
+            .terms
+            .iter()
+            .filter(|(_, live)| live.session == session && live.pane.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in parked {
+            self.drop_term(id);
+        }
     }
 
-    fn touch_terminal(&mut self, pane: u64) {
-        self.term_lru.retain(|&id| id != pane);
-        self.term_lru.push(pane);
+    /// Park the process `pane` shows so switching back reattaches it. Exited
+    /// processes, duplicate terminals for a session another pane still shows,
+    /// and older parked ones are stopped instead.
+    fn park_terminal(&mut self, pane: u64) {
+        let Some(term_id) = self.pane_term.remove(&pane) else {
+            return;
+        };
+        let Some(live) = self.terms.get_mut(&term_id) else {
+            return;
+        };
+        live.pane = None;
+        let session = live.session;
+        let exited = live.term.snapshot().exited;
+        let shown_elsewhere = self
+            .terms
+            .values()
+            .any(|other| other.session == session && other.pane.is_some());
+        if exited || shown_elsewhere {
+            self.drop_term(term_id);
+            return;
+        }
+        // One hidden terminal per session is enough to switch back to.
+        if let Some(old) = self.parked_terminal(session).filter(|&id| id != term_id) {
+            self.drop_term(old);
+        }
+    }
+
+    /// The session's hidden terminal, most recently shown first.
+    fn parked_terminal(&self, session_id: i64) -> Option<u64> {
+        self.term_lru.iter().rev().copied().find(|id| {
+            self.terms.get(id).is_some_and(|live| {
+                live.pane.is_none()
+                    && live.session == session_id
+                    && !live.term.snapshot().exited
+            })
+        })
+    }
+
+    /// Stop one terminal process and forget where it was shown.
+    fn drop_term(&mut self, term_id: u64) {
+        if let Some(live) = self.terms.remove(&term_id)
+            && let Some(pane) = live.pane
+            && self.pane_term.get(&pane) == Some(&term_id)
+        {
+            self.pane_term.remove(&pane);
+        }
+        self.term_lru.retain(|&id| id != term_id);
+    }
+
+    fn touch_terminal(&mut self, term_id: u64) {
+        self.term_lru.retain(|&id| id != term_id);
+        self.term_lru.push(term_id);
     }
 
     fn drop_session_terminals(&mut self, session_id: i64) {
-        let panes: Vec<u64> = self
-            .term_session
+        let terms: Vec<u64> = self
+            .terms
             .iter()
-            .filter(|(_, sid)| **sid == session_id)
-            .map(|(pane, _)| *pane)
+            .filter(|(_, live)| live.session == session_id)
+            .map(|(id, _)| *id)
             .collect();
-        for pane in panes {
-            self.drop_terminal(pane);
+        for id in terms {
+            self.drop_term(id);
         }
     }
 
@@ -281,11 +385,11 @@ impl Workspace {
         let dead: Vec<u64> = self
             .terms
             .iter()
-            .filter(|(_, term)| term.snapshot().exited)
+            .filter(|(_, live)| live.term.snapshot().exited)
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
-            self.drop_terminal(id);
+            self.drop_term(id);
         }
         let alive: Vec<u64> = self
             .term_lru
@@ -294,13 +398,13 @@ impl Workspace {
             .filter(|id| self.terms.contains_key(id))
             .collect();
         for id in terminal_evictions(&alive, MAX_LIVE_TERMINALS) {
-            self.drop_terminal(id);
+            self.drop_term(id);
         }
     }
 
     fn watch_terminal(
         &self,
-        pane: u64,
+        term_id: u64,
         session_id: i64,
         mut wake: futures::channel::mpsc::UnboundedReceiver<()>,
         cx: &mut Context<Self>,
@@ -309,10 +413,12 @@ impl Workspace {
             while wake.next().await.is_some() {
                 let watching = this
                     .update(cx, |workspace, cx| {
-                        let Some(term) = workspace.terms.get(&pane) else {
+                        let Some(live) = workspace.terms.get(&term_id) else {
                             return false;
                         };
-                        let snapshot = term.snapshot();
+                        let snapshot = live.term.snapshot();
+                        let pane = live.pane;
+                        let term = live.term.clone();
                         // `exit` (or any clean shell death) closes this pane.
                         // The session row stays while another pane still shows
                         // it; spawn failures keep the pane so the header can
@@ -323,14 +429,21 @@ impl Workspace {
                                 .session(session_id)
                                 .is_some_and(|s| crate::term::is_shell(&s.agent));
                         if shell_done {
-                            workspace.drop_terminal(pane);
-                            cx.emit(WorkspaceEvent::PaneExited {
-                                pane,
-                                session: session_id,
-                            });
+                            workspace.drop_term(term_id);
+                            if let Some(pane) = pane {
+                                cx.emit(WorkspaceEvent::PaneExited {
+                                    pane,
+                                    session: session_id,
+                                });
+                            }
                             return false;
                         }
-                        cx.emit(WorkspaceEvent::Frame(pane));
+                        match pane {
+                            Some(pane) => cx.emit(WorkspaceEvent::Frame(pane)),
+                            // Parked: keep reading so it does not block on a
+                            // full pty, but no pane draws it.
+                            None => term.wake_handled(),
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -439,21 +552,26 @@ impl Workspace {
     /// has not set, with what the scan needs to ask the agents' stores. Gathered
     /// here because the PTY handles live in this struct.
     fn title_queries(&self) -> Vec<TitleQuery> {
-        // One query per sidebar session. Several panes may share a session;
-        // pick a stable pane (lowest id) so title claims stay deterministic.
-        let mut live: Vec<(i64, u64, Option<u32>)> = self
+        // One query per sidebar session. Several terminals may share a session;
+        // prefer one a pane still shows, then the lowest terminal id, so title
+        // claims stay deterministic.
+        let mut live: Vec<(i64, bool, u64, Option<u32>)> = self
             .terms
             .iter()
-            .filter(|(_, term)| !term.snapshot().exited)
-            .filter_map(|(pane, term)| {
-                let session_id = *self.term_session.get(pane)?;
-                Some((session_id, *pane, term.process_id()))
+            .filter(|(_, live)| !live.term.snapshot().exited)
+            .map(|(id, live)| {
+                (
+                    live.session,
+                    live.pane.is_none(),
+                    *id,
+                    live.term.process_id(),
+                )
             })
             .collect();
-        live.sort_by_key(|(session_id, pane, _)| (*session_id, *pane));
+        live.sort_by_key(|(session_id, parked, term_id, _)| (*session_id, *parked, *term_id));
         let mut seen = HashSet::new();
         live.into_iter()
-            .filter_map(|(session_id, _, pid)| {
+            .filter_map(|(session_id, _, _, pid)| {
                 if !seen.insert(session_id) {
                     return None;
                 }
