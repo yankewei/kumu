@@ -1,8 +1,8 @@
 //! Local SQLite persistence for projects and sessions.
 //!
-//! Accessed synchronously on the UI (main) thread. Schema is created on open.
-//! The `messages` table is still created and cleaned up with sessions so older
-//! databases keep working; the in-app chat path that wrote those rows is gone.
+//! Accessed synchronously on the UI (main) thread. Schema is created on open;
+//! tables and columns left over from the removed in-app chat path are dropped
+//! there too, so an older database keeps working with the current one.
 
 use rusqlite::{Connection, Result, params};
 
@@ -58,62 +58,31 @@ impl Store {
                 title TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 resume_id TEXT,
-                model TEXT,
-                mode TEXT,
-                sandbox TEXT,
-                reasoning TEXT,
                 title_manual INTEGER NOT NULL DEFAULT 0,
-                usage TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                duration_ms INTEGER,
-                attachments TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            -- Kept so older databases that still hold chat rows stay indexed;
-            -- every delete of a session filters on `session_id`.
-            CREATE INDEX IF NOT EXISTS idx_messages_session_id
-                ON messages(session_id);",
+            -- The removed chat path's history. Its index goes with the table.
+            DROP TABLE IF EXISTS messages;",
         )?;
-        // Migrations for dbs created before model/mode/sandbox/reasoning/
-        // title_manual/duration_ms/attachments/usage were part of CREATE TABLE (duplicate-column
-        // errors on fresh dbs are expected and ignored).
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])
-            .ok();
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN mode TEXT", [])
-            .ok();
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN sandbox TEXT", [])
-            .ok();
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN reasoning TEXT", [])
-            .ok();
+        // Columns from that chat path. `DROP COLUMN` errors when the column is
+        // already missing, which is the expected case on fresh and current dbs.
+        for column in ["model", "mode", "sandbox", "reasoning", "usage"] {
+            self.conn
+                .execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), [])
+                .ok();
+        }
+        // Databases created before `title_manual` and `resume_id` joined the
+        // schema gain them here.
         self.conn
             .execute(
                 "ALTER TABLE sessions ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0",
                 [],
             )
-            .ok();
-        self.conn
-            .execute("ALTER TABLE messages ADD COLUMN duration_ms INTEGER", [])
-            .ok();
-        self.conn
-            .execute("ALTER TABLE messages ADD COLUMN attachments TEXT", [])
-            .ok();
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN usage TEXT", [])
             .ok();
         let has_resume_id: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
@@ -190,15 +159,11 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Delete a session and all of its leftover message rows.
-    ///
-    /// The messages FK cascade does not fire here (SQLite's `foreign_keys`
-    /// pragma is off), so the rows are removed explicitly, in one transaction.
+    /// Delete a session.
     pub fn delete_session(&self, id: i64) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
-        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-        tx.commit()
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     /// Store a generated title — typically one read from an agent's own session
@@ -298,11 +263,9 @@ mod tests {
         store
     }
 
-    /// Deleting a session drops leftover history with it, and touches nothing
-    /// else: the cascade on `messages` never fires (the pragma is off), so this
-    /// is the only thing keeping orphan rows out of the db.
+    /// Deleting one session leaves its siblings alone.
     #[test]
-    fn deleting_a_session_removes_only_its_messages() {
+    fn deleting_a_session_keeps_the_others() {
         let store = store();
         let project = store.insert_project("kumu", "/tmp").unwrap();
         let doomed = store
@@ -311,44 +274,12 @@ mod tests {
         let kept = store
             .insert_session(project, "omp", "会话 2", "/tmp")
             .unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', '删除我')",
-                params![doomed],
-            )
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO messages (session_id, role, content) VALUES (?1, 'user', '留下我')",
-                params![kept],
-            )
-            .unwrap();
 
         store.delete_session(doomed).unwrap();
 
         let sessions = store.sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, kept);
-        let leftover: i64 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM messages WHERE session_id = ?1",
-                params![doomed],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(leftover, 0);
-        let kept_count: i64 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM messages WHERE session_id = ?1",
-                params![kept],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept_count, 1);
     }
 
     /// Deleting an unknown id is a no-op rather than an error, so a stale
@@ -393,54 +324,73 @@ mod tests {
         assert_eq!(store.sessions()[0].title, "重构 backend");
     }
 
-    /// Both deletes and the leftover chat rows filter on `session_id`, on a
-    /// table that only grows, so the index must exist — and `init` runs on
-    /// every open, so re-opening an old database must leave exactly one.
+    /// A database from the chat era keeps its rows but loses that era's table
+    /// and columns the next time it is opened.
     #[test]
-    fn messages_are_indexed_by_session() {
-        let store = store();
-        store.init().unwrap();
-        let count: i64 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'idx_messages_session_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "exactly one session_id index, however often init runs"
-        );
-    }
-
-    /// A database written before the column existed gains it on open: the
-    /// upgrade path is the same `init` every open runs.
-    #[test]
-    fn an_older_messages_table_gains_the_duration_column() {
+    fn an_older_database_drops_the_chat_schema_and_keeps_its_sessions() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE messages (
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                resume_id TEXT,
+                model TEXT,
+                mode TEXT,
+                sandbox TEXT,
+                reasoning TEXT,
+                usage TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                duration_ms INTEGER,
+                attachments TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            );
+            INSERT INTO projects (name, path) VALUES ('kumu', '/tmp');
+            INSERT INTO sessions (project_id, agent, title, cwd, model)
+                VALUES (1, 'shell', '终端 1', '/tmp', 'old-model');
+            INSERT INTO messages (session_id, role, content) VALUES (1, 'user', 'hi');",
         )
         .unwrap();
         let store = Store { conn };
         store.init().unwrap();
 
-        let columns: i64 = store
+        let sessions = store.sessions();
+        assert_eq!(sessions.len(), 1, "the session row survives");
+        assert_eq!(sessions[0].title, "终端 1");
+        let chat_table: i64 = store
             .conn
             .query_row(
-                "SELECT count(*) FROM pragma_table_info('messages') WHERE name = 'duration_ms'",
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(columns, 1, "the migration adds the column");
+        assert_eq!(chat_table, 0, "the chat table is gone");
+        for column in ["model", "mode", "sandbox", "reasoning", "usage"] {
+            let left: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "{column} is gone");
+        }
     }
 }
