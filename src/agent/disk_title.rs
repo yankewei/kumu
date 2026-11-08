@@ -6,12 +6,12 @@
 //! `~/.pi/agent/sessions`); this module reads those and scores a match against
 //! a kumu terminal's cwd and, when known, its process id.
 //!
-//! Only Claude can be claimed by a *shell* session: its live session file
-//! carries the agent's pid, so kumu can prove the TUI runs under that shell's
-//! PTY. Codex, OpenCode and Pi record no pid, and a cwd match cannot tell the
-//! agent running in this terminal from an older session in the same directory,
-//! so their stores are only consulted when the session itself is the agent (a
-//! non-shell session — which the app does not create today).
+//! A *shell* session can claim any agent's title: the shell's process tree
+//! tells us which agent TUI is running under its PTY and when that process
+//! started, and only sessions written after that start are considered — a cwd
+//! match alone would let a new shell inherit an older session in the same
+//! directory. Claude additionally writes its pid into the live session file,
+//! so its own binding is exact.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,9 @@ pub struct DiskTitle {
     /// Higher wins: an exact PID hit outranks a cwd-only match, and within the
     /// same tier a more recently updated agent session wins.
     pub score: i64,
+    /// Session write time in Unix seconds; compared with the agent process
+    /// start when a shell claims a title.
+    pub updated: i64,
 }
 
 /// Resume ids we persist are `agent:id` so a later lookup knows which store to
@@ -58,11 +61,11 @@ pub fn lookup(resume: &str) -> Option<String> {
 /// Discover titles that may belong to a terminal in `cwd`.
 ///
 /// `prefer` limits the search when the session already names an agent; a shell
-/// session (or `None`) asks every store. When `process_bound` is set, only
-/// titles whose agent process is this terminal (or a child of it) are returned
-/// — a bare cwd match is not enough, so a newly opened shell does not inherit
-/// an older agent session's name. That is also why a shell only ever finds
-/// Claude (see the module notes).
+/// session (or `None`) asks every store. When `process_bound` is set, titles
+/// are accepted only when the agent process running under the terminal (or a
+/// child of it) started before the session was last written, and an exact pid
+/// in Claude's session file outranks that. A bare cwd match is never enough, so
+/// a newly opened shell does not inherit an older agent session's name.
 ///
 /// Results are unsorted — callers pick by [`DiskTitle::score`] and exclusive
 /// resume claiming.
@@ -76,11 +79,8 @@ pub fn discover(
     if cwd.is_empty() {
         return Vec::new();
     }
-    // A shell can only safely claim a title when we see the agent process
-    // under its PTY. Claude is the one that writes a pid file; the others
-    // are cwd-only and must wait until the session itself is that agent.
     if process_bound {
-        return claude_discover(&cwd, pid, true);
+        return process_bound_titles(&cwd, pid);
     }
     let mut found = Vec::new();
     let agents: &[&str] = match prefer {
@@ -91,22 +91,63 @@ pub fn discover(
         _ => &["claude", "codex", "opencode", "pi"],
     };
     for agent in agents {
-        match *agent {
-            "claude" => found.extend(claude_discover(&cwd, pid, false)),
-            "codex" => found.extend(codex_discover(&cwd)),
-            "opencode" => found.extend(opencode_discover(&cwd)),
-            "pi" => found.extend(pi_discover(&cwd)),
-            _ => {}
+        found.extend(discover_store(agent, &cwd, pid));
+    }
+    found
+}
+
+/// Every store's sessions for `agent` in `cwd`, with no process filter.
+///
+/// `pid` only strengthens Claude's score when the live session file names that
+/// process; other stores ignore it.
+fn discover_store(agent: &str, cwd: &str, pid: Option<u32>) -> Vec<DiskTitle> {
+    match agent {
+        "claude" => claude_discover(cwd, pid, false),
+        "codex" => codex_discover(cwd),
+        "opencode" => opencode_discover(cwd),
+        "pi" => pi_discover(cwd),
+        _ => Vec::new(),
+    }
+}
+
+/// Titles a shell terminal may claim: one whose agent runs under that PTY.
+fn process_bound_titles(cwd: &str, pid: Option<u32>) -> Vec<DiskTitle> {
+    let Some(pid) = pid else {
+        return Vec::new();
+    };
+    let tree = process_tree(&process_snapshot(), pid);
+    let mut found = claude_discover_under(cwd, Some(&tree), true);
+    for &(agent, started) in &tree.agents {
+        // Claude already answered above by pid; a looser cwd-tier candidate
+        // for the same store would only risk claiming a stale file.
+        if agent == "claude" {
+            continue;
+        }
+        for mut title in discover_store(agent, cwd, None) {
+            if !covers_start(title.updated, started) {
+                continue;
+            }
+            title.score = PROCESS_SCORE + title.updated;
+            found.push(title);
         }
     }
     found
 }
 
+/// Whether a session write at `updated` can belong to an agent that started at
+/// `started`. The skew absorbs whole-second `ps` clocks and the gap before the
+/// TUI's first write.
+fn covers_start(updated: i64, started: i64) -> bool {
+    updated + START_SKEW_SECS >= started
+}
+
 /// Whether a previously bound resume id still belongs to this terminal.
 ///
-/// Shell sessions only keep a Claude binding whose pid is the terminal or a
-/// descendant; cwd-only claims (Codex / OpenCode / Pi, or a stale Claude file)
-/// are rejected so a new shell does not keep someone else's name.
+/// Claude is proved by its pid file: the binding keeps only while that pid is
+/// the terminal or a descendant. The other agents record no pid, so they are
+/// proved by an agent process of the same kind under this terminal plus a
+/// session written after that process started. A stale binding is rejected so
+/// a new shell does not keep someone else's name.
 pub fn resume_belongs_to_terminal(resume: &str, term_pid: Option<u32>) -> bool {
     let Some(term_pid) = term_pid else {
         return false;
@@ -115,11 +156,34 @@ pub fn resume_belongs_to_terminal(resume: &str, term_pid: Option<u32>) -> bool {
         return false;
     };
     match agent {
-        "claude" => claude_pid_for(id).is_some_and(|pid| {
-            process_tree_pids(term_pid).contains(&pid)
-        }),
+        "claude" => claude_pid_for(id)
+            .is_some_and(|pid| process_tree_pids(term_pid).contains(&pid)),
+        "codex" | "opencode" | "pi" => {
+            let Some(started) = agent_started_under(term_pid, agent) else {
+                return false;
+            };
+            let updated = match agent {
+                "codex" => codex_updated(id),
+                "opencode" => opencode_updated(id),
+                "pi" => pi_updated(id),
+                _ => None,
+            };
+            updated.is_some_and(|updated| covers_start(updated, started))
+        }
         _ => false,
     }
+}
+
+/// When an `agent` process under `term_pid` started, in Unix seconds.
+///
+/// The earliest such process wins: the TUI itself is an ancestor of any helper
+/// it spawns, and a session must have been written after the TUI started.
+fn agent_started_under(term_pid: u32, agent: &str) -> Option<i64> {
+    process_tree(&process_snapshot(), term_pid)
+        .agents
+        .into_iter()
+        .find(|(a, _)| *a == agent)
+        .map(|(_, started)| started)
 }
 
 fn normalize_cwd(cwd: &str) -> String {
@@ -179,7 +243,26 @@ fn claude_sessions_dir() -> Option<PathBuf> {
 /// epoch OpenCode keeps.
 const PROCESS_SCORE: i64 = 1 << 50;
 
+/// How far a session's write time may trail an agent process's start before we
+/// stop believing it belongs to that process. `ps` reports whole seconds, and
+/// the TUI may have been spawned a moment before its first write.
+const START_SKEW_SECS: i64 = 5;
+
 fn claude_discover(cwd: &str, pid: Option<u32>, process_bound: bool) -> Vec<DiskTitle> {
+    let tree = match (pid, process_bound) {
+        (Some(pid), true) => Some(process_tree(&process_snapshot(), pid)),
+        // Exact pid-file match against this terminal without a full `ps`.
+        (Some(pid), false) => Some(process_tree(&[], pid)),
+        (None, _) => None,
+    };
+    claude_discover_under(cwd, tree.as_ref(), process_bound)
+}
+
+fn claude_discover_under(
+    cwd: &str,
+    tree: Option<&ProcessTree>,
+    process_bound: bool,
+) -> Vec<DiskTitle> {
     let Some(dir) = claude_sessions_dir() else {
         return Vec::new();
     };
@@ -187,8 +270,6 @@ fn claude_discover(cwd: &str, pid: Option<u32>, process_bound: bool) -> Vec<Disk
     let Ok(entries) = fs::read_dir(&dir) else {
         return found;
     };
-    // Only worth a `ps` snapshot when there are files to match against.
-    let tree = pid.map(process_tree_pids);
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -221,14 +302,15 @@ fn claude_discover(cwd: &str, pid: Option<u32>, process_bound: bool) -> Vec<Disk
             continue;
         };
         let file_pid = value.get("pid").and_then(Value::as_u64).map(|p| p as u32);
-        let under_terminal = match (tree.as_ref(), file_pid) {
-            (Some(tree), Some(have)) => tree.contains(&have),
+        let under_terminal = match (tree, file_pid) {
+            (Some(tree), Some(have)) => tree.pids.contains(&have),
             _ => false,
         };
         if process_bound && !under_terminal {
             continue;
         }
-        let mut score = mtime_score(&path);
+        let updated = mtime_score(&path);
+        let mut score = updated;
         if under_terminal {
             score += PROCESS_SCORE;
         }
@@ -237,17 +319,16 @@ fn claude_discover(cwd: &str, pid: Option<u32>, process_bound: bool) -> Vec<Disk
             resume_id: encode_resume("claude", id),
             title,
             score,
+            updated,
         });
     }
     found
 }
 
-fn claude_pid_for(id: &str) -> Option<u32> {
+/// The live `~/.claude/sessions/<pid>.json` for `id`, if Claude still has one.
+fn claude_live_session(id: &str) -> Option<(PathBuf, Value)> {
     let dir = claude_sessions_dir()?;
-    let Ok(entries) = fs::read_dir(dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -258,39 +339,86 @@ fn claude_pid_for(id: &str) -> Option<u32> {
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if value.get("sessionId").and_then(Value::as_str) != Some(id) {
-            continue;
+        if value.get("sessionId").and_then(Value::as_str) == Some(id) {
+            return Some((path, value));
         }
-        return value
-            .get("pid")
-            .and_then(Value::as_u64)
-            .map(|p| p as u32);
     }
     None
 }
 
+fn claude_pid_for(id: &str) -> Option<u32> {
+    claude_live_session(id)?
+        .1
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|p| p as u32)
+}
+
 /// `root` and every process descended from it, via one `ps` snapshot.
 fn process_tree_pids(root: u32) -> std::collections::HashSet<u32> {
-    let mut set = std::collections::HashSet::new();
-    set.insert(root);
+    process_tree(&process_snapshot(), root).pids
+}
+
+/// One row of the `ps` snapshot used to find the agent under a terminal.
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    /// Unix seconds, derived from `ps`'s elapsed time.
+    started: i64,
+    /// The process's command line, split on whitespace.
+    args: Vec<String>,
+}
+
+/// The processes under a terminal, and which agents they are.
+struct ProcessTree {
+    pids: std::collections::HashSet<u32>,
+    /// Agent id → earliest start time among its processes.
+    agents: Vec<(&'static str, i64)>,
+}
+
+/// One `ps` snapshot of every process, with its start time and command line.
+///
+/// `etime` (elapsed seconds) is used instead of a formatted start date because
+/// the latter is locale-dependent; `args` instead of `comm` because macOS
+/// truncates `comm` to 16 characters.
+fn process_snapshot() -> Vec<Proc> {
     let Ok(output) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
+        .args(["-axo", "pid=,ppid=,etime=,args="])
         .output()
     else {
-        return set;
+        return Vec::new();
     };
-    let text = String::from_utf8_lossy(&output.stdout);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| parse_proc_line(line, now))
+        .collect()
+}
+
+fn parse_proc_line(line: &str, now: i64) -> Option<Proc> {
+    let mut fields = line.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let ppid = fields.next()?.parse().ok()?;
+    let elapsed = parse_elapsed(fields.next()?)?;
+    Some(Proc {
+        pid,
+        ppid,
+        started: now - elapsed,
+        args: fields.map(str::to_string).collect(),
+    })
+}
+
+/// `root`, its descendants, and the agent processes among them.
+fn process_tree(procs: &[Proc], root: u32) -> ProcessTree {
+    let mut pids = std::collections::HashSet::new();
+    pids.insert(root);
     let mut children: std::collections::HashMap<u32, Vec<u32>> =
         std::collections::HashMap::new();
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(pid) = parts.next().and_then(|s| s.parse().ok()) else {
-            continue;
-        };
-        let Some(ppid) = parts.next().and_then(|s| s.parse().ok()) else {
-            continue;
-        };
-        children.entry(ppid).or_default().push(pid);
+    for proc_ in procs {
+        children.entry(proc_.ppid).or_default().push(proc_.pid);
     }
     let mut stack = vec![root];
     while let Some(pid) = stack.pop() {
@@ -298,33 +426,77 @@ fn process_tree_pids(root: u32) -> std::collections::HashSet<u32> {
             continue;
         };
         for &kid in kids {
-            if set.insert(kid) {
+            if pids.insert(kid) {
                 stack.push(kid);
             }
         }
     }
-    set
+    let mut by_agent: std::collections::HashMap<&'static str, i64> =
+        std::collections::HashMap::new();
+    for proc_ in procs.iter().filter(|p| pids.contains(&p.pid)) {
+        let Some(agent) = agent_of_process(&proc_.args) else {
+            continue;
+        };
+        by_agent
+            .entry(agent)
+            .and_modify(|started| *started = (*started).min(proc_.started))
+            .or_insert(proc_.started);
+    }
+    let mut agents: Vec<_> = by_agent.into_iter().collect();
+    agents.sort_by_key(|(agent, _)| *agent);
+    ProcessTree { pids, agents }
+}
+
+/// Which known agent a command line runs, if any.
+///
+/// The first word is the executable path; when it is a JavaScript runtime the
+/// script it runs is checked too, because an npm-installed agent executes as
+/// `node …/claude`.
+fn agent_of_process(args: &[String]) -> Option<&'static str> {
+    let name_of = |arg: &str| {
+        Path::new(arg)
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_start_matches('-').to_string())
+    };
+    let first = args.first().and_then(|a| name_of(a))?;
+    if let Some(agent) = agent_by_name(&first) {
+        return Some(agent);
+    }
+    if matches!(first.as_str(), "node" | "bun" | "deno") {
+        return args.iter().skip(1).find_map(|arg| {
+            let name = name_of(arg)?;
+            agent_by_name(&name)
+        });
+    }
+    None
+}
+
+fn agent_by_name(name: &str) -> Option<&'static str> {
+    match name {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        // `omp` is Oh My Pi and keeps its sessions in Pi's store.
+        "pi" | "omp" => Some("pi"),
+        _ => None,
+    }
+}
+
+/// Parse `ps`'s elapsed time: `MM:SS`, `HH:MM:SS`, or `D-HH:MM:SS`.
+fn parse_elapsed(text: &str) -> Option<i64> {
+    let (days, rest) = match text.split_once('-') {
+        Some((days, rest)) => (days.parse::<i64>().ok()?, rest),
+        None => (0, text),
+    };
+    let mut seconds = 0i64;
+    for part in rest.split(':') {
+        seconds = seconds.checked_mul(60)?.checked_add(part.parse().ok()?)?;
+    }
+    Some(days * 86_400 + seconds)
 }
 
 fn claude_by_id(id: &str) -> Option<String> {
-    let dir = claude_sessions_dir()?;
-    let Ok(entries) = fs::read_dir(dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if value.get("sessionId").and_then(Value::as_str) != Some(id) {
-            continue;
-        }
+    if let Some((_, value)) = claude_live_session(id) {
         return value
             .get("name")
             .and_then(Value::as_str)
@@ -335,39 +507,38 @@ fn claude_by_id(id: &str) -> Option<String> {
     claude_transcript_title(id)
 }
 
-fn claude_transcript_title(id: &str) -> Option<String> {
+fn claude_transcript_path(id: &str) -> Option<PathBuf> {
     let projects = home()?.join(".claude").join("projects");
-    let Ok(projects) = fs::read_dir(projects) else {
-        return None;
-    };
-    for project in projects.flatten() {
+    for project in fs::read_dir(projects).ok()?.flatten() {
         let path = project.path().join(format!("{id}.jsonl"));
-        if !path.is_file() {
-            continue;
+        if path.is_file() {
+            return Some(path);
         }
-        let Ok(text) = fs::read_to_string(&path) else {
+    }
+    None
+}
+
+fn claude_transcript_title(id: &str) -> Option<String> {
+    let text = fs::read_to_string(claude_transcript_path(id)?).ok()?;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let content = value
-                .pointer("/message/content")
-                .and_then(|c| c.as_str().map(|s| s.to_string()).or_else(|| {
-                    c.as_array().and_then(|parts| {
-                        parts.iter().find_map(|part| {
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .map(|s| s.to_string())
-                        })
-                    })
-                }))?;
-            return first_line_title(&content);
+        if value.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
         }
+        let content = value
+            .pointer("/message/content")
+            .and_then(|c| c.as_str().map(|s| s.to_string()).or_else(|| {
+                c.as_array().and_then(|parts| {
+                    parts.iter().find_map(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .map(|s| s.to_string())
+                    })
+                })
+            }))?;
+        return first_line_title(&content);
     }
     None
 }
@@ -402,41 +573,28 @@ fn codex_discover(cwd: &str) -> Vec<DiskTitle> {
     let mut found = Vec::new();
     let sessions = root.join("sessions");
     for path in recent_files(&sessions, 80) {
-        let Ok(file) = fs::File::open(&path) else {
+        let Some(meta) = codex_file_meta(&path) else {
             continue;
         };
-        let mut first = String::new();
-        use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(file);
-        if reader.read_line(&mut first).is_err() {
-            continue;
-        }
-        let Ok(meta) = serde_json::from_str::<Value>(first.trim()) else {
-            continue;
-        };
-        let payload = meta.get("payload").unwrap_or(&meta);
-        let Some(session_cwd) = payload.get("cwd").and_then(Value::as_str) else {
+        let Some(session_cwd) = meta.get("cwd").and_then(Value::as_str) else {
             continue;
         };
         if normalize_cwd(session_cwd) != normalize_cwd(cwd) {
             continue;
         }
-        let Some(id) = payload
-            .get("session_id")
-            .or_else(|| payload.get("id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
+        let Some(id) = codex_meta_id(&meta) else {
             continue;
         };
-        let Some(title) = names.get(id).cloned() else {
+        let Some(title) = names.get(&id).cloned() else {
             continue;
         };
+        let updated = mtime_score(&path);
         found.push(DiskTitle {
             agent: "codex",
-            resume_id: encode_resume("codex", id),
+            resume_id: encode_resume("codex", &id),
             title,
-            score: mtime_score(&path),
+            score: updated,
+            updated,
         });
     }
     found
@@ -445,6 +603,38 @@ fn codex_discover(cwd: &str) -> Vec<DiskTitle> {
 fn codex_by_id(id: &str) -> Option<String> {
     let root = codex_home()?;
     codex_thread_names(&root.join("session_index.jsonl")).remove(id)
+}
+
+fn codex_updated(id: &str) -> Option<i64> {
+    // Same clock discover uses: the rollout file's mtime. Index `updated_at`
+    // can lag an active thread, so it is not a fallback here.
+    let root = codex_home()?;
+    for path in recent_files(&root.join("sessions"), 80) {
+        let Some(meta) = codex_file_meta(&path) else {
+            continue;
+        };
+        if codex_meta_id(&meta).as_deref() == Some(id) {
+            return Some(mtime_score(&path));
+        }
+    }
+    None
+}
+
+fn codex_file_meta(path: &Path) -> Option<Value> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    let meta = serde_json::from_str::<Value>(first.trim()).ok()?;
+    Some(meta.get("payload").cloned().unwrap_or(meta))
+}
+
+fn codex_meta_id(meta: &Value) -> Option<String> {
+    meta.get("session_id")
+        .or_else(|| meta.get("id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn codex_thread_names(path: &Path) -> std::collections::HashMap<String, String> {
@@ -508,10 +698,7 @@ fn opencode_discover(cwd: &str) -> Vec<DiskTitle> {
     if !path.is_file() {
         return Vec::new();
     }
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Some(conn) = opencode_connection() else {
         return Vec::new();
     };
     let Ok(mut stmt) = conn.prepare(
@@ -533,23 +720,22 @@ fn opencode_discover(cwd: &str) -> Vec<DiskTitle> {
     rows.flatten()
         .filter_map(|(id, title, updated)| {
             let title = title_of(&title)?;
+            // `time_updated` is a millisecond epoch; the rest of the module
+            // ranks and compares in seconds.
+            let updated = updated / 1000;
             Some(DiskTitle {
                 agent: "opencode",
                 resume_id: encode_resume("opencode", &id),
                 title,
                 score: updated,
+                updated,
             })
         })
         .collect()
 }
 
 fn opencode_by_id(id: &str) -> Option<String> {
-    let path = opencode_db()?;
-    let conn = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = opencode_connection()?;
     conn.query_row(
         "SELECT title FROM session_v2 WHERE id = ?1",
         [id],
@@ -558,6 +744,27 @@ fn opencode_by_id(id: &str) -> Option<String> {
     .ok()
     .flatten()
     .and_then(|t| title_of(&t))
+}
+
+fn opencode_updated(id: &str) -> Option<i64> {
+    let conn = opencode_connection()?;
+    let updated: i64 = conn
+        .query_row(
+            "SELECT time_updated FROM session_v2 WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    Some(updated / 1000)
+}
+
+fn opencode_connection() -> Option<rusqlite::Connection> {
+    let path = opencode_db()?;
+    rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
 }
 
 // --- Pi --------------------------------------------------------------------
@@ -593,21 +800,31 @@ fn pi_discover(cwd: &str) -> Vec<DiskTitle> {
         let Some((id, title)) = pi_file_title(&path) else {
             continue;
         };
+        let updated = mtime_score(&path);
         found.push(DiskTitle {
             agent: "pi",
             resume_id: encode_resume("pi", &id),
             title,
-            score: mtime_score(&path),
+            score: updated,
+            updated,
         });
     }
     found
 }
 
 fn pi_by_id(id: &str) -> Option<String> {
+    let path = pi_file_for(id)?;
+    pi_file_title(&path).map(|(_, title)| title)
+}
+
+fn pi_updated(id: &str) -> Option<i64> {
+    Some(mtime_score(&pi_file_for(id)?))
+}
+
+/// The session file whose id is `id`, across every cwd directory.
+fn pi_file_for(id: &str) -> Option<PathBuf> {
     let root = pi_sessions_root()?;
-    let Ok(dirs) = fs::read_dir(root) else {
-        return None;
-    };
+    let dirs = fs::read_dir(root).ok()?;
     for dir in dirs.flatten() {
         let path = dir.path();
         if !path.is_dir() {
@@ -622,10 +839,10 @@ fn pi_by_id(id: &str) -> Option<String> {
             if !name.contains(id) || path.extension()?.to_str()? != "jsonl" {
                 continue;
             }
-            if let Some((found_id, title)) = pi_file_title(&path)
+            if let Some((found_id, _)) = pi_file_title(&path)
                 && found_id == id
             {
-                return Some(title);
+                return Some(path);
             }
         }
     }
@@ -821,6 +1038,71 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].title, "refactor auth");
         assert_eq!(found[0].resume_id, "pi:sess-1");
+    }
+
+    #[test]
+    fn ps_lines_keep_their_start_time_and_command() {
+        let proc_ = parse_proc_line(
+            " 69523 69268 05:56 /Users/yankewei/.opencode/bin/opencode",
+            10_000,
+        )
+        .unwrap();
+        assert_eq!((proc_.pid, proc_.ppid), (69_523, 69_268));
+        assert_eq!(proc_.started, 10_000 - 356);
+        assert_eq!(
+            agent_of_process(&proc_.args),
+            Some("opencode"),
+            "the executable's basename identifies the agent"
+        );
+    }
+
+    #[test]
+    fn only_sessions_written_after_the_agent_started_are_claimed() {
+        assert!(
+            !covers_start(900, 1_000),
+            "an older session in the same cwd is refused"
+        );
+        assert!(covers_start(2_000, 1_000));
+        // Whole-second clocks and the gap before the first write are forgiven.
+        assert!(covers_start(998, 1_000));
+    }
+
+    #[test]
+    fn the_agent_process_under_a_terminal_is_recognized() {
+        let procs = vec![
+            Proc {
+                pid: 1,
+                ppid: 0,
+                started: 0,
+                args: vec!["-zsh".into()],
+            },
+            Proc {
+                pid: 2,
+                ppid: 1,
+                started: 90,
+                args: vec!["node".into(), "/usr/local/bin/opencode".into()],
+            },
+            Proc {
+                pid: 3,
+                ppid: 0,
+                started: 0,
+                args: vec!["/opt/homebrew/bin/codex".into()],
+            },
+        ];
+        let tree = process_tree(&procs, 1);
+        assert!(tree.pids.contains(&2));
+        assert_eq!(
+            tree.agents,
+            vec![("opencode", 90)],
+            "a sibling terminal's codex is not under this root"
+        );
+    }
+
+    #[test]
+    fn elapsed_times_parse_for_the_boundary_checks() {
+        assert_eq!(parse_elapsed("00:05"), Some(5));
+        assert_eq!(parse_elapsed("01:02:03"), Some(3_723));
+        assert_eq!(parse_elapsed("1-01:02:03"), Some(86_400 + 3_723));
     }
 
     fn tempfile() -> PathBuf {

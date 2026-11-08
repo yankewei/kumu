@@ -370,8 +370,9 @@ impl Workspace {
     }
 
     /// Poll each agent's on-disk session store for titles, so a shell that
-    /// launched `claude` picks up the name that agent wrote. Only agents whose
-    /// store records a pid can be claimed by a shell — currently Claude alone;
+    /// launched an agent picks up the name that agent wrote. The shell's
+    /// process tree says which agent TUI is running under it; a title is only
+    /// accepted when the session was written after that process started.
     /// `agent::disk_title` says why.
     ///
     /// The scan is file and process work — one `ps` snapshot per live terminal
