@@ -43,6 +43,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        ui::init(cx);
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);

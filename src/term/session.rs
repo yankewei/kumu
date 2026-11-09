@@ -582,6 +582,45 @@ mod tests {
         assert!(text.contains("12 40"), "grid was:\n{text}");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_tab_completion_lists_command_candidates() {
+        let (term, _wake) = Term::launch(
+            "/bin/zsh".into(),
+            vec!["-f".into(), "-i".into()],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        // A deterministic command-specific completer exercises the same ZLE
+        // path as the user's z plugin, without loading their shell config.
+        term.write(concat!(
+            "autoload -Uz compinit; compinit -D; ",
+            "unsetopt menucomplete; setopt autolist; ",
+            "bindkey '^I' complete-word; ",
+            "_kumu_z() { compadd -- kumu-alpha kumu-beta; }; ",
+            "compdef _kumu_z z; PS1='kumu> '; ",
+            "printf '\\nCOMPLETION_%s\\n' READY\n",
+        ));
+        let text = wait_text(&term, "COMPLETION_READY");
+        assert!(text.contains("COMPLETION_READY"), "grid was:\n{text}");
+        term.write(b"z kumu-");
+        for _ in 0..2 {
+            term.key(KeyInput {
+                key: "tab".into(),
+                key_char: Some("\t".into()),
+                shift: false,
+                control: false,
+                alt: false,
+            });
+        }
+        let text = wait_text(&term, "kumu-alpha  kumu-beta");
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "kumu-alpha  kumu-beta"),
+            "completion candidates were not listed:\n{text}"
+        );
+    }
+
     #[test]
     fn exiting_one_shell_leaves_the_other() {
         let (program, args) = crate::term::default_shell();

@@ -1351,6 +1351,21 @@ mod tests {
     }
 
     #[test]
+    fn completion_keys_encode_for_the_shell() {
+        let mut vt = Vt::new(16, 4);
+        let mut input = KeyInput {
+            key: "tab".into(),
+            key_char: Some("\t".into()),
+            shift: false,
+            control: false,
+            alt: false,
+        };
+        assert_eq!(vt.encode_input(&input), b"\t");
+        input.shift = true;
+        assert_eq!(vt.encode_input(&input), b"\x1b[Z");
+    }
+
+    #[test]
     fn a_drag_selects_plain_text() {
         let mut vt = Vt::new(16, 4);
         vt.write(b"hello");

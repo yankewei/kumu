@@ -731,6 +731,7 @@ impl Render for TerminalView {
                     .min_w_0()
                     .size_full()
                     .track_focus(&self.focus)
+                    .key_context("Terminal")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, window, cx| {
