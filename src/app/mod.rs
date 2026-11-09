@@ -6,15 +6,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use gpui_kit::{Context, EventEmitter};
+use gpui_kit::{Context, EventEmitter, Global};
 
 use crate::agent;
 use crate::db::{Project, Session, Store, db_path};
-use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors};
+use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
+
+/// Shared by the home and settings windows; changes apply immediately.
+pub struct NotificationSettings {
+    pub enabled: bool,
+}
+
+impl Global for NotificationSettings {}
 
 /// How often to re-read agent session stores for sidebar titles.
 const TITLE_SYNC_EVERY: Duration = Duration::from_secs(2);
@@ -37,6 +44,12 @@ pub enum WorkspaceEvent {
     Failed(String),
     /// A pane's terminal grid changed. Only that pane draws it.
     Frame(u64),
+    /// An explicit OSC notification from a visible or parked terminal.
+    Attention {
+        terminal: u64,
+        session: i64,
+        notification: TermNotification,
+    },
     /// A pane's shell exited cleanly. The home window closes that pane; the
     /// session row is removed only when no pane still belongs to it.
     PaneExited { pane: u64, session: i64 },
@@ -51,6 +64,7 @@ struct LiveTerm {
     /// another session, and the process keeps running (and reading) so
     /// switching back reattaches the same TUI instead of restarting it.
     pane: Option<u64>,
+    last_notification: Option<(Instant, TermNotification)>,
 }
 
 /// Projects, sessions, and each live terminal.
@@ -262,12 +276,37 @@ impl Workspace {
                 term,
                 session: session_id,
                 pane: Some(pane),
+                last_notification: None,
             },
         );
         self.pane_term.insert(pane, term_id);
         self.touch_terminal(term_id);
         self.watch_terminal(term_id, session_id, wake, cx);
         snapshot
+    }
+
+    /// A removed terminal or the terminal being read no longer needs attention.
+    /// `focused_pane` is absent while the home window is inactive.
+    pub fn notification_is_read(&self, terminal: u64, focused_pane: Option<u64>) -> bool {
+        match self.terms.get(&terminal) {
+            None => true,
+            Some(live) => live.pane.is_some() && live.pane == focused_pane,
+        }
+    }
+
+    /// Bring the exact terminal that sent a notification back into a pane.
+    /// A parked process is reattached without restarting its agent.
+    pub fn reveal_terminal(&mut self, terminal: u64, fallback_pane: u64) -> Option<(u64, i64)> {
+        let live = self.terms.get(&terminal)?;
+        let session = live.session;
+        let pane = live.pane.unwrap_or(fallback_pane);
+        if live.pane.is_none() {
+            self.park_terminal(pane);
+            self.terms.get_mut(&terminal)?.pane = Some(pane);
+            self.pane_term.insert(pane, terminal);
+        }
+        self.touch_terminal(terminal);
+        Some((pane, session))
     }
 
     /// Push the UI theme's colors into every live terminal.
@@ -485,12 +524,30 @@ impl Workspace {
             while wake.next().await.is_some() {
                 let watching = this
                     .update(cx, |workspace, cx| {
-                        let Some(live) = workspace.terms.get(&term_id) else {
+                        let Some(live) = workspace.terms.get_mut(&term_id) else {
                             return false;
                         };
                         let snapshot = live.term.snapshot();
                         let pane = live.pane;
                         let term = live.term.clone();
+                        while let Some(notification) = term.take_notification() {
+                            let now = Instant::now();
+                            if !live
+                                .last_notification
+                                .as_ref()
+                                .is_some_and(|(last, previous)| {
+                                    now.duration_since(*last) < Duration::from_secs(2)
+                                        && previous == &notification
+                                })
+                            {
+                                live.last_notification = Some((now, notification.clone()));
+                                cx.emit(WorkspaceEvent::Attention {
+                                    terminal: term_id,
+                                    session: session_id,
+                                    notification,
+                                });
+                            }
+                        }
                         // `exit` (or any clean shell death) closes this pane.
                         // The session row stays while another pane still shows
                         // it; spawn failures keep the pane so the header can
@@ -1006,6 +1063,73 @@ mod tests {
             agent_session_id: None,
             title_manual: false,
         }
+    }
+
+    #[test]
+    fn notification_navigation_restores_the_exact_terminal_and_acknowledges_only_its_pane() {
+        use super::{LiveTerm, Workspace};
+        use crate::term::{Term, TermColors};
+        use std::collections::HashMap;
+
+        let mut terms = HashMap::new();
+        for (id, session, pane) in [(1, 10, Some(1)), (2, 10, Some(2)), (3, 20, None)] {
+            let (term, _wake) = Term::launch(
+                "/bin/cat".into(),
+                Vec::new(),
+                std::env::temp_dir(),
+                TermColors::default(),
+            );
+            terms.insert(
+                id,
+                LiveTerm {
+                    term,
+                    session,
+                    pane,
+                    last_notification: None,
+                },
+            );
+        }
+        let mut workspace = Workspace {
+            store: crate::db::Store::in_memory().expect("test store"),
+            persistent: false,
+            projects: Vec::new(),
+            sessions: Vec::new(),
+            terms,
+            pane_term: HashMap::from([(1, 1), (2, 2)]),
+            term_lru: vec![3, 1, 2],
+            next_term: 4,
+            startup_error: None,
+            saved_workspace: None,
+        };
+        assert!(!workspace.notification_is_read(1, None), "inactive window");
+        assert!(
+            !workspace.notification_is_read(2, Some(1)),
+            "same session, other pane"
+        );
+        assert!(workspace.notification_is_read(1, Some(1)));
+        assert!(
+            !workspace.notification_is_read(3, Some(1)),
+            "parked terminal"
+        );
+        assert_eq!(workspace.reveal_terminal(2, 1), Some((2, 10)));
+        assert_eq!(
+            workspace.pane_term[&1], 1,
+            "an already visible terminal keeps its pane"
+        );
+        assert_eq!(workspace.reveal_terminal(3, 1), Some((1, 20)));
+        assert_eq!(workspace.pane_term[&1], 3);
+        assert_eq!(workspace.pane_term[&2], 2);
+        assert_eq!(workspace.terms[&3].pane, Some(1));
+        assert!(workspace.notification_is_read(3, Some(1)));
+        assert!(
+            workspace.notification_is_read(1, None),
+            "removed terminal clears stale attention"
+        );
+        assert_eq!(
+            workspace.reveal_terminal(1, 1),
+            None,
+            "stale notification cannot restart a process"
+        );
     }
 
     /// Deleting the session the user is looking at must land them next door,

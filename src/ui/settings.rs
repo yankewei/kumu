@@ -1,8 +1,11 @@
 //! Settings window, Waku-style: sidebar (back row + search + icon nav) on the
 //! left; a centered content column with card-grouped rows on the right.
 
+use std::collections::HashMap;
+
 use super::widgets::{agent_logo, pill};
-use crate::agent::AGENTS;
+use crate::agent::{AGENTS, integration};
+use crate::app::NotificationSettings;
 use crate::db;
 use crate::theme;
 use crate::ui::layers;
@@ -76,6 +79,8 @@ pub struct SettingsWindow {
     /// UI font-size picker over the app's type scale.
     font_size_select: Entity<SelectState<SearchableVec<FontSizeItem>>>,
     updater: Entity<Updater>,
+    integrations: HashMap<&'static str, Result<integration::Status, String>>,
+    integration_busy: Option<&'static str>,
     /// The window's overlay for hover labels; mounted by `window_layers`.
     tooltips: Entity<Tooltips>,
 }
@@ -135,8 +140,62 @@ impl SettingsWindow {
             font_select,
             font_size_select,
             updater,
+            integrations: AGENTS
+                .iter()
+                .map(|agent| {
+                    (
+                        agent.id,
+                        integration::status(agent.id).map_err(|error| error.to_string()),
+                    )
+                })
+                .collect(),
+            integration_busy: None,
             tooltips: cx.new(|cx| Tooltips::new(cx)),
         }
+    }
+
+    fn change_integration(
+        &mut self,
+        agent: &'static str,
+        remove: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.integration_busy.is_some() {
+            return;
+        }
+        self.integration_busy = Some(agent);
+        cx.notify();
+        let window = window.window_handle();
+        let work = cx.background_executor().spawn(async move {
+            let result = if remove {
+                integration::uninstall(agent)
+            } else {
+                integration::install(agent)
+            };
+            let status = integration::status(agent).map_err(|error| error.to_string());
+            (result, status)
+        });
+        cx.spawn(async move |this, cx| {
+            let (result, status) = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.integration_busy = None;
+                this.integrations.insert(agent, status);
+                let note = match result {
+                    Ok(()) => Notification::success(if remove {
+                        "已移除通知接入；请重新启动 Agent。"
+                    } else if agent == "codex" {
+                        "已注册通知 hooks；重新启动 Codex 后，请在 /hooks 中审查并信任。"
+                    } else {
+                        "已安装通知接入；请重新启动 Agent。"
+                    }),
+                    Err(error) => Notification::error(format!("通知接入失败：{error}")),
+                };
+                let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Open the update card from the main window's persistent notice.
@@ -296,9 +355,9 @@ impl SettingsWindow {
         };
 
         let cards: Vec<AnyElement> = match self.settings_page {
-            SettingsPage::Providers => vec![self.render_providers_card(dark, theme)],
+            SettingsPage::Providers => vec![self.render_providers_card(dark, theme, cx)],
             SettingsPage::General => vec![
-                self.render_general_card(dark, theme),
+                self.render_general_card(dark, theme, cx),
                 self.render_updates_card(dark, theme, cx),
             ],
         };
@@ -355,7 +414,7 @@ impl SettingsWindow {
         div().w_full().px_5().py_4().rounded_lg().bg(bg)
     }
 
-    fn render_providers_card(&self, dark: bool, theme: &Theme) -> AnyElement {
+    fn render_providers_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         let (base_bg, radius, primary, link, muted, muted_fg, border) = (
             theme.background,
             theme.radius,
@@ -377,6 +436,19 @@ impl SettingsWindow {
                 // list takes from the machine. An agent that is not installed
                 // is still shown, so its absence is visible.
                 let installed = crate::agent::installed(a.id);
+                let agent = a.id;
+                let status = self.integrations.get(agent);
+                let registered = matches!(status, Some(Ok(integration::Status::Registered)));
+                let needs_repair = matches!(status, Some(Ok(integration::Status::NeedsRepair)));
+                let notice = match status {
+                    Some(Ok(integration::Status::Registered)) if agent == "codex" => {
+                        "通知已注册；请在 Codex /hooks 中确认信任。"
+                    }
+                    Some(Ok(integration::Status::Registered)) => "通知已接入",
+                    Some(Ok(integration::Status::NeedsRepair)) => "通知接入需要修复",
+                    Some(Err(_)) => "无法读取通知接入状态",
+                    _ => "通知未接入",
+                };
                 let status_pill = pill(
                     installed,
                     if installed { "已安装" } else { "未安装" },
@@ -428,9 +500,42 @@ impl SettingsWindow {
                                     .text_color(muted_fg)
                                     .text_ellipsis()
                                     .child(a.desc),
-                            ),
+                            )
+                            .child(div().mt_0p5().text_xs().text_color(muted_fg).child(notice)),
                     )
-                    .child(status_pill)
+                    .child(
+                        v_flex().items_end().gap_1().child(status_pill).child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new(format!("install-notifications-{agent}"))
+                                        .small()
+                                        .ghost()
+                                        .label(if registered || needs_repair {
+                                            "修复接入"
+                                        } else {
+                                            "接入通知"
+                                        })
+                                        .loading(self.integration_busy == Some(agent))
+                                        .disabled(self.integration_busy.is_some())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.change_integration(agent, false, window, cx)
+                                        })),
+                                )
+                                .when(registered || needs_repair, |row| {
+                                    row.child(
+                                        Button::new(format!("remove-notifications-{agent}"))
+                                            .small()
+                                            .ghost()
+                                            .label("移除")
+                                            .disabled(self.integration_busy.is_some())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.change_integration(agent, true, window, cx)
+                                            })),
+                                    )
+                                }),
+                        ),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -440,12 +545,9 @@ impl SettingsWindow {
                     .min_w_0()
                     .gap_1()
                     .child(div().text_xs().font_medium().child("编码 Agent"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child("检测本机安装的编码 Agent；Kumu 会直接打开它们自己的终端界面。"),
-                    ),
+                    .child(div().text_xs().text_color(muted_fg).child(
+                        "接入通知会注册到 Agent 的配置或扩展目录，之后可按原来的方式启动。",
+                    )),
             )
             .child(v_flex().mt_1().children(rows))
             .into_any_element()
@@ -574,7 +676,7 @@ impl SettingsWindow {
         .into_any_element()
     }
 
-    fn render_general_card(&self, dark: bool, theme: &Theme) -> AnyElement {
+    fn render_general_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
         let (radius, primary, link, muted, muted_fg, border) = (
             theme.radius,
             theme.primary,
@@ -616,6 +718,22 @@ impl SettingsWindow {
                 );
             })
             .into_any_element();
+        let notifications = Switch::new("terminal-notifications")
+            .checked(cx.global::<NotificationSettings>().enabled)
+            .on_click(|checked, window, cx| {
+                if let Err(error) =
+                    db::set_setting(db::SETTING_NOTIFICATIONS, if *checked { "1" } else { "0" })
+                {
+                    window.push_notification(
+                        Notification::error(format!("保存通知设置失败：{error}")),
+                        cx,
+                    );
+                    return;
+                }
+                cx.set_global(NotificationSettings { enabled: *checked });
+                window.refresh();
+            })
+            .into_any_element();
         let font_select = div()
             .w_48()
             .child(
@@ -654,6 +772,13 @@ impl SettingsWindow {
                 "界面字体大小",
                 "界面文字与间距的基础字号。",
                 font_size_select,
+                border,
+                false,
+            ))
+            .child(row(
+                "Agent 通知",
+                "任务完成或需要输入、确认时提醒；应用在后台时发送系统通知。",
+                notifications,
                 border,
                 false,
             ))

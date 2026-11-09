@@ -3818,6 +3818,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3856,13 +3865,14 @@ dependencies = [
 
 [[package]]
 name = "kumu"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "futures",
  "ghostty-sys",
  "gpui-kit",
  "gpui-pre",
  "gpui-updater-pre",
+ "jsonc-parser",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",

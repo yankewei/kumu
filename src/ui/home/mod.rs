@@ -14,12 +14,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::SettingsWindow;
-use crate::app::{Workspace, WorkspaceEvent};
+use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::{Notification, NotificationDelivery};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -41,6 +42,9 @@ pub struct KumuApp {
     settings_window: Option<WindowHandle<Root>>,
     /// Session highlighted in the sidebar — the focused pane's session.
     selected: Option<i64>,
+    /// Terminals that requested attention while unattended, mapped to their
+    /// session for the sidebar marker.
+    unread_notifications: HashMap<u64, i64>,
     /// A persistence failure the workspace reported, shown above the panes
     /// until dismissed.
     store_error: Option<String>,
@@ -74,10 +78,78 @@ impl KumuApp {
         let tooltips = cx.new(|cx| Tooltips::new(cx));
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
-        cx.subscribe(&workspace, |this, _, ev, cx| match ev {
+        cx.subscribe_in(&workspace, window, |this, _, ev, window, cx| match ev {
             WorkspaceEvent::Changed => cx.notify(),
             WorkspaceEvent::Failed(message) => {
                 this.store_error = Some(message.clone());
+                cx.notify();
+            }
+            WorkspaceEvent::Attention {
+                terminal,
+                session,
+                notification,
+            } => {
+                if !cx.global::<NotificationSettings>().enabled
+                    || this.workspace.read(cx).notification_is_read(
+                        *terminal,
+                        window.is_window_active().then_some(this.focused.0),
+                    )
+                {
+                    return;
+                }
+                let workspace = this.workspace.read(cx);
+                let Some(session_info) = workspace.session(*session) else {
+                    return;
+                };
+                let project = workspace
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == session_info.project_id);
+                let title = match project {
+                    Some(project) => format!("{} · {}", project.name, session_info.title),
+                    None => session_info.title.clone(),
+                };
+                let message = match (notification.title.is_empty(), notification.body.is_empty()) {
+                    (true, true) => "终端需要你的关注".to_string(),
+                    (false, true) => notification.title.clone(),
+                    (true, false) => notification.body.clone(),
+                    (false, false) => format!("{}\n{}", notification.title, notification.body),
+                };
+                this.unread_notifications.insert(*terminal, *session);
+                let terminal = *terminal;
+                let weak = cx.entity().downgrade();
+                let note = Notification::info(message)
+                    .title(title)
+                    .id1::<NotificationSettings>(terminal.to_string())
+                    .delivery(NotificationDelivery::InApp)
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            let target = this.workspace.update(cx, |workspace, _| {
+                                workspace.reveal_terminal(terminal, this.focused.0)
+                            });
+                            if let Some((pane, session)) = target {
+                                let pane = PaneId(pane);
+                                let snapshot = this.workspace.read(cx).terminal_snapshot(pane.0);
+                                if let Some(view) = this.panes.get(&pane)
+                                    && let Some(snapshot) = snapshot
+                                {
+                                    view.update(cx, |view, cx| view.attach(session, snapshot, cx));
+                                }
+                                this.focus_pane(pane, cx);
+                                this.focus_terminal(window, cx);
+                            }
+                        });
+                    });
+                // Keep a toast available when OS delivery is denied or when
+                // developing with an unbundled `cargo run` binary.
+                window.push_notification(
+                    if window.is_window_active() {
+                        note
+                    } else {
+                        note.in_app_and_system()
+                    },
+                    cx,
+                );
                 cx.notify();
             }
             WorkspaceEvent::PaneExited { pane, session } => {
@@ -86,6 +158,11 @@ impl KumuApp {
             _ => {}
         })
         .detach();
+
+        cx.observe_global::<NotificationSettings>(|_, cx| cx.notify())
+            .detach();
+        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+            .detach();
 
         let updater = crate::updates::init(cx);
         cx.observe(&updater, |_, _, cx| cx.notify()).detach();
@@ -111,6 +188,7 @@ impl KumuApp {
             updater,
             settings_window: None,
             selected: None,
+            unread_notifications: HashMap::new(),
             store_error: startup_error,
             collapsed_projects: HashSet::new(),
             tooltips,
@@ -955,6 +1033,26 @@ impl Render for KumuApp {
             && let Some(terminal) = self.panes.get(&pane).cloned()
         {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        // Reading the focused terminal acknowledges its attention request.
+        // Also retract notifications when a session is deleted or the setting
+        // is disabled, including banners still in Notification Center.
+        let enabled = cx.global::<NotificationSettings>().enabled;
+        let workspace = self.workspace.read(cx);
+        let focused = window.is_window_active().then_some(self.focused.0);
+        let read: Vec<u64> = self
+            .unread_notifications
+            .iter()
+            .filter(|(terminal, session)| {
+                !enabled
+                    || workspace.session(**session).is_none()
+                    || workspace.notification_is_read(**terminal, focused)
+            })
+            .map(|(terminal, _)| *terminal)
+            .collect();
+        for terminal in read {
+            self.unread_notifications.remove(&terminal);
+            window.remove_notification1::<NotificationSettings>(terminal.to_string(), cx);
         }
         self.render_home(window, cx)
     }

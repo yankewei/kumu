@@ -12,7 +12,7 @@ mod vt;
 pub use session::Term;
 pub use vt::{
     Cell, CursorShape, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb, SelectStep,
-    Snapshot, TermColors,
+    Snapshot, TermColors, TermNotification,
 };
 
 /// Stored on [`crate::db::Session::agent`] for a pure shell session — not an

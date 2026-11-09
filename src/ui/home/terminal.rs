@@ -182,16 +182,23 @@ impl TerminalView {
 
     /// Show `session_id`, starting its TUI if it is not already running.
     pub fn show(&mut self, session_id: i64, cx: &mut Context<Self>) {
+        let pane = self.pane.0;
+        let snapshot = self.workspace.update(cx, |workspace, cx| {
+            workspace.show_terminal(pane, session_id, cx)
+        });
+        self.attach(session_id, snapshot, cx);
+    }
+
+    /// Attach a terminal already assigned to this pane by the workspace.
+    /// Notification navigation preserves even an exited process's final screen.
+    pub fn attach(&mut self, session_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.reset_gesture();
         self.session = Some(session_id);
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
         self.painted.borrow_mut().rows.clear();
         self.sync_theme(cx);
-        let pane = self.pane.0;
-        self.snapshot = self.workspace.update(cx, |workspace, cx| {
-            workspace.show_terminal(pane, session_id, cx)
-        });
+        self.snapshot = snapshot;
         cx.notify();
     }
 

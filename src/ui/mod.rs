@@ -10,6 +10,12 @@ pub use home::KumuApp;
 pub use settings::SettingsWindow;
 
 pub fn init(cx: &mut gpui_kit::App) {
+    if !cx.has_global::<crate::app::NotificationSettings>() {
+        cx.set_global(crate::app::NotificationSettings {
+            enabled: crate::db::get_setting(crate::db::SETTING_NOTIFICATIONS).as_deref()
+                != Some("0"),
+        });
+    }
     // Root's focus-navigation actions run before on_key_down. Let the
     // focused terminal receive completion keys through its normal encoder.
     cx.bind_keys([

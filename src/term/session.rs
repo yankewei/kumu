@@ -1,5 +1,6 @@
 //! The thread that owns one PTY and its terminal emulator.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -10,10 +11,14 @@ use futures::channel::mpsc::UnboundedReceiver;
 use portable_pty::PtySize;
 
 use super::pty::{self, Pty};
-use super::vt::{KeyInput, MouseInput, MouseMods, SelectStep, Snapshot, TermColors, Vt};
+use super::vt::{
+    KeyInput, MAX_NOTIFICATIONS, MouseInput, MouseMods, SelectStep, Snapshot, TermColors,
+    TermNotification, Vt,
+};
 
 struct Live {
     screen: Mutex<Snapshot>,
+    notifications: Mutex<VecDeque<TermNotification>>,
     generation: AtomicU64,
     queued: AtomicBool,
     /// PTY child pid, or 0 before spawn / when the platform does not report one.
@@ -111,6 +116,7 @@ impl Term {
         let cwd_text = cwd.display().to_string();
         let live = Arc::new(Live {
             screen: Mutex::new(Snapshot::blank_with(&command, &cwd_text, colors.bg)),
+            notifications: Mutex::new(VecDeque::new()),
             generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
             pid: AtomicU32::new(0),
@@ -136,6 +142,15 @@ impl Term {
 
     pub fn snapshot(&self) -> Snapshot {
         self.live.screen.lock().unwrap().clone()
+    }
+
+    /// Consume attention separately from the screen so redraws cannot replay it.
+    pub fn take_notification(&self) -> Option<TermNotification> {
+        self.live
+            .notifications
+            .lock()
+            .expect("terminal notification lock")
+            .pop_front()
     }
 
     pub fn generation(&self) -> u64 {
@@ -519,6 +534,18 @@ impl Running {
     }
 
     fn publish(&mut self) {
+        let mut pending = self
+            .live
+            .notifications
+            .lock()
+            .expect("terminal notification lock");
+        while let Some(notification) = self.vt.take_notification() {
+            if pending.len() == MAX_NOTIFICATIONS {
+                pending.pop_front();
+            }
+            pending.push_back(notification);
+        }
+        drop(pending);
         self.live
             .publish(self.vt.snapshot(&self.command, &self.cwd, self.exited));
     }
@@ -542,6 +569,68 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn arbitrary_launch_commands_keep_arguments_and_inherit_only_terminal_identity() {
+        let (term, _wake) = Term::launch(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                r#"printf 'ARG=<%s>\n' "$@"; printf 'IDENTITY=%s\n' "$KUMU_TERMINAL"; printf 'PROGRAM=%s\n' "$TERM_PROGRAM"; printf 'TTY=%s\n' "$KUMU_TTY"; test -w "$KUMU_TTY" && echo tty-writable; echo identity-ready"#.into(),
+                "custom-script".into(),
+                "--settings".into(),
+                "value with spaces".into(),
+            ],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        let text = wait_text(&term, "identity-ready");
+        assert!(text.contains("ARG=<--settings>"), "{text}");
+        assert!(text.contains("ARG=<value with spaces>"), "{text}");
+        assert!(text.contains("IDENTITY=1"), "{text}");
+        assert!(text.contains("PROGRAM=kumu"), "{text}");
+        assert!(text.contains("TTY=/dev/"), "{text}");
+        assert!(text.contains("tty-writable"), "{text}");
+    }
+
+    #[test]
+    fn pty_notifications_are_consumed_once_and_survive_screen_reads() {
+        let (term, _wake) = Term::launch(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                r"printf '\033]9;Task ready\007'; echo notification-sent; sleep 1".into(),
+            ],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        assert!(wait_text(&term, "notification-sent").contains("notification-sent"));
+        assert_eq!(
+            term.take_notification().expect("PTY notification").body,
+            "Task ready"
+        );
+        term.snapshot();
+        term.resize(90, 30, 8, 16);
+        assert_eq!(term.take_notification(), None);
+    }
+
+    #[test]
+    fn notifications_from_one_read_are_consumed_in_order() {
+        let (term, _wake) = Term::launch(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                r"printf '\033]9;first\007\033]9;second\007'; echo notifications-sent; sleep 1"
+                    .into(),
+            ],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        assert!(wait_text(&term, "notifications-sent").contains("notifications-sent"));
+        assert_eq!(term.take_notification().expect("first").body, "first");
+        assert_eq!(term.take_notification().expect("second").body, "second");
+        assert_eq!(term.take_notification(), None);
     }
 
     #[test]

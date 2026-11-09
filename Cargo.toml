@@ -1,6 +1,6 @@
 [package]
 name = "kumu"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+jsonc-parser = { version = "0.34.0", features = ["cst", "serde_json"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }

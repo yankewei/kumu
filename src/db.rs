@@ -393,6 +393,9 @@ pub const SETTING_FONT_SIZE: &str = "font_size";
 /// Setting key holding the last light/dark choice: `"light"` or `"dark"`.
 pub const SETTING_THEME_MODE: &str = "theme_mode";
 
+/// Whether terminal attention notifications are enabled (`"0"` disables them).
+pub const SETTING_NOTIFICATIONS: &str = "notifications";
+
 /// Setting key marking that the first-run project/session were seeded. It stays
 /// after the user deletes them, so an intentionally empty workspace is not
 /// refilled on the next launch.

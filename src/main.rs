@@ -35,6 +35,9 @@ use gpui_kit::*;
 use ui::KumuApp;
 
 fn main() {
+    if let Some(code) = agent::integration::run_cli() {
+        std::process::exit(code);
+    }
     let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
 
     // Closing the last window on macOS leaves the app running. A Dock click
@@ -44,6 +47,7 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         ui::init(cx);
+        cx.set_app_identity("com.yankewei.kumu", "Kumu");
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);

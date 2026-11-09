@@ -17,9 +17,20 @@ pub fn open(program: &str, args: &[String], cwd: &Path, size: PtySize) -> std::i
         .openpty(size)
         .map_err(std::io::Error::other)?;
     let mut cmd = CommandBuilder::new(program);
-    for arg in args {
-        cmd.arg(arg);
+    cmd.args(args);
+    cmd.env("KUMU_TERMINAL", "1");
+    if let Ok(binary) = std::env::current_exe() {
+        cmd.env("KUMU_APP_BINARY", binary);
+    } else {
+        cmd.env_remove("KUMU_APP_BINARY");
     }
+    // Agent hooks run without a controlling terminal (Claude/Codex detach
+    // them), so they cannot rely on `/dev/tty`. The slave's device path is the
+    // channel back to this terminal's VT.
+    if let Some(tty) = pair.master.tty_name() {
+        cmd.env("KUMU_TTY", tty);
+    }
+    cmd.env("TERM_PROGRAM", "kumu");
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");

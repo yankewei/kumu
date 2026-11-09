@@ -12,6 +12,7 @@ Kumu 将 Codex、Claude Code、OpenCode、Pi、omp 等工具的原生终端界�
 - **原生 Agent 体验**：直接运行 Agent 自带的交互界面，保留熟悉的命令和操作方式。
 - **本地数据**：项目与会话记录保存在本机 SQLite 数据库中。
 - **Agent 检测**：在设置中查看已安装的 Agent，支持深浅色外观。
+- **Agent 通知**：在设置中为 Codex、Claude Code、OpenCode、Pi 和 Oh My Pi 安装持久通知接入，接收任务结束、提问与确认提醒；后台会话显示未读标记，应用在后台时发送 macOS 系统通知，点击可回到对应终端。可在 **设置 → 通用 → Agent 通知** 中关闭。
 - **应用内更新**：启动时检查新版本，在侧栏查看更新提示、下载进度和重启入口。
 
 ## 安装
@@ -31,6 +32,16 @@ Kumu 将 Codex、Claude Code、OpenCode、Pi、omp 等工具的原生终端界�
 3. 输入 `codex`、`claude`、`opencode`、`pi` 或 `omp`，启动要使用的 Agent。
 
 需要同时处理多个任务时，可拆分终端面板。打开 **设置 → 编码 Agent**，可以查看 Agent 的安装检测结果。
+
+打开 **设置 → 服务商 → 编码 Agent**，点击对应 Agent 的 **接入通知**，再重新启动该 Agent。通知 hooks／扩展会注册到 Agent 自己的配置或自动发现目录；随后可照常通过命令、绝对路径或自定义脚本启动，Kumu 原样保留启动参数。Codex 需要在 `/hooks` 中审查并信任新增 hooks。设置提供修复和移除，只管理 Kumu 自己的注册，保留已有 hooks 与配置注释。详见 [Agent 通知接入说明](docs/agent-notifications.md)。
+
+macOS 系统通知需要从 `.app` 启动，并在首次提醒时允许通知；也可在 **系统设置 → 通知 → Kumu** 中调整。`cargo run` 提供应用内提醒与未读标记。
+
+可在终端中运行以下命令测试，然后切换到其他会话或应用：
+
+```sh
+sleep 3; printf '\033]9;任务完成\007'
+```
 
 项目与会话数据库位于 `~/.kumu/kumu.db`。
 

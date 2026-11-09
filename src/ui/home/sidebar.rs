@@ -215,6 +215,16 @@ impl KumuApp {
                                             .hover_label(&self.tooltips, title_tooltip)
                                             .child(title),
                                     )
+                                    .when(
+                                        self.unread_notifications
+                                            .values()
+                                            .any(|session| *session == sid),
+                                        |row| {
+                                            row.child(
+                                                div().size_1p5().rounded_full().bg(theme.link),
+                                            )
+                                        },
+                                    )
                                     .child(div().size(px(14.)).flex_none().child(if shell {
                                         Icon::new(IconName::SquareTerminal)
                                             .with_size(px(14.))

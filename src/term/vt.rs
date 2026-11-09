@@ -1,6 +1,6 @@
 //! libghostty-vt on one thread: bytes in, a cell grid out, query replies back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use ghostty_sys::*;
 
 const SYNC_OUTPUT: GhosttyMode = 2026;
 const GRAPHEME_CLUSTER: GhosttyMode = 2027;
+pub(super) const MAX_NOTIFICATIONS: usize = 128;
 const MAX_HOLD: Duration = Duration::from_millis(1000);
 const SCROLLBACK_MAX_LINES: usize = 10_000;
 const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
@@ -217,11 +218,19 @@ pub struct KeyInput {
     pub alt: bool,
 }
 
+/// A terminal's explicit request for the user's attention.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TermNotification {
+    pub title: String,
+    pub body: String,
+}
+
 struct Shared {
     state: GhosttyRenderState,
     size: GhosttySizeReportSize,
     held_since: Option<Instant>,
     replies: Vec<u8>,
+    notifications: VecDeque<TermNotification>,
 }
 
 fn ok(status: GhosttyResult, what: &str) {
@@ -240,6 +249,41 @@ unsafe extern "C" fn on_write_pty(
             .replies
             .extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
     }
+}
+
+// Ghostty invokes effects synchronously on the terminal's owning thread.
+unsafe extern "C" fn on_desktop_notification(
+    _term: GhosttyTerminal,
+    userdata: *mut c_void,
+    notification: *const GhosttyTerminalDesktopNotification,
+) {
+    // The sized request and its strings are borrowed only for this callback.
+    let Some(notification) = (unsafe { notification.as_ref() }) else {
+        return;
+    };
+    if notification.size < std::mem::size_of::<GhosttyTerminalDesktopNotification>() {
+        return;
+    }
+    let text = |value: GhosttyString| {
+        if value.ptr.is_null() || value.len == 0 {
+            String::new()
+        } else {
+            // Limit untrusted terminal content before copying it into the UI.
+            let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len.min(4096)) };
+            String::from_utf8_lossy(bytes)
+                .chars()
+                .filter(|ch| !ch.is_control() || *ch == '\n')
+                .collect()
+        }
+    };
+    let shared = unsafe { &mut *(userdata as *mut Shared) };
+    if shared.notifications.len() == MAX_NOTIFICATIONS {
+        shared.notifications.pop_front();
+    }
+    shared.notifications.push_back(TermNotification {
+        title: text(notification.title),
+        body: text(notification.body),
+    });
 }
 
 unsafe extern "C" fn on_render_hold(term: GhosttyTerminal, userdata: *mut c_void, held: bool) {
@@ -383,6 +427,7 @@ impl Vt {
                 },
                 held_since: None,
                 replies: Vec::new(),
+                notifications: VecDeque::new(),
             });
             let userdata = &mut *shared as *mut Shared as *const c_void;
             ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_USERDATA, userdata);
@@ -397,6 +442,14 @@ impl Vt {
                 term,
                 GHOSTTY_TERMINAL_OPT_SIZE,
                 std::mem::transmute::<GhosttyTerminalSizeFn, *const c_void>(size),
+            );
+            let notification: GhosttyTerminalDesktopNotificationFn = Some(on_desktop_notification);
+            ghostty_terminal_set(
+                term,
+                GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
+                std::mem::transmute::<GhosttyTerminalDesktopNotificationFn, *const c_void>(
+                    notification,
+                ),
             );
             let write: GhosttyTerminalWritePtyFn = Some(on_write_pty);
             ghostty_terminal_set(
@@ -495,6 +548,10 @@ impl Vt {
 
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.shared.replies)
+    }
+
+    pub fn take_notification(&mut self) -> Option<TermNotification> {
+        self.shared.notifications.pop_front()
     }
 
     /// How long to wait before a held synchronized-output frame must be shown.
@@ -1297,6 +1354,58 @@ mod tests {
 
     fn cell(snapshot: &Snapshot, x: usize, y: usize) -> &Cell {
         &snapshot.cells[y][x]
+    }
+
+    #[test]
+    fn terminal_notifications_parse_across_pty_reads() {
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"\x1b]9;");
+        assert_eq!(vt.take_notification(), None);
+        vt.write("任务完成".as_bytes());
+        // Ghostty dispatches OSC on ESC, before consuming ST's final slash.
+        vt.write(b"\x1b");
+        assert_eq!(
+            vt.take_notification(),
+            Some(TermNotification {
+                title: String::new(),
+                body: "任务完成".into(),
+            })
+        );
+        vt.write(b"\\");
+        assert_eq!(vt.take_notification(), None);
+
+        vt.write(b"\x1b]777;notify;Claude;Permission needed\x07");
+        assert_eq!(
+            vt.take_notification(),
+            Some(TermNotification {
+                title: "Claude".into(),
+                body: "Permission needed".into(),
+            })
+        );
+        assert_eq!(
+            vt.take_notification(),
+            None,
+            "OSC's BEL terminator is not another bell"
+        );
+    }
+
+    #[test]
+    fn terminal_titles_progress_and_bells_do_not_request_attention() {
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"\x1b]2;Terminal title\x07\x1b]9;4;1;50\x07");
+        assert_eq!(vt.take_notification(), None);
+        vt.write(b"\x07\x07");
+        assert_eq!(vt.take_notification(), None);
+        vt.write(b"\x1b]9;Ready\x07\x07");
+        assert_eq!(
+            vt.take_notification().expect("OSC notification").body,
+            "Ready"
+        );
+        assert_eq!(
+            vt.take_notification(),
+            None,
+            "a following bell must not create another alert"
+        );
     }
 
     #[test]
