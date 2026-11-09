@@ -37,30 +37,42 @@ use ui::KumuApp;
 fn main() {
     let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
 
+    // Closing the last window on macOS leaves the app running. A Dock click
+    // must create a window again instead of only activating the empty app.
+    app.on_reopen(open_main_window);
+
     app.run(move |cx| {
         gpui_kit::init(cx);
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);
-        let mut window_options = TitleBar::window_options();
-        window_options.window_bounds = Some(
-            window_state::load(cx)
-                .unwrap_or_else(|| WindowBounds::centered(size(px(1360.), px(900.)), cx)),
-        );
-        window_options.window_min_size = Some(size(
-            px(window_state::MIN_WIDTH),
-            px(window_state::MIN_HEIGHT),
-        ));
-
-        cx.spawn(async move |cx| {
-            match cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| KumuApp::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            }) {
-                Ok(_) => eprintln!("[ui] window opened"),
-                Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),
-            }
-        })
-        .detach();
+        cx.spawn(async move |cx| cx.update(open_main_window))
+            .detach();
     });
+}
+
+fn open_main_window(cx: &mut App) {
+    // Keep the check and creation synchronous so repeated reopen events
+    // cannot queue multiple main windows.
+    if !cx.windows().is_empty() {
+        return;
+    }
+
+    let mut window_options = TitleBar::window_options();
+    window_options.window_bounds = Some(
+        window_state::load(cx)
+            .unwrap_or_else(|| WindowBounds::centered(size(px(1360.), px(900.)), cx)),
+    );
+    window_options.window_min_size = Some(size(
+        px(window_state::MIN_WIDTH),
+        px(window_state::MIN_HEIGHT),
+    ));
+
+    match cx.open_window(window_options, |window, cx| {
+        let view = cx.new(|cx| KumuApp::new(window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    }) {
+        Ok(_) => eprintln!("[ui] window opened"),
+        Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),
+    }
 }
