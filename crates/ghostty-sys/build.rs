@@ -62,7 +62,10 @@ fn main() {
         .arg(out.join("zig-cache"))
         .status()
         .unwrap_or_else(|e| panic!("cannot run {zig:?} (Zig 0.16 required): {e}"));
-    assert!(status.success(), "zig build of libghostty-vt failed: {status}");
+    assert!(
+        status.success(),
+        "zig build of libghostty-vt failed: {status}"
+    );
 
     let lib = out.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
