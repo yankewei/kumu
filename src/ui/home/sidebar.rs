@@ -1,6 +1,10 @@
 //! Left column: projects, sessions, and settings entry.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::Cancel;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -79,18 +83,18 @@ impl KumuApp {
                     .context_menu({
                         let weak = weak.clone();
                         move |menu, _, _| {
-                            let rename = PopupMenuItem::new("重命名").on_click({
+                            let rename = menu_action("重命名", {
                                 let weak = weak.clone();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, move |app, cx| {
+                                move |window, cx| {
+                                    let _ = weak.update(cx, |app, cx| {
                                         app.prompt_rename_project(project_id, window, cx)
                                     });
                                 }
                             });
-                            let delete = PopupMenuItem::new("删除").on_click({
+                            let delete = menu_action("删除", {
                                 let weak = weak.clone();
-                                move |_, window, cx| {
-                                    let _ = weak.update(cx, move |app, cx| {
+                                move |window, cx| {
+                                    let _ = weak.update(cx, |app, cx| {
                                         app.confirm_delete_project(project_id, window, cx)
                                     });
                                 }
@@ -121,23 +125,46 @@ impl KumuApp {
                             .child(project_name),
                     )
                     .child(
-                        div()
-                            .id(format!("project-new-session-{project_id}"))
-                            .rounded(radius)
-                            .p_0p5()
-                            .cursor_pointer()
-                            .text_color(muted_fg)
-                            .opacity(0.)
-                            .group_hover(group, |style| style.opacity(1.))
-                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .hover_label(&self.tooltips, "新建终端")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.new_session(Some(project_id), cx);
-                                this.focus_terminal(window, cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                            .child(Icon::new(IconName::SquareTerminal).small()),
+                        h_flex()
+                            .flex_none()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .id(format!("project-remove-{project_id}"))
+                                    .rounded(radius)
+                                    .p_0p5()
+                                    .cursor_pointer()
+                                    .text_color(muted_fg)
+                                    .opacity(0.)
+                                    .group_hover(group.clone(), |style| style.opacity(1.))
+                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                    .hover_label(&self.tooltips, "移除项目")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_delete_project(project_id, window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(IconName::Close).small()),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("project-new-session-{project_id}"))
+                                    .rounded(radius)
+                                    .p_0p5()
+                                    .cursor_pointer()
+                                    .text_color(muted_fg)
+                                    .opacity(0.)
+                                    .group_hover(group, |style| style.opacity(1.))
+                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                    .hover_label(&self.tooltips, "新建终端")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.new_session(Some(project_id), cx);
+                                        this.focus_terminal(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(IconName::SquareTerminal).small()),
+                            ),
                     )
                     .into_any_element(),
             );
@@ -206,18 +233,18 @@ impl KumuApp {
                             .context_menu({
                                 let weak = weak.clone();
                                 move |menu, _, _| {
-                                    let rename = PopupMenuItem::new("重命名").on_click({
+                                    let rename = menu_action("重命名", {
                                         let weak = weak.clone();
-                                        move |_, window, cx| {
-                                            let _ = weak.update(cx, move |app, cx| {
+                                        move |window, cx| {
+                                            let _ = weak.update(cx, |app, cx| {
                                                 app.prompt_rename_session(sid, window, cx)
                                             });
                                         }
                                     });
-                                    let delete = PopupMenuItem::new("删除").on_click({
+                                    let delete = menu_action("删除", {
                                         let weak = weak.clone();
-                                        move |_, window, cx| {
-                                            let _ = weak.update(cx, move |app, cx| {
+                                        move |window, cx| {
+                                            let _ = weak.update(cx, |app, cx| {
                                                 app.confirm_delete_session(sid, window, cx)
                                             });
                                         }
@@ -313,4 +340,45 @@ impl KumuApp {
                     ),
             )
     }
+}
+
+/// A context-menu row that runs on mouse-down.
+///
+/// gpui-kit 0.6 draws a context menu in a deferred overlay, where
+/// `PopupMenuItem::on_click` never fires (longbridge/gpui-component#3134).
+/// The menu is dismissed on the press so the overlay is gone before a
+/// confirm dialog opens. Enter goes through the item's click handler, and
+/// `fired` collapses the two paths into one dialog.
+fn menu_action(
+    label: &'static str,
+    on_press: impl Fn(&mut Window, &mut App) + 'static,
+) -> PopupMenuItem {
+    let on_press = Rc::new(on_press);
+    let fired = Rc::new(Cell::new(false));
+    let run = Rc::new(move |window: &mut Window, cx: &mut App| {
+        if fired.replace(true) {
+            return;
+        }
+        let on_press = on_press.clone();
+        window.defer(cx, move |window, cx| on_press(window, cx));
+    });
+    let run_mouse = run.clone();
+    PopupMenuItem::element(move |_, _| {
+        let run_mouse = run_mouse.clone();
+        div()
+            .w_full()
+            .flex_1()
+            .text_sm()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(Box::new(Cancel), cx);
+                run_mouse(window, cx);
+            })
+            .child(label)
+    })
+    .on_click({
+        let run = run.clone();
+        move |_, window, cx| run(window, cx)
+    })
 }
