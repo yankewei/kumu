@@ -121,23 +121,46 @@ impl KumuApp {
                             .child(project_name),
                     )
                     .child(
-                        div()
-                            .id(format!("project-new-session-{project_id}"))
-                            .rounded(radius)
-                            .p_0p5()
-                            .cursor_pointer()
-                            .text_color(muted_fg)
-                            .opacity(0.)
-                            .group_hover(group, |style| style.opacity(1.))
-                            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .hover_label(&self.tooltips, "新建终端")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.new_session(Some(project_id), cx);
-                                this.focus_terminal(window, cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }))
-                            .child(Icon::new(IconName::SquareTerminal).small()),
+                        h_flex()
+                            .flex_none()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .id(format!("project-remove-{project_id}"))
+                                    .rounded(radius)
+                                    .p_0p5()
+                                    .cursor_pointer()
+                                    .text_color(muted_fg)
+                                    .opacity(0.)
+                                    .group_hover(group.clone(), |style| style.opacity(1.))
+                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                    .hover_label(&self.tooltips, "移除项目")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_delete_project(project_id, window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(IconName::Close).small()),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("project-new-session-{project_id}"))
+                                    .rounded(radius)
+                                    .p_0p5()
+                                    .cursor_pointer()
+                                    .text_color(muted_fg)
+                                    .opacity(0.)
+                                    .group_hover(group, |style| style.opacity(1.))
+                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                    .hover_label(&self.tooltips, "新建终端")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.new_session(Some(project_id), cx);
+                                        this.focus_terminal(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(IconName::SquareTerminal).small()),
+                            ),
                     )
                     .into_any_element(),
             );
