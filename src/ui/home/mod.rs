@@ -101,6 +101,9 @@ impl KumuApp {
                 let Some(session_info) = workspace.session(*session) else {
                     return;
                 };
+                if cx.global::<NotificationSettings>().sound {
+                    window.play_system_bell();
+                }
                 let project = workspace
                     .projects()
                     .iter()

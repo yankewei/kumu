@@ -50,7 +50,7 @@ Claude Code 和 Codex 都会把 command hook 放到没有控制终端的新 sess
 - Kumu 在后台时同时发送 macOS 系统通知，需从 `.app` 启动并允许通知。`cargo run` 保留应用内提示和未读标记。
 - 点击提醒回到发出事件的终端，包括不同分栏和隐藏的进程；已退出的终端保留最后输出。
 - 内容相同的短时间重复提醒会合并；输入请求与任务结束提醒互不抑制。
-- **设置 → 通用 → Agent 通知** 可关闭显示；持久接入可在编码 Agent 列表中独立移除。
+- **设置 → 通用 → Agent 通知** 可关闭显示或提示音；持久接入可在编码 Agent 列表中独立移除。
 
 `Stop` 表示本轮 Agent 工作已结束，不表示 Kumu 验证了任务成果。Pi 使用 `agent_settled`，会跳过取消、自动重试／压缩、排队中的下一条输入、无交互界面的运行及子 Agent 完成事件；OMP 通过 `agent_end` 的 `isTerminal`／`yielded` 过滤中间态。Claude 的 `PermissionRequest` 负责权限提醒，`Notification` 只保留 MCP elicitation，避免与“任务结束”“空闲等待”重复。OpenCode 子会话不单独提醒，失败使用失败提示。
 

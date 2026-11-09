@@ -730,7 +730,32 @@ impl SettingsWindow {
                     );
                     return;
                 }
-                cx.set_global(NotificationSettings { enabled: *checked });
+                let sound = cx.global::<NotificationSettings>().sound;
+                cx.set_global(NotificationSettings {
+                    enabled: *checked,
+                    sound,
+                });
+                window.refresh();
+            })
+            .into_any_element();
+        let notification_sound = Switch::new("notification-sound")
+            .checked(cx.global::<NotificationSettings>().sound)
+            .on_click(|checked, window, cx| {
+                if let Err(error) = db::set_setting(
+                    db::SETTING_NOTIFICATION_SOUND,
+                    if *checked { "1" } else { "0" },
+                ) {
+                    window.push_notification(
+                        Notification::error(format!("保存提示音设置失败：{error}")),
+                        cx,
+                    );
+                    return;
+                }
+                let enabled = cx.global::<NotificationSettings>().enabled;
+                cx.set_global(NotificationSettings {
+                    enabled,
+                    sound: *checked,
+                });
                 window.refresh();
             })
             .into_any_element();
@@ -779,6 +804,13 @@ impl SettingsWindow {
                 "Agent 通知",
                 "任务完成或需要输入、确认时提醒；应用在后台时发送系统通知。",
                 notifications,
+                border,
+                false,
+            ))
+            .child(row(
+                "通知提示音",
+                "提醒时播放 macOS 提示音；仅在 Agent 通知开启时生效。",
+                notification_sound,
                 border,
                 false,
             ))

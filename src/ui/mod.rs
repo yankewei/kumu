@@ -14,6 +14,8 @@ pub fn init(cx: &mut gpui_kit::App) {
         cx.set_global(crate::app::NotificationSettings {
             enabled: crate::db::get_setting(crate::db::SETTING_NOTIFICATIONS).as_deref()
                 != Some("0"),
+            sound: crate::db::get_setting(crate::db::SETTING_NOTIFICATION_SOUND).as_deref()
+                != Some("0"),
         });
     }
     // Root's focus-navigation actions run before on_key_down. Let the

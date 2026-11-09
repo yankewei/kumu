@@ -19,6 +19,8 @@ use crate::theme;
 /// Shared by the home and settings windows; changes apply immediately.
 pub struct NotificationSettings {
     pub enabled: bool,
+    /// Play the macOS alert sound when an attention notification is raised.
+    pub sound: bool,
 }
 
 impl Global for NotificationSettings {}

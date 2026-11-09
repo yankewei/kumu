@@ -396,6 +396,9 @@ pub const SETTING_THEME_MODE: &str = "theme_mode";
 /// Whether terminal attention notifications are enabled (`"0"` disables them).
 pub const SETTING_NOTIFICATIONS: &str = "notifications";
 
+/// Whether attention notifications play the macOS alert sound (`"0"` mutes).
+pub const SETTING_NOTIFICATION_SOUND: &str = "notification_sound";
+
 /// Setting key marking that the first-run project/session were seeded. It stays
 /// after the user deletes them, so an intentionally empty workspace is not
 /// refilled on the next launch.
