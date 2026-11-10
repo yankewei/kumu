@@ -570,7 +570,8 @@ impl KumuApp {
         self.pending_focus = Some(next);
         // Last pane for this session: drop the sidebar row so Close does not
         // leave an orphan "终端".
-        if !self.pane_shows(session_id, cx) && self.workspace.read(cx).session(session_id).is_some() {
+        if !self.pane_shows(session_id, cx) && self.workspace.read(cx).session(session_id).is_some()
+        {
             self.workspace.update(cx, |workspace, cx| {
                 let _ = workspace.delete_session(session_id, cx);
             });
