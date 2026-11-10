@@ -78,11 +78,6 @@ pub struct SavedWorkspace {
 
 /// Persisted layouts that passed validation.
 pub struct RestoredWorkspace {
-    /// Compatibility view of the selected session's layout.
-    pub layout: PaneNode,
-    /// Compatibility mapping of the selected session's leaves.
-    pub sessions: HashMap<u64, i64>,
-    pub focused: PaneId,
     pub layouts: HashMap<i64, PaneNode>,
     pub focused_by_session: HashMap<i64, PaneId>,
     pub selected: Option<i64>,
@@ -197,7 +192,9 @@ impl SavedWorkspace {
             .saturating_add(1)
             .max(2);
         let selected = selected?;
-        let (layout, sessions, focused) = if state.version == 1 {
+        // Version 1 stored one global tree; its per-group ratios still apply
+        // to the per-session trees that were just derived from it.
+        if state.version == 1 {
             let valid: HashSet<u64> = state
                 .panes
                 .iter()
@@ -206,42 +203,14 @@ impl SavedWorkspace {
                 .collect();
             let mut legacy_groups = HashMap::new();
             let mut legacy_next = 1;
-            let legacy_layout =
-                state
-                    .layout
-                    .restore(&valid, &mut legacy_next, &mut legacy_groups)?;
+            state
+                .layout
+                .restore(&valid, &mut legacy_next, &mut legacy_groups)?;
             for (group, sizes) in legacy_groups {
                 group_sizes.entry(group).or_insert(sizes);
             }
-            let legacy_focus = if legacy_layout.panes().contains(&PaneId(state.focused)) {
-                PaneId(state.focused)
-            } else {
-                legacy_layout.panes()[0]
-            };
-            let bindings = state
-                .panes
-                .iter()
-                .filter(|pane| session_exists(pane.session))
-                .map(|pane| (pane.pane, pane.session))
-                .collect();
-            (legacy_layout, bindings, legacy_focus)
-        } else {
-            let layout = layouts.get(&selected)?.clone();
-            let focused = focused_by_session
-                .get(&selected)
-                .copied()
-                .unwrap_or(PaneId(1));
-            let sessions = layout
-                .panes()
-                .into_iter()
-                .map(|pane| (pane.0, selected))
-                .collect();
-            (layout, sessions, focused)
-        };
+        }
         Some(RestoredWorkspace {
-            layout,
-            sessions,
-            focused,
             layouts,
             focused_by_session,
             selected: Some(selected),
@@ -308,20 +277,7 @@ fn restore_session_layouts(
     let selected = selected
         .filter(|session| layouts.contains_key(session))
         .or_else(|| layouts.keys().next().copied())?;
-    let layout = layouts.get(&selected)?.clone();
-    let focused = focused_by_session
-        .get(&selected)
-        .copied()
-        .unwrap_or(PaneId(1));
-    let sessions = layout
-        .panes()
-        .into_iter()
-        .map(|pane| (pane.0, selected))
-        .collect();
     Some(RestoredWorkspace {
-        layout,
-        sessions,
-        focused,
         layouts,
         focused_by_session,
         selected: Some(selected),
@@ -733,7 +689,9 @@ mod tests {
         let restored =
             SavedWorkspace::restore(&serde_json::to_string(&saved).unwrap(), |_| true, |_| true)
                 .expect("the old layout is still usable");
-        assert_eq!(restored.layout.panes(), vec![PaneId(1), PaneId(2)]);
+        assert_eq!(restored.layouts.len(), 2);
+        assert_eq!(restored.layouts.get(&10).unwrap().panes(), vec![PaneId(1)]);
+        assert_eq!(restored.layouts.get(&20).unwrap().panes(), vec![PaneId(2)]);
         assert_eq!(restored.group_sizes.get(&1), Some(&Vec::new()));
     }
 
@@ -830,8 +788,12 @@ mod tests {
         let restored =
             SavedWorkspace::restore(&json, |session| session == 20, |project| project == 3)
                 .expect("one live pane");
-        assert_eq!(restored.layout.panes(), vec![PaneId(2)]);
-        assert_eq!(restored.focused, PaneId(2));
+        assert_eq!(restored.selected, Some(20));
+        assert_eq!(
+            restored.layouts.get(&20).map(PaneNode::panes),
+            Some(vec![PaneId(2)])
+        );
+        assert_eq!(restored.focused_by_session.get(&20), Some(&PaneId(2)));
         assert_eq!(restored.collapsed_projects, vec![3]);
         assert_eq!(restored.next_pane, 3);
     }

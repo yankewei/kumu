@@ -266,7 +266,6 @@ impl KumuApp {
             group_sizes,
             next_pane,
             next_group,
-            ..
         } = restored;
         self.layouts = layouts;
         self.focused_by_session = focused_by_session;
@@ -462,10 +461,10 @@ impl KumuApp {
     }
 
     fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
-        if self.selected != Some(id) {
-            if let Some(previous) = self.selected {
-                self.hide_session_panes(previous, cx);
-            }
+        if self.selected != Some(id)
+            && let Some(previous) = self.selected
+        {
+            self.hide_session_panes(previous, cx);
         }
         self.ensure_session_layout(id, cx);
         self.selected = Some(id);
