@@ -153,16 +153,18 @@ impl SavedWorkspace {
         for (session, valid_panes) in grouped {
             let mut local_groups = HashMap::new();
             let mut local_next_group = next_group;
-            let layout = state
-                .layout
-                .restore(&valid_panes, &mut local_next_group, &mut local_groups)?;
+            let layout =
+                state
+                    .layout
+                    .restore(&valid_panes, &mut local_next_group, &mut local_groups)?;
             let leaves = layout.panes();
             if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
                 continue;
             }
-            if leaves.iter().any(|pane| {
-                pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen_panes.insert(pane.0)
-            }) {
+            if leaves
+                .iter()
+                .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen_panes.insert(pane.0))
+            {
                 continue;
             }
             next_group = local_next_group;
@@ -181,18 +183,33 @@ impl SavedWorkspace {
             .find(|pane| pane.pane == state.focused && layouts.contains_key(&pane.session))
             .map(|pane| pane.session)
             .or_else(|| layouts.keys().next().copied());
-        let collapsed_projects = state.collapsed_projects.iter().copied()
-            .filter(|id| project_exists(*id)).collect();
-        let next_pane = seen_panes.iter().copied().max().unwrap_or(1).saturating_add(1).max(2);
+        let collapsed_projects = state
+            .collapsed_projects
+            .iter()
+            .copied()
+            .filter(|id| project_exists(*id))
+            .collect();
+        let next_pane = seen_panes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .saturating_add(1)
+            .max(2);
         let selected = selected?;
         let (layout, sessions, focused) = if state.version == 1 {
-            let valid: HashSet<u64> = state.panes.iter()
+            let valid: HashSet<u64> = state
+                .panes
+                .iter()
                 .filter(|pane| session_exists(pane.session))
                 .map(|pane| pane.pane)
                 .collect();
             let mut legacy_groups = HashMap::new();
             let mut legacy_next = 1;
-            let legacy_layout = state.layout.restore(&valid, &mut legacy_next, &mut legacy_groups)?;
+            let legacy_layout =
+                state
+                    .layout
+                    .restore(&valid, &mut legacy_next, &mut legacy_groups)?;
             for (group, sizes) in legacy_groups {
                 group_sizes.entry(group).or_insert(sizes);
             }
@@ -201,15 +218,24 @@ impl SavedWorkspace {
             } else {
                 legacy_layout.panes()[0]
             };
-            let bindings = state.panes.iter()
+            let bindings = state
+                .panes
+                .iter()
                 .filter(|pane| session_exists(pane.session))
                 .map(|pane| (pane.pane, pane.session))
                 .collect();
             (legacy_layout, bindings, legacy_focus)
         } else {
             let layout = layouts.get(&selected)?.clone();
-            let focused = focused_by_session.get(&selected).copied().unwrap_or(PaneId(1));
-            let sessions = layout.panes().into_iter().map(|pane| (pane.0, selected)).collect();
+            let focused = focused_by_session
+                .get(&selected)
+                .copied()
+                .unwrap_or(PaneId(1));
+            let sessions = layout
+                .panes()
+                .into_iter()
+                .map(|pane| (pane.0, selected))
+                .collect();
             (layout, sessions, focused)
         };
         Some(RestoredWorkspace {
@@ -247,14 +273,17 @@ fn restore_session_layouts(
         let ids = saved.layout.pane_ids();
         let mut local_groups = HashMap::new();
         let mut local_next_group = next_group;
-        let layout = saved.layout.restore(&ids, &mut local_next_group, &mut local_groups)?;
+        let layout = saved
+            .layout
+            .restore(&ids, &mut local_next_group, &mut local_groups)?;
         let leaves = layout.panes();
         if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
             continue;
         }
-        if leaves.iter().any(|pane| {
-            pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen.insert(pane.0)
-        }) {
+        if leaves
+            .iter()
+            .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen.insert(pane.0))
+        {
             continue;
         }
         next_group = local_next_group;
@@ -268,7 +297,11 @@ fn restore_session_layouts(
         );
         focused_by_session.insert(
             saved.session,
-            if leaves.contains(&PaneId(saved.focused)) { PaneId(saved.focused) } else { leaves[0] },
+            if leaves.contains(&PaneId(saved.focused)) {
+                PaneId(saved.focused)
+            } else {
+                leaves[0]
+            },
         );
         layouts.insert(saved.session, layout);
     }
@@ -276,8 +309,15 @@ fn restore_session_layouts(
         .filter(|session| layouts.contains_key(session))
         .or_else(|| layouts.keys().next().copied())?;
     let layout = layouts.get(&selected)?.clone();
-    let focused = focused_by_session.get(&selected).copied().unwrap_or(PaneId(1));
-    let sessions = layout.panes().into_iter().map(|pane| (pane.0, selected)).collect();
+    let focused = focused_by_session
+        .get(&selected)
+        .copied()
+        .unwrap_or(PaneId(1));
+    let sessions = layout
+        .panes()
+        .into_iter()
+        .map(|pane| (pane.0, selected))
+        .collect();
     Some(RestoredWorkspace {
         layout,
         sessions,
@@ -300,10 +340,7 @@ impl SavedNode {
     fn pane_ids(&self) -> HashSet<u64> {
         match self {
             Self::Leaf { pane } => HashSet::from([*pane]),
-            Self::Group { children, .. } => children
-                .iter()
-                .flat_map(Self::pane_ids)
-                .collect(),
+            Self::Group { children, .. } => children.iter().flat_map(Self::pane_ids).collect(),
             Self::SessionLayouts { sessions, .. } => sessions
                 .iter()
                 .flat_map(|session| session.layout.pane_ids())
