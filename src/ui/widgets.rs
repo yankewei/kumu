@@ -1,6 +1,5 @@
 //! Shared UI building blocks (theme-token helpers reused across windows).
 
-use gpui_kit::component::theme::Colorize as _;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -10,10 +9,8 @@ use gpui_kit::*;
 pub enum PillTone {
     /// Link-tinted: the healthy state kumu itself owns.
     Accent,
-    /// Muted: absence, or a state that could not be read.
+    /// Muted: absence, or a secondary fact about the row.
     Neutral,
-    /// Amber-tinted: something the user should put right.
-    Warning,
 }
 
 /// A small status pill, Zed-badge style.
@@ -21,12 +18,6 @@ pub fn pill(tone: PillTone, label: impl Into<SharedString>, theme: &Theme) -> Di
     let (bg, fg) = match tone {
         PillTone::Accent => (theme.primary.opacity(0.14), theme.link),
         PillTone::Neutral => (theme.muted, theme.muted_foreground),
-        // Amber itself is too light for badge text on a light card; pull it
-        // toward the foreground, which darkens it on light and lifts it on dark.
-        PillTone::Warning => (
-            theme.warning.opacity(0.16),
-            theme.warning.mix_oklab(theme.foreground, 0.45),
-        ),
     };
     div()
         .px_2()

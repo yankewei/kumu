@@ -33,7 +33,7 @@ Kumu 将 Codex、Claude Code、OpenCode、Pi、omp 等工具的原生终端界�
 
 需要同时处理多个任务时，可拆分终端面板。打开 **设置 → 编码 Agent**，可以查看 Agent 的安装检测结果。
 
-打开 **设置 → 服务商 → 编码 Agent**，点击对应 Agent 的 **接入通知**，再重新启动该 Agent。通知 hooks／扩展会注册到 Agent 自己的配置或自动发现目录；随后可照常通过命令、绝对路径或自定义脚本启动，Kumu 原样保留启动参数。Codex 需要在 `/hooks` 中审查并信任新增 hooks。设置提供修复和移除，只管理 Kumu 自己的注册，保留已有 hooks 与配置注释。详见 [Agent 通知接入说明](docs/agent-notifications.md)。
+打开 **设置 → 服务商 → 编码 Agent**，对已安装的 Agent 点击 **开启通知**，再重新启动该 Agent。通知 hooks／扩展会注册到 Agent 自己的配置或自动发现目录；随后可照常通过命令、绝对路径或自定义脚本启动，Kumu 原样保留启动参数。已开启时同一位置显示 **关闭通知**，未安装的 Agent 只显示“未安装”，不提供通知操作。Codex 需要在 `/hooks` 中审查并信任新增 hooks。设置只管理 Kumu 自己的注册，保留已有 hooks 与配置注释。详见 [Agent 通知接入说明](docs/agent-notifications.md)。
 
 macOS 系统通知需要从 `.app` 启动，并在首次提醒时允许通知；也可在 **系统设置 → 通知 → Kumu** 中调整。`cargo run` 提供应用内提醒与未读标记。
 

@@ -183,13 +183,13 @@ impl SettingsWindow {
                 this.integrations.insert(agent, status);
                 let note = match result {
                     Ok(()) => Notification::success(if remove {
-                        "已移除通知接入；请重新启动 Agent。"
+                        "已关闭通知；请重新启动 Agent。"
                     } else if agent == "codex" {
-                        "已注册通知 hooks；重新启动 Codex 后，请在 /hooks 中审查并信任。"
+                        "已开启通知；重新启动 Codex 后，请在 /hooks 中审查并信任。"
                     } else {
-                        "已安装通知接入；请重新启动 Agent。"
+                        "已开启通知；请重新启动 Agent。"
                     }),
-                    Err(error) => Notification::error(format!("通知接入失败：{error}")),
+                    Err(error) => Notification::error(format!("通知设置失败：{error}")),
                 };
                 let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
                 cx.notify();
@@ -437,36 +437,20 @@ impl SettingsWindow {
                 let agent = a.id;
                 let status = self.integrations.get(agent);
                 let registered = matches!(status, Some(Ok(integration::Status::Registered)));
-                let needs_repair = matches!(status, Some(Ok(integration::Status::NeedsRepair)));
-                // The pill is the state this row acts on — notification
-                // registration — so it always agrees with the button beside it.
-                // Whether the agent's own CLI is installed is another fact: a
-                // quiet tag by the name, since this card cannot install it.
-                let (tone, pill_label) = match status {
-                    Some(Ok(integration::Status::Registered)) => (PillTone::Accent, "已接入"),
-                    Some(Ok(integration::Status::NeedsRepair)) => (PillTone::Warning, "需修复"),
-                    Some(Err(_)) => (PillTone::Neutral, "状态未知"),
-                    _ => (PillTone::Neutral, "未接入"),
-                };
-                // The common case keeps two lines; a hint adds a third only
-                // when there is something the row itself cannot say.
-                let hint = match status {
-                    Some(Ok(integration::Status::Registered)) if agent == "codex" => {
-                        Some("在 Codex /hooks 中确认信任")
-                    }
-                    Some(Ok(integration::Status::NeedsRepair)) => {
-                        Some("接入已失效，重新接入即可恢复")
-                    }
-                    Some(Err(_)) => Some("无法读取 Agent 配置，请检查文件权限"),
-                    _ => None,
-                };
-                // A healthy registration has nothing to repair.
-                let primary = if registered {
-                    None
-                } else if needs_repair {
-                    Some("修复接入")
+                // Installed and registered are separate facts. Without the CLI
+                // there is nothing to register against, so the row only reports
+                // the absence. Once installed, one button carries the
+                // notification state: enable when it is off, disable when it is
+                // on.
+                let notification_pill =
+                    (installed && registered).then_some((PillTone::Accent, "已开启"));
+                // The codex hint is the one thing the row itself cannot say.
+                let hint = (installed && registered && agent == "codex")
+                    .then_some("在 Codex /hooks 中确认信任");
+                let (action, removing) = if registered {
+                    ("关闭通知", true)
                 } else {
-                    Some("接入通知")
+                    ("开启通知", false)
                 };
 
                 h_flex()
@@ -512,7 +496,9 @@ impl SettingsWindow {
                                             div().text_xs().text_color(muted_fg).child("· 未安装"),
                                         )
                                     })
-                                    .child(pill(tone, pill_label, theme)),
+                                    .when_some(notification_pill, |line, (tone, label)| {
+                                        line.child(pill(tone, label, theme))
+                                    }),
                             )
                             .child(
                                 div()
@@ -528,39 +514,25 @@ impl SettingsWindow {
                                 )
                             }),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
-                            // The primary action is outlined so it reads as a
-                            // control; removal stays a quiet text button.
-                            .when_some(primary, |row, label| {
-                                row.child(
-                                    Button::new(format!("install-notifications-{agent}"))
-                                        .small()
-                                        .outline()
-                                        .label(label)
-                                        .loading(self.integration_busy == Some(agent))
-                                        .disabled(self.integration_busy.is_some())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.change_integration(agent, false, window, cx)
-                                        })),
-                                )
-                            })
-                            .when(registered || needs_repair, |row| {
-                                row.child(
-                                    Button::new(format!("remove-notifications-{agent}"))
-                                        .small()
-                                        .ghost()
-                                        .label("移除")
-                                        .disabled(self.integration_busy.is_some())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.change_integration(agent, true, window, cx)
-                                        })),
-                                )
-                            }),
-                    )
+                    // One control toggles notification registration, and only
+                    // an installed agent can be a target at all.
+                    .when(installed, |row| {
+                        let button = Button::new(format!("toggle-notifications-{agent}"))
+                            .small()
+                            .label(action)
+                            .loading(self.integration_busy == Some(agent))
+                            .disabled(self.integration_busy.is_some())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.change_integration(agent, removing, window, cx)
+                            }));
+                        // Enabling is the outlined call to action; once on, the
+                        // same control turns into a quiet way to turn it off.
+                        row.child(if removing {
+                            button.ghost()
+                        } else {
+                            button.outline()
+                        })
+                    })
             })
             .collect::<Vec<_>>();
 
@@ -571,7 +543,7 @@ impl SettingsWindow {
                     .gap_1()
                     .child(div().text_xs().font_medium().child("编码 Agent"))
                     .child(div().text_xs().text_color(muted_fg).child(
-                        "接入通知会注册到 Agent 的配置或扩展目录，之后可按原来的方式启动。",
+                        "开启通知会注册到 Agent 的配置或扩展目录，之后可按原来的方式启动。",
                     )),
             )
             .child(v_flex().mt_1().children(rows))
