@@ -2,25 +2,11 @@
 # shellcheck shell=bash
 
 # Prefer an explicit CODESIGN_IDENTITY ("-" = ad-hoc).
-# When unset and REQUIRE_DEVELOPER_ID=1, pick the first Developer ID Application
-# identity from the keychain (local release path — no GitHub secrets).
+# make-app.sh/make-dmg.sh build local test packages, so they default to ad-hoc;
+# a distributable DMG goes through packaging/release.sh and its cloud signing.
 codesign_identity() {
     if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
         echo "$CODESIGN_IDENTITY"
-        return
-    fi
-    if [[ "${REQUIRE_DEVELOPER_ID:-}" == 1 ]]; then
-        local id
-        id="$(security find-identity -v -p codesigning 2>/dev/null \
-            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' \
-            | head -n1)"
-        if [[ -z "$id" ]]; then
-            echo "No Developer ID Application identity in keychain." >&2
-            echo "Install one via Xcode → Settings → Accounts → Manage Certificates," >&2
-            echo "or set CODESIGN_IDENTITY explicitly." >&2
-            return 1
-        fi
-        echo "$id"
         return
     fi
     echo "-"

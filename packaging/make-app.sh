@@ -14,8 +14,9 @@
 # CODEX_BIN / CLAUDE_BIN / PI_BIN (src/agent/config.rs).
 #
 # Signing: set CODESIGN_IDENTITY to a "Developer ID Application: …" identity
-# for release builds (hardened runtime). Unset / "-" keeps an ad-hoc seal for
-# local use. For cloud signing, follow packaging/RELEASING.md.
+# for a locally signed bundle (hardened runtime). Unset / "-" keeps an ad-hoc
+# seal for local use. Distributable DMGs go through packaging/release.sh,
+# which cloud-signs the exported app instead.
 #
 # Usage: packaging/make-app.sh [release|debug] [--open]
 set -euo pipefail

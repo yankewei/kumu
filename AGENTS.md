@@ -19,4 +19,5 @@ Stay on the two-step rem scale; no custom `text_size(px(...))` or `text_base`+ i
 - Use [zed](https://github.com/zed-industries/zed) and [herdr-app](https://github.com/herdrdev/herdr-app) source code on github as a reference when you need to design a UI or build a feature
 
 ## macOS releases
-- 生成可分发的 macOS DMG 或发布新版本时，先读取并执行 [packaging/RELEASING.md](packaging/RELEASING.md)。默认使用已验证的 Xcode 云端 Developer ID 签名流程；不要把缺少本机 Developer ID 私钥直接视为阻断。
+- 生成可分发的 macOS DMG 或发布新版本时，用 `packaging/release.sh`（`--publish` 才打标签上传）；步骤和前置条件见 `.agents/skills/release-macos/SKILL.md`，默认走已验证的 Xcode 云端 Developer ID 签名，不要把缺少本机 Developer ID 私钥视为阻断。
+- `make-app.sh`/`make-dmg.sh` 只做本地测试包，不要在云端签名后重跑它们覆盖正式产物。
