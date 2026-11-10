@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::widgets::{agent_logo, pill};
+use super::widgets::{PillTone, agent_logo, pill};
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
@@ -415,11 +415,9 @@ impl SettingsWindow {
     }
 
     fn render_providers_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let (base_bg, radius, primary, link, muted, muted_fg, border) = (
+        let (base_bg, radius, muted, muted_fg, border) = (
             theme.background,
             theme.radius,
-            theme.primary,
-            theme.link,
             theme.muted,
             theme.muted_foreground,
             theme.border,
@@ -440,25 +438,37 @@ impl SettingsWindow {
                 let status = self.integrations.get(agent);
                 let registered = matches!(status, Some(Ok(integration::Status::Registered)));
                 let needs_repair = matches!(status, Some(Ok(integration::Status::NeedsRepair)));
-                let notice = match status {
-                    Some(Ok(integration::Status::Registered)) if agent == "codex" => {
-                        "通知已注册；请在 Codex /hooks 中确认信任。"
-                    }
-                    Some(Ok(integration::Status::Registered)) => "通知已接入",
-                    Some(Ok(integration::Status::NeedsRepair)) => "通知接入需要修复",
-                    Some(Err(_)) => "无法读取通知接入状态",
-                    _ => "通知未接入",
+                // The pill is the state this row acts on — notification
+                // registration — so it always agrees with the button beside it.
+                // Whether the agent's own CLI is installed is another fact: a
+                // quiet tag by the name, since this card cannot install it.
+                let (tone, pill_label) = match status {
+                    Some(Ok(integration::Status::Registered)) => (PillTone::Accent, "已接入"),
+                    Some(Ok(integration::Status::NeedsRepair)) => (PillTone::Warning, "需修复"),
+                    Some(Err(_)) => (PillTone::Neutral, "状态未知"),
+                    _ => (PillTone::Neutral, "未接入"),
                 };
-                let status_pill = pill(
-                    installed,
-                    if installed { "已安装" } else { "未安装" },
-                    radius,
-                    primary,
-                    link,
-                    muted,
-                    muted_fg,
-                )
-                .into_any_element();
+                // The common case keeps two lines; a hint adds a third only
+                // when there is something the row itself cannot say.
+                let hint = match status {
+                    Some(Ok(integration::Status::Registered)) if agent == "codex" => {
+                        Some("在 Codex /hooks 中确认信任")
+                    }
+                    Some(Ok(integration::Status::NeedsRepair)) => {
+                        Some("接入已失效，重新接入即可恢复")
+                    }
+                    Some(Err(_)) => Some("无法读取 Agent 配置，请检查文件权限"),
+                    _ => None,
+                };
+                // A healthy registration has nothing to repair.
+                let primary = if registered {
+                    None
+                } else if needs_repair {
+                    Some("修复接入")
+                } else {
+                    Some("接入通知")
+                };
+
                 h_flex()
                     .items_center()
                     .gap_3()
@@ -487,11 +497,22 @@ impl SettingsWindow {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .when(!installed, |d| d.text_color(muted_fg))
-                                    .child(a.name),
+                                h_flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .when(!installed, |d| d.text_color(muted_fg))
+                                            .child(a.name),
+                                    )
+                                    .when(!installed, |line| {
+                                        line.child(
+                                            div().text_xs().text_color(muted_fg).child("· 未安装"),
+                                        )
+                                    })
+                                    .child(pill(tone, pill_label, theme)),
                             )
                             .child(
                                 div()
@@ -501,40 +522,44 @@ impl SettingsWindow {
                                     .text_ellipsis()
                                     .child(a.desc),
                             )
-                            .child(div().mt_0p5().text_xs().text_color(muted_fg).child(notice)),
+                            .when_some(hint, |column, hint| {
+                                column.child(
+                                    div().mt_0p5().text_xs().text_color(muted_fg).child(hint),
+                                )
+                            }),
                     )
                     .child(
-                        v_flex().items_end().gap_1().child(status_pill).child(
-                            h_flex()
-                                .gap_1()
-                                .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            // The primary action is outlined so it reads as a
+                            // control; removal stays a quiet text button.
+                            .when_some(primary, |row, label| {
+                                row.child(
                                     Button::new(format!("install-notifications-{agent}"))
                                         .small()
-                                        .ghost()
-                                        .label(if registered || needs_repair {
-                                            "修复接入"
-                                        } else {
-                                            "接入通知"
-                                        })
+                                        .outline()
+                                        .label(label)
                                         .loading(self.integration_busy == Some(agent))
                                         .disabled(self.integration_busy.is_some())
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.change_integration(agent, false, window, cx)
                                         })),
                                 )
-                                .when(registered || needs_repair, |row| {
-                                    row.child(
-                                        Button::new(format!("remove-notifications-{agent}"))
-                                            .small()
-                                            .ghost()
-                                            .label("移除")
-                                            .disabled(self.integration_busy.is_some())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.change_integration(agent, true, window, cx)
-                                            })),
-                                    )
-                                }),
-                        ),
+                            })
+                            .when(registered || needs_repair, |row| {
+                                row.child(
+                                    Button::new(format!("remove-notifications-{agent}"))
+                                        .small()
+                                        .ghost()
+                                        .label("移除")
+                                        .disabled(self.integration_busy.is_some())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.change_integration(agent, true, window, cx)
+                                        })),
+                                )
+                            }),
                     )
             })
             .collect::<Vec<_>>();
@@ -677,14 +702,7 @@ impl SettingsWindow {
     }
 
     fn render_general_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let (radius, primary, link, muted, muted_fg, border) = (
-            theme.radius,
-            theme.primary,
-            theme.link,
-            theme.muted,
-            theme.muted_foreground,
-            theme.border,
-        );
+        let (muted, muted_fg, border) = (theme.muted, theme.muted_foreground, theme.border);
         let row = |title: &'static str,
                    desc: &'static str,
                    control: AnyElement,
@@ -817,7 +835,7 @@ impl SettingsWindow {
             .child(row(
                 "本地数据",
                 "项目与会话记录保存在 ~/.kumu/kumu.db。",
-                pill(false, "SQLite", radius, primary, link, muted, muted_fg).into_any_element(),
+                pill(PillTone::Neutral, "SQLite", theme).into_any_element(),
                 border,
                 true,
             ))
