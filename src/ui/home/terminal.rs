@@ -189,6 +189,14 @@ impl TerminalView {
         self.attach(session_id, snapshot, cx);
     }
 
+    /// Keep this session's pane state while its session is hidden.
+    pub fn hide(&mut self, cx: &mut Context<Self>) {
+        let pane = self.pane.0;
+        self.workspace.update(cx, |workspace, _| {
+            workspace.hide_terminal(pane);
+        });
+    }
+
     /// Attach a terminal already assigned to this pane by the workspace.
     /// Notification navigation preserves even an exited process's final screen.
     pub fn attach(&mut self, session_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {

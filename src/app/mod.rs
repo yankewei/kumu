@@ -66,6 +66,8 @@ struct LiveTerm {
     /// another session, and the process keeps running (and reading) so
     /// switching back reattaches the same TUI instead of restarting it.
     pane: Option<u64>,
+    /// Pane that owned this process before its session was hidden.
+    parked_for: Option<u64>,
     last_notification: Option<(Instant, TermNotification)>,
 }
 
@@ -247,8 +249,10 @@ impl Workspace {
         // This session was shown before: reattach its process and screen. Try
         // this before reclaiming, because a reattach starts no new process and
         // must not cost some other terminal its process — least of all its own.
-        if let Some(term_id) = self.parked_terminal(session_id) {
-            self.terms.get_mut(&term_id).unwrap().pane = Some(pane);
+        if let Some(term_id) = self.parked_terminal(session_id, pane) {
+            let live = self.terms.get_mut(&term_id).unwrap();
+            live.pane = Some(pane);
+            live.parked_for = None;
             self.pane_term.insert(pane, term_id);
             self.touch_terminal(term_id);
             let term = self.terms[&term_id].term.clone();
@@ -278,6 +282,7 @@ impl Workspace {
                 term,
                 session: session_id,
                 pane: Some(pane),
+                parked_for: None,
                 last_notification: None,
             },
         );
@@ -301,7 +306,7 @@ impl Workspace {
     pub fn reveal_terminal(&mut self, terminal: u64, fallback_pane: u64) -> Option<(u64, i64)> {
         let live = self.terms.get(&terminal)?;
         let session = live.session;
-        let pane = live.pane.unwrap_or(fallback_pane);
+        let pane = live.pane.or(live.parked_for).unwrap_or(fallback_pane);
         if live.pane.is_none() {
             self.park_terminal(pane);
             self.terms.get_mut(&terminal)?.pane = Some(pane);
@@ -419,8 +424,7 @@ impl Workspace {
     }
 
     /// Park the process `pane` shows so switching back reattaches it. Exited
-    /// processes, duplicate terminals for a session another pane still shows,
-    /// and older parked ones are stopped instead.
+    /// processes are stopped; live processes retain their prior pane id.
     fn park_terminal(&mut self, pane: u64) {
         let Some(term_id) = self.pane_term.remove(&pane) else {
             return;
@@ -429,27 +433,26 @@ impl Workspace {
             return;
         };
         live.pane = None;
-        let session = live.session;
+        live.parked_for = Some(pane);
         let exited = live.term.snapshot().exited;
-        let shown_elsewhere = self
-            .terms
-            .values()
-            .any(|other| other.session == session && other.pane.is_some());
-        if exited || shown_elsewhere {
+        if exited {
             self.drop_term(term_id);
-            return;
-        }
-        // One hidden terminal per session is enough to switch back to.
-        if let Some(old) = self.parked_terminal(session).filter(|&id| id != term_id) {
-            self.drop_term(old);
         }
     }
 
-    /// The session's hidden terminal, most recently shown first.
-    fn parked_terminal(&self, session_id: i64) -> Option<u64> {
+    /// Park a pane while its owning session is hidden from the window.
+    pub fn hide_terminal(&mut self, pane: u64) {
+        self.park_terminal(pane);
+    }
+
+    /// The hidden terminal owned by `pane`.
+    fn parked_terminal(&self, session_id: i64, pane: u64) -> Option<u64> {
         self.term_lru.iter().rev().copied().find(|id| {
             self.terms.get(id).is_some_and(|live| {
-                live.pane.is_none() && live.session == session_id && !live.term.snapshot().exited
+                live.pane.is_none()
+                    && live.session == session_id
+                    && live.parked_for == Some(pane)
+                    && !live.term.snapshot().exited
             })
         })
     }
@@ -1087,6 +1090,7 @@ mod tests {
                     term,
                     session,
                     pane,
+                    parked_for: pane,
                     last_notification: None,
                 },
             );
