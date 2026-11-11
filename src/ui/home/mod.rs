@@ -641,6 +641,91 @@ impl KumuApp {
         }
     }
 
+    /// Ask for a branch name and create a worktree next to the repository.
+    fn prompt_create_worktree(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("分支名，例如 feat/login"));
+        let weak = cx.weak_entity();
+        let dialog_input = input.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title("新建 worktree")
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "将在「{}」的同级目录创建 worktree，并检出同名分支。",
+                            project.path
+                        )),
+                )
+                .child(Input::new(&dialog_input).small())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("创建")
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok({
+                    let weak = weak.clone();
+                    let input = dialog_input.clone();
+                    move |_, _, cx| {
+                        let value = input.read(cx).value().to_string();
+                        let branch = value.trim().to_string();
+                        if branch.is_empty() {
+                            return false;
+                        }
+                        let _ = weak.update(cx, move |app, cx| {
+                            app.create_worktree(project_id, branch, cx)
+                        });
+                        true
+                    }
+                })
+        });
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            cx.notify();
+        });
+    }
+
+    /// Create the worktree off the UI thread, then add it as a project under
+    /// its repository. Failures stay in the banner above the panes.
+    fn create_worktree(&mut self, project_id: i64, branch: String, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .workspace
+            .read(cx)
+            .project(project_id)
+            .map(|project| PathBuf::from(&project.path))
+        else {
+            return;
+        };
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::git::create_worktree(&path, &branch) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |app, cx| match result {
+                Ok(worktree) => {
+                    let path = worktree.path.to_string_lossy().into_owned();
+                    let id = app.workspace.update(cx, |workspace, cx| {
+                        workspace.add_worktree(project_id, &worktree.name, &path, cx)
+                    });
+                    if let Some(id) = id {
+                        app.ensure_project_layout(id, cx);
+                        app.select_project(id, cx);
+                    }
+                }
+                Err(message) => {
+                    app.store_error = Some(format!("创建 worktree 失败：{message}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Rename a project: the dialog starts on the current name.
     fn prompt_rename_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
@@ -688,25 +773,35 @@ impl KumuApp {
 
     /// Ask before deleting a project and closing its terminals.
     fn confirm_delete_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self
-            .workspace
-            .read(cx)
-            .projects()
-            .iter()
-            .find(|project| project.id == project_id)
-            .map(|project| project.name.clone())
-            .unwrap_or_default();
-        let description = format!("「{name}」及其终端将被关闭，此操作无法撤销。");
+        let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
+            return;
+        };
+        let name = project.name;
+        // A worktree row is only a view of a directory; removing it must not
+        // pretend the checkout on disk goes away.
+        let (title, description, ok_text) = if project.parent_id.is_some() {
+            (
+                "移除 worktree",
+                format!("「{name}」将从侧边栏移除，磁盘上的 worktree 不会被删除。"),
+                "移除",
+            )
+        } else {
+            (
+                "删除项目",
+                format!("「{name}」及其 worktree、终端将被关闭，此操作无法撤销。"),
+                "删除",
+            )
+        };
         // The dialog outlives this call, so it reaches the view weakly.
         let weak = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let weak = weak.clone();
             alert
-                .title("删除项目")
+                .title(title)
                 .description(description.clone())
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("删除")
+                        .ok_text(ok_text)
                         .ok_variant(ButtonVariant::Danger)
                         .cancel_text("取消")
                         .show_cancel(true),
@@ -718,9 +813,10 @@ impl KumuApp {
         });
     }
 
-    /// Delete a project and close its panes, then show another project when
-    /// one remains.
+    /// Delete a project and its worktrees, then show another project when
+    /// one remains. Worktree directories stay on disk.
     fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        let removed = self.workspace.read(cx).project_tree_ids(project_id);
         if self
             .workspace
             .update(cx, |workspace, cx| workspace.delete_project(project_id, cx))
@@ -730,13 +826,16 @@ impl KumuApp {
             // project and its panes exactly where they are.
             return;
         }
-        if let Some(layout) = self.layouts.remove(&project_id) {
-            for pane in layout.panes() {
-                self.panes.remove(&pane);
+        let selected_removed = self.selected.is_some_and(|id| removed.contains(&id));
+        for id in removed {
+            if let Some(layout) = self.layouts.remove(&id) {
+                for pane in layout.panes() {
+                    self.panes.remove(&pane);
+                }
             }
+            self.focused_by_project.remove(&id);
         }
-        self.focused_by_project.remove(&project_id);
-        if self.selected == Some(project_id) {
+        if selected_removed {
             let next = self.workspace.read(cx).projects().first().map(|p| p.id);
             self.selected = next;
             if let Some(next) = next {

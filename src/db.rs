@@ -13,12 +13,14 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 use serde_json::{Value, json};
 
-/// A project: a directory with its own terminal panes.
+/// A project: a directory with its own terminal panes. A worktree is a
+/// project whose `parent_id` points at the repository it was created from.
 #[derive(Clone, Debug)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub path: String,
+    pub parent_id: Option<i64>,
 }
 
 pub struct Store {
@@ -64,7 +66,7 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in `PRAGMA user_version`. Bump it with a new
 /// `migrate_vN` step; opening an older database applies the steps it is
 /// missing exactly once.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
@@ -119,6 +121,9 @@ impl Store {
         }
         if version < 4 {
             self.migrate_v4()?;
+        }
+        if version < 5 {
+            self.migrate_v5()?;
         }
         if version < SCHEMA_VERSION {
             self.conn
@@ -275,16 +280,38 @@ impl Store {
         Ok(())
     }
 
+    /// A worktree is a project that points at the repository it came from.
+    /// Deleting the repository removes its worktree rows with it; the
+    /// directories on disk are left alone.
+    fn migrate_v5(&self) -> Result<()> {
+        let has_parent: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'parent_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_parent {
+            self.conn.execute_batch(
+                "ALTER TABLE projects
+                     ADD COLUMN parent_id INTEGER
+                     REFERENCES projects(id) ON DELETE CASCADE;
+                 CREATE INDEX IF NOT EXISTS projects_parent
+                     ON projects(parent_id);",
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn projects(&self) -> Vec<Project> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path FROM projects ORDER BY id")
+            .prepare("SELECT id, name, path, parent_id FROM projects ORDER BY id")
             .unwrap();
         stmt.query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
+                parent_id: row.get(3)?,
             })
         })
         .unwrap()
@@ -300,6 +327,15 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Add a worktree row under the repository it belongs to.
+    pub fn insert_worktree(&self, parent_id: i64, name: &str, path: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO projects (name, path, parent_id) VALUES (?1, ?2, ?3)",
+            params![name, path, parent_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Rename a project without moving it.
     pub fn rename_project(&self, id: i64, name: &str) -> Result<()> {
         self.conn.execute(
@@ -309,10 +345,18 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a project. Callers stop its terminals first.
+    /// Delete a project and its worktree rows. Callers stop their terminals
+    /// first; the worktree directories stay on disk.
     pub fn delete_project(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        self.conn.execute(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM projects WHERE id = ?1
+                 UNION ALL
+                 SELECT projects.id FROM projects JOIN tree ON projects.parent_id = tree.id
+             )
+             DELETE FROM projects WHERE id IN (SELECT id FROM tree)",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -745,6 +789,35 @@ mod tests {
         assert_eq!(projects[0].id, kept);
     }
 
+    /// A worktree row hangs off its repository and is removed with it; the
+    /// directory on disk is not the database's business.
+    #[test]
+    fn worktrees_are_children_of_their_project() {
+        let store = store();
+        let repo = store.insert_project("repo", "/repo").unwrap();
+        let worktree = store
+            .insert_worktree(repo, "feat/login", "/repo-feat-login")
+            .unwrap();
+
+        let projects = store.projects();
+        assert_eq!(
+            projects
+                .iter()
+                .find(|project| project.id == worktree)
+                .unwrap()
+                .parent_id,
+            Some(repo)
+        );
+
+        store.delete_project(repo).unwrap();
+        assert!(
+            store
+                .projects()
+                .iter()
+                .all(|project| project.id != worktree)
+        );
+    }
+
     /// The layout is one replaceable row; reading it back is what lets the
     /// home window restore its panes on the next launch.
     #[test]
@@ -962,7 +1035,10 @@ mod tests {
     fn a_failed_upgrade_rolls_back_layout_and_session_removal() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL);
+            "CREATE TABLE projects (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL
+             );
+             CREATE TABLE sessions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL);
              INSERT INTO sessions VALUES (1, 10);
              CREATE TABLE workspace_state (
                  id INTEGER PRIMARY KEY, layout_json TEXT NOT NULL, updated_at TEXT

@@ -577,6 +577,48 @@ impl Workspace {
         Some(id)
     }
 
+    /// Add a worktree row below the project it was created from. The
+    /// directory already exists; this only makes it visible as a project of
+    /// its own.
+    pub fn add_worktree(
+        &mut self,
+        parent_id: i64,
+        name: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<i64> {
+        if !self.projects.iter().any(|project| project.id == parent_id) {
+            return None;
+        }
+        let id = match self.store.insert_worktree(parent_id, name, path) {
+            Ok(id) => id,
+            Err(error) => {
+                Self::failed(cx, "添加 worktree 失败", error);
+                return None;
+            }
+        };
+        self.refresh();
+        cx.emit(WorkspaceEvent::Changed);
+        Some(id)
+    }
+
+    /// A project and every worktree below it. Deleting the project removes
+    /// all of these rows, so the caller must clean up each one.
+    pub fn project_tree_ids(&self, project_id: i64) -> Vec<i64> {
+        let mut ids = vec![project_id];
+        let mut index = 0;
+        while index < ids.len() {
+            let parent = ids[index];
+            for project in &self.projects {
+                if project.parent_id == Some(parent) && !ids.contains(&project.id) {
+                    ids.push(project.id);
+                }
+            }
+            index += 1;
+        }
+        ids
+    }
+
     /// Rename a project without moving it.
     pub fn rename_project(&mut self, project_id: i64, name: String, cx: &mut Context<Self>) {
         if let Err(error) = self.store.rename_project(project_id, &name) {
@@ -587,14 +629,17 @@ impl Workspace {
         cx.emit(WorkspaceEvent::Changed);
     }
 
-    /// Delete a project. Terminals are stopped only after the row is gone,
-    /// so a failed write leaves the workspace untouched.
+    /// Delete a project and its worktrees. Terminals are stopped only after
+    /// the rows are gone, so a failed write leaves the workspace untouched.
     pub fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) -> Result<(), ()> {
+        let removed = self.project_tree_ids(project_id);
         if let Err(error) = self.store.delete_project(project_id) {
             Self::failed(cx, "删除项目失败", error);
             return Err(());
         }
-        self.drop_project_terminals(project_id);
+        for id in removed {
+            self.drop_project_terminals(id);
+        }
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
         Ok(())
@@ -682,6 +727,7 @@ mod tests {
             id,
             name: format!("project-{id}"),
             path: path.into(),
+            parent_id: None,
         }
     }
 
