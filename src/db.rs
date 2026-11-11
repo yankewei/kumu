@@ -3,7 +3,9 @@
 //! Accessed synchronously on the UI (main) thread. Schema is created and
 //! upgraded on open through `PRAGMA user_version`; tables and columns left over
 //! from the removed in-app chat path are dropped there too, so an older
-//! database keeps working with the current one.
+//! database keeps working with the current one. A database written by a newer
+//! build is refused ([`OpenError::SchemaTooNew`]) rather than opened against
+//! queries that no longer match it.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,6 +25,39 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Why a database file could not be opened for this build.
+#[derive(Debug)]
+pub enum OpenError {
+    Db(rusqlite::Error),
+    /// The file was last written by a newer build whose schema this one does
+    /// not know. Reading it as if it were current would fail on missing tables
+    /// and columns, so the app keeps running from memory instead.
+    SchemaTooNew {
+        found: i64,
+        supported: i64,
+    },
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(error) => write!(f, "{error}"),
+            Self::SchemaTooNew { found, supported } => write!(
+                f,
+                "数据库版本为 {found}，高于当前 Kumu 支持的版本 {supported}，请升级 Kumu"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<rusqlite::Error> for OpenError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
 /// How long a write waits for another connection's write to finish.
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -32,13 +67,25 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA_VERSION: i64 = 4;
 
 impl Store {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
+    pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
         let conn = Connection::open(path)?;
         prepare(&conn)?;
         let store = Self { conn };
+        // A newer build has already migrated this file. Its tables no longer
+        // match this build's queries, so reopening it here must fail loudly
+        // instead of panicking halfway through the first read.
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(OpenError::SchemaTooNew {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         store.init()?;
         Ok(store)
     }
@@ -642,6 +689,38 @@ mod tests {
         assert_eq!(foreign_keys, 1);
 
         drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file written by a newer build has already been migrated past this
+    /// build's queries. Opening it must fail so the app can fall back to
+    /// memory, not panic on the first read of a table that is gone.
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "kumu-db-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kumu.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+
+        let Err(error) = Store::open(&path) else {
+            panic!("a newer schema must not open");
+        };
+        assert!(matches!(
+            error,
+            OpenError::SchemaTooNew { found, supported }
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+        ));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
