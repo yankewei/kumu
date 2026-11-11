@@ -3865,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "kumu"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "futures",
  "ghostty-sys",
