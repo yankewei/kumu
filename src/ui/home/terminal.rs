@@ -1173,23 +1173,50 @@ fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
-/// Ghostty `minimum-contrast`: keep intentional low-contrast sprites, else
-/// lift fg toward near-white / near-black when it would vanish into `bg`.
+/// Keep light-background text readable without flattening its colors. Dark
+/// backgrounds retain the existing near-invisible-text safeguard.
 fn readable_fg(fg: Rgb, bg: Rgb, text: &str) -> Rgb {
-    const MINIMUM: f32 = 1.1;
     if super::sprites::is_sprite(text) || preserves_graphics_color(text) {
         return fg;
     }
-    if contrast_ratio(fg, bg) >= MINIMUM {
+    let light_background = luminance(bg) > 0.5;
+    let minimum = if light_background { 4.5 } else { 1.1 };
+    if contrast_ratio(fg, bg) >= minimum {
         return fg;
     }
     let light = Rgb(0xf2, 0xf2, 0xf4);
     let dark = Rgb(0x1b, 0x1b, 0x1e);
-    if contrast_ratio(light, bg) >= contrast_ratio(dark, bg) {
+    let target = if light_background {
+        Rgb(0, 0, 0)
+    } else if contrast_ratio(light, bg) >= contrast_ratio(dark, bg) {
         light
     } else {
         dark
+    };
+    if !light_background {
+        return target;
     }
+    // Find the smallest blend that meets the contrast floor, preserving the
+    // original hue instead of replacing every pale color with the same ink.
+    let (mut low, mut high) = (0., 1.);
+    let mut result = target;
+    for _ in 0..8 {
+        let amount = (low + high) / 2.;
+        let mix =
+            |from: u8, to: u8| (from as f32 + (to as f32 - from as f32) * amount).round() as u8;
+        let candidate = Rgb(
+            mix(fg.0, target.0),
+            mix(fg.1, target.1),
+            mix(fg.2, target.2),
+        );
+        if contrast_ratio(candidate, bg) >= minimum {
+            high = amount;
+            result = candidate;
+        } else {
+            low = amount;
+        }
+    }
+    result
 }
 
 fn preserves_graphics_color(text: &str) -> bool {
@@ -1284,7 +1311,14 @@ fn row_ops(
         let cell_bg = c.bg.unwrap_or(term_bg);
         let mut color = paint_color(readable_fg(c.fg, cell_bg, &c.text));
         if c.faint {
-            color.a = 0.6;
+            color.a = if luminance(cell_bg) > 0.5
+                && !super::sprites::is_sprite(&c.text)
+                && !preserves_graphics_color(&c.text)
+            {
+                0.75
+            } else {
+                0.6
+            };
         }
         if super::sprites::is_sprite(&c.text) {
             ops.push(RowOp::Sprite {
@@ -1566,4 +1600,53 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         cell: (cell_w, cell_h),
     });
     origin
+}
+
+#[cfg(test)]
+mod tests {
+    use core::prelude::v1::test;
+
+    use super::{contrast_ratio, readable_fg};
+    use crate::term::Rgb;
+
+    #[test]
+    fn pale_terminal_text_gains_contrast_without_losing_its_color() {
+        let bg = Rgb(0xf9, 0xf9, 0xf8);
+        // Theme gray and ANSI accents, plus a truecolor gray supplied by a TUI.
+        for fg in [
+            Rgb(0x8a, 0x8b, 0x90),
+            Rgb(0xd1, 0x68, 0x6f),
+            Rgb(0x7f, 0xae, 0x6a),
+            Rgb(0xd5, 0xab, 0x60),
+            Rgb(0x94, 0xa4, 0xf5),
+            Rgb(0xbc, 0x74, 0xd2),
+            Rgb(0x56, 0xb6, 0xc2),
+            Rgb(0xaa, 0xaa, 0xaa),
+        ] {
+            let adjusted = readable_fg(fg, bg, "text");
+            assert!(contrast_ratio(adjusted, bg) >= 4.5, "{fg:?}: {adjusted:?}");
+            assert_ne!(adjusted, Rgb(0x1b, 0x1b, 0x1e));
+            assert_eq!(fg.0.cmp(&fg.1), adjusted.0.cmp(&adjusted.1));
+            assert_eq!(fg.1.cmp(&fg.2), adjusted.1.cmp(&adjusted.2));
+        }
+    }
+
+    #[test]
+    fn readable_text_and_terminal_graphics_keep_their_colors() {
+        let bg = Rgb(0xf9, 0xf9, 0xf8);
+        let body = Rgb(0x40, 0x3f, 0x44);
+        assert_eq!(readable_fg(body, bg, "text"), body);
+        let pale = Rgb(0xe0, 0xe0, 0xe0);
+        for graphic in ["─", "█", "⠿", "\u{e0b0}"] {
+            assert_eq!(readable_fg(pale, bg, graphic), pale);
+        }
+    }
+
+    #[test]
+    fn dark_backgrounds_keep_the_existing_contrast_behavior() {
+        let bg = Rgb(0x22, 0x25, 0x2b);
+        let gray = Rgb(0x7c, 0x82, 0x8c);
+        assert_eq!(readable_fg(gray, bg, "text"), gray);
+        assert_eq!(readable_fg(bg, bg, "text"), Rgb(0xf2, 0xf2, 0xf4));
+    }
 }
