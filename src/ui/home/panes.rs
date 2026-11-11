@@ -1,7 +1,7 @@
 //! Pane layout tree: leaves hold a pane id; groups split along an axis.
 //!
-//! Each sidebar session owns a pane tree. Splitting adds another pane to that
-//! session; switching sessions restores its own tree.
+//! Each project owns a pane tree. Splitting adds another pane to that project;
+//! switching projects restores its own tree.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +13,7 @@ pub struct PaneId(pub u64);
 
 /// Structure version of [`SavedWorkspace`]. Bump it when the JSON shape
 /// changes; an unknown version is ignored rather than guessed at.
-pub const WORKSPACE_STATE_VERSION: u32 = 2;
+pub const WORKSPACE_STATE_VERSION: u32 = 3;
 
 /// A saved layout is restored only up to this many panes: every restored pane
 /// starts a process, so a corrupt document must not be able to launch hundreds.
@@ -43,45 +43,34 @@ pub enum SavedNode {
         sizes: Vec<f32>,
         children: Vec<SavedNode>,
     },
-    /// Version 2 payload: independent layouts owned by their sessions.
-    SessionLayouts {
+    /// Version 3 payload: one pane tree per project.
+    ProjectLayouts {
         selected: Option<i64>,
-        sessions: Vec<SavedSessionLayout>,
+        projects: Vec<SavedProjectLayout>,
     },
 }
 
-/// One saved pane → session binding in the legacy single-tree format.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct SavedPane {
-    pub pane: u64,
-    pub session: i64,
-}
-
-/// One session's saved pane tree and last focused pane.
+/// One project's saved pane tree and last focused pane.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct SavedSessionLayout {
-    pub session: i64,
+pub struct SavedProjectLayout {
+    pub project: i64,
     pub layout: SavedNode,
     pub focused: u64,
 }
 
-/// The home window's saved session layouts.
+/// The home window's saved project layouts.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SavedWorkspace {
     pub version: u32,
     pub layout: SavedNode,
-    pub panes: Vec<SavedPane>,
     pub focused: u64,
-    #[serde(default)]
-    pub collapsed_projects: Vec<i64>,
 }
 
 /// Persisted layouts that passed validation.
 pub struct RestoredWorkspace {
     pub layouts: HashMap<i64, PaneNode>,
-    pub focused_by_session: HashMap<i64, PaneId>,
+    pub focused_by_project: HashMap<i64, PaneId>,
     pub selected: Option<i64>,
-    pub collapsed_projects: Vec<i64>,
     /// Group id → normalized child sizes. Every restored group has an entry;
     /// an empty vector means "no usable sizes, divide evenly".
     pub group_sizes: HashMap<u64, Vec<f32>>,
@@ -111,150 +100,54 @@ fn normalized_sizes(sizes: &[f32], children: usize) -> Option<Vec<f32>> {
 impl SavedWorkspace {
     /// Parse and validate persisted state. Invalid or obsolete documents are
     /// ignored so the app can open a fresh default pane without a startup error.
-    pub fn restore(
-        saved: &str,
-        session_exists: impl Fn(i64) -> bool,
-        project_exists: impl Fn(i64) -> bool,
-    ) -> Option<RestoredWorkspace> {
+    pub fn restore(saved: &str, project_exists: impl Fn(i64) -> bool) -> Option<RestoredWorkspace> {
         let state: Self = serde_json::from_str(saved).ok()?;
-        if state.version != WORKSPACE_STATE_VERSION && state.version != 1 {
+        if state.version != WORKSPACE_STATE_VERSION {
             return None;
         }
-        if let SavedNode::SessionLayouts { selected, sessions } = &state.layout {
-            if state.version != WORKSPACE_STATE_VERSION {
-                return None;
-            }
-            return restore_session_layouts(
-                sessions,
-                *selected,
-                &state.collapsed_projects,
-                session_exists,
-                project_exists,
-            );
-        }
-        // Migrate older global pane trees by retaining each session's leaves
-        // and collapsing groups that only contain panes from other sessions.
-        let mut grouped: HashMap<i64, HashSet<u64>> = HashMap::new();
-        for pane in &state.panes {
-            if session_exists(pane.session) {
-                grouped.entry(pane.session).or_default().insert(pane.pane);
-            }
-        }
-        let mut next_group = 1;
-        let mut group_sizes = HashMap::new();
-        let mut layouts = HashMap::new();
-        let mut focused_by_session = HashMap::new();
-        let mut seen_panes = HashSet::new();
-        for (session, valid_panes) in grouped {
-            let mut local_groups = HashMap::new();
-            let mut local_next_group = next_group;
-            let layout =
-                state
-                    .layout
-                    .restore(&valid_panes, &mut local_next_group, &mut local_groups)?;
-            let leaves = layout.panes();
-            if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
-                continue;
-            }
-            if leaves
-                .iter()
-                .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen_panes.insert(pane.0))
-            {
-                continue;
-            }
-            next_group = local_next_group;
-            group_sizes.extend(local_groups);
-            let focused = if leaves.contains(&PaneId(state.focused)) {
-                PaneId(state.focused)
-            } else {
-                leaves[0]
-            };
-            focused_by_session.insert(session, focused);
-            layouts.insert(session, layout);
-        }
-        let selected = state
-            .panes
-            .iter()
-            .find(|pane| pane.pane == state.focused && layouts.contains_key(&pane.session))
-            .map(|pane| pane.session)
-            .or_else(|| layouts.keys().next().copied());
-        let collapsed_projects = state
-            .collapsed_projects
-            .iter()
-            .copied()
-            .filter(|id| project_exists(*id))
-            .collect();
-        let next_pane = seen_panes
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .saturating_add(1)
-            .max(2);
-        let selected = selected?;
-        // Version 1 stored one global tree; its per-group ratios still apply
-        // to the per-session trees that were just derived from it.
-        if state.version == 1 {
-            let valid: HashSet<u64> = state
-                .panes
-                .iter()
-                .filter(|pane| session_exists(pane.session))
-                .map(|pane| pane.pane)
-                .collect();
-            let mut legacy_groups = HashMap::new();
-            let mut legacy_next = 1;
-            state
-                .layout
-                .restore(&valid, &mut legacy_next, &mut legacy_groups)?;
-            for (group, sizes) in legacy_groups {
-                group_sizes.entry(group).or_insert(sizes);
-            }
-        }
-        Some(RestoredWorkspace {
-            layouts,
-            focused_by_session,
-            selected: Some(selected),
-            collapsed_projects,
-            group_sizes,
-            next_pane,
-            next_group,
-        })
+        let SavedNode::ProjectLayouts { selected, projects } = &state.layout else {
+            return None;
+        };
+        restore_project_layouts(projects, *selected, project_exists)
     }
 }
 
-fn restore_session_layouts(
-    saved_sessions: &[SavedSessionLayout],
+fn restore_project_layouts(
+    saved_projects: &[SavedProjectLayout],
     selected: Option<i64>,
-    collapsed_projects: &[i64],
-    session_exists: impl Fn(i64) -> bool,
     project_exists: impl Fn(i64) -> bool,
 ) -> Option<RestoredWorkspace> {
     let mut next_group = 1;
     let mut next_pane = 2;
     let mut group_sizes = HashMap::new();
     let mut layouts = HashMap::new();
-    let mut focused_by_session = HashMap::new();
+    let mut focused_by_project = HashMap::new();
     let mut seen = HashSet::new();
-    for saved in saved_sessions {
-        if !session_exists(saved.session) || layouts.contains_key(&saved.session) {
+    for saved in saved_projects {
+        if !project_exists(saved.project) || layouts.contains_key(&saved.project) {
             continue;
         }
         let ids = saved.layout.pane_ids();
         let mut local_groups = HashMap::new();
         let mut local_next_group = next_group;
-        let layout = saved
+        let Some(layout) = saved
             .layout
-            .restore(&ids, &mut local_next_group, &mut local_groups)?;
+            .restore(&ids, &mut local_next_group, &mut local_groups)
+        else {
+            continue;
+        };
         let leaves = layout.panes();
         if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
             continue;
         }
-        if leaves
-            .iter()
-            .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || !seen.insert(pane.0))
+        if ids.len() != leaves.len()
+            || leaves
+                .iter()
+                .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || seen.contains(&pane.0))
         {
             continue;
         }
+        seen.extend(ids);
         next_group = local_next_group;
         group_sizes.extend(local_groups);
         next_pane = next_pane.max(
@@ -264,28 +157,35 @@ fn restore_session_layouts(
                 .max()
                 .unwrap_or(2),
         );
-        focused_by_session.insert(
-            saved.session,
+        focused_by_project.insert(
+            saved.project,
             if leaves.contains(&PaneId(saved.focused)) {
                 PaneId(saved.focused)
             } else {
                 leaves[0]
             },
         );
-        layouts.insert(saved.session, layout);
+        layouts.insert(saved.project, layout);
     }
     let selected = selected
-        .filter(|session| layouts.contains_key(session))
-        .or_else(|| layouts.keys().next().copied())?;
+        .filter(|project| {
+            project_exists(*project)
+                && (layouts.contains_key(project)
+                    || !saved_projects.iter().any(|saved| saved.project == *project))
+        })
+        .or_else(|| {
+            saved_projects
+                .iter()
+                .find(|saved| layouts.contains_key(&saved.project))
+                .map(|saved| saved.project)
+        });
+    if selected.is_none() && !saved_projects.is_empty() {
+        return None;
+    }
     Some(RestoredWorkspace {
         layouts,
-        focused_by_session,
-        selected: Some(selected),
-        collapsed_projects: collapsed_projects
-            .iter()
-            .copied()
-            .filter(|id| project_exists(*id))
-            .collect(),
+        focused_by_project,
+        selected,
         group_sizes,
         next_pane,
         next_group,
@@ -297,9 +197,9 @@ impl SavedNode {
         match self {
             Self::Leaf { pane } => HashSet::from([*pane]),
             Self::Group { children, .. } => children.iter().flat_map(Self::pane_ids).collect(),
-            Self::SessionLayouts { sessions, .. } => sessions
+            Self::ProjectLayouts { projects, .. } => projects
                 .iter()
-                .flat_map(|session| session.layout.pane_ids())
+                .flat_map(|project| project.layout.pane_ids())
                 .collect(),
         }
     }
@@ -481,7 +381,7 @@ fn collapse(node: &mut PaneNode) {
 }
 
 impl SavedNode {
-    /// Rebuild the layout, keeping only panes in `valid` (their session still
+    /// Rebuild the layout, keeping only panes in `valid` (their project still
     /// exists) and collapsing groups left with a single child. Group ids are
     /// assigned from `next_group` so a restored tree never collides with one
     /// created later.
@@ -495,7 +395,7 @@ impl SavedNode {
             Self::Leaf { pane } => valid
                 .contains(pane)
                 .then_some(PaneNode::Leaf(PaneId(*pane))),
-            Self::SessionLayouts { .. } => None,
+            Self::ProjectLayouts { .. } => None,
             Self::Group {
                 horizontal,
                 sizes,
@@ -664,38 +564,7 @@ mod tests {
         assert_eq!(group_sizes.get(&1), Some(&Vec::new()));
     }
 
-    /// A layout written before group ratios existed must still open; the new
-    /// field defaults to an even split.
-    #[test]
-    fn a_group_saved_before_ratios_still_parses() {
-        let json = r#"{
-            "version": 1,
-            "layout": {
-                "Group": {
-                    "horizontal": true,
-                    "children": [
-                        {"Leaf": {"pane": 1}},
-                        {"Leaf": {"pane": 2}}
-                    ]
-                }
-            },
-            "panes": [
-                {"pane": 1, "session": 10},
-                {"pane": 2, "session": 20}
-            ],
-            "focused": 1
-        }"#;
-        let saved: SavedWorkspace = serde_json::from_str(json).unwrap();
-        let restored =
-            SavedWorkspace::restore(&serde_json::to_string(&saved).unwrap(), |_| true, |_| true)
-                .expect("the old layout is still usable");
-        assert_eq!(restored.layouts.len(), 2);
-        assert_eq!(restored.layouts.get(&10).unwrap().panes(), vec![PaneId(1)]);
-        assert_eq!(restored.layouts.get(&20).unwrap().panes(), vec![PaneId(2)]);
-        assert_eq!(restored.group_sizes.get(&1), Some(&Vec::new()));
-    }
-
-    /// A deleted session takes its pane with it; groups that lose all but one
+    /// A deleted project takes its panes with it; groups that lose all but one
     /// child collapse rather than leaving a one-slot split.
     #[test]
     fn restoring_prunes_missing_panes_and_collapses_groups() {
@@ -741,13 +610,15 @@ mod tests {
     fn the_saved_workspace_serializes_with_its_version() {
         let saved = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::Leaf { pane: 7 },
-            panes: vec![SavedPane {
-                pane: 7,
-                session: 3,
-            }],
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(3),
+                projects: vec![SavedProjectLayout {
+                    project: 3,
+                    layout: SavedNode::Leaf { pane: 7 },
+                    focused: 7,
+                }],
+            },
             focused: 7,
-            collapsed_projects: vec![2],
         };
         let json = serde_json::to_string(&saved).unwrap();
         assert_eq!(
@@ -757,77 +628,131 @@ mod tests {
         assert!(json.contains(&format!("\"version\":{WORKSPACE_STATE_VERSION}")));
     }
 
-    fn two_pane_state() -> SavedWorkspace {
+    fn two_project_state() -> SavedWorkspace {
         SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::Group {
-                horizontal: true,
-                sizes: vec![0.5, 0.5],
-                children: vec![SavedNode::Leaf { pane: 1 }, SavedNode::Leaf { pane: 2 }],
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(20),
+                projects: vec![
+                    SavedProjectLayout {
+                        project: 10,
+                        layout: SavedNode::Leaf { pane: 1 },
+                        focused: 1,
+                    },
+                    SavedProjectLayout {
+                        project: 20,
+                        layout: SavedNode::Leaf { pane: 2 },
+                        focused: 2,
+                    },
+                ],
             },
-            panes: vec![
-                SavedPane {
-                    pane: 1,
-                    session: 10,
-                },
-                SavedPane {
-                    pane: 2,
-                    session: 20,
-                },
-            ],
             focused: 2,
-            collapsed_projects: vec![3, 4],
         }
     }
 
-    /// Restoring keeps only live sessions, lands focus on a surviving pane, and
-    /// drops collapsed-project ids that no longer exist.
+    /// Restoring keeps only projects that still exist and lands focus on a
+    /// surviving pane.
     #[test]
-    fn restoring_keeps_only_live_sessions_and_projects() {
-        let json = serde_json::to_string(&two_pane_state()).unwrap();
+    fn restoring_keeps_only_live_projects() {
+        let json = serde_json::to_string(&two_project_state()).unwrap();
         let restored =
-            SavedWorkspace::restore(&json, |session| session == 20, |project| project == 3)
-                .expect("one live pane");
+            SavedWorkspace::restore(&json, |project| project == 20).expect("one live project");
         assert_eq!(restored.selected, Some(20));
         assert_eq!(
             restored.layouts.get(&20).map(PaneNode::panes),
             Some(vec![PaneId(2)])
         );
-        assert_eq!(restored.focused_by_session.get(&20), Some(&PaneId(2)));
-        assert_eq!(restored.collapsed_projects, vec![3]);
+        assert_eq!(restored.focused_by_project.get(&20), Some(&PaneId(2)));
         assert_eq!(restored.next_pane, 3);
     }
 
-    /// Malformed JSON, an unknown version, all-dead sessions, and duplicate
+    #[test]
+    fn restoring_keeps_an_empty_project_selected() {
+        let mut state = two_project_state();
+        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
+            projects.retain(|project| project.project != 20);
+        }
+        let json = serde_json::to_string(&state).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(restored.selected, Some(20));
+        assert!(!restored.layouts.contains_key(&20));
+        assert!(restored.layouts.contains_key(&10));
+
+        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
+            projects.clear();
+        }
+        let json = serde_json::to_string(&state).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(restored.selected, Some(20));
+        assert!(restored.layouts.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_project_layout_does_not_discard_later_projects() {
+        let mut state = two_project_state();
+        if let SavedNode::ProjectLayouts { projects, selected } = &mut state.layout {
+            *selected = Some(10);
+            projects[0].layout = SavedNode::Group {
+                horizontal: true,
+                sizes: Vec::new(),
+                children: Vec::new(),
+            };
+        }
+        let json = serde_json::to_string(&state).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(restored.selected, Some(20));
+        assert_eq!(restored.layouts.len(), 1);
+
+        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
+            projects[0].layout = SavedNode::Group {
+                horizontal: true,
+                sizes: Vec::new(),
+                children: vec![SavedNode::Leaf { pane: 2 }, SavedNode::Leaf { pane: 2 }],
+            };
+        }
+        let json = serde_json::to_string(&state).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(restored.selected, Some(20));
+        assert_eq!(restored.layouts[&20].panes(), vec![PaneId(2)]);
+    }
+
+    /// Malformed JSON, an unknown version, a missing project, and duplicate
     /// pane ids all mean "open the default pane", never a startup failure.
     #[test]
     fn an_untrusted_saved_workspace_is_rejected() {
-        assert!(SavedWorkspace::restore("{", |_| true, |_| true).is_none());
+        assert!(SavedWorkspace::restore("{", |_| true).is_none());
 
-        let state = two_pane_state();
+        let state = two_project_state();
         let json = serde_json::to_string(&state).unwrap();
         assert!(
-            SavedWorkspace::restore(&json, |_| false, |_| true).is_none(),
-            "every session is gone"
+            SavedWorkspace::restore(&json, |_| false).is_none(),
+            "every project is gone"
         );
 
         let mut future = state.clone();
         future.version = WORKSPACE_STATE_VERSION + 1;
         let json = serde_json::to_string(&future).unwrap();
         assert!(
-            SavedWorkspace::restore(&json, |_| true, |_| true).is_none(),
+            SavedWorkspace::restore(&json, |_| true).is_none(),
             "an unknown structure version is not guessed at"
         );
 
         let mut duplicate = state;
-        duplicate.layout = SavedNode::Group {
-            horizontal: true,
-            sizes: vec![0.5, 0.5],
-            children: vec![SavedNode::Leaf { pane: 1 }, SavedNode::Leaf { pane: 1 }],
+        duplicate.layout = SavedNode::ProjectLayouts {
+            selected: Some(10),
+            projects: vec![SavedProjectLayout {
+                project: 10,
+                layout: SavedNode::Group {
+                    horizontal: true,
+                    sizes: vec![0.5, 0.5],
+                    children: vec![SavedNode::Leaf { pane: 1 }, SavedNode::Leaf { pane: 1 }],
+                },
+                focused: 1,
+            }],
         };
         let json = serde_json::to_string(&duplicate).unwrap();
         assert!(
-            SavedWorkspace::restore(&json, |_| true, |_| true).is_none(),
+            SavedWorkspace::restore(&json, |_| true).is_none(),
             "two leaves cannot share a pane"
         );
     }

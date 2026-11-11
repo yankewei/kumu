@@ -1,18 +1,17 @@
-//! The application layer: projects, sessions, and live terminals —
-//! independent of how it is drawn.
+//! The application layer: projects and live terminals — independent of how
+//! it is drawn.
 //!
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
 //! notify: a terminal frame only concerns that pane.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter, Global};
 
-use crate::agent;
-use crate::db::{Project, Session, Store, db_path};
+use crate::db::{Project, Store, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
 
@@ -25,21 +24,17 @@ pub struct NotificationSettings {
 
 impl Global for NotificationSettings {}
 
-/// How often to re-read agent session stores for sidebar titles.
-const TITLE_SYNC_EVERY: Duration = Duration::from_secs(2);
-
-/// How many native agent TUIs may stay running at once.
+/// How many terminal processes may stay running at once.
 ///
-/// A session past the cap is stopped, least recently shown first — but only a
+/// A terminal past the cap is stopped, least recently shown first — but only a
 /// parked one: a terminal a pane is showing is never stopped, so the cap is
-/// soft when every process is on screen. Selecting a stopped session again
-/// starts a new process.
+/// soft when every process is on screen. Showing a stopped pane again starts
+/// a new shell.
 const MAX_LIVE_TERMINALS: usize = 12;
 
 /// What changed in the [`Workspace`], for the views that draw it.
 pub enum WorkspaceEvent {
-    /// Something the home or settings view draws: the project or session list,
-    /// or a session's title.
+    /// Something the home view draws: the project list.
     Changed,
     /// A persistence write failed. The home window shows the message until the
     /// user dismisses it, instead of leaving the action looking like a no-op.
@@ -49,43 +44,42 @@ pub enum WorkspaceEvent {
     /// An explicit OSC notification from a visible or parked terminal.
     Attention {
         terminal: u64,
-        session: i64,
+        project: i64,
         notification: TermNotification,
     },
-    /// A pane's shell exited cleanly. The home window closes that pane; the
-    /// session row is removed only when no pane still belongs to it.
-    PaneExited { pane: u64, session: i64 },
+    /// A pane's shell exited cleanly. The home window closes that pane. The
+    /// project stays; with no pane left, its tree is empty.
+    PaneExited { pane: u64, project: i64 },
 }
 
 /// One native TUI process and where it is drawn.
 struct LiveTerm {
     term: Term,
-    /// Sidebar session this process belongs to.
-    session: i64,
-    /// The pane showing it, or `None` while parked: its pane switched to
-    /// another session, and the process keeps running (and reading) so
-    /// switching back reattaches the same TUI instead of restarting it.
+    /// Project this process was started in.
+    project: i64,
+    /// The pane showing it, or `None` while parked: its project was hidden,
+    /// and the process keeps running so switching back reattaches the same
+    /// shell instead of restarting it.
     pane: Option<u64>,
-    /// Pane that owned this process before its session was hidden.
+    /// Pane that owned this process before its project was hidden.
     parked_for: Option<u64>,
     last_notification: Option<(Instant, TermNotification)>,
 }
 
-/// Projects, sessions, and each live terminal.
+/// Projects and each live terminal.
 ///
-/// One per app, owned by the home window. Nothing in here renders. Agent TUIs
-/// are launched through [`agent::interactive`].
+/// One per app, owned by the home window. Nothing in here renders. Every pane
+/// runs the user's shell in the project's directory.
 ///
-/// A sidebar session may occupy several panes; each pane has its own PTY. A
-/// pane switching sessions parks its process rather than killing it, so a
-/// hidden agent keeps its state until the cap stops it.
+/// A project may occupy several panes; each pane has its own PTY. Switching
+/// projects parks those processes rather than killing them, so a hidden shell
+/// keeps its state until the cap stops it.
 pub struct Workspace {
     store: Store,
     /// Whether `store` is the on-disk database. An in-memory fallback still
-    /// gets its first-run project and shell, because nothing else persists.
+    /// gets its first-run project, because nothing else persists.
     persistent: bool,
     projects: Vec<Project>,
-    sessions: Vec<Session>,
     /// Native TUI processes keyed by a stable terminal id.
     terms: HashMap<u64, LiveTerm>,
     /// Which terminal each pane shows right now.
@@ -103,7 +97,7 @@ pub struct Workspace {
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
 impl Workspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         // A database that cannot be opened must not take the window down with
         // it: keep working from memory for this run, and say that nothing will
         // be saved rather than dying before there is anywhere to say it.
@@ -126,7 +120,6 @@ impl Workspace {
             store,
             persistent,
             projects: Vec::new(),
-            sessions: Vec::new(),
             terms: HashMap::new(),
             pane_term: HashMap::new(),
             term_lru: Vec::new(),
@@ -135,7 +128,6 @@ impl Workspace {
             saved_workspace,
         };
         workspace.bootstrap();
-        workspace.watch_agent_titles(cx);
         workspace
     }
 
@@ -166,26 +158,17 @@ impl Workspace {
         }
     }
 
-    /// A first run gets a project for the current directory and a shell in
-    /// it, so the window never opens onto nothing. The seeded flag keeps an
-    /// intentionally emptied workspace empty on later launches.
+    /// A first run gets a project for the current directory, so the window
+    /// never opens onto nothing. The seeded flag keeps an intentionally
+    /// emptied workspace empty on later launches.
     fn bootstrap(&mut self) {
         let seeded = self.persistent && crate::db::get_setting(crate::db::SETTING_SEEDED).is_some();
         if !seeded {
-            let mut seeded_ok = true;
-            if self.store.projects().is_empty() {
-                seeded_ok = insert_bootstrap_project(&self.store).is_some();
-            }
-            self.refresh();
-            if seeded_ok
-                && self.sessions.is_empty()
-                && let Some(project) = self.projects.first().cloned()
-            {
-                seeded_ok = self
-                    .store
-                    .insert_session(project.id, crate::term::SHELL, "终端 1", &project.path)
-                    .is_ok();
-            }
+            let seeded_ok = if self.store.projects().is_empty() {
+                insert_bootstrap_project(&self.store).is_some()
+            } else {
+                true
+            };
             if seeded_ok && self.persistent {
                 let _ = crate::db::set_setting(crate::db::SETTING_SEEDED, "1");
             }
@@ -195,47 +178,48 @@ impl Workspace {
 
     fn refresh(&mut self) {
         self.projects = self.store.projects();
-        self.sessions = self.store.sessions();
     }
 
     pub fn projects(&self) -> &[Project] {
         &self.projects
     }
 
-    pub fn sessions(&self) -> &[Session] {
-        &self.sessions
+    pub fn project(&self, id: i64) -> Option<&Project> {
+        self.projects.iter().find(|project| project.id == id)
     }
 
-    pub fn session(&self, id: i64) -> Option<&Session> {
-        self.sessions.iter().find(|s| s.id == id)
+    /// The first project, creating the first-run one when the list is empty.
+    pub fn ensure_project(&mut self, cx: &mut Context<Self>) -> Option<i64> {
+        if let Some(id) = self.projects.first().map(|project| project.id) {
+            return Some(id);
+        }
+        let Some(id) = insert_bootstrap_project(&self.store) else {
+            cx.emit(WorkspaceEvent::Failed("无法创建默认项目".to_string()));
+            return None;
+        };
+        self.refresh();
+        cx.emit(WorkspaceEvent::Changed);
+        Some(id)
     }
 
-    /// Mark a session as used for the sidebar's recency order. The in-memory
-    /// order is deliberately left alone, so rows do not jump under the pointer
-    /// while the user is working; the next launch shows the new order.
-    pub fn touch_session(&self, session_id: i64) {
-        self.store.touch_session(session_id).ok();
-    }
-
-    /// The pane's screen, after making sure its process is running for
-    /// `session_id`.
+    /// The pane's screen, after making sure a shell is running in `project_id`.
     ///
-    /// Agent sessions launch that agent's interactive TUI; shell sessions
-    /// launch the user's `$SHELL`. An exited agent TUI starts again; an exited
-    /// shell closes the pane (see [`Self::watch_terminal`]). Switching the pane
-    /// to another session parks the old process and reattaches it when that
-    /// session is shown again. Starting a process past the cap stops the parked
-    /// one shown least recently; a pane's visible terminal is never stopped.
+    /// An exited shell closes the pane (see [`Self::watch_terminal`]). Hiding
+    /// the project parks the process and reattaches it when that project is
+    /// shown again. Starting a process past the cap stops the parked one shown
+    /// least recently; a pane's visible terminal is never stopped.
     pub fn show_terminal(
         &mut self,
         pane: u64,
-        session_id: i64,
+        project_id: i64,
         cx: &mut Context<Self>,
     ) -> Snapshot {
+        // A clean exit is still owned by its pane until the watcher reports
+        // it. Switching projects in that gap must not start a replacement.
         if let Some(term_id) = self.pane_term.get(&pane).copied()
             && let Some(live) = self.terms.get(&term_id)
-            && live.session == session_id
-            && !live.term.snapshot().exited
+            && live.project == project_id
+            && live.term.snapshot().spawn_error.is_none()
         {
             let term = live.term.clone();
             self.touch_terminal(term_id);
@@ -243,13 +227,13 @@ impl Workspace {
             return term.snapshot();
         }
         self.park_terminal(pane);
-        let Some(session) = self.session(session_id).cloned() else {
+        let Some(path) = self.project(project_id).map(|project| project.path.clone()) else {
             return Snapshot::blank("", "");
         };
-        // This session was shown before: reattach its process and screen. Try
+        // This pane was shown before: reattach its process and screen. Try
         // this before reclaiming, because a reattach starts no new process and
         // must not cost some other terminal its process — least of all its own.
-        if let Some(term_id) = self.parked_terminal(session_id, pane) {
+        if let Some(term_id) = self.parked_terminal(project_id, pane) {
             let live = self.terms.get_mut(&term_id).unwrap();
             live.pane = Some(pane);
             live.parked_for = None;
@@ -261,18 +245,8 @@ impl Workspace {
         }
         self.reclaim_terminals();
         let colors = theme::term_colors(cx);
-        let launch = if crate::term::is_shell(&session.agent) {
-            Some(crate::term::default_shell())
-        } else {
-            agent::interactive(&session.agent)
-        };
-        let Some((program, args)) = launch else {
-            let mut snapshot = Snapshot::blank_with(&session.agent, &session.cwd, colors.bg);
-            snapshot.exited = true;
-            snapshot.spawn_error = Some("没有这个 agent".to_string());
-            return snapshot;
-        };
-        let (term, wake) = Term::launch(program, args, PathBuf::from(&session.cwd), colors);
+        let (program, args) = crate::term::default_shell();
+        let (term, wake) = Term::launch(program, args, PathBuf::from(&path), colors);
         let snapshot = term.snapshot();
         let term_id = self.next_term;
         self.next_term += 1;
@@ -280,7 +254,7 @@ impl Workspace {
             term_id,
             LiveTerm {
                 term,
-                session: session_id,
+                project: project_id,
                 pane: Some(pane),
                 parked_for: None,
                 last_notification: None,
@@ -288,7 +262,7 @@ impl Workspace {
         );
         self.pane_term.insert(pane, term_id);
         self.touch_terminal(term_id);
-        self.watch_terminal(term_id, session_id, wake, cx);
+        self.watch_terminal(term_id, project_id, wake, cx);
         snapshot
     }
 
@@ -303,17 +277,19 @@ impl Workspace {
 
     /// Bring the exact terminal that sent a notification back into a pane.
     /// A parked process is reattached without restarting its agent.
-    pub fn reveal_terminal(&mut self, terminal: u64, fallback_pane: u64) -> Option<(u64, i64)> {
+    pub fn reveal_terminal(&mut self, terminal: u64) -> Option<(u64, i64)> {
         let live = self.terms.get(&terminal)?;
-        let session = live.session;
-        let pane = live.pane.or(live.parked_for).unwrap_or(fallback_pane);
+        let project = live.project;
+        let pane = live.pane.or(live.parked_for)?;
         if live.pane.is_none() {
             self.park_terminal(pane);
-            self.terms.get_mut(&terminal)?.pane = Some(pane);
+            let live = self.terms.get_mut(&terminal)?;
+            live.pane = Some(pane);
+            live.parked_for = None;
             self.pane_term.insert(pane, terminal);
         }
         self.touch_terminal(terminal);
-        Some((pane, session))
+        Some((pane, project))
     }
 
     /// Push the UI theme's colors into every live terminal.
@@ -329,6 +305,15 @@ impl Workspace {
 
     pub fn terminal_snapshot(&self, pane: u64) -> Option<Snapshot> {
         self.shown_term(pane).map(|live| live.term.snapshot())
+    }
+
+    /// What the terminal at `terminal` calls itself, for the notification
+    /// title. Empty when the program set no title and no command is known.
+    pub fn terminal_label(&self, terminal: u64) -> String {
+        self.terms
+            .get(&terminal)
+            .map(|live| live.term.snapshot().label())
+            .unwrap_or_default()
     }
 
     pub fn terminal_generation(&self, pane: u64) -> Option<u64> {
@@ -399,23 +384,15 @@ impl Workspace {
         }
     }
 
-    /// Stop the process shown in `pane`, and any parked ones for the session it
-    /// was showing — closing the last pane of a session ends the terminal.
+    /// Stop the process shown in `pane`, and any process parked for that pane.
     pub fn drop_terminal(&mut self, pane: u64) {
-        let Some(term_id) = self.pane_term.remove(&pane) else {
-            return;
-        };
-        let session = self.terms.get(&term_id).map(|live| live.session);
-        self.drop_term(term_id);
-        let Some(session) = session else {
-            return;
-        };
-        // Another pane still shows the session; its parked siblings belong to
-        // this pane's shell and go with it.
+        if let Some(term_id) = self.pane_term.remove(&pane) {
+            self.drop_term(term_id);
+        }
         let parked: Vec<u64> = self
             .terms
             .iter()
-            .filter(|(_, live)| live.session == session && live.pane.is_none())
+            .filter(|(_, live)| live.pane.is_none() && live.parked_for == Some(pane))
             .map(|(id, _)| *id)
             .collect();
         for id in parked {
@@ -423,8 +400,8 @@ impl Workspace {
         }
     }
 
-    /// Park the process `pane` shows so switching back reattaches it. Exited
-    /// processes are stopped; live processes retain their prior pane id.
+    /// Park the process `pane` shows so switching back reattaches it. Clean
+    /// exits keep their owner until the watcher closes the pane.
     fn park_terminal(&mut self, pane: u64) {
         let Some(term_id) = self.pane_term.remove(&pane) else {
             return;
@@ -434,25 +411,24 @@ impl Workspace {
         };
         live.pane = None;
         live.parked_for = Some(pane);
-        let exited = live.term.snapshot().exited;
-        if exited {
+        if live.term.snapshot().spawn_error.is_some() {
             self.drop_term(term_id);
         }
     }
 
-    /// Park a pane while its owning session is hidden from the window.
+    /// Park a pane while its project is hidden from the window.
     pub fn hide_terminal(&mut self, pane: u64) {
         self.park_terminal(pane);
     }
 
     /// The hidden terminal owned by `pane`.
-    fn parked_terminal(&self, session_id: i64, pane: u64) -> Option<u64> {
+    fn parked_terminal(&self, project_id: i64, pane: u64) -> Option<u64> {
         self.term_lru.iter().rev().copied().find(|id| {
             self.terms.get(id).is_some_and(|live| {
                 live.pane.is_none()
-                    && live.session == session_id
+                    && live.project == project_id
                     && live.parked_for == Some(pane)
-                    && !live.term.snapshot().exited
+                    && live.term.snapshot().spawn_error.is_none()
             })
         })
     }
@@ -473,11 +449,11 @@ impl Workspace {
         self.term_lru.push(term_id);
     }
 
-    fn drop_session_terminals(&mut self, session_id: i64) {
+    fn drop_project_terminals(&mut self, project_id: i64) {
         let terms: Vec<u64> = self
             .terms
             .iter()
-            .filter(|(_, live)| live.session == session_id)
+            .filter(|(_, live)| live.project == project_id)
             .map(|(id, _)| *id)
             .collect();
         for id in terms {
@@ -485,28 +461,24 @@ impl Workspace {
         }
     }
 
-    /// Drop exited processes, then stop parked ones until one more process fits
-    /// under the cap.
+    /// Stop parked processes until one more running process fits under the cap.
     ///
     /// Only parked terminals are candidates. Dropping a visible one would
     /// remove its pane's mapping and leave a pane that still believes it has a
-    /// session while nothing answers its input; the cap is soft when every
+    /// shell while nothing answers its input; the cap is soft when every
     /// running process is on screen.
     fn reclaim_terminals(&mut self) {
-        let dead: Vec<u64> = self
-            .terms
-            .iter()
-            .filter(|(_, live)| live.term.snapshot().exited)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in dead {
-            self.drop_term(id);
-        }
+        // The watcher owns exit cleanup and must still report the pane to the
+        // UI. Reclaiming it here would consume that exit before it is handled.
         let alive: Vec<u64> = self
             .term_lru
             .iter()
             .copied()
-            .filter(|id| self.terms.contains_key(id))
+            .filter(|id| {
+                self.terms
+                    .get(id)
+                    .is_some_and(|live| !live.term.snapshot().exited)
+            })
             .collect();
         let parked: Vec<u64> = alive
             .iter()
@@ -521,7 +493,7 @@ impl Workspace {
     fn watch_terminal(
         &self,
         term_id: u64,
-        session_id: i64,
+        project_id: i64,
         mut wake: futures::channel::mpsc::UnboundedReceiver<()>,
         cx: &mut Context<Self>,
     ) {
@@ -534,6 +506,7 @@ impl Workspace {
                         };
                         let snapshot = live.term.snapshot();
                         let pane = live.pane;
+                        let owning_pane = pane.or(live.parked_for);
                         let term = live.term.clone();
                         while let Some(notification) = term.take_notification() {
                             let now = Instant::now();
@@ -548,26 +521,21 @@ impl Workspace {
                                 live.last_notification = Some((now, notification.clone()));
                                 cx.emit(WorkspaceEvent::Attention {
                                     terminal: term_id,
-                                    session: session_id,
+                                    project: project_id,
                                     notification,
                                 });
                             }
                         }
                         // `exit` (or any clean shell death) closes this pane.
-                        // The session row stays while another pane still shows
-                        // it; spawn failures keep the pane so the header can
-                        // show why.
-                        let shell_done = snapshot.exited
-                            && snapshot.spawn_error.is_none()
-                            && workspace
-                                .session(session_id)
-                                .is_some_and(|s| crate::term::is_shell(&s.agent));
+                        // The project stays. Spawn failures keep the pane so
+                        // the header can show why.
+                        let shell_done = snapshot.exited && snapshot.spawn_error.is_none();
                         if shell_done {
                             workspace.drop_term(term_id);
-                            if let Some(pane) = pane {
+                            if let Some(pane) = owning_pane {
                                 cx.emit(WorkspaceEvent::PaneExited {
                                     pane,
-                                    session: session_id,
+                                    project: project_id,
                                 });
                             }
                             return false;
@@ -609,7 +577,7 @@ impl Workspace {
         Some(id)
     }
 
-    /// Rename a project without moving it or its sessions.
+    /// Rename a project without moving it.
     pub fn rename_project(&mut self, project_id: i64, name: String, cx: &mut Context<Self>) {
         if let Err(error) = self.store.rename_project(project_id, &name) {
             Self::failed(cx, "重命名项目失败", error);
@@ -619,271 +587,17 @@ impl Workspace {
         cx.emit(WorkspaceEvent::Changed);
     }
 
-    /// Delete a project and every session in it. Terminals are stopped only
-    /// after the row is gone, so a failed write leaves the workspace untouched.
-    ///
-    /// Returns the first session left in another project, for the panes that
-    /// were showing the deleted project to land on.
-    pub fn delete_project(
-        &mut self,
-        project_id: i64,
-        cx: &mut Context<Self>,
-    ) -> Result<Option<i64>, ()> {
-        let sessions: Vec<i64> = self
-            .sessions
-            .iter()
-            .filter(|session| session.project_id == project_id)
-            .map(|session| session.id)
-            .collect();
-        let next = self
-            .sessions
-            .iter()
-            .find(|session| session.project_id != project_id)
-            .map(|session| session.id);
+    /// Delete a project. Terminals are stopped only after the row is gone,
+    /// so a failed write leaves the workspace untouched.
+    pub fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) -> Result<(), ()> {
         if let Err(error) = self.store.delete_project(project_id) {
             Self::failed(cx, "删除项目失败", error);
             return Err(());
         }
-        for session_id in sessions {
-            self.drop_session_terminals(session_id);
-        }
+        self.drop_project_terminals(project_id);
         self.refresh();
         cx.emit(WorkspaceEvent::Changed);
-        Ok(next)
-    }
-
-    /// Start a shell session in `project_id`, or in the first project when
-    /// none is given, returning its id.
-    pub fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) -> Option<i64> {
-        let project_id = match project_id.or_else(|| self.projects.first().map(|p| p.id)) {
-            Some(id) => id,
-            None => {
-                // The row was just inserted, so pick up its path before reading
-                // the cwd below.
-                let Some(id) = insert_bootstrap_project(&self.store) else {
-                    cx.emit(WorkspaceEvent::Failed("无法创建默认项目".to_string()));
-                    return None;
-                };
-                self.refresh();
-                id
-            }
-        };
-        let cwd = self
-            .projects
-            .iter()
-            .find(|p| p.id == project_id)
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
-        let n = self.sessions.len() + 1;
-        let id = match self.store.insert_session(
-            project_id,
-            crate::term::SHELL,
-            &format!("终端 {n}"),
-            &cwd,
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                Self::failed(cx, "新建会话失败", error);
-                return None;
-            }
-        };
-        self.refresh();
-        cx.emit(WorkspaceEvent::Changed);
-        Some(id)
-    }
-
-    /// Apply the name the user chose. It is marked as theirs, which is what
-    /// keeps a title generated later from replacing it.
-    pub fn rename_session(&mut self, session_id: i64, title: String, cx: &mut Context<Self>) {
-        if let Err(error) = self.store.rename_session(session_id, &title) {
-            Self::failed(cx, "重命名会话失败", error);
-            return;
-        }
-        self.refresh();
-        cx.emit(WorkspaceEvent::Changed);
-    }
-
-    /// Poll each agent's on-disk session store for titles, so a shell that
-    /// launched an agent picks up the name that agent wrote. The shell's
-    /// process tree says which agent TUI is running under it; a title is only
-    /// accepted when the session was written after that process started.
-    /// `agent::disk_title` says why.
-    ///
-    /// The scan is file and process work — one `ps` snapshot per live terminal
-    /// and a walk of the agents' stores — so it runs on the background executor
-    /// and only its findings are applied on the UI thread. With no live
-    /// terminal there is nothing to look up, and the round trip is skipped.
-    fn watch_agent_titles(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(TITLE_SYNC_EVERY).await;
-                let queries = match this.update(cx, |workspace, _| workspace.title_queries()) {
-                    Ok(queries) => queries,
-                    Err(_) => break,
-                };
-                if queries.is_empty() {
-                    continue;
-                }
-                let scans = cx
-                    .background_executor()
-                    .spawn(async move { queries.into_iter().map(scan_title).collect::<Vec<_>>() })
-                    .await;
-                let changed =
-                    match this.update(cx, |workspace, _| workspace.apply_title_scan(scans)) {
-                        Ok(changed) => changed,
-                        Err(_) => break,
-                    };
-                if changed {
-                    let _ = this.update(cx, |_workspace, cx| {
-                        cx.emit(WorkspaceEvent::Changed);
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// What a title poll needs to look at: live terminals whose titles the user
-    /// has not set, with what the scan needs to ask the agents' stores. Gathered
-    /// here because the PTY handles live in this struct.
-    fn title_queries(&self) -> Vec<TitleQuery> {
-        // One query per sidebar session. Several terminals may share a session;
-        // prefer one a pane still shows, then the lowest terminal id, so title
-        // claims stay deterministic.
-        let mut live: Vec<(i64, bool, u64, Option<u32>)> = self
-            .terms
-            .iter()
-            .filter(|(_, live)| !live.term.snapshot().exited)
-            .map(|(id, live)| {
-                (
-                    live.session,
-                    live.pane.is_none(),
-                    *id,
-                    live.term.process_id(),
-                )
-            })
-            .collect();
-        live.sort_by_key(|(session_id, parked, term_id, _)| (*session_id, *parked, *term_id));
-        let mut seen = HashSet::new();
-        live.into_iter()
-            .filter_map(|(session_id, _, _, pid)| {
-                if !seen.insert(session_id) {
-                    return None;
-                }
-                let session = self.sessions.iter().find(|s| s.id == session_id)?;
-                if session.title_manual {
-                    return None;
-                }
-                Some(TitleQuery {
-                    session_id,
-                    cwd: session.cwd.clone(),
-                    pid,
-                    agent_id: session.agent.clone(),
-                    shell: crate::term::is_shell(&session.agent),
-                    agent_session_id: session.agent_session_id.clone(),
-                })
-            })
-            .collect()
-    }
-
-    /// Fold a batch of scans into the sessions, returning whether anything the
-    /// sidebar shows changed.
-    fn apply_title_scan(&mut self, scans: Vec<TitleScan>) -> bool {
-        let mut claimed: HashSet<String> = self
-            .sessions
-            .iter()
-            .filter_map(|s| s.agent_session_id.clone())
-            .collect();
-        let mut changed = false;
-        for scan in scans {
-            let TitleScan {
-                session_id,
-                binding_alive,
-                bound_title,
-                mut candidates,
-            } = scan;
-            let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
-                continue;
-            };
-            // A binding whose agent has exited is dropped so a later agent
-            // session under the same shell can be claimed. The title stays: it
-            // is still what this terminal is showing, and rewriting it to
-            // "终端 N" would also lose every agent-assigned name on restart,
-            // when the process is gone but the session row is not.
-            if binding_alive == Some(false) {
-                let _ = self.store.clear_session_agent_session_id(session_id);
-                if let Some(resume) = session.agent_session_id.as_deref() {
-                    claimed.remove(resume);
-                }
-                if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    row.agent_session_id = None;
-                }
-                changed = true;
-                continue;
-            }
-            let next = if let Some(resume) = session.agent_session_id.as_deref() {
-                bound_title.map(|title| (resume.to_string(), title))
-            } else {
-                candidates.retain(|c| !claimed.contains(&c.agent_session_id));
-                candidates
-                    .into_iter()
-                    .max_by_key(|c| c.score)
-                    .map(|c| (c.agent_session_id, c.title))
-            };
-            let Some((agent_session_id, title)) = next else {
-                continue;
-            };
-            if session.agent_session_id.as_deref() != Some(agent_session_id.as_str()) {
-                if self
-                    .store
-                    .set_session_agent_session_id(session_id, &agent_session_id)
-                    .is_ok()
-                {
-                    claimed.insert(agent_session_id.clone());
-                    if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        row.agent_session_id = Some(agent_session_id);
-                    }
-                    changed = true;
-                }
-            } else {
-                claimed.insert(agent_session_id);
-            }
-            if session.title != title
-                && self
-                    .store
-                    .update_session_title(session_id, &title)
-                    .unwrap_or(false)
-            {
-                if let Some(row) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    row.title = title;
-                }
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Delete a session: remove the row, then drop every pane terminal bound to
-    /// it.
-    ///
-    /// Returns the neighbor to select next — computed before the row is gone —
-    /// so a caller that was looking at this session can land somewhere else.
-    /// The row goes first: if the write fails, nothing is torn down and the
-    /// session can be retried.
-    pub fn delete_session(
-        &mut self,
-        session_id: i64,
-        cx: &mut Context<Self>,
-    ) -> Result<Option<i64>, ()> {
-        let next = neighbor_session(&self.sessions, session_id);
-        if let Err(error) = self.store.delete_session(session_id) {
-            Self::failed(cx, "删除会话失败", error);
-            return Err(());
-        }
-        self.drop_session_terminals(session_id);
-        self.refresh();
-        cx.emit(WorkspaceEvent::Changed);
-        Ok(next)
+        Ok(())
     }
 }
 
@@ -944,92 +658,6 @@ fn insert_bootstrap_project(store: &Store) -> Option<i64> {
     store.insert_project(&project_name(&dir), &path).ok()
 }
 
-/// One live session as a title poll sees it: everything the off-thread scan
-/// needs, copied off the [`Workspace`] so the scan can run on the background
-/// executor.
-struct TitleQuery {
-    session_id: i64,
-    cwd: String,
-    pid: Option<u32>,
-    agent_id: String,
-    shell: bool,
-    agent_session_id: Option<String>,
-}
-
-/// What a scan found for one query: the verdict on a stored binding, or the
-/// candidates an unbound session could claim.
-struct TitleScan {
-    session_id: i64,
-    /// `Some(false)` when the stored binding no longer belongs to the terminal.
-    binding_alive: Option<bool>,
-    /// The title a live binding resolves to.
-    bound_title: Option<String>,
-    candidates: Vec<agent::DiskTitle>,
-}
-
-/// Read one session's agent stores. Runs on the background executor: it shells
-/// out to `ps` and walks the agents' session files, which is far too slow for
-/// the UI thread's two-second poll.
-fn scan_title(query: TitleQuery) -> TitleScan {
-    let TitleQuery {
-        session_id,
-        cwd,
-        pid,
-        agent_id,
-        shell,
-        agent_session_id,
-    } = query;
-    let mut scan = TitleScan {
-        session_id,
-        binding_alive: None,
-        bound_title: None,
-        candidates: Vec::new(),
-    };
-    match agent_session_id.as_deref() {
-        // A shell's binding has to be re-proved every poll: the agent it names
-        // may have exited, and a cwd-only match must not let this terminal keep
-        // someone else's name.
-        Some(resume) if shell => {
-            let alive = agent::resume_belongs_to_terminal(resume, pid);
-            scan.binding_alive = Some(alive);
-            if alive {
-                scan.bound_title = agent::lookup_disk_title(resume);
-            }
-        }
-        // A non-shell session is the agent itself; its own store answers, and
-        // there is no process to re-check.
-        Some(resume) => scan.bound_title = agent::lookup_disk_title(resume),
-        None => {
-            let prefer = (!shell).then_some(agent_id.as_str());
-            scan.candidates = agent::discover_disk_title(&cwd, pid, prefer, shell);
-        }
-    }
-    scan
-}
-
-/// Which session to select after `id` is deleted.
-///
-/// The nearest sibling in the same project in sidebar order (the next one, else
-/// the previous), else the first session left anywhere, else none — so the
-/// right pane never goes blank while sessions remain.
-pub(crate) fn neighbor_session(sessions: &[Session], id: i64) -> Option<i64> {
-    let project = sessions.iter().find(|s| s.id == id)?.project_id;
-    let siblings: Vec<i64> = sessions
-        .iter()
-        .filter(|s| s.project_id == project)
-        .map(|s| s.id)
-        .collect();
-    let position = siblings.iter().position(|&sid| sid == id);
-    position
-        .and_then(|i| siblings.get(i + 1).copied())
-        .or_else(|| {
-            position
-                .and_then(|i| i.checked_sub(1))
-                .and_then(|i| siblings.get(i).copied())
-        })
-        .or_else(|| sessions.iter().map(|s| s.id).find(|&sid| sid != id))
-}
-
 /// Which parked terminals to stop so one more process fits under `cap`, least
 /// recently shown first. `order` holds only parked terminals; `alive` is every
 /// running process, including those a pane shows. Returning nothing is correct
@@ -1045,28 +673,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ProjectPick, first_run_dir_from, neighbor_session, project_name, resolve_project_pick,
-        terminal_evictions,
+        ProjectPick, first_run_dir_from, project_name, resolve_project_pick, terminal_evictions,
     };
-    use crate::db::{Project, Session};
+    use crate::db::Project;
 
     fn project(id: i64, path: &str) -> Project {
         Project {
             id,
             name: format!("project-{id}"),
             path: path.into(),
-        }
-    }
-
-    fn session(id: i64, project_id: i64) -> Session {
-        Session {
-            id,
-            project_id,
-            agent: "shell".into(),
-            title: format!("终端 {id}"),
-            cwd: "/tmp".into(),
-            agent_session_id: None,
-            title_manual: false,
         }
     }
 
@@ -1077,7 +692,11 @@ mod tests {
         use std::collections::HashMap;
 
         let mut terms = HashMap::new();
-        for (id, session, pane) in [(1, 10, Some(1)), (2, 10, Some(2)), (3, 20, None)] {
+        for (id, project, pane, parked_for) in [
+            (1, 10, Some(1), None),
+            (2, 10, Some(2), None),
+            (3, 20, None, Some(3)),
+        ] {
             let (term, _wake) = Term::launch(
                 "/bin/cat".into(),
                 Vec::new(),
@@ -1088,9 +707,9 @@ mod tests {
                 id,
                 LiveTerm {
                     term,
-                    session,
+                    project,
                     pane,
-                    parked_for: pane,
+                    parked_for,
                     last_notification: None,
                 },
             );
@@ -1099,7 +718,6 @@ mod tests {
             store: crate::db::Store::in_memory().expect("test store"),
             persistent: false,
             projects: Vec::new(),
-            sessions: Vec::new(),
             terms,
             pane_term: HashMap::from([(1, 1), (2, 2)]),
             term_lru: vec![3, 1, 2],
@@ -1110,72 +728,123 @@ mod tests {
         assert!(!workspace.notification_is_read(1, None), "inactive window");
         assert!(
             !workspace.notification_is_read(2, Some(1)),
-            "same session, other pane"
+            "same project, other pane"
         );
         assert!(workspace.notification_is_read(1, Some(1)));
         assert!(
             !workspace.notification_is_read(3, Some(1)),
             "parked terminal"
         );
-        assert_eq!(workspace.reveal_terminal(2, 1), Some((2, 10)));
+        assert_eq!(workspace.reveal_terminal(2), Some((2, 10)));
         assert_eq!(
             workspace.pane_term[&1], 1,
             "an already visible terminal keeps its pane"
         );
-        assert_eq!(workspace.reveal_terminal(3, 1), Some((1, 20)));
-        assert_eq!(workspace.pane_term[&1], 3);
+        assert_eq!(workspace.reveal_terminal(3), Some((3, 20)));
+        assert_eq!(workspace.pane_term[&1], 1);
         assert_eq!(workspace.pane_term[&2], 2);
-        assert_eq!(workspace.terms[&3].pane, Some(1));
-        assert!(workspace.notification_is_read(3, Some(1)));
+        assert_eq!(workspace.pane_term[&3], 3);
+        assert_eq!(workspace.terms[&3].pane, Some(3));
+        assert_eq!(workspace.terms[&3].parked_for, None);
+        assert!(workspace.notification_is_read(3, Some(3)));
+        workspace.hide_terminal(3);
+        assert_eq!(workspace.parked_terminal(20, 3), Some(3));
+        workspace.drop_terminal(1);
         assert!(
             workspace.notification_is_read(1, None),
             "removed terminal clears stale attention"
         );
         assert_eq!(
-            workspace.reveal_terminal(1, 1),
+            workspace.reveal_terminal(1),
             None,
             "stale notification cannot restart a process"
         );
     }
 
-    /// Deleting the session the user is looking at must land them next door,
-    /// not on a blank pane.
-    #[test]
-    fn deletion_falls_back_to_the_nearest_sibling() {
-        let sessions = vec![session(1, 10), session(2, 10), session(3, 10)];
+    #[gpui::test]
+    fn shell_exit_reports_both_visible_and_parked_panes(cx: &mut gpui_kit::TestAppContext) {
+        use super::{LiveTerm, Workspace, WorkspaceEvent};
+        use crate::term::{Term, TermColors};
+        use gpui_kit::{AppContext, Entity};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
 
-        assert_eq!(neighbor_session(&sessions, 2), Some(3), "the next one");
-        assert_eq!(
-            neighbor_session(&sessions, 3),
-            Some(2),
-            "no next: the previous one"
-        );
-        assert_eq!(
-            neighbor_session(&sessions, 1),
-            Some(2),
-            "the first one skips forward too"
-        );
-    }
-
-    /// The sidebar orders sessions by recency, so the neighbor after a delete
-    /// has to follow that order rather than numeric ids.
-    #[test]
-    fn deletion_follows_sidebar_order_not_id_order() {
-        let sessions = vec![session(3, 10), session(1, 10), session(2, 10)];
-        assert_eq!(neighbor_session(&sessions, 1), Some(2), "the next row");
-        assert_eq!(neighbor_session(&sessions, 2), Some(1), "the previous row");
-    }
-
-    /// With no sibling left in the project, the other project's sessions still
-    /// beat the empty state; only a truly empty list returns `None`.
-    #[test]
-    fn deletion_falls_back_across_projects_then_to_nothing() {
-        let sessions = vec![session(1, 10), session(2, 20)];
-
-        assert_eq!(neighbor_session(&sessions, 1), Some(2), "another project");
-        assert_eq!(neighbor_session(&sessions, 2), Some(1), "and back");
-        assert_eq!(neighbor_session(&[session(1, 10)], 1), None, "the last one");
-        assert_eq!(neighbor_session(&[], 1), None, "unknown id");
+        let workspace = cx.new(|cx| {
+            let mut workspace = Workspace {
+                store: crate::db::Store::in_memory().expect("test store"),
+                persistent: false,
+                projects: Vec::new(),
+                terms: HashMap::new(),
+                pane_term: HashMap::from([(1, 1), (2, 2), (3, 3)]),
+                term_lru: vec![1, 2, 3],
+                next_term: 4,
+                startup_error: None,
+                saved_workspace: None,
+            };
+            for id in 1..=3 {
+                let (program, args) = if id == 3 {
+                    ("/bin/cat", Vec::new())
+                } else {
+                    ("/bin/sh", vec!["-c".into(), "exit 0".into()])
+                };
+                let (term, _wake) = Term::launch(
+                    program.into(),
+                    args,
+                    std::env::temp_dir(),
+                    TermColors::default(),
+                );
+                if id != 3 {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !term.snapshot().exited {
+                        assert!(Instant::now() < deadline, "test shell must exit");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(term.snapshot().spawn_error.is_none());
+                }
+                workspace.terms.insert(
+                    id,
+                    LiveTerm {
+                        term,
+                        project: 10,
+                        pane: Some(id),
+                        parked_for: None,
+                        last_notification: None,
+                    },
+                );
+                if id != 3 {
+                    // Deliver the final wake on this thread: GPUI's test
+                    // scheduler rejects wakes from native PTY threads.
+                    let (tx, wake) = futures::channel::mpsc::unbounded();
+                    tx.unbounded_send(()).unwrap();
+                    drop(tx);
+                    workspace.watch_terminal(id, 10, wake, cx);
+                }
+            }
+            workspace.hide_terminal(2);
+            workspace.reclaim_terminals();
+            assert_eq!(workspace.parked_terminal(10, 2), Some(2));
+            assert!(workspace.show_terminal(1, 10, cx).exited);
+            workspace
+        });
+        let events: Entity<Vec<(u64, i64)>> = cx.new(|cx| {
+            cx.subscribe(&workspace, |events: &mut Vec<(u64, i64)>, _, event, _| {
+                if let WorkspaceEvent::PaneExited { pane, project } = event {
+                    events.push((*pane, *project));
+                }
+            })
+            .detach();
+            Vec::new()
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let mut exited = events.read(cx).clone();
+            exited.sort_unstable();
+            assert_eq!(exited, vec![(1, 10), (2, 10)]);
+            let workspace = workspace.read(cx);
+            assert_eq!(workspace.terms.len(), 1);
+            assert_eq!(workspace.pane_term, HashMap::from([(3, 3)]));
+            assert_eq!(workspace.term_lru, vec![3]);
+        });
     }
 
     #[test]

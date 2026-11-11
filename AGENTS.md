@@ -1,5 +1,5 @@
 # AGENTS.md
-A macOS workspace that runs local coding agents in their own terminal interfaces, one project/session tree and a splitable grid of PTYs.
+A macOS workspace that runs local coding agents in their own terminal interfaces, one project list and a splitable grid of PTYs per project.
 
 ## Tech stack
 - gpui-kit, the entire UI: GPUI rendering engine (wgpu drawing, text layout), declarative element tree, component library (Button/Input/Switch/TitleBar/Root), theme system (ThemeRegistry + semantic tokens), multi-window management. Hover labels on app elements go through an overlay of the app's own (src/ui/tooltip.rs, mounted by src/ui/layers.rs::`window_layers`) because the one `Root` mounts is crate-private — the tooltip surface and the overlay are both public API, the trait that asks the overlay for a tooltip is not
@@ -10,8 +10,8 @@ A macOS workspace that runs local coding agents in their own terminal interfaces
 
 ## Type scale
 Stay on the two-step rem scale; no custom `text_size(px(...))` or `text_base`+ in app code:
-- `text_sm` (14px) — body text: message content in the conversation, card/section titles (pair with `font_medium`/`font_bold`), main empty states ("还没有会话"), window title bar
-- `text_xs` (12px) — everything secondary/meta: sidebar project & session rows, composer chip labels (model name), the model picker's list rows (name + provider subtitle, name keeps `font_medium`), timestamps, inline labels and captions, empty list placeholders
+- `text_sm` (14px) — body text: message content in the conversation, card/section titles (pair with `font_medium`/`font_bold`), main empty states ("还没有项目"), window title bar
+- `text_xs` (12px) — everything secondary/meta: sidebar project rows, composer chip labels (model name), the model picker's list rows (name + provider subtitle, name keeps `font_medium`), timestamps, inline labels and captions, empty list placeholders
 - Hierarchy within the same size comes from `font_medium`/`font_bold` and muted foreground color, not from mixing extra sizes
 - Input components set their own font (theme mono size); don't override their text size
 

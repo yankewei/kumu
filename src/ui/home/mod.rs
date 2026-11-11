@@ -1,8 +1,7 @@
-//! Home window: projects → sessions tree on the left, the selected session's
-//! splitable pane tree on the right. Owns the settings window handle.
+//! Home window: projects on the left, the selected project's splitable pane
+//! tree on the right. Owns the settings window handle.
 //!
-//! A session belongs to a project and owns its panes. Splitting adds another
-//! pane (and its own shell) to that session; the sidebar lists sessions.
+//! A project owns its panes. Splitting adds another shell to that project.
 
 mod panes;
 mod sidebar;
@@ -24,9 +23,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::Updater;
-use panes::{
-    PaneId, PaneNode, SavedPane, SavedSessionLayout, SavedWorkspace, WORKSPACE_STATE_VERSION,
-};
+use panes::{PaneId, PaneNode, SavedProjectLayout, SavedWorkspace, WORKSPACE_STATE_VERSION};
 use terminal::{TerminalEvent, TerminalView};
 
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
@@ -35,33 +32,31 @@ use terminal::{TerminalEvent, TerminalView};
 const RATIO_SCALE: f32 = 10_000.;
 
 pub struct KumuApp {
-    /// Projects, sessions and their live agents; the home view draws it and
-    /// hands it every user action.
+    /// Projects and their live shells; the home view draws it and hands it
+    /// every user action.
     workspace: Entity<Workspace>,
     /// Owned by the home window so closing Settings does not interrupt an update.
     updater: Entity<Updater>,
     settings_window: Option<WindowHandle<Root>>,
-    /// Session currently shown in the content area.
+    /// Project currently shown in the content area.
     selected: Option<i64>,
     /// Terminals that requested attention while unattended, mapped to their
-    /// session for the sidebar marker.
+    /// project for the sidebar marker.
     unread_notifications: HashMap<u64, i64>,
     /// A persistence failure the workspace reported, shown above the panes
     /// until dismissed.
     store_error: Option<String>,
-    /// Projects collapsed in the sidebar tree.
-    collapsed_projects: HashSet<i64>,
-    /// Hover labels for the sidebar tree (see [`Tooltips`]).
+    /// Hover labels for the sidebar (see [`Tooltips`]).
     tooltips: Entity<Tooltips>,
     /// Terminal views keyed by pane id.
     panes: HashMap<PaneId, Entity<TerminalView>>,
-    /// Each sidebar session owns an independent pane tree.
+    /// Each project owns an independent pane tree.
     layouts: HashMap<i64, PaneNode>,
-    /// Last focused pane in each session's tree.
-    focused_by_session: HashMap<i64, PaneId>,
+    /// Last focused pane in each project's tree.
+    focused_by_project: HashMap<i64, PaneId>,
     /// Resizable state per split group, so drag sizes can be saved and restored.
     group_states: HashMap<u64, Entity<ResizableState>>,
-    /// Focused pane in the selected session.
+    /// Focused pane in the selected project.
     focused: PaneId,
     /// Focus this pane's terminal on the next paint (after a split / select).
     pending_focus: Option<PaneId>,
@@ -89,7 +84,7 @@ impl KumuApp {
             }
             WorkspaceEvent::Attention {
                 terminal,
-                session,
+                project,
                 notification,
             } => {
                 if !cx.global::<NotificationSettings>().enabled
@@ -101,19 +96,15 @@ impl KumuApp {
                     return;
                 }
                 let workspace = this.workspace.read(cx);
-                let Some(session_info) = workspace.session(*session) else {
+                let Some(project_info) = workspace.project(*project) else {
                     return;
                 };
                 if cx.global::<NotificationSettings>().sound {
                     window.play_system_bell();
                 }
-                let project = workspace
-                    .projects()
-                    .iter()
-                    .find(|project| project.id == session_info.project_id);
-                let title = match project {
-                    Some(project) => format!("{} · {}", project.name, session_info.title),
-                    None => session_info.title.clone(),
+                let title = match workspace.terminal_label(*terminal) {
+                    label if label.is_empty() => project_info.name.clone(),
+                    label => format!("{} · {}", project_info.name, label),
                 };
                 let message = match (notification.title.is_empty(), notification.body.is_empty()) {
                     (true, true) => "终端需要你的关注".to_string(),
@@ -121,7 +112,7 @@ impl KumuApp {
                     (true, false) => notification.body.clone(),
                     (false, false) => format!("{}\n{}", notification.title, notification.body),
                 };
-                this.unread_notifications.insert(*terminal, *session);
+                this.unread_notifications.insert(*terminal, *project);
                 let terminal = *terminal;
                 let weak = cx.entity().downgrade();
                 let note = Notification::info(message)
@@ -130,16 +121,16 @@ impl KumuApp {
                     .delivery(NotificationDelivery::InApp)
                     .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |this, cx| {
-                            let target = this.workspace.update(cx, |workspace, _| {
-                                workspace.reveal_terminal(terminal, this.focused.0)
-                            });
-                            if let Some((pane, session)) = target {
+                            let target = this
+                                .workspace
+                                .update(cx, |workspace, _| workspace.reveal_terminal(terminal));
+                            if let Some((pane, project)) = target {
                                 let pane = PaneId(pane);
                                 let snapshot = this.workspace.read(cx).terminal_snapshot(pane.0);
                                 if let Some(view) = this.panes.get(&pane)
                                     && let Some(snapshot) = snapshot
                                 {
-                                    view.update(cx, |view, cx| view.attach(session, snapshot, cx));
+                                    view.update(cx, |view, cx| view.attach(project, snapshot, cx));
                                 }
                                 this.focus_pane(pane, cx);
                                 this.focus_terminal(window, cx);
@@ -158,8 +149,16 @@ impl KumuApp {
                 );
                 cx.notify();
             }
-            WorkspaceEvent::PaneExited { pane, session } => {
-                this.on_pane_exited(PaneId(*pane), *session, cx);
+            WorkspaceEvent::PaneExited { pane, project } => {
+                let pane = PaneId(*pane);
+                if this
+                    .panes
+                    .get(&pane)
+                    .and_then(|view| view.read(cx).project_id())
+                    == Some(*project)
+                {
+                    this.close_pane(pane, cx);
+                }
             }
             _ => {}
         })
@@ -196,15 +195,14 @@ impl KumuApp {
             selected: None,
             unread_notifications: HashMap::new(),
             store_error: startup_error,
-            collapsed_projects: HashSet::new(),
             tooltips,
             panes: HashMap::new(),
             layouts: HashMap::new(),
-            focused_by_session: HashMap::new(),
+            focused_by_project: HashMap::new(),
             group_states: HashMap::new(),
             focused: PaneId(1),
             pending_focus: None,
-            next_pane: 2,
+            next_pane: 1,
             next_group: 1,
             last_saved_layout,
         };
@@ -217,26 +215,25 @@ impl KumuApp {
         app
     }
 
-    /// Show the first session in a single pane — the first run, and the
+    /// Show the first project in a single pane — the first run, and the
     /// fallback whenever a saved layout cannot be used.
     fn start_default(&mut self, cx: &mut Context<Self>) {
-        let pane = PaneId(1);
-        let Some(session) = self.workspace.read(cx).sessions().first().map(|s| s.id) else {
+        let Some(project) = self.workspace.read(cx).projects().first().map(|p| p.id) else {
             return;
         };
-        self.layouts.insert(session, PaneNode::leaf(pane));
-        self.focused_by_session.insert(session, pane);
-        self.selected = Some(session);
-        self.focused = pane;
-        let terminal = self.install_pane(pane, cx);
-        terminal.update(cx, |terminal, cx| terminal.show(session, cx));
-        self.next_pane = 2;
-        self.next_group = 1;
+        self.ensure_project_layout(project, cx);
+        self.selected = Some(project);
+        self.focused = self
+            .focused_by_project
+            .get(&project)
+            .copied()
+            .unwrap_or(PaneId(1));
+        self.show_project_panes(project, cx);
     }
 
     /// Recreate the saved pane tree and terminals, or return false so the
     /// caller falls back to [`Self::start_default`]. A layout is accepted only
-    /// when its JSON and version are known and every pane still has a session:
+    /// when its JSON and version are known and every pane still has a project:
     /// a stale row, a corrupt document, or an absurd pane count must never
     /// prevent the window from opening.
     fn restore_workspace(&mut self, saved: Option<&str>, cx: &mut Context<Self>) -> bool {
@@ -244,54 +241,48 @@ impl KumuApp {
             return false;
         };
         let workspace = self.workspace.clone();
-        let Some(restored) = SavedWorkspace::restore(
-            saved,
-            |session| workspace.read(cx).session(session).is_some(),
-            |project| {
-                workspace
-                    .read(cx)
-                    .projects()
-                    .iter()
-                    .any(|p| p.id == project)
-            },
-        ) else {
+        let Some(restored) = SavedWorkspace::restore(saved, |project| {
+            workspace
+                .read(cx)
+                .projects()
+                .iter()
+                .any(|p| p.id == project)
+        }) else {
             return false;
         };
 
         let panes::RestoredWorkspace {
             layouts,
-            focused_by_session,
+            focused_by_project,
             selected,
-            collapsed_projects,
             group_sizes,
             next_pane,
             next_group,
         } = restored;
         self.layouts = layouts;
-        self.focused_by_session = focused_by_session;
+        self.focused_by_project = focused_by_project;
         self.selected = selected;
         self.next_pane = next_pane;
         self.next_group = next_group;
-        self.collapsed_projects = collapsed_projects.into_iter().collect();
         self.group_states.clear();
         for (group, ratios) in group_sizes {
             let state = Self::new_group_state(&ratios, cx);
             self.group_states.insert(group, state);
         }
-        if let Some(session) = self.selected {
-            self.show_session_panes(session, cx);
+        if let Some(project) = self.selected {
+            self.show_project_panes(project, cx);
         }
         self.focused = self
             .selected
-            .and_then(|session| self.focused_by_session.get(&session).copied())
+            .and_then(|project| self.focused_by_project.get(&project).copied())
             .unwrap_or(PaneId(1));
         true
     }
 
-    /// Materialize and attach every pane in the selected session. Other
-    /// sessions keep their saved trees and create their views when selected.
-    fn show_session_panes(&mut self, session: i64, cx: &mut Context<Self>) {
-        let Some(layout) = self.layouts.get(&session) else {
+    /// Materialize and attach every pane in the selected project. Other
+    /// projects keep their saved trees and create their views when selected.
+    fn show_project_panes(&mut self, project: i64, cx: &mut Context<Self>) {
+        let Some(layout) = self.layouts.get(&project) else {
             return;
         };
         let pane_ids = layout.panes();
@@ -301,7 +292,7 @@ impl KumuApp {
             } else {
                 self.install_pane(pane, cx)
             };
-            terminal.update(cx, |terminal, cx| terminal.show(session, cx));
+            terminal.update(cx, |terminal, cx| terminal.show(project, cx));
         }
     }
 
@@ -334,11 +325,11 @@ impl KumuApp {
         state
     }
 
-    /// Write the pane tree, its sessions, the focused pane and the collapsed
-    /// projects for the next launch. Identical state is not rewritten, so
-    /// selecting or clicking around does not turn into a stream of writes.
+    /// Write each project's pane tree and the focused pane for the next
+    /// launch. Identical state is not rewritten, so selecting or clicking
+    /// around does not turn into a stream of writes.
     fn persist_workspace(&mut self, cx: &mut Context<Self>) {
-        // Group ids are unique across session layouts and stale groups can be
+        // Group ids are unique across project layouts and stale groups can be
         // dropped once their owning pane tree no longer contains them.
         let live_groups: HashSet<u64> = self
             .layouts
@@ -364,46 +355,31 @@ impl KumuApp {
                     .then_some((*group, ratios))
             })
             .collect();
-        let mut sessions: Vec<SavedSessionLayout> = self
+        let mut projects: Vec<SavedProjectLayout> = self
             .layouts
             .iter()
-            .filter_map(|(session, layout)| {
+            .filter_map(|(project, layout)| {
                 let focused = self
-                    .focused_by_session
-                    .get(session)
+                    .focused_by_project
+                    .get(project)
                     .copied()
                     .filter(|pane| layout.panes().contains(pane))
                     .or_else(|| layout.panes().first().copied())?;
-                Some(SavedSessionLayout {
-                    session: *session,
+                Some(SavedProjectLayout {
+                    project: *project,
                     layout: layout.to_saved(&ratios),
                     focused: focused.0,
                 })
             })
             .collect();
-        sessions.sort_by_key(|session| session.session);
-        let mut collapsed: Vec<i64> = self.collapsed_projects.iter().copied().collect();
-        collapsed.sort_unstable();
-        let mut saved_panes: Vec<SavedPane> = self
-            .layouts
-            .iter()
-            .flat_map(|(session, layout)| {
-                layout.panes().into_iter().map(|pane| SavedPane {
-                    pane: pane.0,
-                    session: *session,
-                })
-            })
-            .collect();
-        saved_panes.sort_by_key(|pane| pane.pane);
+        projects.sort_by_key(|project| project.project);
         let state = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: panes::SavedNode::SessionLayouts {
+            layout: panes::SavedNode::ProjectLayouts {
                 selected: self.selected,
-                sessions,
+                projects,
             },
-            panes: saved_panes,
             focused: self.focused.0,
-            collapsed_projects: collapsed,
         };
         let Ok(json) = serde_json::to_string(&state) else {
             return;
@@ -431,70 +407,75 @@ impl KumuApp {
         if !self.panes.contains_key(&pane) {
             return;
         }
-        let session = self
+        let project = self
             .panes
             .get(&pane)
-            .and_then(|terminal| terminal.read(cx).session_id());
-        if let Some(session) = session {
-            if self.selected != Some(session) {
+            .and_then(|terminal| terminal.read(cx).project_id());
+        if let Some(project) = project {
+            if self.selected != Some(project) {
                 if let Some(previous) = self.selected {
-                    self.hide_session_panes(previous, cx);
+                    self.hide_project_panes(previous, cx);
                 }
-                self.selected = Some(session);
-                self.show_session_panes(session, cx);
+                self.selected = Some(project);
+                self.show_project_panes(project, cx);
             }
-            self.focused_by_session.insert(session, pane);
+            self.focused_by_project.insert(project, pane);
         }
         self.focused = pane;
-        if let Some(session) = self.selected {
-            self.workspace.read(cx).touch_session(session);
-        }
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
 
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .selected
+            .and_then(|project| self.layouts.get(&project))
+            .is_some_and(|layout| layout.panes().contains(&self.focused))
+        {
+            return;
+        }
         if let Some(terminal) = self.panes.get(&self.focused).cloned() {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
     }
 
-    fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
+    fn select_project(&mut self, id: i64, cx: &mut Context<Self>) {
         if self.selected != Some(id)
             && let Some(previous) = self.selected
         {
-            self.hide_session_panes(previous, cx);
+            self.hide_project_panes(previous, cx);
         }
-        self.ensure_session_layout(id, cx);
         self.selected = Some(id);
         self.focused = self
-            .focused_by_session
+            .focused_by_project
             .get(&id)
             .copied()
             .or_else(|| self.layouts.get(&id)?.panes().first().copied())
             .unwrap_or(PaneId(1));
-        self.focused_by_session.insert(id, self.focused);
-        self.show_session_panes(id, cx);
-        self.workspace.read(cx).touch_session(id);
+        if self.layouts.contains_key(&id) {
+            self.focused_by_project.insert(id, self.focused);
+        }
+        self.pending_focus = self.layouts.contains_key(&id).then_some(self.focused);
+        self.show_project_panes(id, cx);
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
 
-    fn ensure_session_layout(&mut self, session: i64, cx: &mut Context<Self>) {
-        if self.layouts.contains_key(&session) {
+    fn ensure_project_layout(&mut self, project: i64, cx: &mut Context<Self>) {
+        if self.layouts.contains_key(&project) {
             return;
         }
         let pane = PaneId(self.next_pane);
         self.next_pane += 1;
-        self.layouts.insert(session, PaneNode::leaf(pane));
-        self.focused_by_session.insert(session, pane);
+        self.layouts.insert(project, PaneNode::leaf(pane));
+        self.focused_by_project.insert(project, pane);
         self.install_pane(pane, cx);
     }
 
-    fn hide_session_panes(&mut self, session: i64, cx: &mut Context<Self>) {
-        let Some(layout) = self.layouts.get(&session) else {
+    fn hide_project_panes(&mut self, project: i64, cx: &mut Context<Self>) {
+        let Some(layout) = self.layouts.get(&project) else {
             return;
         };
         for pane in layout.panes() {
@@ -504,17 +485,17 @@ impl KumuApp {
         }
     }
 
-    /// Split `pane` along `axis`, open another shell under the same session,
-    /// and focus the new pane. No new sidebar row.
+    /// Split `pane` along `axis`, open another shell in the same project, and
+    /// focus the new pane.
     fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
         if !self.panes.contains_key(&pane) {
             return;
         }
-        let Some(session_id) = self
+        let Some(project_id) = self
             .panes
             .get(&pane)
-            .and_then(|t| t.read(cx).session_id())
-            .filter(|&sid| self.workspace.read(cx).session(sid).is_some())
+            .and_then(|t| t.read(cx).project_id())
+            .filter(|&id| self.workspace.read(cx).project(id).is_some())
         else {
             return;
         };
@@ -523,7 +504,7 @@ impl KumuApp {
         self.next_pane += 1;
         let group_id = self.next_group;
         self.next_group += 1;
-        let Some(layout) = self.layouts.get_mut(&session_id) else {
+        let Some(layout) = self.layouts.get_mut(&project_id) else {
             return;
         };
         if !layout.split(pane, axis, new_id, group_id) {
@@ -535,95 +516,50 @@ impl KumuApp {
         }
 
         let terminal = self.install_pane(new_id, cx);
-        terminal.update(cx, |terminal, cx| terminal.show(session_id, cx));
+        terminal.update(cx, |terminal, cx| terminal.show(project_id, cx));
         self.focused = new_id;
-        self.selected = Some(session_id);
-        self.focused_by_session.insert(session_id, new_id);
+        self.selected = Some(project_id);
+        self.focused_by_project.insert(project_id, new_id);
         self.pending_focus = Some(new_id);
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
 
+    /// Remove a pane after a close action or shell exit. The last pane leaves
+    /// an empty project; a background exit keeps the selected project intact.
     fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        let session_id = self.panes.get(&pane).and_then(|t| t.read(cx).session_id());
-        let Some(session_id) = session_id else {
+        let project_id = self.panes.get(&pane).and_then(|t| t.read(cx).project_id());
+        let Some(project_id) = project_id else {
             return;
         };
-        let Some(layout) = self.layouts.get_mut(&session_id) else {
+        let Some(layout) = self.layouts.get_mut(&project_id) else {
             return;
         };
-        let Some(next) = layout.neighbor(pane) else {
-            return;
-        };
-        if !layout.remove(pane) {
+        if !layout.panes().contains(&pane) {
             return;
         }
-        self.workspace.update(cx, |workspace, _| {
-            workspace.drop_terminal(pane.0);
-        });
-        self.panes.remove(&pane);
-        self.focused = next;
-        self.focused_by_session.insert(session_id, next);
-        self.selected = Some(session_id);
-        self.pending_focus = Some(next);
-        // Last pane for this session: drop the sidebar row so Close does not
-        // leave an orphan "终端".
-        if !self.pane_shows(session_id, cx) && self.workspace.read(cx).session(session_id).is_some()
-        {
-            self.workspace.update(cx, |workspace, cx| {
-                let _ = workspace.delete_session(session_id, cx);
-            });
-            if self.selected == Some(session_id) {
-                self.selected = self
-                    .panes
-                    .get(&self.focused)
-                    .and_then(|t| t.read(cx).session_id());
-            }
-        }
-        self.sync_pane_chrome(cx);
-        self.persist_workspace(cx);
-        cx.notify();
-    }
-
-    /// A pane's shell exited: close that pane (or clear the last one), then
-    /// drop the session row when no pane still belongs to it.
-    fn on_pane_exited(&mut self, pane: PaneId, session_id: i64, cx: &mut Context<Self>) {
-        let Some(panes) = self.layouts.get(&session_id).map(PaneNode::panes) else {
-            return;
-        };
-        if panes.len() > 1 {
-            let Some(layout) = self.layouts.get_mut(&session_id) else {
-                return;
-            };
-            let Some(next) = layout.neighbor(pane) else {
-                return;
-            };
+        if let Some(next) = layout.neighbor(pane) {
             if !layout.remove(pane) {
                 return;
             }
-            self.panes.remove(&pane);
-            if self.focused_by_session.get(&session_id) == Some(&pane) {
-                self.focused_by_session.insert(session_id, next);
-                if self.selected == Some(session_id) {
+            if self.focused_by_project.get(&project_id) == Some(&pane) {
+                self.focused_by_project.insert(project_id, next);
+                if self.selected == Some(project_id) {
                     self.focused = next;
                     self.pending_focus = Some(next);
                 }
             }
         } else {
-            if let Some(terminal) = self.panes.get(&pane).cloned() {
-                terminal.update(cx, |terminal, cx| terminal.clear(cx));
-            }
-            if self.workspace.read(cx).session(session_id).is_some() {
-                let next = self
-                    .workspace
-                    .update(cx, |workspace, cx| workspace.delete_session(session_id, cx))
-                    .ok()
-                    .flatten();
-                self.on_session_closed(session_id, next, cx);
-                return;
+            self.layouts.remove(&project_id);
+            self.focused_by_project.remove(&project_id);
+            if self.selected == Some(project_id) {
+                self.pending_focus = None;
             }
         }
+        self.workspace
+            .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
+        self.panes.remove(&pane);
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();
@@ -632,28 +568,41 @@ impl KumuApp {
     fn sync_pane_chrome(&mut self, cx: &mut Context<Self>) {
         let visible: HashSet<PaneId> = self
             .selected
-            .and_then(|session| self.layouts.get(&session))
+            .and_then(|project_id| self.layouts.get(&project_id))
             .map(PaneNode::panes)
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let can_close = visible.len() > 1;
         let focused = self.focused;
         for (id, terminal) in &self.panes {
             let active = visible.contains(id) && *id == focused;
             terminal.update(cx, |terminal, cx| {
-                terminal.set_chrome(active, visible.contains(id) && can_close, cx);
+                terminal.set_chrome(active, visible.contains(id), cx);
             });
         }
     }
 
-    /// Start a shell session — in `project_id`, or the first project — and show it.
-    fn new_session(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
-        let id = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.new_session(project_id, cx));
-        if let Some(id) = id {
-            self.select_session(id, cx);
+    /// Open another shell in `project_id`, or in the selected project, or in
+    /// the first one. A project with no pane gets its first; one that already
+    /// has panes gains a split beside the focused pane.
+    fn add_terminal(&mut self, project_id: Option<i64>, cx: &mut Context<Self>) {
+        let project_id = project_id.or(self.selected).or_else(|| {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.ensure_project(cx))
+        });
+        let Some(project_id) = project_id else {
+            return;
+        };
+        let had_panes = self
+            .layouts
+            .get(&project_id)
+            .is_some_and(|layout| !layout.panes().is_empty());
+        if had_panes {
+            self.select_project(project_id, cx);
+            self.split_pane(self.focused, Axis::Horizontal, cx);
+        } else {
+            self.ensure_project_layout(project_id, cx);
+            self.select_project(project_id, cx);
         }
     }
 
@@ -680,22 +629,19 @@ impl KumuApp {
         .detach();
     }
 
-    /// Show the picked project, expanded — whether it was just added or was
-    /// one already.
+    /// Show the picked project — whether it was just added or was one already.
     fn finish_add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let path = path.to_string_lossy().into_owned();
         let id = self
             .workspace
             .update(cx, |workspace, cx| workspace.add_project(&path, cx));
         if let Some(id) = id {
-            self.collapsed_projects.remove(&id);
-            self.persist_workspace(cx);
-            cx.notify();
+            self.ensure_project_layout(id, cx);
+            self.select_project(id, cx);
         }
     }
 
-    /// Rename a project: the dialog starts on the current name, like the
-    /// session dialog.
+    /// Rename a project: the dialog starts on the current name.
     fn prompt_rename_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .workspace
@@ -740,28 +686,17 @@ impl KumuApp {
         });
     }
 
-    /// Ask before deleting a project and every session under it.
+    /// Ask before deleting a project and closing its terminals.
     fn confirm_delete_project(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let (name, count) = {
-            let workspace = self.workspace.read(cx);
-            let name = workspace
-                .projects()
-                .iter()
-                .find(|project| project.id == project_id)
-                .map(|project| project.name.clone())
-                .unwrap_or_default();
-            let count = workspace
-                .sessions()
-                .iter()
-                .filter(|session| session.project_id == project_id)
-                .count();
-            (name, count)
-        };
-        let description = if count == 0 {
-            format!("「{name}」将被删除，此操作无法撤销。")
-        } else {
-            format!("「{name}」下的 {count} 个会话及其终端将被关闭，此操作无法撤销。")
-        };
+        let name = self
+            .workspace
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.clone())
+            .unwrap_or_default();
+        let description = format!("「{name}」及其终端将被关闭，此操作无法撤销。");
         // The dialog outlives this call, so it reaches the view weakly.
         let weak = cx.weak_entity();
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -783,156 +718,36 @@ impl KumuApp {
         });
     }
 
-    /// Delete a project and close every pane that was showing one of its
-    /// sessions, landing them on a session that survived.
+    /// Delete a project and close its panes, then show another project when
+    /// one remains.
     fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) {
-        let sessions: Vec<i64> = self
-            .workspace
-            .read(cx)
-            .sessions()
-            .iter()
-            .filter(|session| session.project_id == project_id)
-            .map(|session| session.id)
-            .collect();
-        let Ok(next) = self
+        if self
             .workspace
             .update(cx, |workspace, cx| workspace.delete_project(project_id, cx))
-        else {
+            .is_err()
+        {
             // The failure is already on its way to the banner; leave the
             // project and its panes exactly where they are.
             return;
-        };
-        self.collapsed_projects.remove(&project_id);
-        for session_id in sessions {
-            self.on_session_closed(session_id, next, cx);
         }
-        self.persist_workspace(cx);
-        cx.notify();
-    }
-
-    /// Ask before deleting: the session and the terminals bound to it go away
-    /// for good.
-    fn confirm_delete_session(&self, session_id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        // The dialog outlives this call, so it reaches the view weakly.
-        let weak = cx.weak_entity();
-        let title = self
-            .workspace
-            .read(cx)
-            .session(session_id)
-            .map(|s| s.title.clone())
-            .unwrap_or_default();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let weak = weak.clone();
-            alert
-                .title("删除会话")
-                .description(format!("「{title}」及其终端将被永久删除，此操作无法撤销。"))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("删除")
-                        .ok_variant(ButtonVariant::Danger)
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = weak.update(cx, |app, cx| app.delete_session(session_id, cx));
-                    true
-                })
-        });
-    }
-
-    /// Rename a session: the dialog's field starts on the current name, so the
-    /// name can be replaced in one go.
-    fn prompt_rename_session(&self, session_id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self
-            .workspace
-            .read(cx)
-            .session(session_id)
-            .map(|s| s.title.clone())
-            .unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
-        // The dialog outlives this call, so it reaches the view weakly.
-        let weak = cx.weak_entity();
-        let dialog_input = input.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("重命名会话")
-                .child(Input::new(&dialog_input).small())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("保存")
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok({
-                    let weak = weak.clone();
-                    let input = dialog_input.clone();
-                    move |_, _, cx| {
-                        let name = input.read(cx).value().trim().to_string();
-                        if !name.is_empty() {
-                            let _ = weak.update(cx, move |app, cx| {
-                                app.workspace.update(cx, |workspace, cx| {
-                                    workspace.rename_session(session_id, name, cx)
-                                })
-                            });
-                        }
-                        true
-                    }
-                })
-        });
-        // Focusing after opening leaves the input the last handle the window
-        // focused; the dialog only traps Tab, so nothing steals it back.
-        input.update(cx, |state, cx| {
-            state.focus(window, cx);
-            state.select_all(window, cx);
-        });
-    }
-
-    /// Delete a session, then land on its neighbor if it was the one on screen.
-    fn delete_session(&mut self, session_id: i64, cx: &mut Context<Self>) {
-        let Ok(next) = self
-            .workspace
-            .update(cx, |workspace, cx| workspace.delete_session(session_id, cx))
-        else {
-            // The failure is already on its way to the banner; leave the
-            // session and its panes exactly where they are.
-            return;
-        };
-        self.on_session_closed(session_id, next, cx);
-    }
-
-    /// After a session disappears, discard its pane tree and show a surviving
-    /// session if the deleted one was active.
-    fn on_session_closed(&mut self, session_id: i64, next: Option<i64>, cx: &mut Context<Self>) {
-        if let Some(layout) = self.layouts.remove(&session_id) {
+        if let Some(layout) = self.layouts.remove(&project_id) {
             for pane in layout.panes() {
                 self.panes.remove(&pane);
             }
         }
-        self.focused_by_session.remove(&session_id);
-        if self.selected == Some(session_id) {
-            let replacement = next
-                .filter(|id| self.workspace.read(cx).session(*id).is_some())
-                .or_else(|| self.workspace.read(cx).sessions().first().map(|s| s.id));
-            self.selected = replacement;
-            if let Some(replacement) = replacement {
-                self.select_session(replacement, cx);
-            } else {
-                self.focused = PaneId(1);
+        self.focused_by_project.remove(&project_id);
+        if self.selected == Some(project_id) {
+            let next = self.workspace.read(cx).projects().first().map(|p| p.id);
+            self.selected = next;
+            if let Some(next) = next {
+                self.select_project(next, cx);
+                return;
             }
+            self.focused = PaneId(1);
         }
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();
-    }
-
-    fn pane_shows(&self, session_id: i64, cx: &App) -> bool {
-        self.layouts.get(&session_id).is_some_and(|layout| {
-            layout.panes().iter().any(|pane| {
-                self.panes
-                    .get(pane)
-                    .is_some_and(|terminal| terminal.read(cx).session_id() == Some(session_id))
-            })
-        })
     }
 
     /// Focus the settings window if it's open, else open a new one (resizable,
@@ -964,7 +779,7 @@ impl KumuApp {
 
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         self.selected
-            .and_then(|session| self.layouts.get(&session))
+            .and_then(|project_id| self.layouts.get(&project_id))
             .map(|layout| self.render_node(layout, cx))
             .unwrap_or_else(|| div().into_any_element())
     }
@@ -1008,26 +823,35 @@ impl KumuApp {
         let overlays = layers::window_layers(&self.tooltips, window, cx);
         let theme = cx.theme();
         let warning = theme.warning;
-        // Keep the pane tree if a pane still points at a live session — do not
-        // blank the whole split just because the exited session was removed.
-        let pane_sessions: Vec<Option<i64>> = self
-            .panes
-            .values()
-            .map(|t| t.read(cx).session_id())
-            .collect();
         let workspace = self.workspace.read(cx);
-        let has_sessions = !workspace.sessions().is_empty()
-            || pane_sessions
-                .iter()
-                .any(|id| id.is_some_and(|id| workspace.session(id).is_some()));
+        let has_projects = !workspace.projects().is_empty();
+        let has_panes = self
+            .selected
+            .and_then(|project| self.layouts.get(&project))
+            .is_some_and(|layout| !layout.panes().is_empty());
         let right =
-            if has_sessions {
+            if has_panes {
                 v_flex()
                     .flex_1()
                     .h_full()
                     .min_w_0()
                     .min_h_0()
                     .child(self.render_panes(cx))
+            } else if has_projects {
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_color(theme.muted_foreground)
+                    .child(div().text_sm().child("还没有终端"))
+                    .child(Button::new("empty-new").ghost().label("新建终端").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.add_terminal(None, cx);
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        }),
+                    ))
             } else {
                 v_flex()
                     .flex_1()
@@ -1035,14 +859,15 @@ impl KumuApp {
                     .justify_center()
                     .gap_3()
                     .text_color(theme.muted_foreground)
-                    .child(div().text_sm().child("还没有会话"))
-                    .child(Button::new("empty-new").ghost().label("新建终端").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.new_session(None, cx);
-                            this.focus_terminal(window, cx);
-                            cx.notify();
-                        }),
-                    ))
+                    .child(div().text_sm().child("还没有项目"))
+                    .child(
+                        Button::new("empty-open")
+                            .ghost()
+                            .label("打开项目")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_project(cx);
+                            })),
+                    )
             };
 
         // Full-width title bar strip: brand on the left (traffic lights float
@@ -1100,7 +925,7 @@ impl Render for KumuApp {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
         // Reading the focused terminal acknowledges its attention request.
-        // Also retract notifications when a session is deleted or the setting
+        // Also retract notifications when a project is deleted or the setting
         // is disabled, including banners still in Notification Center.
         let enabled = cx.global::<NotificationSettings>().enabled;
         let workspace = self.workspace.read(cx);
@@ -1108,9 +933,9 @@ impl Render for KumuApp {
         let read: Vec<u64> = self
             .unread_notifications
             .iter()
-            .filter(|(terminal, session)| {
+            .filter(|(terminal, project)| {
                 !enabled
-                    || workspace.session(**session).is_none()
+                    || workspace.project(**project).is_none()
                     || workspace.notification_is_read(**terminal, focused)
             })
             .map(|(terminal, _)| *terminal)

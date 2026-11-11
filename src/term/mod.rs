@@ -15,15 +15,6 @@ pub use vt::{
     Snapshot, TermColors, TermNotification,
 };
 
-/// Stored on [`crate::db::Session::agent`] for a pure shell session — not an
-/// agent, and not listed in [`crate::agent::AGENTS`].
-pub const SHELL: &str = "shell";
-
-/// Whether this session id is a pure shell rather than an agent TUI.
-pub fn is_shell(agent: &str) -> bool {
-    agent == SHELL
-}
-
 /// The user's login shell: `$SHELL`, falling back to `/bin/sh`.
 /// Load login profiles so Finder-launched terminals get the user's tool paths.
 pub fn default_shell() -> (String, Vec<String>) {
@@ -34,13 +25,6 @@ pub fn default_shell() -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_id_is_reserved() {
-        assert!(is_shell(SHELL));
-        assert!(!is_shell("omp"));
-        assert!(!is_shell(""));
-    }
 
     #[test]
     fn default_shell_has_a_program() {

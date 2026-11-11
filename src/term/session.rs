@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -21,8 +21,6 @@ struct Live {
     notifications: Mutex<VecDeque<TermNotification>>,
     generation: AtomicU64,
     queued: AtomicBool,
-    /// PTY child pid, or 0 before spawn / when the platform does not report one.
-    pid: AtomicU32,
     wake: futures::channel::mpsc::UnboundedSender<()>,
 }
 
@@ -119,7 +117,6 @@ impl Term {
             notifications: Mutex::new(VecDeque::new()),
             generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
-            pid: AtomicU32::new(0),
             wake,
         });
         let thread_tx = tx.clone();
@@ -155,14 +152,6 @@ impl Term {
 
     pub fn generation(&self) -> u64 {
         self.live.generation.load(Ordering::Acquire)
-    }
-
-    /// The PTY child's process id, when the platform reported one.
-    pub fn process_id(&self) -> Option<u32> {
-        match self.live.pid.load(Ordering::Acquire) {
-            0 => None,
-            pid => Some(pid),
-        }
     }
 
     /// The UI has started handling a wake. A publish that arrives after this
@@ -311,9 +300,6 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
             return;
         }
     };
-    if let Some(pid) = portable_pty::Child::process_id(pty.child.as_ref()) {
-        live.pid.store(pid, Ordering::Release);
-    }
     let mut session = Running {
         pty,
         vt: Vt::with_colors(80, 24, colors),

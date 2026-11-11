@@ -1,7 +1,7 @@
 //! Where each local coding agent's executable lives, and whether it can run.
 //!
-//! kumu does not speak any agent protocol itself: a session opens the agent's
-//! own interactive TUI in a PTY. This module only resolves the executable — a
+//! kumu does not speak any agent protocol itself. The user starts an agent's
+//! TUI inside a project pane. This module only resolves the executable — a
 //! GUI-launched process does not inherit the shell's PATH — and checks that it
 //! is actually runnable, so the settings list can tell supported from installed.
 //!
@@ -13,15 +13,9 @@ use std::path::{Path, PathBuf};
 /// Whether the agent `id`'s executable is present and runnable on this machine.
 ///
 /// The registry says what kumu supports, not what is installed. This asks the
-/// same resolver [`interactive`] launches through, so the two cannot disagree.
+/// executable resolver, so a listed agent and a launchable one stay the same.
 pub fn installed(id: &'static str) -> bool {
     executable(id).is_some_and(|command| is_executable(&command))
-}
-
-/// The interactive TUI for an agent: the program itself, with no protocol
-/// subcommand or arguments.
-pub fn interactive(agent: &str) -> Option<(String, Vec<String>)> {
-    executable(agent).map(|command| (command, Vec::new()))
 }
 
 /// The resolved executable for a registry agent id, or `None` when the id is
@@ -173,17 +167,15 @@ fn pi_bin() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{installed, interactive, is_executable};
+    use super::{installed, is_executable};
     use crate::agent::AGENTS;
 
     #[test]
-    fn interactive_launch_is_the_tui() {
+    fn every_agent_has_an_executable() {
         for agent in AGENTS.iter().map(|a| a.id) {
-            let (command, args) = interactive(agent).expect(agent);
-            assert!(!command.is_empty(), "{agent}");
-            assert!(args.is_empty(), "{agent} args were {args:?}");
+            assert!(super::executable(agent).is_some(), "{agent}");
         }
-        assert!(interactive("nope").is_none());
+        assert!(super::executable("nope").is_none());
     }
 
     /// Detection must not take a path's word for it: a stale override or a

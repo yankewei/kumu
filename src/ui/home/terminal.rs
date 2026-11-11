@@ -1,4 +1,4 @@
-//! One terminal pane: a session's TUI, with chrome for split / close.
+//! One terminal pane: a project's shell, with chrome for split / close.
 //!
 //! Painting follows the herdr/Ghostty path: merge same-color backgrounds and
 //! same-style text into runs, force glyphs onto the cell grid, draw box /
@@ -17,25 +17,23 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::panes::PaneId;
-use crate::agent::AGENTS;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::{
-    self, Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
+    Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
     MouseInput, MouseMods, Rgb, SelectStep, Snapshot,
 };
 use crate::theme::{self, ThemeRevision};
 use crate::ui::tooltip::{HoverLabel as _, Tooltips};
-use crate::ui::widgets::agent_logo;
 
 /// Chrome / focus messages from a pane up to the home window.
 pub enum TerminalEvent {
     /// The user clicked into this pane; the home window should focus it.
     Activated,
-    /// Split this pane to the right (another shell under the same session).
+    /// Split this pane to the right (another shell in the same project).
     SplitRight,
     /// Split this pane downward.
     SplitDown,
-    /// Close this pane and its shell; the session row goes when it was the last pane.
+    /// Close this pane and its shell.
     Close,
 }
 
@@ -72,12 +70,12 @@ pub struct TerminalView {
     workspace: Entity<Workspace>,
     /// Hover labels for the pane chrome buttons.
     tooltips: Entity<Tooltips>,
-    session: Option<i64>,
+    project: Option<i64>,
     snapshot: Snapshot,
     focus: FocusHandle,
     /// Whether the home window treats this pane as the focused one.
     active: bool,
-    /// Close is only meaningful when more than one pane is open.
+    /// Hidden panes do not expose close controls.
     can_close: bool,
     /// Theme revision last pushed into the live terminals.
     theme_rev: u64,
@@ -94,7 +92,7 @@ pub struct TerminalView {
     /// Accumulated scroll remainder (touchpad line fractions).
     scrolled: f32,
     /// The last size sent to the process on screen, so a repaint does not
-    /// resize again. Cleared when the session changes.
+    /// resize again. Cleared when the attached project changes.
     sent: Rc<Cell<(u16, u16, u32, u32)>>,
     painted: Rc<RefCell<PaintCache>>,
 }
@@ -121,7 +119,7 @@ impl TerminalView {
             pane,
             workspace,
             tooltips,
-            session: None,
+            project: None,
             snapshot: Snapshot::blank("", ""),
             focus,
             active: true,
@@ -150,8 +148,8 @@ impl TerminalView {
         }
     }
 
-    pub fn session_id(&self) -> Option<i64> {
-        self.session
+    pub fn project_id(&self) -> Option<i64> {
+        self.project
     }
 
     pub fn set_chrome(&mut self, active: bool, can_close: bool, cx: &mut Context<Self>) {
@@ -180,16 +178,16 @@ impl TerminalView {
         self.focus.focus(window, cx);
     }
 
-    /// Show `session_id`, starting its TUI if it is not already running.
-    pub fn show(&mut self, session_id: i64, cx: &mut Context<Self>) {
+    /// Show `project_id`, starting its shell if it is not already running.
+    pub fn show(&mut self, project_id: i64, cx: &mut Context<Self>) {
         let pane = self.pane.0;
         let snapshot = self.workspace.update(cx, |workspace, cx| {
-            workspace.show_terminal(pane, session_id, cx)
+            workspace.show_terminal(pane, project_id, cx)
         });
-        self.attach(session_id, snapshot, cx);
+        self.attach(project_id, snapshot, cx);
     }
 
-    /// Keep this session's pane state while its session is hidden.
+    /// Keep this pane's process while its project is hidden.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
@@ -198,10 +196,10 @@ impl TerminalView {
     }
 
     /// Attach a terminal already assigned to this pane by the workspace.
-    /// Notification navigation preserves even an exited process's final screen.
-    pub fn attach(&mut self, session_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
+    /// Notification navigation reattaches the process that sent the request.
+    pub fn attach(&mut self, project_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.reset_gesture();
-        self.session = Some(session_id);
+        self.project = Some(project_id);
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
         self.painted.borrow_mut().rows.clear();
@@ -210,23 +208,9 @@ impl TerminalView {
         cx.notify();
     }
 
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
-        let pane = self.pane.0;
-        self.workspace.update(cx, |workspace, _| {
-            workspace.drop_terminal(pane);
-        });
-        self.reset_gesture();
-        self.session = None;
-        self.sent.set((0, 0, 0, 0));
-        self.marked = None;
-        self.painted.borrow_mut().rows.clear();
-        self.snapshot = Snapshot::blank("", "");
-        cx.notify();
-    }
-
-    /// A pane that changes session abandons whatever mouse gesture was in
+    /// A pane that changes project abandons whatever mouse gesture was in
     /// flight. Left alone, `selecting` would make the next plain move end a
-    /// selection that belonged to the old session, and a `reported` button
+    /// selection that belonged to the old screen, and a `reported` button
     /// whose release never arrived (a drag that switched panes or lost focus)
     /// would keep this pane from taking any click again.
     fn reset_gesture(&mut self) {
@@ -236,7 +220,7 @@ impl TerminalView {
     }
 
     fn pull(&mut self, cx: &mut Context<Self>) {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let pane = self.pane.0;
@@ -256,7 +240,7 @@ impl TerminalView {
     }
 
     fn write_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.session.is_none() || text.is_empty() {
+        if self.project.is_none() || text.is_empty() {
             return;
         }
         let pane = self.pane.0;
@@ -293,7 +277,7 @@ impl TerminalView {
         if mods.platform {
             return;
         }
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let pane = self.pane.0;
@@ -312,7 +296,7 @@ impl TerminalView {
     /// Copy the current selection. The text lives on the session thread, so the
     /// read happens on a background task instead of blocking event dispatch.
     fn copy(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return false;
         }
         let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
@@ -334,7 +318,7 @@ impl TerminalView {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
@@ -347,7 +331,7 @@ impl TerminalView {
 
     /// Whether the running program owns the pointer for a new gesture.
     fn takes_mouse(&self, mods: &Modifiers) -> bool {
-        self.session.is_some() && self.snapshot.mouse_tracking && !mods.shift
+        self.project.is_some() && self.snapshot.mouse_tracking && !mods.shift
     }
 
     /// Hand a button press to the program, latching it until its Release.
@@ -390,7 +374,7 @@ impl TerminalView {
         mods: &Modifiers,
         cx: &mut Context<Self>,
     ) {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let pane = self.pane.0;
@@ -419,7 +403,7 @@ impl TerminalView {
     /// and the text both live on the session thread, so it runs off-thread.
     fn finish_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         self.selecting = false;
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let Some(point) = self.select_point(pos) else {
@@ -453,7 +437,7 @@ impl TerminalView {
     }
 
     fn apply_select(&mut self, step: SelectStep, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let Some(point) = self.select_point(pos) else {
@@ -492,7 +476,7 @@ impl TerminalView {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        if self.session.is_none() {
+        if self.project.is_none() {
             return;
         }
         let pane = self.pane.0;
@@ -686,9 +670,9 @@ impl Render for TerminalView {
         let snapshot = self.snapshot.clone();
         let marked = self.marked.clone();
         let workspace = self.workspace.clone();
-        let session = self.session;
+        let project = self.project;
         let pane_term = self.pane.0;
-        let has_session = session.is_some();
+        let has_project = project.is_some();
         let sent = self.sent.clone();
         let painted = self.painted.clone();
         let cursor_at = self.cursor_at.clone();
@@ -697,7 +681,7 @@ impl Render for TerminalView {
         let input_focus = self.focus.clone();
         let input_view = cx.entity();
         let mouse_view = cx.entity().downgrade();
-        let (mark, name, cwd) = header_identity(session, &snapshot, &self.workspace, cx);
+        let (mark, name, cwd) = header_identity(&snapshot, cx);
         let note = header_note(&snapshot);
         let active = self.active;
         let can_close = self.can_close;
@@ -753,7 +737,7 @@ impl Render for TerminalView {
                             this.focus.focus(window, cx);
                             cx.emit(TerminalEvent::Activated);
                             if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
-                                if this.session.is_some() {
+                                if this.project.is_some() {
                                     let pane = this.pane.0;
                                     this.workspace.update(cx, |workspace, _| {
                                         workspace.terminal_clear_selection(pane);
@@ -809,7 +793,7 @@ impl Render for TerminalView {
                                 let next = (cols, rows, cell_px.0, cell_px.1);
                                 if sent.get() != next {
                                     sent.set(next);
-                                    if has_session {
+                                    if has_project {
                                         workspace.update(cx, |workspace, _| {
                                             workspace.terminal_resize(
                                                 pane_term, cols, rows, cell_px.0, cell_px.1,
@@ -952,6 +936,9 @@ fn terminal_header(
         .child(
             div()
                 .flex_none()
+                .max_w(px(180.))
+                .min_w_0()
+                .truncate()
                 .text_xs()
                 .font_medium()
                 .text_color(fg)
@@ -1040,50 +1027,22 @@ fn chrome_button(
         )
 }
 
-fn header_identity(
-    session_id: Option<i64>,
-    snapshot: &Snapshot,
-    workspace: &Entity<Workspace>,
-    cx: &App,
-) -> (AnyElement, String, String) {
-    let theme = cx.theme();
-    let muted = theme.muted_foreground;
-    let session = session_id.and_then(|id| workspace.read(cx).session(id).cloned());
-    let agent_id = session
-        .as_ref()
-        .map(|s| s.agent.as_str())
-        .filter(|id| !id.is_empty())
-        .unwrap_or(snapshot.command.as_str());
-    let cwd = session
-        .as_ref()
-        .map(|s| s.cwd.clone())
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| snapshot.cwd.clone());
-    if term::is_shell(agent_id) {
-        let name = if snapshot.command.is_empty() {
-            "终端".into()
-        } else {
-            snapshot.command.clone()
-        };
-        let mark = Icon::new(IconName::SquareTerminal)
-            .with_size(px(14.))
-            .text_color(muted)
-            .into_any_element();
-        return (mark, name, cwd);
+fn header_identity(snapshot: &Snapshot, cx: &App) -> (AnyElement, String, String) {
+    let muted = cx.theme().muted_foreground;
+    let mark = Icon::new(IconName::SquareTerminal)
+        .with_size(px(14.))
+        .text_color(muted)
+        .into_any_element();
+    (mark, header_name(snapshot), snapshot.cwd.clone())
+}
+
+/// The pane header's label: what the program calls itself, or a placeholder
+/// before anything has run.
+fn header_name(snapshot: &Snapshot) -> String {
+    match snapshot.label() {
+        label if label.is_empty() => "终端".into(),
+        label => label,
     }
-    let agent = AGENTS.iter().find(|a| a.id == agent_id);
-    let name = agent.map(|a| a.name.to_string()).unwrap_or_else(|| {
-        if snapshot.command.is_empty() {
-            "终端".into()
-        } else {
-            snapshot.command.clone()
-        }
-    });
-    (
-        agent_logo(agent.and_then(|a| a.logo), px(14.), muted),
-        name,
-        cwd,
-    )
 }
 
 fn header_note(snapshot: &Snapshot) -> Option<String> {
@@ -1094,7 +1053,7 @@ fn header_note(snapshot: &Snapshot) -> Option<String> {
         return Some("已退出".into());
     }
     if snapshot.command.is_empty() {
-        return Some("还没有会话".into());
+        return Some("还没有终端".into());
     }
     None
 }

@@ -1,36 +1,22 @@
-//! Local SQLite persistence for projects, sessions, and the home window's last
-//! layout.
+//! Local SQLite persistence for projects and the home window's last layout.
 //!
 //! Accessed synchronously on the UI (main) thread. Schema is created and
 //! upgraded on open through `PRAGMA user_version`; tables and columns left over
 //! from the removed in-app chat path are dropped there too, so an older
 //! database keeps working with the current one.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
+use serde_json::{Value, json};
 
-/// A project: a workspace the user groups sessions under.
+/// A project: a directory with its own terminal panes.
 #[derive(Clone, Debug)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub path: String,
-}
-
-/// A session belonging to a project and bound to an agent (or a shell).
-#[derive(Clone, Debug)]
-pub struct Session {
-    pub id: i64,
-    pub project_id: i64,
-    pub agent: String,
-    pub title: String,
-    pub cwd: String,
-    /// Agent-side session id, when we have latched onto one (`agent:id`).
-    /// Currently used to look the title up; it is not a resume cursor yet.
-    pub agent_session_id: Option<String>,
-    /// The user typed this title; generated names must not replace it.
-    pub title_manual: bool,
 }
 
 pub struct Store {
@@ -43,7 +29,7 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in `PRAGMA user_version`. Bump it with a new
 /// `migrate_vN` step; opening an older database applies the steps it is
 /// missing exactly once.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -58,7 +44,7 @@ impl Store {
     }
 
     /// An empty store that lives only for this process. Used when the on-disk
-    /// database cannot be opened, so the window still works for the session
+    /// database cannot be opened, so the window still works for this run
     /// even though nothing is saved.
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
@@ -69,6 +55,9 @@ impl Store {
     }
 
     fn init(&self) -> Result<()> {
+        // Keep the old layout and its session ownership together until the
+        // rewritten layout, table removal, and schema version all commit.
+        let transaction = self.conn.unchecked_transaction()?;
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -81,16 +70,22 @@ impl Store {
         if version < 3 {
             self.migrate_v3()?;
         }
+        if version < 4 {
+            self.migrate_v4()?;
+        }
         if version < SCHEMA_VERSION {
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        Ok(())
+        transaction.commit()
     }
 
     /// The project/session/settings schema, plus the cleanup of the removed
     /// in-app chat path. Existing databases have `user_version = 0` and already
     /// contain most of this, so every step here is idempotent.
+    ///
+    /// `sessions` is created even on a fresh database because the v3 step below
+    /// inspects its columns; `migrate_v4` then drops it in the same transaction.
     fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
@@ -199,6 +194,40 @@ impl Store {
         Ok(())
     }
 
+    /// Projects own panes directly. Older databases stored a session row per
+    /// terminal; their layout is rewritten onto the owning project and the
+    /// table is dropped. A project can later gain a worktree without growing
+    /// another list in the sidebar.
+    fn migrate_v4(&self) -> Result<()> {
+        let has_sessions: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_sessions {
+            let mut session_project = HashMap::new();
+            {
+                let mut stmt = self.conn.prepare("SELECT id, project_id FROM sessions")?;
+                let rows =
+                    stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+                for row in rows {
+                    let (session, project) = row?;
+                    session_project.insert(session, project);
+                }
+            }
+            if let Some(json) = self.workspace_state()?
+                && let Some(next) = rekey_workspace_json(&json, &session_project)
+            {
+                self.save_workspace_state(&next)?;
+            }
+            self.conn.execute_batch(
+                "DROP INDEX IF EXISTS sessions_last_used;
+                 DROP TABLE IF EXISTS sessions;",
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn projects(&self) -> Vec<Project> {
         let mut stmt = self
             .conn
@@ -224,7 +253,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Rename a project without moving it or touching its sessions.
+    /// Rename a project without moving it.
     pub fn rename_project(&self, id: i64, name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE projects SET name = ?1 WHERE id = ?2",
@@ -233,119 +262,10 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a project. Its sessions go with it through the schema's
-    /// `ON DELETE CASCADE`; callers must stop their terminals first.
+    /// Delete a project. Callers stop its terminals first.
     pub fn delete_project(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// Sessions in sidebar order: most recently used first within a project,
-    /// newest first as the tie-break. Title updates do not touch this clock.
-    pub fn sessions(&self) -> Vec<Session> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, project_id, agent, title, cwd, agent_session_id, title_manual
-                 FROM sessions
-                 ORDER BY project_id, last_used_at DESC, id DESC",
-            )
-            .unwrap();
-        stmt.query_map([], |row| {
-            Ok(Session {
-                id: row.get(0)?,
-                project_id: row.get(1)?,
-                agent: row.get(2)?,
-                title: row.get(3)?,
-                cwd: row.get(4)?,
-                agent_session_id: row.get(5)?,
-                title_manual: row.get::<_, i64>(6)? != 0,
-            })
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
-    }
-
-    pub fn insert_session(
-        &self,
-        project_id: i64,
-        agent: &str,
-        title: &str,
-        cwd: &str,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO sessions (project_id, agent, title, cwd, last_used_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            params![project_id, agent, title, cwd],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Mark a session as used now, without touching its title bookkeeping.
-    ///
-    /// This is the sidebar's recency clock; it deliberately runs on selection
-    /// rather than on every write, so generated titles cannot reorder the tree.
-    pub fn touch_session(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET last_used_at = datetime('now') WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    /// Delete a session.
-    pub fn delete_session(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// Store a generated title — typically one read from an agent's own session
-    /// store — and report whether it was applied.
-    ///
-    /// A session the user has renamed refuses it: [`Store::rename_session`]
-    /// makes the title the user's, and a generated one must not overwrite a
-    /// name they typed out.
-    pub fn update_session_title(&self, id: i64, title: &str) -> Result<bool> {
-        let applied = self.conn.execute(
-            "UPDATE sessions SET title = ?1, updated_at = datetime('now')
-             WHERE id = ?2 AND title_manual = 0",
-            params![title, id],
-        )?;
-        Ok(applied > 0)
-    }
-
-    /// Remember which agent-side session this row is bound to (`agent:id`).
-    pub fn set_session_agent_session_id(&self, id: i64, agent_session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET agent_session_id = ?1, updated_at = datetime('now')
-             WHERE id = ?2",
-            params![agent_session_id, id],
-        )?;
-        Ok(())
-    }
-
-    /// Drop the agent-session binding (the agent process is gone or was never
-    /// ours).
-    pub fn clear_session_agent_session_id(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET agent_session_id = NULL, updated_at = datetime('now')
-             WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    /// Rename a session to a name the user chose. From here on the name is the
-    /// session's own: generated titles no longer replace it.
-    pub fn rename_session(&self, id: i64, title: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET title = ?1, title_manual = 1, updated_at = datetime('now')
-             WHERE id = ?2",
-            params![title, id],
-        )?;
         Ok(())
     }
 
@@ -374,6 +294,251 @@ impl Store {
     }
 }
 
+/// Rewrite a version 1 or 2 layout so each project owns the panes that used to
+/// belong to its sessions. Version 3 is left untouched.
+fn rekey_workspace_json(json: &str, session_project: &HashMap<i64, i64>) -> Option<String> {
+    let mut value: Value = serde_json::from_str(json).ok()?;
+    let version = value.get("version").and_then(Value::as_u64).unwrap_or(0);
+    if version == 0 || version >= 3 {
+        return None;
+    }
+    let layout = value.get("layout").cloned().unwrap_or(Value::Null);
+    let focused_hint = value.get("focused").and_then(Value::as_u64);
+    let grouped = if let Some(body) = layout.get("SessionLayouts") {
+        projects_from_session_layouts(body, session_project, focused_hint)
+    } else {
+        projects_from_legacy_tree(
+            &layout,
+            value.get("panes").and_then(Value::as_array),
+            session_project,
+            focused_hint,
+        )
+    };
+    let (projects, selected) = grouped.unwrap_or_else(|| (Vec::new(), None));
+    let focused = selected
+        .as_ref()
+        .and_then(|project| {
+            projects
+                .iter()
+                .find(|row| row.get("project") == Some(project))
+        })
+        .and_then(|row| row.get("focused"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    value["version"] = json!(3);
+    value["layout"] = json!({
+        "ProjectLayouts": {
+            "selected": selected,
+            "projects": projects,
+        }
+    });
+    value["focused"] = json!(focused);
+    value.as_object_mut()?.remove("panes");
+    value.as_object_mut()?.remove("collapsed_projects");
+    serde_json::to_string(&value).ok()
+}
+
+fn projects_from_session_layouts(
+    body: &Value,
+    session_project: &HashMap<i64, i64>,
+    focused_hint: Option<u64>,
+) -> Option<(Vec<Value>, Option<Value>)> {
+    let selected_session = body.get("selected").and_then(Value::as_i64);
+    let sessions = body.get("sessions")?.as_array()?;
+    let mut order: Vec<i64> = Vec::new();
+    let mut by_project: HashMap<i64, Vec<&Value>> = HashMap::new();
+    for session in sessions {
+        let Some(id) = session.get("session").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(project) = session_project.get(&id).copied() else {
+            continue;
+        };
+        if !by_project.contains_key(&project) {
+            order.push(project);
+        }
+        by_project.entry(project).or_default().push(session);
+    }
+    let selected_project = selected_session.and_then(|id| session_project.get(&id).copied());
+    Some(finish_project_rows(
+        order,
+        by_project,
+        selected_project,
+        focused_hint,
+    ))
+}
+
+fn projects_from_legacy_tree(
+    layout: &Value,
+    panes: Option<&Vec<Value>>,
+    session_project: &HashMap<i64, i64>,
+    focused_hint: Option<u64>,
+) -> Option<(Vec<Value>, Option<Value>)> {
+    let panes = panes?;
+    let mut order: Vec<i64> = Vec::new();
+    let mut panes_by_project: HashMap<i64, Vec<u64>> = HashMap::new();
+    for pane in panes {
+        let Some(pane_id) = pane.get("pane").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(session) = pane.get("session").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(project) = session_project.get(&session).copied() else {
+            continue;
+        };
+        if !panes_by_project.contains_key(&project) {
+            order.push(project);
+        }
+        panes_by_project.entry(project).or_default().push(pane_id);
+    }
+    let mut by_project: HashMap<i64, Vec<Value>> = HashMap::new();
+    for (project, ids) in &panes_by_project {
+        let valid: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if let Some(filtered) = filter_layout(layout, &valid) {
+            by_project.insert(
+                *project,
+                vec![json!({"layout": filtered, "focused": focused_hint.unwrap_or(ids[0])})],
+            );
+        }
+    }
+    let selected_project = focused_hint.and_then(|pane| {
+        panes.iter().find_map(|row| {
+            (row.get("pane").and_then(Value::as_u64) == Some(pane))
+                .then(|| row.get("session").and_then(Value::as_i64))
+                .flatten()
+                .and_then(|session| session_project.get(&session).copied())
+        })
+    });
+    Some(finish_project_rows(
+        order,
+        by_project
+            .iter()
+            .map(|(k, v)| (*k, v.iter().collect()))
+            .collect(),
+        selected_project,
+        focused_hint,
+    ))
+}
+
+fn finish_project_rows(
+    order: Vec<i64>,
+    by_project: HashMap<i64, Vec<&Value>>,
+    selected_project: Option<i64>,
+    focused_hint: Option<u64>,
+) -> (Vec<Value>, Option<Value>) {
+    let mut projects = Vec::new();
+    for project in order {
+        let Some(rows) = by_project.get(&project) else {
+            continue;
+        };
+        let layouts: Vec<Value> = rows
+            .iter()
+            .filter_map(|row| row.get("layout").cloned())
+            .collect();
+        if layouts.is_empty() {
+            continue;
+        }
+        let layout = merge_layouts(layouts);
+        let focused = focused_hint
+            .filter(|pane| contains_pane(&layout, *pane))
+            .or_else(|| {
+                rows.iter()
+                    .filter_map(|row| row.get("focused").and_then(Value::as_u64))
+                    .find(|pane| contains_pane(&layout, *pane))
+            })
+            .or_else(|| first_pane(&layout))
+            .unwrap_or(1);
+        projects.push(json!({
+            "project": project,
+            "layout": layout,
+            "focused": focused,
+        }));
+    }
+    let selected = selected_project
+        .filter(|project| {
+            projects
+                .iter()
+                .any(|row| row.get("project").and_then(Value::as_i64) == Some(*project))
+        })
+        .or_else(|| {
+            projects
+                .first()
+                .and_then(|row| row.get("project"))
+                .and_then(Value::as_i64)
+        });
+    (projects, selected.map(|id| json!(id)))
+}
+
+fn merge_layouts(layouts: Vec<Value>) -> Value {
+    if layouts.len() == 1 {
+        return layouts.into_iter().next().unwrap();
+    }
+    json!({
+        "Group": {
+            "horizontal": true,
+            "sizes": [],
+            "children": layouts,
+        }
+    })
+}
+
+fn filter_layout(node: &Value, valid: &std::collections::HashSet<u64>) -> Option<Value> {
+    if let Some(pane) = node
+        .get("Leaf")
+        .and_then(|leaf| leaf.get("pane"))
+        .and_then(Value::as_u64)
+    {
+        return valid.contains(&pane).then(|| node.clone());
+    }
+    let children = node.get("Group")?.get("children")?.as_array()?;
+    let kept: Vec<Value> = children
+        .iter()
+        .filter_map(|child| filter_layout(child, valid))
+        .collect();
+    match kept.len() {
+        0 => None,
+        1 => kept.into_iter().next(),
+        _ => {
+            let mut group = node.get("Group")?.clone();
+            group["children"] = json!(kept);
+            if kept.len() != children.len() {
+                group["sizes"] = json!([]);
+            }
+            Some(json!({ "Group": group }))
+        }
+    }
+}
+
+fn contains_pane(node: &Value, pane: u64) -> bool {
+    if node
+        .get("Leaf")
+        .and_then(|leaf| leaf.get("pane"))
+        .and_then(Value::as_u64)
+        == Some(pane)
+    {
+        return true;
+    }
+    node.get("Group")
+        .and_then(|group| group.get("children"))
+        .and_then(Value::as_array)
+        .is_some_and(|children| children.iter().any(|child| contains_pane(child, pane)))
+}
+
+fn first_pane(node: &Value) -> Option<u64> {
+    if let Some(pane) = node
+        .get("Leaf")
+        .and_then(|leaf| leaf.get("pane"))
+        .and_then(Value::as_u64)
+    {
+        return Some(pane);
+    }
+    node.get("Group")
+        .and_then(|group| group.get("children"))
+        .and_then(Value::as_array)
+        .and_then(|children| children.iter().find_map(first_pane))
+}
+
 /// Connection settings shared by the store and its in-memory fallback: WAL lets
 /// the settings window's short-lived connections share the file with the
 /// UI-owned store, and the busy timeout covers the writes that still collide.
@@ -399,7 +564,7 @@ pub const SETTING_NOTIFICATIONS: &str = "notifications";
 /// Whether attention notifications play the macOS alert sound (`"0"` mutes).
 pub const SETTING_NOTIFICATION_SOUND: &str = "notification_sound";
 
-/// Setting key marking that the first-run project/session were seeded. It stays
+/// Setting key marking that the first-run project was seeded. It stays
 /// after the user deletes them, so an intentionally empty workspace is not
 /// refilled on the next launch.
 pub const SETTING_SEEDED: &str = "seeded";
@@ -480,140 +645,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Deleting one session leaves its siblings alone.
+    /// Renaming a project keeps it; deleting it removes only that row.
     #[test]
-    fn deleting_a_session_keeps_the_others() {
+    fn project_rename_and_delete() {
         let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let doomed = store
-            .insert_session(project, "omp", "会话 1", "/tmp")
-            .unwrap();
-        let kept = store
-            .insert_session(project, "omp", "会话 2", "/tmp")
-            .unwrap();
+        let kept = store.insert_project("keep", "/keep").unwrap();
+        let doomed = store.insert_project("doomed", "/doomed").unwrap();
 
-        store.delete_session(doomed).unwrap();
-
-        let sessions = store.sessions();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, kept);
-    }
-
-    /// Deleting an unknown id is a no-op rather than an error, so a stale
-    /// menu action can never break the db.
-    #[test]
-    fn deleting_an_unknown_session_is_harmless() {
-        let store = store();
-        store.delete_session(404).unwrap();
-        assert!(store.sessions().is_empty());
-    }
-
-    #[test]
-    fn renaming_a_session_updates_its_title() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let session = store
-            .insert_session(project, "omp", "会话 1", "/tmp")
-            .unwrap();
-
-        store.rename_session(session, "重构 backend").unwrap();
-        assert_eq!(store.sessions()[0].title, "重构 backend");
-        assert!(store.sessions()[0].title_manual);
-    }
-
-    /// A generated title fills an unnamed session, but once the user renames
-    /// it every later generated title is refused — the name they typed stands.
-    #[test]
-    fn a_manual_title_outranks_generated_ones() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let session = store
-            .insert_session(project, "omp", "会话 1", "/tmp")
-            .unwrap();
-
-        assert!(store.update_session_title(session, "首条消息").unwrap());
-        assert_eq!(store.sessions()[0].title, "首条消息");
-
-        store.rename_session(session, "重构 backend").unwrap();
-        assert!(
-            !store
-                .update_session_title(session, "agent 起的名字")
-                .unwrap()
-        );
-        assert_eq!(store.sessions()[0].title, "重构 backend");
-    }
-
-    /// Renaming a project keeps its sessions; deleting it takes them with it
-    /// through the schema's cascade, which `foreign_keys=ON` makes real.
-    #[test]
-    fn project_rename_and_delete_keep_the_right_sessions() {
-        let store = store();
-        let kept_project = store.insert_project("keep", "/keep").unwrap();
-        let doomed_project = store.insert_project("doomed", "/doomed").unwrap();
-        let kept = store
-            .insert_session(kept_project, "shell", "终端 1", "/keep")
-            .unwrap();
-        store
-            .insert_session(doomed_project, "shell", "终端 2", "/doomed")
-            .unwrap();
-
-        store.rename_project(doomed_project, "renamed").unwrap();
+        store.rename_project(doomed, "renamed").unwrap();
         assert!(
             store
                 .projects()
                 .iter()
-                .any(|p| p.id == doomed_project && p.name == "renamed")
+                .any(|p| p.id == doomed && p.name == "renamed")
         );
 
-        store.delete_project(doomed_project).unwrap();
-        assert_eq!(store.projects().len(), 1);
-        let sessions = store.sessions();
-        assert_eq!(sessions.len(), 1, "the other project's session survives");
-        assert_eq!(sessions[0].id, kept);
-    }
-
-    /// The sidebar's order comes from `last_used_at`, and generated-title
-    /// bookkeeping must not move a session.
-    #[test]
-    fn sessions_order_by_recent_use_not_title_updates() {
-        let store = store();
-        let project = store.insert_project("kumu", "/tmp").unwrap();
-        let (a, b, c) = (
-            store.insert_session(project, "shell", "a", "/tmp").unwrap(),
-            store.insert_session(project, "shell", "b", "/tmp").unwrap(),
-            store.insert_session(project, "shell", "c", "/tmp").unwrap(),
-        );
-        for (id, at) in [
-            (a, "2024-01-01 00:00:00"),
-            (b, "2024-01-02 00:00:00"),
-            (c, "2024-01-03 00:00:00"),
-        ] {
-            store
-                .conn
-                .execute(
-                    "UPDATE sessions SET last_used_at = ?1 WHERE id = ?2",
-                    rusqlite::params![at, id],
-                )
-                .unwrap();
-        }
-        let ids = || {
-            store
-                .sessions()
-                .into_iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(), vec![c, b, a]);
-
-        store.touch_session(a).unwrap();
-        assert_eq!(ids(), vec![a, c, b], "using a session moves it up");
-
-        store.update_session_title(a, "agent title").unwrap();
-        assert_eq!(
-            ids(),
-            vec![a, c, b],
-            "a generated title must not reorder the sidebar"
-        );
+        store.delete_project(doomed).unwrap();
+        let projects = store.projects();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, kept);
     }
 
     /// The layout is one replaceable row; reading it back is what lets the
@@ -644,10 +694,10 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
-    /// A database from the chat era keeps its rows but loses that era's table
-    /// and columns the next time it is opened.
+    /// A database from the chat era keeps its project and drops that era's
+    /// tables; the old session rows go with the removed session list.
     #[test]
-    fn an_older_database_drops_the_chat_schema_and_keeps_its_sessions() {
+    fn an_older_database_drops_sessions_and_keeps_its_project() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE projects (
@@ -689,9 +739,17 @@ mod tests {
         let store = Store { conn };
         store.init().unwrap();
 
-        let sessions = store.sessions();
-        assert_eq!(sessions.len(), 1, "the session row survives");
-        assert_eq!(sessions[0].title, "终端 1");
+        assert_eq!(store.projects().len(), 1, "the project survives");
+        assert_eq!(store.projects()[0].name, "kumu");
+        let sessions_table: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions_table, 0, "sessions are no longer a table");
         let chat_table: i64 = store
             .conn
             .query_row(
@@ -715,41 +773,171 @@ mod tests {
             )
             .unwrap();
         assert_eq!(workspace_table, 1, "the workspace table is added");
-        let last_used: Option<String> = store
-            .conn
-            .query_row(
-                "SELECT last_used_at FROM sessions WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            last_used.is_some(),
-            "the recency clock starts at the existing row's creation time"
-        );
-        let renamed: i64 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('sessions')
-                 WHERE name = 'agent_session_id'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(renamed, 1, "resume_id is renamed to agent_session_id");
-        for column in ["model", "mode", "sandbox", "reasoning", "usage"] {
-            let left: i64 = store
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('sessions') WHERE name = ?1",
-                    [column],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(left, 0, "{column} is gone");
-        }
 
         // Opening it again must be a no-op rather than re-running the upgrade.
         store.init().unwrap();
+    }
+
+    /// Two sessions under one project become one pane tree. A session in
+    /// another project stays on that project.
+    #[test]
+    fn opening_an_old_layout_gives_each_project_its_panes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL
+            );
+            CREATE TABLE workspace_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                layout_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO projects (name, path) VALUES ('kumu', '/kumu'), ('other', '/other');
+            INSERT INTO sessions (project_id, agent, title, cwd) VALUES
+                (1, 'shell', '终端 1', '/kumu'),
+                (1, 'shell', '终端 2', '/kumu'),
+                (2, 'shell', '终端 3', '/other');
+            PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        let layout = r#"{
+            "version": 2,
+            "layout": {
+                "SessionLayouts": {
+                    "selected": 2,
+                    "sessions": [
+                        {"session": 1, "layout": {"Leaf": {"pane": 1}}, "focused": 1},
+                        {"session": 2, "layout": {"Leaf": {"pane": 2}}, "focused": 2},
+                        {"session": 3, "layout": {"Leaf": {"pane": 3}}, "focused": 3}
+                    ]
+                }
+            },
+            "focused": 2
+        }"#;
+        conn.execute(
+            "INSERT INTO workspace_state (id, layout_json) VALUES (1, ?1)",
+            [layout],
+        )
+        .unwrap();
+        let store = Store { conn };
+        store.init().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&store.workspace_state().unwrap().unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        let projects = saved["layout"]["ProjectLayouts"]["projects"]
+            .as_array()
+            .unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(saved["layout"]["ProjectLayouts"]["selected"], 1);
+        assert_eq!(saved["focused"], 2);
+        assert_eq!(projects[0]["focused"], 2);
+        let merged = &projects[0]["layout"]["Group"]["children"];
+        assert_eq!(merged[0]["Leaf"]["pane"], 1);
+        assert_eq!(merged[1]["Leaf"]["pane"], 2);
+        assert_eq!(projects[1]["layout"]["Leaf"]["pane"], 3);
+    }
+
+    #[test]
+    fn legacy_layout_migration_preserves_surviving_split_sizes() {
+        let layout = json!({
+            "version": 1,
+            "focused": 2,
+            "layout": {"Group": {
+                "horizontal": true,
+                "sizes": [0.7, 0.3],
+                "children": [
+                    {"Group": {
+                        "horizontal": false,
+                        "sizes": [0.4, 0.6],
+                        "children": [{"Leaf": {"pane": 1}}, {"Leaf": {"pane": 2}}]
+                    }},
+                    {"Leaf": {"pane": 3}}
+                ]
+            }},
+            "panes": [
+                {"pane": 1, "session": 10},
+                {"pane": 2, "session": 10},
+                {"pane": 3, "session": 20}
+            ]
+        });
+        let migrated =
+            rekey_workspace_json(&layout.to_string(), &HashMap::from([(10, 1), (20, 2)])).unwrap();
+        let migrated: Value = serde_json::from_str(&migrated).unwrap();
+        let projects = &migrated["layout"]["ProjectLayouts"]["projects"];
+        assert_eq!(projects[0]["layout"]["Group"]["sizes"], json!([0.4, 0.6]));
+        assert_eq!(projects[0]["focused"], 2);
+        assert_eq!(projects[1]["layout"]["Leaf"]["pane"], 3);
+    }
+
+    #[test]
+    fn a_failed_upgrade_rolls_back_layout_and_session_removal() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL);
+             INSERT INTO sessions VALUES (1, 10);
+             CREATE TABLE workspace_state (
+                 id INTEGER PRIMARY KEY, layout_json TEXT NOT NULL, updated_at TEXT
+             );
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        let layout = json!({
+            "version": 2,
+            "layout": {"SessionLayouts": {
+                "selected": 1,
+                "sessions": [{"session": 1, "layout": {"Leaf": {"pane": 1}}, "focused": 1}]
+            }},
+            "focused": 1
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO workspace_state VALUES (1, ?1, NULL)",
+            [&layout],
+        )
+        .unwrap();
+        // Fail after the layout write, at the table-removal step.
+        conn.execute_batch(
+            "CREATE TABLE session_guard (session_id INTEGER REFERENCES sessions(id));
+             INSERT INTO session_guard VALUES (1);
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        let store = Store { conn };
+        assert!(store.init().is_err());
+        assert_eq!(store.workspace_state().unwrap(), Some(layout));
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        store.conn.execute("DROP TABLE session_guard", []).unwrap();
+        store.init().unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 }

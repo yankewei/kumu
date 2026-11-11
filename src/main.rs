@@ -12,10 +12,10 @@
 //!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `app/`     projects, sessions, and live terminals;
-//!   - `db.rs`    local SQLite persistence (projects/sessions/workspace);
-//!   - `term/`    PTY + VT for agent TUIs and shell sessions;
-//!   - `agent/`   registry, executable lookup, and on-disk title lookup;
+//!   - `app/`     projects and live terminals;
+//!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
+//!   - `term/`    PTY + VT for shells and the agent TUIs they launch;
+//!   - `agent/`   registry and executable lookup;
 //!   - `window_state.rs` the main window's saved geometry.
 
 mod agent;

@@ -149,6 +149,8 @@ pub struct Snapshot {
     pub cursor_cell: Option<(u16, u16)>,
     pub command: String,
     pub cwd: String,
+    /// The title the program set with OSC 0/2, empty when it set none.
+    pub title: String,
     pub exited: bool,
     pub spawn_error: Option<String>,
     /// The program asked for mouse reports (click goes to it unless Shift).
@@ -156,6 +158,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// What the program calls itself: its OSC title (an agent TUI names itself
+    /// there), else the command it was launched as, else an empty string.
+    /// Titles are untrusted text the program wrote, so control characters are
+    /// dropped before the label leaves the terminal.
+    pub fn label(&self) -> String {
+        let title: String = self.title.chars().filter(|ch| !ch.is_control()).collect();
+        let title = title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+        self.command.clone()
+    }
+
     pub fn blank(command: &str, cwd: &str) -> Self {
         Self::blank_with(command, cwd, TermColors::default().bg)
     }
@@ -171,6 +186,7 @@ impl Snapshot {
             cursor_cell: None,
             command: command.to_string(),
             cwd: cwd.to_string(),
+            title: String::new(),
             exited: false,
             spawn_error: None,
             mouse_tracking: false,
@@ -235,6 +251,65 @@ struct Shared {
 
 fn ok(status: GhosttyResult, what: &str) {
     assert!(status == GHOSTTY_SUCCESS, "ghostty {what} failed: {status}");
+}
+
+/// Copy a borrowed string field out of a terminal. The pointer libghostty
+/// returns is only valid until the next mutating call, so it is read here.
+unsafe fn terminal_text(term: GhosttyTerminal, data: GhosttyTerminalData) -> String {
+    unsafe {
+        let mut out = GhosttyString::default();
+        if ghostty_terminal_get(term, data, &mut out as *mut _ as *mut c_void) != GHOSTTY_SUCCESS
+            || out.ptr.is_null()
+            || out.len == 0
+        {
+            return String::new();
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(out.ptr, out.len)).into_owned()
+    }
+}
+
+/// Turn a client-reported pwd into a path. OSC 7 carries a `file://host/path`
+/// URI; OSC 9 and iTerm2's OSC 1337 carry a bare path.
+fn reported_path(raw: &str) -> Option<String> {
+    let path = match raw.strip_prefix("file://") {
+        Some(rest) => match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => "/",
+        },
+        None => raw,
+    };
+    let path = percent_decode(path);
+    (!path.is_empty()).then_some(path)
+}
+
+fn percent_decode(text: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| hex(bytes[i + 1]).zip(hex(bytes[i + 2])))
+            .flatten();
+        match decoded {
+            Some((high, low)) => {
+                out.push(high * 16 + low);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 unsafe extern "C" fn on_write_pty(
@@ -579,6 +654,10 @@ impl Vt {
 
     pub fn snapshot(&mut self, command: &str, cwd: &str, exited: bool) -> Snapshot {
         unsafe {
+            // Read these first: the strings are borrowed from the terminal and
+            // copied before the render-state calls below.
+            let title = terminal_text(self.term, GHOSTTY_TERMINAL_DATA_TITLE);
+            let pwd = terminal_text(self.term, GHOSTTY_TERMINAL_DATA_PWD);
             if let Some(since) = self.shared.held_since
                 && since.elapsed() > MAX_HOLD
             {
@@ -731,7 +810,8 @@ impl Vt {
                 cursor,
                 cursor_cell,
                 command: command.to_string(),
-                cwd: cwd.to_string(),
+                cwd: reported_path(&pwd).unwrap_or_else(|| cwd.to_string()),
+                title,
                 exited,
                 spawn_error: None,
                 mouse_tracking: self.mouse_tracking(),
@@ -1406,6 +1486,25 @@ mod tests {
             None,
             "a following bell must not create another alert"
         );
+    }
+
+    #[test]
+    fn a_program_title_and_reported_pwd_reach_the_snapshot() {
+        let mut vt = Vt::new(40, 4);
+        vt.write(b"\x1b]2;Claude Code\x07");
+        let snapshot = vt.snapshot("zsh", "/launch", false);
+        assert_eq!(snapshot.title, "Claude Code");
+        assert_eq!(snapshot.label(), "Claude Code");
+        assert_eq!(snapshot.cwd, "/launch", "no OSC 7: the launch directory");
+
+        // OSC 7 carries a URI and percent-encodes the path.
+        vt.write(b"\x1b]7;file://host/Users/me/kumu%20demo\x07");
+        let snapshot = vt.snapshot("zsh", "/launch", false);
+        assert_eq!(snapshot.cwd, "/Users/me/kumu demo");
+
+        // iTerm2's OSC 1337 carries a bare path.
+        vt.write(b"\x1b]1337;CurrentDir=/tmp/demo\x07");
+        assert_eq!(vt.snapshot("zsh", "/launch", false).cwd, "/tmp/demo");
     }
 
     #[test]

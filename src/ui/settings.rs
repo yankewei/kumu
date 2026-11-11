@@ -806,7 +806,7 @@ impl SettingsWindow {
             ))
             .child(row(
                 "本地数据",
-                "项目与会话记录保存在 ~/.kumu/kumu.db。",
+                "项目与终端布局保存在 ~/.kumu/kumu.db。",
                 pill(PillTone::Neutral, "SQLite", theme).into_any_element(),
                 border,
                 true,
