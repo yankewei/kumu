@@ -231,11 +231,17 @@ impl KumuApp {
                 }
             })
             .child(
-                Icon::new(if active {
-                    IconName::FolderOpen
+                // A worktree is a checkout of its own, so it wears the branch
+                // mark. The repository it came from keeps the folder.
+                if worktree {
+                    Icon::empty().path("icons/git-branch.svg")
                 } else {
-                    IconName::Folder
-                })
+                    Icon::new(if active {
+                        IconName::FolderOpen
+                    } else {
+                        IconName::Folder
+                    })
+                }
                 .small()
                 .text_color(fg),
             )
