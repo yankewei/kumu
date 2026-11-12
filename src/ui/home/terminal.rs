@@ -16,7 +16,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::panes::PaneId;
+use super::panes::{PaneDirection, PaneId};
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::{
     Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
@@ -33,8 +33,21 @@ pub enum TerminalEvent {
     SplitRight,
     /// Split this pane downward.
     SplitDown,
+    /// Move keyboard focus to the pane in this direction.
+    Focus(PaneDirection),
     /// Close this pane and its shell.
     Close,
+}
+
+/// Direction for a ⌘⌥arrow focus move.
+fn pane_direction(key: &str) -> Option<PaneDirection> {
+    match key {
+        "left" => Some(PaneDirection::Left),
+        "right" => Some(PaneDirection::Right),
+        "up" => Some(PaneDirection::Up),
+        "down" => Some(PaneDirection::Down),
+        _ => None,
+    }
 }
 
 /// Inset around the cell grid, matching the padded look of a pane TUI.
@@ -256,25 +269,42 @@ impl TerminalView {
         }
         let mods = &event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
-        if mods.platform && !mods.control && !mods.alt && !mods.shift {
-            match key {
-                "c" => {
-                    if self.copy(cx) {
-                        cx.stop_propagation();
-                    }
-                    return;
-                }
-                "v" => {
-                    self.paste(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                // Select-all is not wired yet; don't send ⌘A into the PTY.
-                "a" => return,
-                _ => return,
-            }
-        }
         if mods.platform {
+            // ⌘⌥arrows move focus between panes; ⌘D / ⌘⇧D split the focused
+            // pane, matching the split buttons in the pane chrome.
+            if mods.alt && !mods.control && !mods.shift {
+                if let Some(direction) = pane_direction(key) {
+                    cx.emit(TerminalEvent::Focus(direction));
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            if !mods.alt && !mods.control {
+                match key {
+                    "d" => {
+                        cx.emit(if mods.shift {
+                            TerminalEvent::SplitDown
+                        } else {
+                            TerminalEvent::SplitRight
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "c" if !mods.shift => {
+                        if self.copy(cx) {
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
+                    "v" if !mods.shift => {
+                        self.paste(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // Select-all is not wired yet; don't send ⌘A into the PTY.
+                    _ => return,
+                }
+            }
             return;
         }
         if self.project.is_none() {
@@ -959,7 +989,7 @@ fn terminal_header(
         .child(chrome_button(
             format!("split-right-{}", pane.0),
             "split-right.svg",
-            "向右分屏",
+            "向右分屏 ⌘D",
             muted,
             radius,
             hover,
@@ -972,7 +1002,7 @@ fn terminal_header(
         .child(chrome_button(
             format!("split-down-{}", pane.0),
             "split-down.svg",
-            "向下分屏",
+            "向下分屏 ⌘⇧D",
             muted,
             radius,
             hover,

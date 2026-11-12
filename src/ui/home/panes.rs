@@ -11,6 +11,15 @@ use gpui_kit::Axis;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
 
+/// Direction of a keyboard focus move between panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Structure version of [`SavedWorkspace`]. Bump it when the JSON shape
 /// changes; an unknown version is ignored rather than guessed at.
 pub const WORKSPACE_STATE_VERSION: u32 = 3;
@@ -217,6 +226,27 @@ pub enum PaneNode {
     },
 }
 
+/// A pane's box with every group dividing its space evenly. Exact split
+/// ratios do not matter for picking a direction: panes on opposite sides of a
+/// split stay on those sides whatever the ratios are.
+#[derive(Clone, Copy)]
+struct Region {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Region {
+    fn center_x(self) -> f32 {
+        self.x + self.w / 2.
+    }
+
+    fn center_y(self) -> f32 {
+        self.y + self.h / 2.
+    }
+}
+
 impl PaneNode {
     pub fn leaf(id: PaneId) -> Self {
         Self::Leaf(id)
@@ -227,6 +257,89 @@ impl PaneNode {
         match self {
             Self::Leaf(id) => vec![*id],
             Self::Group { children, .. } => children.iter().flat_map(Self::panes).collect(),
+        }
+    }
+
+    /// The pane next to `id` toward `direction`, crossing group boundaries.
+    /// The nearest pane on that side wins, so a pane nested in another column
+    /// is reachable without knowing the tree shape.
+    pub fn neighbor_in(&self, id: PaneId, direction: PaneDirection) -> Option<PaneId> {
+        let mut regions = Vec::new();
+        self.collect_regions(
+            Region {
+                x: 0.,
+                y: 0.,
+                w: 1.,
+                h: 1.,
+            },
+            &mut regions,
+        );
+        let target = *regions
+            .iter()
+            .find(|(pane, _)| *pane == id)
+            .map(|(_, region)| region)?;
+        let mut best: Option<(PaneId, f32, f32)> = None;
+        for &(pane, region) in &regions {
+            if pane == id {
+                continue;
+            }
+            // `gap` is the distance along the movement axis: negative means the
+            // pane is behind the target and cannot be the neighbor. `side` is
+            // how far the two centers are apart on the other axis, breaking
+            // ties between panes at the same distance.
+            let (gap, side) = match direction {
+                PaneDirection::Left => (
+                    target.x - (region.x + region.w),
+                    (region.center_y() - target.center_y()).abs(),
+                ),
+                PaneDirection::Right => (
+                    region.x - (target.x + target.w),
+                    (region.center_y() - target.center_y()).abs(),
+                ),
+                PaneDirection::Up => (
+                    target.y - (region.y + region.h),
+                    (region.center_x() - target.center_x()).abs(),
+                ),
+                PaneDirection::Down => (
+                    region.y - (target.y + target.h),
+                    (region.center_x() - target.center_x()).abs(),
+                ),
+            };
+            // Panes share exact edges; float error must not hide those.
+            if gap < -0.0001 {
+                continue;
+            }
+            if best.is_none_or(|(_, best_gap, best_side)| (gap, side) < (best_gap, best_side)) {
+                best = Some((pane, gap, side));
+            }
+        }
+        best.map(|(pane, _, _)| pane)
+    }
+
+    fn collect_regions(&self, region: Region, out: &mut Vec<(PaneId, Region)>) {
+        match self {
+            Self::Leaf(id) => out.push((*id, region)),
+            Self::Group { axis, children, .. } => {
+                let count = children.len() as f32;
+                for (i, child) in children.iter().enumerate() {
+                    let offset = i as f32 / count;
+                    let child_region = match axis {
+                        Axis::Horizontal => Region {
+                            x: region.x + region.w * offset,
+                            y: region.y,
+                            w: region.w / count,
+                            h: region.h,
+                        },
+                        Axis::Vertical => Region {
+                            x: region.x,
+                            y: region.y + region.h * offset,
+                            w: region.w,
+                            h: region.h / count,
+                        },
+                    };
+                    child.collect_regions(child_region, out);
+                }
+            }
         }
     }
 
@@ -497,6 +610,61 @@ mod tests {
         n.split(PaneId(2), Axis::Horizontal, PaneId(3), 10);
         assert_eq!(n.neighbor(PaneId(2)), Some(PaneId(1)));
         assert_eq!(n.neighbor(PaneId(1)), Some(PaneId(2)));
+    }
+
+    /// A direction crosses split boundaries instead of walking depth-first:
+    /// from the bottom-right pane, left lands in the full-height left column.
+    #[test]
+    fn directional_focus_crosses_split_boundaries() {
+        let mut n = leaf(1);
+        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
+
+        assert_eq!(
+            n.neighbor_in(PaneId(1), PaneDirection::Right),
+            Some(PaneId(2))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(3), PaneDirection::Left),
+            Some(PaneId(1))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(2), PaneDirection::Down),
+            Some(PaneId(3))
+        );
+        assert_eq!(n.neighbor_in(PaneId(3), PaneDirection::Up), Some(PaneId(2)));
+        assert_eq!(n.neighbor_in(PaneId(1), PaneDirection::Left), None);
+        assert_eq!(n.neighbor_in(PaneId(2), PaneDirection::Up), None);
+    }
+
+    /// In a 2×2 grid the pane sharing the edge wins over the diagonal one.
+    #[test]
+    fn directional_focus_prefers_the_aligned_pane() {
+        let mut n = leaf(1);
+        n.split(PaneId(1), Axis::Vertical, PaneId(2), 10);
+        n.split(PaneId(1), Axis::Horizontal, PaneId(3), 11);
+        n.split(PaneId(2), Axis::Horizontal, PaneId(4), 12);
+
+        assert_eq!(
+            n.neighbor_in(PaneId(1), PaneDirection::Right),
+            Some(PaneId(3))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(1), PaneDirection::Down),
+            Some(PaneId(2))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(3), PaneDirection::Down),
+            Some(PaneId(4))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(4), PaneDirection::Left),
+            Some(PaneId(2))
+        );
+        assert_eq!(
+            n.neighbor_in(PaneId(2), PaneDirection::Right),
+            Some(PaneId(4))
+        );
     }
 
     /// A saved tree comes back with the same leaves and split axes, even though
