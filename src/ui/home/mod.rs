@@ -23,7 +23,9 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::Updater;
-use panes::{PaneId, PaneNode, SavedProjectLayout, SavedWorkspace, WORKSPACE_STATE_VERSION};
+use panes::{
+    PaneDirection, PaneId, PaneNode, SavedProjectLayout, SavedWorkspace, WORKSPACE_STATE_VERSION,
+};
 use terminal::{TerminalEvent, TerminalView};
 
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
@@ -399,8 +401,22 @@ impl KumuApp {
             TerminalEvent::Activated => self.focus_pane(pane, cx),
             TerminalEvent::SplitRight => self.split_pane(pane, Axis::Horizontal, cx),
             TerminalEvent::SplitDown => self.split_pane(pane, Axis::Vertical, cx),
+            TerminalEvent::Focus(direction) => self.focus_neighbor(pane, *direction, cx),
             TerminalEvent::Close => self.close_pane(pane, cx),
         }
+    }
+
+    /// Move keyboard focus to the pane next to `pane` in `direction`.
+    fn focus_neighbor(&mut self, pane: PaneId, direction: PaneDirection, cx: &mut Context<Self>) {
+        let Some(next) = self
+            .layouts
+            .values()
+            .find_map(|layout| layout.neighbor_in(pane, direction))
+        else {
+            return;
+        };
+        self.pending_focus = Some(next);
+        self.focus_pane(next, cx);
     }
 
     fn focus_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
