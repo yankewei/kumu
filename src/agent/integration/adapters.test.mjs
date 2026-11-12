@@ -132,6 +132,46 @@ test("OpenCode 2 scopes events to root sessions and cleans up subscriptions", ()
   assert.equal(disposed, 6);
 });
 
+test("OpenCode 2 ignores sessions in another TUI's project", () => {
+  messages = [];
+  const handlers = {};
+  const cleanup = openCode.setup({
+    location: { directory: "/work/here", project: { id: "mine" } },
+    data: {
+      on: (name, callback) => { handlers[name] = callback; return () => {}; },
+      session: { get: (id) => ({
+        projectID: id === "mine" ? "mine" : "elsewhere",
+        location: { directory: "/work/elsewhere" },
+      }) },
+    },
+  });
+  handlers["session.execution.started"]({ data: { sessionID: "mine" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "mine" } });
+  handlers["session.execution.started"]({ data: { sessionID: "elsewhere" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "elsewhere" } });
+  handlers["permission.asked"]({ data: { sessionID: "elsewhere" } });
+  handlers["form.created"]({ data: { form: { sessionID: "elsewhere" } } });
+  assert.equal(messages.length, 1, "only this TUI's project notifies");
+  assert.match(messages[0], /任务已完成/);
+  cleanup();
+});
+
+test("OpenCode 2 falls back to the directory when project IDs are unavailable", () => {
+  messages = [];
+  const handlers = {};
+  const cleanup = openCode.setup({
+    location: { directory: "/work/here" },
+    data: {
+      on: (name, callback) => { handlers[name] = callback; return () => {}; },
+      session: { get: () => ({ location: { directory: "/work/elsewhere" } }) },
+    },
+  });
+  handlers["session.execution.started"]({ data: { sessionID: "elsewhere" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "elsewhere" } });
+  assert.equal(messages.length, 0);
+  cleanup();
+});
+
 test("OpenCode 1 distinguishes completion, questions, permissions and failures", async () => {
   messages = [];
   const adapter = await KumuNotifications({ client: { session: {
