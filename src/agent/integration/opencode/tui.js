@@ -7,22 +7,23 @@ export default {
     if (process.env.KUMU_TERMINAL !== "1") return;
     const ended = new Set();
     // Every attached TUI receives every location's events. Notify only for
-    // sessions in this TUI's project, or each open pane raises its own copy
-    // when one of them finishes a turn.
-    const hereProject = ctx.location?.project?.id;
-    const hereDirectory = ctx.location?.directory;
+    // this TUI's project, otherwise each open pane raises its own copy.
+    // Read the location per event; it can arrive after setup.
     const relevant = (id) => {
       const session = ctx.data.session.get(id);
       if (!session || session.parentID) return false;
+      const hereProject = ctx.location?.project?.id;
       if (hereProject && session.projectID) return hereProject === session.projectID;
-      const there = session.location?.directory;
-      return !hereDirectory || !there || hereDirectory === there;
+      const here = ctx.location?.directory || ctx.data.location?.default?.()?.directory;
+      const there = session.location?.directory || session.directory;
+      if (here && there) return here === there;
+      return !here;
     };
     const end = (event, message) => {
       const id = event.data.sessionID;
-      if (ended.has(id)) return;
+      if (ended.has(id) || !relevant(id)) return;
       ended.add(id);
-      if (relevant(id)) notify("OpenCode", message);
+      notify("OpenCode", message);
     };
     const dispose = [
       ctx.data.on("session.execution.started", (event) => ended.delete(event.data.sessionID)),

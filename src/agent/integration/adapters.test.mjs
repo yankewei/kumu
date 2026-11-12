@@ -141,7 +141,7 @@ test("OpenCode 2 ignores sessions in another TUI's project", () => {
       on: (name, callback) => { handlers[name] = callback; return () => {}; },
       session: { get: (id) => ({
         projectID: id === "mine" ? "mine" : "elsewhere",
-        location: { directory: "/work/elsewhere" },
+        location: { directory: id === "mine" ? "/work/here" : "/work/elsewhere" },
       }) },
     },
   });
@@ -156,19 +156,48 @@ test("OpenCode 2 ignores sessions in another TUI's project", () => {
   cleanup();
 });
 
-test("OpenCode 2 falls back to the directory when project IDs are unavailable", () => {
+test("OpenCode 2 matches the directory when project IDs are unavailable", () => {
   messages = [];
   const handlers = {};
   const cleanup = openCode.setup({
     location: { directory: "/work/here" },
     data: {
       on: (name, callback) => { handlers[name] = callback; return () => {}; },
-      session: { get: () => ({ location: { directory: "/work/elsewhere" } }) },
+      session: { get: (id) => ({ location: { directory: id === "here" ? "/work/here" : "/work/elsewhere" } }) },
     },
   });
   handlers["session.execution.started"]({ data: { sessionID: "elsewhere" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "elsewhere" } });
   assert.equal(messages.length, 0);
+  handlers["session.execution.started"]({ data: { sessionID: "here" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "here" } });
+  assert.equal(messages.length, 1);
+  cleanup();
+});
+
+test("OpenCode 2 reads the TUI directory when the event fires", () => {
+  messages = [];
+  const handlers = {};
+  const location = {};
+  const cleanup = openCode.setup({
+    get location() { return location; },
+    data: {
+      on: (name, callback) => { handlers[name] = callback; return () => {}; },
+      location: { default: () => ({ directory: "/work/here" }) },
+      session: { get: (id) => ({ location: { directory: id } }) },
+    },
+  });
+  handlers["session.execution.started"]({ data: { sessionID: "/work/elsewhere" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/elsewhere" } });
+  handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
+  assert.equal(messages.length, 1, "startup directory applies before location info loads");
+  location.directory = "/work/next";
+  handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
+  handlers["session.execution.started"]({ data: { sessionID: "/work/next" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/next" } });
+  assert.equal(messages.length, 2, "a later directory change is not ignored");
   cleanup();
 });
 
