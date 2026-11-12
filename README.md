@@ -47,7 +47,7 @@ sleep 3; printf '\033]9;任务完成\007'
 
 ## 从源码运行
 
-需要 macOS、Rust、Zig 0.16 和 Xcode。
+需要 macOS、Rust、Zig 0.17 和 Xcode。
 
 ```bash
 git clone --recurse-submodules https://github.com/yankewei/kumu.git

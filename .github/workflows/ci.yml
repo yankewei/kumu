@@ -37,12 +37,12 @@ jobs:
         with:
           submodules: recursive
 
-      # vendor/ghostty's build.zig.zon requires Zig 0.16.0. setup-zig also
+      # vendor/ghostty's build.zig.zon requires Zig 0.17.0. setup-zig also
       # caches Zig's global cache, which is where the libghostty-vt artifacts
       # live between runs.
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
