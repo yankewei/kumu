@@ -13,10 +13,14 @@ description: 构建、签名、公证并发布 Kumu 的可分发 macOS DMG。当
 xcodebuild -version
 xcrun notarytool history --keychain-profile kumu
 sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1
+git -C vendor/ghostty fetch origin --tags
+echo "当前: $(git -C vendor/ghostty describe --tags --exact-match HEAD 2>/dev/null || echo 未在标签上)"
+echo "最新: $(git -C vendor/ghostty tag -l 'vt-*' --sort=-v:refname | head -1)"
 ```
 
 - 本机只有 `Apple Development` 证书是正常的：归档用它签，导出时由 Xcode 云端换成 Developer ID。不要把“没有本机 Developer ID 私钥”当成阻断。
 - 不读取、不打印、不导出钥匙串里的密码。
+- `vendor/ghostty` 只钉 `vt-*` 标签。两行一致就继续。当前未在标签上，或最新标签更新时，先停下来：`git -C vendor/ghostty checkout <vt-标签>`，提交子模块指针，编译并跑终端测试，然后再打包。不要在 `packaging/release.sh` 里自动升级。
 
 ## 版本与提交
 
