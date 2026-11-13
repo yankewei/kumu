@@ -27,6 +27,8 @@ fn executable(agent: &str) -> Option<String> {
         "codex" => codex_bin(),
         "claude" => claude_bin(),
         "pi" => pi_bin(),
+        "cursor" => cursor_bin(),
+        "grok" => grok_bin(),
         _ => return None,
     })
 }
@@ -162,6 +164,54 @@ fn pi_bin() -> String {
             }
         }
         "pi".to_string()
+    })
+}
+
+/// Resolve the Cursor CLI executable: env override, then its install
+/// locations, then PATH.
+///
+/// The installer links `~/.local/bin/agent` and the legacy alias
+/// `~/.local/bin/cursor-agent`. `agent` is a generic name the Grok Build
+/// installer also claims when the two share a machine, so the unambiguous
+/// alias is tried first and the bare fallback is `cursor-agent`, never `agent`.
+fn cursor_bin() -> String {
+    std::env::var("CURSOR_AGENT_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin/cursor-agent"));
+            candidates.push(PathBuf::from(&home).join(".local/bin/agent"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
+        candidates.push(PathBuf::from("/usr/local/bin/cursor-agent"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "cursor-agent".to_string()
+    })
+}
+
+/// Resolve the Grok Build executable: env override, then its install
+/// locations, then PATH.
+///
+/// The installer puts `grok` in `~/.grok/bin` and links it into
+/// `~/.local/bin` when that is already on PATH.
+fn grok_bin() -> String {
+    std::env::var("GROK_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".grok/bin/grok"));
+            candidates.push(PathBuf::from(&home).join(".local/bin/grok"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/grok"));
+        candidates.push(PathBuf::from("/usr/local/bin/grok"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "grok".to_string()
     })
 }
 

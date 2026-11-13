@@ -12,7 +12,7 @@ pub struct AgentDef {
     pub logo: Option<&'static str>,
 }
 
-pub const AGENTS: [AgentDef; 5] = [
+pub const AGENTS: [AgentDef; 7] = [
     AgentDef {
         id: "opencode",
         name: "Opencode",
@@ -42,5 +42,17 @@ pub const AGENTS: [AgentDef; 5] = [
         name: "Pi",
         desc: "轻量终端编码 Agent",
         logo: Some("pi.png"),
+    },
+    AgentDef {
+        id: "cursor",
+        name: "Cursor CLI",
+        desc: "Cursor 的终端编码 Agent",
+        logo: Some("cursor.svg"),
+    },
+    AgentDef {
+        id: "grok",
+        name: "Grok Build",
+        desc: "xAI 的终端编码 Agent",
+        logo: None,
     },
 ];

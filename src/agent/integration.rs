@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 const MARKER: &str = " # kumu-notifications";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Missing,
     Registered,
@@ -67,6 +67,19 @@ fn paths(agent: &str) -> io::Result<Paths> {
                 .join("opencode/plugins");
             config.join("kumu-notifications")
         }
+        // Cursor's own config directory: CURSOR_CONFIG_DIR, else
+        // $XDG_CONFIG_HOME/cursor, else ~/.cursor. Its user hooks live in one
+        // flat `hooks.json` at the top of that directory.
+        "cursor" => std::env::var_os("CURSOR_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("cursor"))
+            })
+            .unwrap_or_else(|| home.join(".cursor"))
+            .join("hooks.json"),
+        // Grok Build reads personal hooks from ~/.grok/hooks/*.json. Kumu keeps
+        // its own file so installing never has to rewrite a user's hook file.
+        "grok" => home.join(".grok/hooks/kumu-notifications.json"),
         _ => return Err(io::Error::other("不支持的 Agent")),
     };
     Ok(Paths {
@@ -77,32 +90,53 @@ fn paths(agent: &str) -> io::Result<Paths> {
 }
 
 fn hook_groups(agent: &str) -> Vec<(&'static str, Value)> {
-    let mut events = vec![
-        ("Stop", None, "complete"),
-        ("PermissionRequest", None, "permission"),
-    ];
-    if agent == "claude" {
-        events.extend([
+    let events: Vec<(&'static str, Option<&'static str>, &'static str)> = match agent {
+        // PermissionRequest already fires the moment a prompt appears;
+        // Notification's permission_prompt/idle_prompt would later repeat the
+        // same turn. Keep only MCP elicitation forms, which have no
+        // PermissionRequest event of their own.
+        "claude" => vec![
+            ("Stop", None, "complete"),
+            ("PermissionRequest", None, "permission"),
             ("PreToolUse", Some("AskUserQuestion|ExitPlanMode"), "input"),
-            // PermissionRequest already fires the moment a prompt appears;
-            // Notification's permission_prompt/idle_prompt would later repeat
-            // the same turn. Keep only MCP elicitation forms, which have no
-            // PermissionRequest event of their own.
             ("Notification", Some("elicitation_dialog"), "input"),
-        ]);
-    } else {
-        events.push(("PreToolUse", Some("^request_user_input$"), "input"));
-    }
-    events.into_iter().map(|(event, matcher, kind)| {
-        let command = format!("if [ \"${{KUMU_TERMINAL:-}}\" = 1 ] && [ -n \"${{KUMU_APP_BINARY:-}}\" ]; then \"$KUMU_APP_BINARY\" --kumu-notify {agent} {kind}; fi{MARKER}");
-        let mut group = json!({"hooks": [{"type": "command", "command": command, "timeout": 3}]});
-        if let Some(matcher) = matcher { group["matcher"] = json!(matcher); }
-        (event, group)
-    }).collect()
+        ],
+        // Grok Build has no PermissionRequest; its Notification event is the
+        // channel that carries a permission prompt or a question.
+        "grok" => vec![("Stop", None, "complete"), ("Notification", None, "input")],
+        _ => vec![
+            ("Stop", None, "complete"),
+            ("PermissionRequest", None, "permission"),
+            ("PreToolUse", Some("^request_user_input$"), "input"),
+        ],
+    };
+    events
+        .into_iter()
+        .map(|(event, matcher, kind)| {
+            let command = notify_command(agent, kind);
+            let mut group =
+                json!({"hooks": [{"type": "command", "command": command, "timeout": 3}]});
+            if let Some(matcher) = matcher {
+                group["matcher"] = json!(matcher);
+            }
+            (event, group)
+        })
+        .collect()
+}
+
+/// The hook command every agent runs. The environment guards keep a registered
+/// hook inert outside a Kumu pane, including in an IDE that reads the same file.
+fn notify_command(agent: &str, kind: &str) -> String {
+    format!(
+        "if [ \"${{KUMU_TERMINAL:-}}\" = 1 ] && [ -n \"${{KUMU_APP_BINARY:-}}\" ]; then \"$KUMU_APP_BINARY\" --kumu-notify {agent} {kind}; fi{MARKER}"
+    )
 }
 
 /// Preserve JSONC comments, user hooks, and unchanged hook hashes during repair.
 fn edit_hooks(text: &str, agent: &str, remove: bool) -> io::Result<String> {
+    if agent == "cursor" {
+        return edit_cursor_hooks(text, remove);
+    }
     let root = CstRootNode::parse(text, &ParseOptions::default()).map_err(io::Error::other)?;
     let object = root
         .object_value()
@@ -185,6 +219,118 @@ fn prune_unknown_managed(hooks: &CstObject, known: &[&str]) {
             continue;
         };
         if remove_managed_from_groups(&groups) && groups.elements().is_empty() {
+            property.remove();
+        }
+    }
+}
+
+/// Cursor's user hooks are flat: an event maps straight to an array of
+/// handlers, and a handler is the command itself — one level shallower than
+/// Claude/Codex. It therefore gets its own read-modify-write.
+fn edit_cursor_hooks(text: &str, remove: bool) -> io::Result<String> {
+    let root = CstRootNode::parse(text, &ParseOptions::default()).map_err(io::Error::other)?;
+    let object = root
+        .object_value()
+        .ok_or_else(|| io::Error::other("配置必须是 JSON 对象，未覆盖原文件"))?;
+    if remove {
+        let Some(hooks) = object.object_value("hooks") else {
+            return Ok(text.into());
+        };
+        if !remove_cursor_handlers(&hooks) {
+            return Ok(text.into());
+        }
+        if hooks.properties().is_empty()
+            && let Some(property) = object.get("hooks")
+        {
+            property.remove();
+        }
+        return Ok(root.to_string());
+    }
+    // Cursor requires a schema version; add it only when the file is new.
+    if object.get("version").is_none() {
+        object.append("version", CstInputValue::Number("1".into()));
+    }
+    let hooks = object
+        .object_value_or_create("hooks")
+        .ok_or_else(|| io::Error::other("hooks 必须是对象，未覆盖原文件"))?;
+    let events = cursor_events();
+    let known: Vec<&str> = events.iter().map(|(event, _)| *event).collect();
+    for (event, kind) in events {
+        let expected = cursor_hook(kind);
+        let handlers = hooks
+            .array_value_or_create(event)
+            .ok_or_else(|| io::Error::other(format!("hooks.{event} 必须是数组，未覆盖原文件")))?;
+        let existing = handlers.elements();
+        let correct = existing
+            .iter()
+            .filter(|node| node.to_serde_value().as_ref() == Some(&expected))
+            .count();
+        let managed = existing
+            .iter()
+            .filter(|node| node.to_serde_value().as_ref().is_some_and(is_managed_hook))
+            .count();
+        if correct == 1 && managed == 1 {
+            continue;
+        }
+        remove_managed_from_event(&handlers);
+        handlers.append(cst_input(expected));
+    }
+    prune_unknown_cursor(&hooks, &known);
+    Ok(root.to_string())
+}
+
+/// `stop` is the only Cursor event that reports the end of a turn. Cursor has
+/// no permission-prompt event: `beforeShellExecution` is a permission gate, and
+/// a malformed response blocks the action, so it must not carry a notification.
+fn cursor_events() -> Vec<(&'static str, &'static str)> {
+    vec![("stop", "complete")]
+}
+
+fn cursor_hook(kind: &str) -> Value {
+    json!({ "command": notify_command("cursor", kind), "timeout": 3 })
+}
+
+fn remove_cursor_handlers(hooks: &CstObject) -> bool {
+    let mut removed = false;
+    for property in hooks.properties() {
+        let Some(handlers) = property.value().and_then(|value| value.as_array()) else {
+            continue;
+        };
+        removed |= remove_managed_from_event(&handlers);
+        if handlers.elements().is_empty() {
+            property.remove();
+        }
+    }
+    removed
+}
+
+fn remove_managed_from_event(handlers: &jsonc_parser::cst::CstArray) -> bool {
+    let managed: Vec<_> = handlers
+        .elements()
+        .into_iter()
+        .filter(|node| node.to_serde_value().as_ref().is_some_and(is_managed_hook))
+        .collect();
+    if managed.is_empty() {
+        return false;
+    }
+    for handler in managed {
+        handler.remove();
+    }
+    true
+}
+
+fn prune_unknown_cursor(hooks: &CstObject, known: &[&str]) {
+    for property in hooks.properties() {
+        let Some(name) = property.decoded_name() else {
+            continue;
+        };
+        if known.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(handlers) = property.value().and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if remove_managed_from_event(&handlers) && handlers.elements().is_empty() {
             property.remove();
         }
     }
@@ -282,9 +428,74 @@ fn asset_files(agent: &str) -> Vec<(&'static str, String)> {
     files
 }
 
+/// Compare a parsed hook file against what this version registers. `nested`
+/// says whether handlers sit inside a group's `hooks` array (Claude/Codex/Grok)
+/// or are the event's entries themselves (Cursor).
+fn hooks_status(value: &Value, install: &[(&'static str, Value)], nested: bool) -> Status {
+    let known: Vec<&str> = install.iter().map(|(event, _)| *event).collect();
+    let mut found = false;
+    let mut complete = true;
+    for (event, expected) in install {
+        let groups = value
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array);
+        // Compare the entry itself, so a user-added handler inside the same
+        // nested group does not pass as Kumu's registration.
+        complete &= groups.is_some_and(|groups| groups.iter().any(|entry| entry == expected));
+        found |= event_handlers(value, event, nested)
+            .iter()
+            .any(is_managed_hook);
+    }
+    // A managed handler under an event this version no longer registers still
+    // fires in the Agent; ask for a repair so install can prune it.
+    let stale = value
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|hooks| {
+            hooks.keys().any(|event| {
+                !known.contains(&event.as_str())
+                    && event_handlers(value, event, nested)
+                        .iter()
+                        .any(is_managed_hook)
+            })
+        });
+    if complete && !stale {
+        Status::Registered
+    } else if found || stale {
+        Status::NeedsRepair
+    } else {
+        Status::Missing
+    }
+}
+
+fn event_handlers(value: &Value, event: &str, nested: bool) -> Vec<Value> {
+    let Some(groups) = value
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .flat_map(|group| {
+            if nested {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                vec![group.clone()]
+            }
+        })
+        .collect()
+}
+
 pub fn status(agent: &str) -> io::Result<Status> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude") {
+    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
         let text = match std::fs::read_to_string(&paths.registration) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Status::Missing),
@@ -294,47 +505,14 @@ pub fn status(agent: &str) -> io::Result<Status> {
         let value = root
             .to_serde_value()
             .ok_or_else(|| io::Error::other("无效的 Agent 配置"))?;
-        let groups_to_check = hook_groups(agent);
-        let known: Vec<&str> = groups_to_check.iter().map(|(event, _)| *event).collect();
-        let mut found = false;
-        let mut complete = true;
-        for (event, expected) in groups_to_check {
-            let groups = value
-                .get("hooks")
-                .and_then(|hooks| hooks.get(event))
-                .and_then(Value::as_array);
-            complete &= groups.is_some_and(|groups| groups.iter().any(|group| group == &expected));
-            found |= groups.is_some_and(|groups| {
-                groups
-                    .iter()
-                    .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                    .flatten()
-                    .any(is_managed_hook)
-            });
-        }
-        // A managed handler under an event this version no longer registers
-        // still fires in the Agent; ask for a repair so install can prune it.
-        let stale = value
-            .get("hooks")
-            .and_then(Value::as_object)
-            .is_some_and(|hooks| {
-                hooks.iter().any(|(event, groups)| {
-                    !known.contains(&event.as_str())
-                        && groups.as_array().is_some_and(|groups| {
-                            groups
-                                .iter()
-                                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                                .flatten()
-                                .any(is_managed_hook)
-                        })
-                })
-            });
-        return Ok(if complete && !stale {
-            Status::Registered
-        } else if found || stale {
-            Status::NeedsRepair
+        return Ok(if agent == "cursor" {
+            let install: Vec<(&'static str, Value)> = cursor_events()
+                .into_iter()
+                .map(|(event, kind)| (event, cursor_hook(kind)))
+                .collect();
+            hooks_status(&value, &install, false)
         } else {
-            Status::Missing
+            hooks_status(&value, &hook_groups(agent), true)
         });
     }
     let target = paths.assets.join("extension");
@@ -366,7 +544,7 @@ pub fn status(agent: &str) -> io::Result<Status> {
 
 pub fn install(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude") {
+    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
         return update_hook_file(&paths.registration, agent, false);
     }
     for (relative, contents) in asset_files(agent) {
@@ -386,7 +564,7 @@ pub fn install(agent: &str) -> io::Result<()> {
 
 pub fn uninstall(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude") {
+    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
         return update_hook_file(&paths.registration, agent, true);
     }
     remove_link(
@@ -455,7 +633,18 @@ fn update_hook_file(path: &Path, agent: &str, remove: bool) -> io::Result<()> {
     if remove && original.is_none() {
         return Ok(());
     }
-    let updated = edit_hooks(original.as_deref().unwrap_or("{}\n"), agent, remove)?;
+    let updated = edit_hooks(
+        original.as_deref().unwrap_or({
+            // Cursor rejects a hooks file without a schema version.
+            if agent == "cursor" {
+                "{\"version\": 1}\n"
+            } else {
+                "{}\n"
+            }
+        }),
+        agent,
+        remove,
+    )?;
     if original.as_deref() == Some(updated.as_str()) {
         return Ok(());
     }
@@ -517,9 +706,9 @@ pub fn run_cli() -> Option<i32> {
             let _ = stdout.write_all(output.to_string().as_bytes());
             let _ = stdout.write_all(b"\n");
         }
-        // Codex also detaches hooks, so write to the explicit PTY path Kumu
-        // inherited into the process rather than `/dev/tty`.
-        "codex" => {
+        // Codex, Grok and Cursor detach hooks, so write to the explicit PTY
+        // path Kumu inherited into the process rather than `/dev/tty`.
+        "codex" | "grok" | "cursor" => {
             if let Some(mut tty) = open_notification_tty() {
                 let _ = tty.write_all(sequence.as_bytes());
             }
@@ -567,7 +756,7 @@ mod tests {
   },
 }
 "#;
-        for agent in ["codex", "claude"] {
+        for agent in ["codex", "claude", "grok"] {
             let registered = edit_hooks(original, agent, false).expect("register");
             assert!(registered.contains("// Keep my settings and this comment."));
             assert!(registered.contains("my-existing-hook"));
@@ -633,6 +822,72 @@ mod tests {
             .expect("notification group")
             .1;
         assert_eq!(notification["matcher"], "elicitation_dialog");
+    }
+
+    #[test]
+    fn grok_registers_completion_and_attention_events() {
+        let events: Vec<&str> = hook_groups("grok")
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert_eq!(events, ["Stop", "Notification"]);
+    }
+
+    /// Cursor's file is flat and versioned; both must survive a round trip that
+    /// only touches Kumu's own handler.
+    #[test]
+    fn cursor_hooks_keep_the_schema_version_and_foreign_handlers() {
+        let original = r#"{
+  // keep my comment
+  "hooks": {
+    "stop": [{"command": "my-stop-hook"}],
+    "beforeShellExecution": [{"command": "my-gate", "timeout": 5}],
+  },
+}
+"#;
+        let registered = edit_cursor_hooks(original, false).expect("register");
+        assert!(registered.contains("my-stop-hook"), "{registered}");
+        assert!(registered.contains("my-gate"), "{registered}");
+        assert!(registered.contains(MARKER), "{registered}");
+        assert!(registered.contains("\"version\": 1"), "{registered}");
+        assert_eq!(
+            registered,
+            edit_cursor_hooks(&registered, false).expect("repair"),
+            "repair must not change trusted handlers"
+        );
+        let removed = edit_cursor_hooks(&registered, true).expect("remove");
+        assert!(!removed.contains(MARKER), "{removed}");
+        assert!(removed.contains("my-stop-hook"), "{removed}");
+        assert!(removed.contains("my-gate"), "{removed}");
+        assert!(removed.contains("// keep my comment"), "{removed}");
+    }
+
+    #[test]
+    fn cursor_registration_adds_a_missing_schema_version() {
+        let registered = edit_cursor_hooks("{}\n", false).expect("register");
+        assert!(registered.contains("\"version\": 1"), "{registered}");
+        let removed = edit_cursor_hooks(&registered, true).expect("remove");
+        assert!(!removed.contains(MARKER), "{removed}");
+    }
+
+    /// Both hook file shapes are recognised, so the settings row can tell an
+    /// installed registration from one that is missing or stale.
+    #[test]
+    fn status_recognizes_nested_and_flat_hook_files() {
+        let install = hook_groups("grok");
+        let value = json!({"hooks": {
+            "Stop": [install[0].1.clone()],
+            "Notification": [install[1].1.clone()],
+        }});
+        assert_eq!(hooks_status(&value, &install, true), Status::Registered);
+
+        let install: Vec<(&'static str, Value)> = cursor_events()
+            .into_iter()
+            .map(|(event, kind)| (event, cursor_hook(kind)))
+            .collect();
+        let value = json!({"version": 1, "hooks": {"stop": [cursor_hook("complete")]}});
+        assert_eq!(hooks_status(&value, &install, false), Status::Registered);
+        assert_eq!(hooks_status(&json!({}), &install, false), Status::Missing);
     }
 
     #[test]

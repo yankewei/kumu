@@ -2,7 +2,7 @@
 
 在一个 macOS 窗口中管理本地编码 Agent 的项目和终端。
 
-Kumu 将 Codex、Claude Code、OpenCode、Pi、omp 等工具的原生终端界面放进同一个工作区，方便在不同项目和任务之间切换。
+Kumu 将 Codex、Claude Code、OpenCode、Pi、omp、Cursor CLI、Grok Build 等工具的原生终端界面放进同一个工作区，方便在不同项目和任务之间切换。
 
 ## 功能
 
@@ -12,7 +12,7 @@ Kumu 将 Codex、Claude Code、OpenCode、Pi、omp 等工具的原生终端界�
 - **原生 Agent 体验**：直接运行 Agent 自带的交互界面，保留熟悉的命令和操作方式。
 - **本地数据**：项目与终端布局保存在本机 SQLite 数据库中。
 - **Agent 检测**：在设置中查看已安装的 Agent，支持深浅色外观。
-- **Agent 通知**：在设置中为 Codex、Claude Code、OpenCode、Pi 和 Oh My Pi 安装持久通知接入，接收任务结束、提问与确认提醒；后台终端所属项目显示未读标记，应用在后台时发送 macOS 系统通知，点击可回到对应终端，并可选择是否播放提示音。可在 **设置 → 通用 → Agent 通知** 中关闭。
+- **Agent 通知**：在设置中为 Codex、Claude Code、OpenCode、Pi、Oh My Pi、Cursor CLI 和 Grok Build 安装持久通知接入，接收任务结束、提问与确认提醒；后台终端所属项目显示未读标记，应用在后台时发送 macOS 系统通知，点击可回到对应终端，并可选择是否播放提示音。可在 **设置 → 通用 → Agent 通知** 中关闭。
 - **应用内更新**：启动时检查新版本，在侧栏查看更新提示、下载进度和重启入口。
 
 ## 安装

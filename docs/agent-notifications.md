@@ -15,12 +15,18 @@ Kumu 不改写用户的 Agent 启动命令，不添加 `-c`、`--settings` 或 `
 | OpenCode | `~/.config/opencode/plugins/kumu-notifications/` | 自动发现的插件，支持 V2 TUI 事件和 V1 `server()` hooks |
 | Pi | `~/.pi/agent/extensions/kumu-notifications/` | `agent_settled`、`ui_prompt_start`、提问工具事件 |
 | Oh My Pi | `~/.omp/agent/extensions/kumu-notifications/` | `agent_end`、`tool_approval_requested`、提问工具事件、输入／确认／选择对话框 |
+| Cursor CLI | `~/.cursor/hooks.json` | `stop`（只覆盖任务结束） |
+| Grok Build | `~/.grok/hooks/kumu-notifications.json` | `Stop`、`Notification` |
+
+Cursor 的钩子文件是扁平结构：事件直接对应处理器数组，处理器自身就是命令（不像 Claude／Codex／Grok 那样再嵌一层 `hooks`），因此 Kumu 用单独的读改写逻辑处理它，并保留 `version` 字段与其他事件。Cursor 没有“等待权限”事件：`beforeShellExecution` 是权限闸门，返回格式错误会阻断命令，因此不用它发送通知，Cursor 只提供任务结束提醒。
+
+Grok 的钩子格式与 Claude 相同，可以复用同一套 CST 逻辑；Kumu 写自己的 `~/.grok/hooks/kumu-notifications.json`，不修改用户已有的 hook 文件。
 
 Pi 与 Oh My Pi 共用 `~/.kumu/agent-integration/pi/` 下的一份扩展；安装时只创建各自的自动发现链接。扩展通过 OMP 独有的 `ctx.agent` 区分宿主（Pi 没有这个字段），因此两者即使通过 `PI_CODING_AGENT_DIR` 指向同一个 agent 目录，也不需要重复安装，更不会互相占用链接。共用同一目录时，移除其中一个链接也会让另一个失效，重新为任一 Agent 接入即可恢复。
 
 OpenCode 的插件对象兼容接口要求 V1 1.18.29 及以上；V2 使用同一包的 TUI 部分。已运行的 OpenCode 后台服务如尚未发现插件，需要在合适的时候重新加载；Kumu 不自动重启用户的服务。
 
-默认位置会根据 Kumu 启动环境中的 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`、`PI_CODING_AGENT_DIR`、`PI_CONFIG_DIR`、`XDG_CONFIG_HOME` 解析。若用户在启动脚本内切换配置目录、使用独立的 OMP profile、关闭自动发现，或主动禁用 hooks／扩展，这套注册可能不被加载，需要在对应配置中另行接入。Kumu 不会绕过这些选择。
+默认位置会根据 Kumu 启动环境中的 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`、`PI_CODING_AGENT_DIR`、`PI_CONFIG_DIR`、`CURSOR_CONFIG_DIR`、`XDG_CONFIG_HOME` 解析（Grok 固定读 `~/.grok`）。若用户在启动脚本内切换配置目录、使用独立的 OMP profile、关闭自动发现，或主动禁用 hooks／扩展，这套注册可能不被加载，需要在对应配置中另行接入。Kumu 不会绕过这些选择。
 
 ## Codex 的信任和事件覆盖
 
@@ -41,7 +47,7 @@ Claude Code 和 Codex 都会把 command hook 放到没有控制终端的新 sess
 传输方式按 Agent 的官方能力区分：
 
 - **Claude Code**：命令向标准输出返回 `{"terminalSequence":"..."}`，由 Claude 自己发到终端（OSC 777）。这是 Claude 文档推荐的无控制终端方案，也适用于 tmux/screen；不支持该字段的旧版本会静默忽略，请更新 Claude Code。
-- **Codex**：hook 打开 `KUMU_TTY` 写入 OSC 777；不向标准输出写内容，避免被 Codex 的 hook 输出协议误读。
+- **Codex／Grok Build／Cursor**：hook 打开 `KUMU_TTY` 写入 OSC 777；不向标准输出写内容，避免被各自的 hook 输出协议误读。Cursor 的 `hooks.json` 与 IDE 共用，`KUMU_TERMINAL` 守卫让它在 IDE 中立即返回。
 - **Pi／Oh My Pi／OpenCode**：扩展通过同一 `KUMU_TTY` 写入；拿不到时回退 `/dev/tty`。
 
 后代进程会继承这些环境变量。不向 hook 的标准输出写入协议内容，也不替用户回答、选择或批准操作。
@@ -66,6 +72,6 @@ node --test src/agent/integration/adapters.test.mjs
 cargo clippy --all-targets -- -D warnings
 ```
 
-Rust 检查配置合并、注释与用户 hooks 保留、重复安装、移除（包括旧版本事件）、文件权限与符号链接保护，以及自定义启动命令的参数和终端身份。Python 在没有控制终端的 session 中检查 Claude 的 `terminalSequence`、Codex 的 `KUMU_TTY` 传输和标准输出隔离。Node 检查 Pi／OMP 的完成边界、同一扩展的宿主识别、OpenCode 事件适配与非 Kumu 环境中的停用。这些测试不等同于五种 Agent 的真实模型任务和 macOS 横幅验收。
+Rust 检查配置合并、注释与用户 hooks 保留、重复安装、移除（包括旧版本事件）、文件权限与符号链接保护，以及自定义启动命令的参数和终端身份。Python 在没有控制终端的 session 中检查 Claude 的 `terminalSequence`、Codex 的 `KUMU_TTY` 传输和标准输出隔离。Node 检查 Pi／OMP 的完成边界、同一扩展的宿主识别、OpenCode 事件适配与非 Kumu 环境中的停用。这些测试不等同于七种 Agent 的真实模型任务和 macOS 横幅验收。
 
-接口依据：[OpenAI hooks](https://learn.chatgpt.com/docs/hooks)、[Claude Code hooks](https://code.claude.com/docs/en/hooks)、[OpenCode 插件自动发现](https://opencode.ai/docs/plugins/)、[OpenCode V1 插件兼容接口](https://opencode.ai/docs/build/plugins/server/#support-v1)、[Pi 发布包](https://www.npmjs.com/package/@mariozechner/pi-coding-agent)、[OMP 扩展加载](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)。
+接口依据：[OpenAI hooks](https://learn.chatgpt.com/docs/hooks)、[Claude Code hooks](https://code.claude.com/docs/en/hooks)、[OpenCode 插件自动发现](https://opencode.ai/docs/plugins/)、[OpenCode V1 插件兼容接口](https://opencode.ai/docs/build/plugins/server/#support-v1)、[Pi 发布包](https://www.npmjs.com/package/@mariozechner/pi-coding-agent)、[OMP 扩展加载](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)、[Cursor hooks](https://cursor.com/docs/agent/hooks)、[Grok Build hooks](https://docs.x.ai/build/features/hooks)。

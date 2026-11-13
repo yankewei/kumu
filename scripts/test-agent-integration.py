@@ -5,7 +5,7 @@ Run after `cargo build`: python3 scripts/test-agent-integration.py
 
 Both Claude and Codex run command hooks in a new session without a
 controlling terminal. Claude therefore receives `terminalSequence` on stdout;
-Codex writes to the explicit PTY path in `KUMU_TTY`.
+Codex, Grok Build and Cursor write to the explicit PTY path in `KUMU_TTY`.
 """
 import json
 import os
@@ -61,33 +61,34 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.assertIn(message, sequence)
                 self.assertTrue(sequence.endswith("\x07"))
 
-    def test_codex_writes_to_the_injected_tty_without_a_controlling_terminal(self):
-        for event, message in [
-            ("complete", "本轮任务已结束"),
-            ("permission", "确认操作权限"),
-            ("input", "输入、确认或选择"),
-        ]:
-            with self.subTest(event=event):
-                master, slave = pty.openpty()
-                try:
-                    env = detached_env(KUMU_TTY=os.ttyname(slave))
-                    process = subprocess.Popen(
-                        [BINARY, "--kumu-notify", "codex", event],
-                        env=env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        preexec_fn=os.setsid,
-                    )
-                    output = read_pty(master)
-                    stdout, stderr = process.communicate(timeout=5)
-                finally:
-                    os.close(slave)
-                    os.close(master)
-                self.assertEqual((process.returncode, stdout, stderr), (0, b"", b""))
-                self.assertIn(f"\x1b]777;notify;codex;", output)
-                self.assertIn(message, output)
-                self.assertTrue(output.endswith("\x07"))
+    def test_hook_agents_write_to_the_injected_tty_without_a_controlling_terminal(self):
+        for agent in ("codex", "grok", "cursor"):
+            for event, message in [
+                ("complete", "本轮任务已结束"),
+                ("permission", "确认操作权限"),
+                ("input", "输入、确认或选择"),
+            ]:
+                with self.subTest(agent=agent, event=event):
+                    master, slave = pty.openpty()
+                    try:
+                        env = detached_env(KUMU_TTY=os.ttyname(slave))
+                        process = subprocess.Popen(
+                            [BINARY, "--kumu-notify", agent, event],
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=os.setsid,
+                        )
+                        output = read_pty(master)
+                        stdout, stderr = process.communicate(timeout=5)
+                    finally:
+                        os.close(slave)
+                        os.close(master)
+                    self.assertEqual((process.returncode, stdout, stderr), (0, b"", b""))
+                    self.assertIn(f"\x1b]777;notify;{agent};", output)
+                    self.assertIn(message, output)
+                    self.assertTrue(output.endswith("\x07"))
 
     def test_hooks_from_absolute_custom_scripts_preserve_the_users_arguments(self):
         with tempfile.TemporaryDirectory(prefix="kumu hooks '") as root:
@@ -120,7 +121,7 @@ printf 'ORIGINAL=<%s>\\n' "$@"
             self.assertEqual((process.returncode, stderr), (0, b""))
 
     def test_callbacks_are_silent_outside_kumu(self):
-        for agent in ("codex", "claude"):
+        for agent in ("codex", "claude", "grok", "cursor"):
             env = detached_env()
             env.pop("KUMU_TERMINAL")
             result = run_hook([agent, "complete"], env)
