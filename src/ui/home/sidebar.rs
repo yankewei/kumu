@@ -225,9 +225,9 @@ impl KumuApp {
                                 });
                             }
                         });
-                    let reveal = PopupMenuItem::new("在 Finder 中显示").on_click({
+                    let reveal = PopupMenuItem::new("在 Finder 中打开").on_click({
                         let path = path.clone();
-                        move |_, _, _| reveal_in_finder(&path)
+                        move |_, _, cx| reveal_in_finder(path.clone(), cx)
                     });
                     let copy_path = path.clone();
                     let copy_name = name.clone();
@@ -349,8 +349,13 @@ impl KumuApp {
     }
 }
 
-/// Show `path` in a Finder window. `open` handles files and directories; the
-/// app is macOS-only, so there is no other platform to branch on.
-fn reveal_in_finder(path: &str) {
-    let _ = std::process::Command::new("open").arg(path).spawn();
+/// Show `path` in a Finder window without blocking the UI thread. `open`
+/// handles files and directories; the app is macOS-only, so there is no other
+/// platform to branch on.
+fn reveal_in_finder(path: String, cx: &mut App) {
+    cx.background_spawn(async move {
+        // Reap the child instead of leaving `open` as a zombie until quit.
+        let _ = std::process::Command::new("open").arg(path).status();
+    })
+    .detach();
 }
