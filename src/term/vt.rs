@@ -155,6 +155,36 @@ pub struct Snapshot {
     pub spawn_error: Option<String>,
     /// The program asked for mouse reports (click goes to it unless Shift).
     pub mouse_tracking: bool,
+    /// Find bar results, present only while a search has a needle.
+    pub search: Option<SearchView>,
+}
+
+/// One visible search match: a run of cells on one viewport row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub row: u16,
+    /// First cell of the run (inclusive).
+    pub from: u16,
+    /// Cell after the run (exclusive).
+    pub to: u16,
+    /// Whether this run belongs to the match the find bar selected.
+    pub selected: bool,
+}
+
+/// What the find bar reads from a terminal: how many matches there are, which
+/// one is selected, and the visible runs to highlight.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchView {
+    /// The query these results answer. The find bar compares it with what it
+    /// sent, because a frame can cross from the session thread before the
+    /// results for the newest keystroke exist.
+    pub needle: String,
+    /// Matches on the active screen, scrollback included.
+    pub total: usize,
+    /// 0-based index of the selected match, newest first.
+    pub selected: Option<usize>,
+    /// Viewport rows and columns to paint under the text.
+    pub hits: Vec<SearchHit>,
 }
 
 impl Snapshot {
@@ -190,6 +220,7 @@ impl Snapshot {
             exited: false,
             spawn_error: None,
             mouse_tracking: false,
+            search: None,
         }
     }
 
@@ -411,6 +442,10 @@ pub struct Vt {
     press: GhosttySelectionGestureEvent,
     drag: GhosttySelectionGestureEvent,
     release: GhosttySelectionGestureEvent,
+    /// Created on the first search and kept until the terminal is freed.
+    /// `needle` is empty when no search is running.
+    search: Option<GhosttySearch>,
+    needle: String,
     cols: u16,
     rows: u16,
     colors: TermColors,
@@ -569,6 +604,8 @@ impl Vt {
                 press,
                 drag,
                 release,
+                search: None,
+                needle: String::new(),
                 cols,
                 rows,
                 colors,
@@ -664,6 +701,9 @@ impl Vt {
             // copied before the render-state calls below.
             let title = terminal_text(self.term, GHOSTTY_TERMINAL_DATA_TITLE);
             let pwd = terminal_text(self.term, GHOSTTY_TERMINAL_DATA_PWD);
+            // Match endpoints must be read before anything below touches the
+            // terminal; they are snapshots valid only for this frame.
+            let search = self.search_view();
             if let Some(since) = self.shared.held_since
                 && since.elapsed() > MAX_HOLD
             {
@@ -821,6 +861,7 @@ impl Vt {
                 exited,
                 spawn_error: None,
                 mouse_tracking: self.mouse_tracking(),
+                search,
             }
         }
     }
@@ -1031,6 +1072,269 @@ impl Vt {
             };
             ghostty_formatter_free(formatter);
             (!text.is_empty()).then_some(text)
+        }
+    }
+
+    /// Set the find bar's needle and jump to the newest match. An empty needle
+    /// closes the search.
+    pub fn search_set(&mut self, needle: &str) {
+        if needle.is_empty() {
+            self.search_clear();
+            return;
+        }
+        let Some(search) = self.ensure_search() else {
+            return;
+        };
+        let value = GhosttyString {
+            ptr: needle.as_ptr(),
+            len: needle.len(),
+        };
+        let status = unsafe {
+            ghostty_search_set(
+                search,
+                GHOSTTY_SEARCH_OPT_NEEDLE,
+                &value as *const _ as *const c_void,
+            )
+        };
+        if status != GHOSTTY_SUCCESS {
+            return;
+        }
+        self.needle = needle.to_string();
+        unsafe {
+            let _ = ghostty_search_run(search);
+            // Typing a query lands on the newest match, like Ghostty's find
+            // bar; Enter from there walks toward older content.
+            let _ = ghostty_search_select_next(search);
+        }
+    }
+
+    /// Move the selected match toward older (`older`) or newer content.
+    pub fn search_step(&mut self, older: bool) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        let Some(search) = self.search else {
+            return false;
+        };
+        let status = unsafe {
+            if older {
+                ghostty_search_select_next(search)
+            } else {
+                ghostty_search_select_prev(search)
+            }
+        };
+        status == GHOSTTY_SUCCESS
+    }
+
+    pub fn search_clear(&mut self) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        self.needle.clear();
+        if let Some(search) = self.search {
+            unsafe {
+                ghostty_search_set(search, GHOSTTY_SEARCH_OPT_NEEDLE, std::ptr::null());
+            }
+        }
+        true
+    }
+
+    /// Let the search see terminal changes since the last frame. No-op while
+    /// no needle is set, so ordinary output costs nothing.
+    pub fn search_feed(&mut self) {
+        if self.needle.is_empty() {
+            return;
+        }
+        if let Some(search) = self.search {
+            unsafe {
+                let _ = ghostty_search_feed(search);
+            }
+        }
+    }
+
+    fn ensure_search(&mut self) -> Option<GhosttySearch> {
+        if let Some(search) = self.search {
+            return Some(search);
+        }
+        let mut search = std::ptr::null_mut();
+        unsafe {
+            ok(
+                ghostty_search_new(std::ptr::null(), &mut search, self.term),
+                "search_new",
+            )
+        };
+        // A successful call always yields a handle. Refuse to cache a null one
+        // so a later query can try again instead of silently searching nothing.
+        if search.is_null() {
+            return None;
+        }
+        self.search = Some(search);
+        Some(search)
+    }
+
+    /// Read the current search state and translate visible matches into
+    /// viewport rows and columns for painting.
+    fn search_view(&self) -> Option<SearchView> {
+        if self.needle.is_empty() {
+            return None;
+        }
+        let search = self.search?;
+        unsafe {
+            let mut total: usize = 0;
+            if ghostty_search_get(
+                search,
+                GHOSTTY_SEARCH_DATA_TOTAL_MATCHES,
+                &mut total as *mut _ as *mut c_void,
+            ) != GHOSTTY_SUCCESS
+            {
+                return None;
+            }
+            let mut index: usize = 0;
+            let selected = (ghostty_search_get(
+                search,
+                GHOSTTY_SEARCH_DATA_SELECTED_INDEX,
+                &mut index as *mut _ as *mut c_void,
+            ) == GHOSTTY_SUCCESS)
+                .then_some(index);
+            let mut selected_match = GhosttySelection::default();
+            let has_selected = ghostty_search_get(
+                search,
+                GHOSTTY_SEARCH_DATA_SELECTED_MATCH,
+                &mut selected_match as *mut _ as *mut c_void,
+            ) == GHOSTTY_SUCCESS;
+
+            // Query the required capacity first; the viewport list is a page
+            // or two of matches, so one allocation is enough.
+            let mut needed = GhosttySelectionBuffer {
+                ptr: std::ptr::null_mut(),
+                cap: 0,
+                len: 0,
+            };
+            let status = ghostty_search_get(
+                search,
+                GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES,
+                &mut needed as *mut _ as *mut c_void,
+            );
+            if needed.len == 0 {
+                return Some(SearchView {
+                    needle: self.needle.clone(),
+                    total,
+                    selected,
+                    hits: Vec::new(),
+                });
+            }
+            if status != GHOSTTY_SUCCESS && status != GHOSTTY_OUT_OF_SPACE {
+                return Some(SearchView {
+                    needle: self.needle.clone(),
+                    total,
+                    selected,
+                    hits: Vec::new(),
+                });
+            }
+            let mut matches = vec![GhosttySelection::default(); needed.len];
+            let mut buffer = GhosttySelectionBuffer {
+                ptr: matches.as_mut_ptr(),
+                cap: matches.len(),
+                len: 0,
+            };
+            if ghostty_search_get(
+                search,
+                GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES,
+                &mut buffer as *mut _ as *mut c_void,
+            ) != GHOSTTY_SUCCESS
+            {
+                return Some(SearchView {
+                    needle: self.needle.clone(),
+                    total,
+                    selected,
+                    hits: Vec::new(),
+                });
+            }
+            matches.truncate(buffer.len.min(matches.len()));
+
+            let rows = self.rows;
+            let cols = self.cols;
+            let mut hits = Vec::new();
+            for selection in &matches {
+                let mut ordered = GhosttySelection::default();
+                if ghostty_terminal_selection_ordered(
+                    self.term,
+                    selection,
+                    GHOSTTY_SELECTION_ORDER_FORWARD,
+                    &mut ordered,
+                ) != GHOSTTY_SUCCESS
+                {
+                    continue;
+                }
+                let (mut start, mut end) = (
+                    GhosttyPointCoordinate::default(),
+                    GhosttyPointCoordinate::default(),
+                );
+                if ghostty_terminal_point_from_grid_ref(
+                    self.term,
+                    &ordered.start,
+                    GHOSTTY_POINT_TAG_VIEWPORT,
+                    &mut start,
+                ) != GHOSTTY_SUCCESS
+                    || ghostty_terminal_point_from_grid_ref(
+                        self.term,
+                        &ordered.end,
+                        GHOSTTY_POINT_TAG_VIEWPORT,
+                        &mut end,
+                    ) != GHOSTTY_SUCCESS
+                {
+                    continue;
+                }
+                if start.y >= rows as u32 || end.y >= rows as u32 {
+                    continue;
+                }
+                let mut equal = false;
+                let selected = has_selected
+                    && ghostty_terminal_selection_equal(
+                        self.term,
+                        selection,
+                        &selected_match,
+                        &mut equal,
+                    ) == GHOSTTY_SUCCESS
+                    && equal;
+                let last = end.x.min(cols.saturating_sub(1));
+                let first = start.x.min(last);
+                if start.y == end.y {
+                    hits.push(SearchHit {
+                        row: start.y as u16,
+                        from: first,
+                        to: last + 1,
+                        selected,
+                    });
+                } else {
+                    hits.push(SearchHit {
+                        row: start.y as u16,
+                        from: first,
+                        to: cols,
+                        selected,
+                    });
+                    for row in start.y + 1..end.y {
+                        hits.push(SearchHit {
+                            row: row as u16,
+                            from: 0,
+                            to: cols,
+                            selected,
+                        });
+                    }
+                    hits.push(SearchHit {
+                        row: end.y as u16,
+                        from: 0,
+                        to: last + 1,
+                        selected,
+                    });
+                }
+            }
+            Some(SearchView {
+                needle: self.needle.clone(),
+                total,
+                selected,
+                hits,
+            })
         }
     }
 
@@ -1464,6 +1768,9 @@ impl Drop for Vt {
             ghostty_key_encoder_free(self.keys);
             ghostty_render_state_row_cells_free(self.cells_it);
             ghostty_render_state_row_iterator_free(self.rows_it);
+            if let Some(search) = self.search {
+                ghostty_search_free(search);
+            }
             ghostty_terminal_free(self.term);
             ghostty_render_state_free(self.shared.state);
         }
@@ -1626,6 +1933,120 @@ mod tests {
         assert!(vt.clear_selection(), "a selection was there to clear");
         assert_eq!(vt.selection_text(), None);
         assert!(!vt.clear_selection(), "clearing again changes nothing");
+    }
+
+    #[test]
+    fn search_finds_matches_and_reports_their_viewport_rows() {
+        let mut vt = Vt::new(20, 6);
+        for line in [
+            "first alpha",
+            "beta",
+            "second alpha",
+            "gamma",
+            "third alpha",
+        ] {
+            vt.write(line.as_bytes());
+            vt.write(b"\r\n");
+        }
+        vt.search_set("alpha");
+        let snapshot = vt.snapshot("sh", "/", false);
+        let search = snapshot.search.clone().expect("a search with a needle");
+        assert_eq!(search.total, 3);
+        assert_eq!(search.selected, Some(0), "the newest match is selected");
+        assert!(!search.hits.is_empty());
+
+        let mut selected = 0;
+        for hit in &search.hits {
+            let row = &snapshot.cells[hit.row as usize];
+            let text: String = row[hit.from as usize..hit.to as usize]
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect();
+            assert_eq!(text, "alpha", "hit {hit:?} covers {text:?}");
+            if hit.selected {
+                selected += 1;
+            }
+        }
+        assert_eq!(selected, 1, "one visible run is the selected match");
+    }
+
+    #[test]
+    fn search_steps_toward_older_matches_and_wraps() {
+        let mut vt = Vt::new(20, 6);
+        for line in ["alpha one", "beta", "alpha two", "gamma", "alpha three"] {
+            vt.write(line.as_bytes());
+            vt.write(b"\r\n");
+        }
+        vt.search_set("alpha");
+        let selected = |vt: &mut Vt| {
+            vt.snapshot("sh", "/", false)
+                .search
+                .expect("search view")
+                .selected
+        };
+        assert_eq!(selected(&mut vt), Some(0));
+        assert!(vt.search_step(true));
+        assert_eq!(selected(&mut vt), Some(1));
+        assert!(vt.search_step(true));
+        assert_eq!(selected(&mut vt), Some(2));
+        assert!(vt.search_step(true), "after the oldest, wraps to newest");
+        assert_eq!(selected(&mut vt), Some(0));
+        assert!(vt.search_step(false));
+        assert_eq!(selected(&mut vt), Some(2), "back toward newer content");
+    }
+
+    #[test]
+    fn clearing_the_needle_removes_search_highlights() {
+        let mut vt = Vt::new(20, 4);
+        vt.write(b"alpha\r\n");
+        vt.search_set("alpha");
+        assert!(vt.snapshot("sh", "/", false).search.is_some());
+        assert!(vt.search_clear());
+        let snapshot = vt.snapshot("sh", "/", false);
+        assert!(snapshot.search.is_none());
+    }
+
+    #[test]
+    fn search_reads_scrollback_beyond_the_visible_rows() {
+        let mut vt = Vt::new(20, 4);
+        for line in 0..40 {
+            vt.write(format!("line {line} alpha\r\n").as_bytes());
+        }
+        vt.search_set("alpha");
+        let snapshot = vt.snapshot("sh", "/", false);
+        let search = snapshot.search.expect("search view");
+        assert_eq!(search.total, 40);
+        for hit in &search.hits {
+            assert!(hit.row < snapshot.rows, "hit {hit:?} outside the viewport");
+        }
+    }
+
+    /// A find bar restarts the search on every keystroke, so one search over a
+    /// full scrollback must not block the session thread for long.
+    #[test]
+    fn searching_a_full_scrollback_stays_interactive() {
+        let mut vt = Vt::new(100, 40);
+        for line in 0..10_000 {
+            vt.write(format!("line {line} with some words on it\r\n").as_bytes());
+        }
+        let started = std::time::Instant::now();
+        vt.search_set("words");
+        let elapsed = started.elapsed();
+        let total = vt
+            .snapshot("sh", "/", false)
+            .search
+            .expect("search view")
+            .total;
+        assert!(
+            total > 0,
+            "the scrollback holds matches, search found {total}"
+        );
+        // This guards against a pathological search, not a latency budget: a
+        // loaded CI machine must not turn it into a flaky benchmark.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a keystroke waited {elapsed:?} for the search"
+        );
     }
 
     #[test]

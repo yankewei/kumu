@@ -8,8 +8,6 @@ use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
 use crate::theme;
-use crate::ui::layers;
-use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
@@ -81,8 +79,6 @@ pub struct SettingsWindow {
     updater: Entity<Updater>,
     integrations: HashMap<&'static str, Result<integration::Status, String>>,
     integration_busy: Option<&'static str>,
-    /// The window's overlay for hover labels; mounted by `window_layers`.
-    tooltips: Entity<Tooltips>,
 }
 
 impl SettingsWindow {
@@ -150,7 +146,6 @@ impl SettingsWindow {
                 })
                 .collect(),
             integration_busy: None,
-            tooltips: cx.new(|cx| Tooltips::new(cx)),
         }
     }
 
@@ -252,8 +247,7 @@ impl SettingsWindow {
         theme::set_font_size(cx, *size as f32);
     }
 
-    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(&self.tooltips, window, cx);
+    fn render_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
@@ -406,7 +400,6 @@ impl SettingsWindow {
                     .child(div().w_px().h_full().bg(sidebar_border))
                     .child(right),
             )
-            .child(overlays)
     }
 
     /// One card: elevated surface (muted bg) with hairline-separated rows.
@@ -578,6 +571,7 @@ impl SettingsWindow {
                             updater.update(cx, |updater, cx| updater.restart(cx));
                             true
                         })
+                        .centered()
                 });
             }
             UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Errored(_) => {

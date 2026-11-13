@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -23,7 +24,7 @@ use crate::term::{
     MouseInput, MouseMods, Rgb, SelectStep, Snapshot,
 };
 use crate::theme::{self, ThemeRevision};
-use crate::ui::tooltip::{HoverLabel as _, Tooltips};
+use crate::ui::tooltip::HoverLabel as _;
 
 /// Chrome / focus messages from a pane up to the home window.
 pub enum TerminalEvent {
@@ -81,9 +82,11 @@ struct GridAt {
 pub struct TerminalView {
     pane: PaneId,
     workspace: Entity<Workspace>,
-    /// Hover labels for the pane chrome buttons.
-    tooltips: Entity<Tooltips>,
     project: Option<i64>,
+    /// Whether the workspace currently shows this pane's terminal here. A
+    /// project row click re-shows every pane, and an already shown one must
+    /// keep its find bar and painted frame.
+    shown: bool,
     snapshot: Snapshot,
     focus: FocusHandle,
     /// Whether the home window treats this pane as the focused one.
@@ -108,17 +111,22 @@ pub struct TerminalView {
     /// resize again. Cleared when the attached project changes.
     sent: Rc<Cell<(u16, u16, u32, u32)>>,
     painted: Rc<RefCell<PaintCache>>,
+    /// Open find bar, if any. Its needle lives on the session thread.
+    find: Option<FindBar>,
+}
+
+/// The find bar's input and the needle last sent for it.
+struct FindBar {
+    input: Entity<InputState>,
+    sent: String,
+    /// Dropped with the bar, so a closed bar leaves no listener behind.
+    _subscription: Subscription,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl TerminalView {
-    pub fn new(
-        pane: PaneId,
-        workspace: Entity<Workspace>,
-        tooltips: Entity<Tooltips>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(pane: PaneId, workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&workspace, |this, _, ev, cx| {
             if let WorkspaceEvent::Frame(pane) = ev
                 && *pane == this.pane.0
@@ -131,8 +139,8 @@ impl TerminalView {
         Self {
             pane,
             workspace,
-            tooltips,
             project: None,
+            shown: false,
             snapshot: Snapshot::blank("", ""),
             focus,
             active: true,
@@ -158,6 +166,7 @@ impl TerminalView {
                 font: (SharedString::from(""), 0),
                 rows: Vec::new(),
             })),
+            find: None,
         }
     }
 
@@ -193,6 +202,12 @@ impl TerminalView {
 
     /// Show `project_id`, starting its shell if it is not already running.
     pub fn show(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        // Selecting the project that is already shown is a no-op: the terminal
+        // and its find bar stay exactly where they are. A failed spawn is the
+        // exception — selecting the project again retries it, as it did before.
+        if self.shown && self.project == Some(project_id) && self.snapshot.spawn_error.is_none() {
+            return;
+        }
         let pane = self.pane.0;
         let snapshot = self.workspace.update(cx, |workspace, cx| {
             workspace.show_terminal(pane, project_id, cx)
@@ -202,8 +217,11 @@ impl TerminalView {
 
     /// Keep this pane's process while its project is hidden.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.shown = false;
+        self.find = None;
         let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_search_clear(pane);
             workspace.hide_terminal(pane);
         });
     }
@@ -212,6 +230,17 @@ impl TerminalView {
     /// Notification navigation reattaches the process that sent the request.
     pub fn attach(&mut self, project_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.reset_gesture();
+        // A find bar belongs to the terminal it was opened on. Reattaching
+        // the pane's own terminal (clicking the selected project, a
+        // notification from the same pane) keeps it; a different terminal
+        // starts without one.
+        if self.project != Some(project_id) {
+            self.find = None;
+            let pane = self.pane.0;
+            self.workspace
+                .update(cx, |workspace, _| workspace.terminal_search_clear(pane));
+        }
+        self.shown = true;
         self.project = Some(project_id);
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
@@ -249,6 +278,17 @@ impl TerminalView {
                 break;
             }
         }
+        // Frames cross from the session thread asynchronously: a snapshot can
+        // still carry the previous needle's matches after the input moved on.
+        if let Some(sent) = self.find.as_ref().map(|bar| bar.sent.clone())
+            && self
+                .snapshot
+                .search
+                .as_ref()
+                .is_some_and(|search| search.needle != sent)
+        {
+            self.snapshot.search = None;
+        }
         cx.notify();
     }
 
@@ -262,13 +302,20 @@ impl TerminalView {
         });
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // IME / character composition: the EntityInputHandler owns these.
         if event.prefer_character_input {
             return;
         }
         let mods = &event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
+        // Esc closes the find bar wherever focus is; once the user clicks the
+        // grid the bar's own key handler no longer sees the event.
+        if self.find.is_some() && key == "escape" && !mods.platform && !mods.control && !mods.alt {
+            self.close_find(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if mods.platform {
             // ⌘⌥arrows move focus between panes; ⌘D / ⌘⇧D split the focused
             // pane, matching the split buttons in the pane chrome.
@@ -287,6 +334,11 @@ impl TerminalView {
                         } else {
                             TerminalEvent::SplitRight
                         });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "f" if !mods.shift => {
+                        self.open_find(window, cx);
                         cx.stop_propagation();
                         return;
                     }
@@ -357,6 +409,95 @@ impl TerminalView {
         let pane = self.pane.0;
         self.workspace
             .update(cx, |workspace, _| workspace.terminal_paste(pane, text));
+    }
+
+    /// Open the find bar and focus its input. ⌘F on an open bar just brings
+    /// focus back to the input.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project.is_none() {
+            return;
+        }
+        if let Some(bar) = &self.find {
+            let input = bar.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("在当前终端中查找"));
+        let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            this.on_find_event(&input, event, cx);
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.find = Some(FindBar {
+            input,
+            sent: String::new(),
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn on_find_event(
+        &mut self,
+        input: &Entity<InputState>,
+        event: &InputEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bar) = &mut self.find else {
+            return;
+        };
+        match event {
+            InputEvent::Change => {
+                let value = input.read(cx).value().to_string();
+                if value == bar.sent {
+                    return;
+                }
+                bar.sent = value.clone();
+                // A result frame from the previous needle must not paint or
+                // report itself as this query's answer while the session
+                // thread still works on the new one.
+                self.snapshot.search = None;
+                let pane = self.pane.0;
+                self.workspace.update(cx, |workspace, _| {
+                    workspace.terminal_search_set(pane, &value);
+                });
+                cx.notify();
+            }
+            // Enter walks toward older content, matching Ghostty's find bar;
+            // Shift+Enter goes back toward newer output.
+            InputEvent::PressEnter { shift, .. } => {
+                let pane = self.pane.0;
+                self.workspace.update(cx, |workspace, _| {
+                    workspace.terminal_search_step(pane, !shift);
+                });
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn step_find(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.pane.0;
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_search_step(pane, older);
+        });
+        // Keep the input focused so Enter keeps walking matches.
+        if let Some(bar) = &self.find {
+            bar.input.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_none() {
+            return;
+        }
+        let pane = self.pane.0;
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_search_clear(pane);
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     /// Whether the running program owns the pointer for a new gesture.
@@ -505,7 +646,7 @@ impl TerminalView {
         })
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         if self.project.is_none() {
             return;
         }
@@ -552,6 +693,118 @@ impl TerminalView {
             )
         });
         cx.notify();
+    }
+
+    /// The floating find bar over this pane's grid: input, match count, older
+    /// / newer buttons and close.
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let bar = self.find.as_ref()?;
+        let theme = cx.theme();
+        let (muted, radius, hover) = (
+            theme.muted_foreground,
+            theme.radius,
+            theme.accent.opacity(0.5),
+        );
+        let (border, background) = (theme.border, theme.secondary);
+        let search = self.snapshot.search.as_ref();
+        // The session thread answers a query a frame or more later; until its
+        // result for this needle arrives, say nothing rather than "no
+        // results" or the previous query's count.
+        let current = search.is_some_and(|search| search.needle == bar.sent);
+        let total = search.filter(|_| current).map_or(0, |search| search.total);
+        let count = if bar.sent.is_empty() {
+            String::new()
+        } else if !current {
+            "…".to_string()
+        } else if total == 0 {
+            "无结果".to_string()
+        } else {
+            match search.and_then(|search| search.selected) {
+                Some(index) => format!("{}/{}", index + 1, total),
+                None => format!("0/{total}"),
+            }
+        };
+        let dim = if !current || total == 0 { 0.4 } else { 1. };
+        let older = find_step_button(
+            format!("find-older-{}", self.pane.0),
+            IconName::ChevronUp,
+            "查找更早的内容（Enter）",
+            true,
+            dim,
+            muted,
+            radius,
+            hover,
+            cx,
+        );
+        let newer = find_step_button(
+            format!("find-newer-{}", self.pane.0),
+            IconName::ChevronDown,
+            "查找更新的内容（⇧Enter）",
+            false,
+            dim,
+            muted,
+            radius,
+            hover,
+            cx,
+        );
+
+        Some(
+            h_flex()
+                .id(format!("pane-find-{}", self.pane.0))
+                .absolute()
+                .top_2()
+                .right_3()
+                .w(px(340.))
+                // Narrow split panes must keep the input reachable instead of
+                // clipping the bar's left edge.
+                .max_w(relative(0.9))
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(radius)
+                .border_1()
+                .border_color(border)
+                .bg(background)
+                .shadow_sm()
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.close_find(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    Input::new(&bar.input)
+                        .small()
+                        .appearance(false)
+                        .flex_1()
+                        .min_w_0(),
+                )
+                .when(!count.is_empty(), |row| {
+                    row.child(div().flex_none().text_xs().text_color(muted).child(count))
+                })
+                .child(older)
+                .child(newer)
+                .child(
+                    div()
+                        .id(format!("find-close-{}", self.pane.0))
+                        .rounded(radius)
+                        .p_0p5()
+                        .cursor_pointer()
+                        .text_color(muted)
+                        .hover(move |style| style.bg(hover))
+                        .hover_label("关闭查找")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_find(window, cx);
+                        }))
+                        .child(
+                            Icon::new(IconName::Close)
+                                .with_size(px(14.))
+                                .text_color(muted),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -716,7 +969,6 @@ impl Render for TerminalView {
         let active = self.active;
         let can_close = self.can_close;
         let pane = self.pane;
-        let tooltips = self.tooltips.clone();
         let border = if active {
             theme.border
         } else {
@@ -732,9 +984,13 @@ impl Render for TerminalView {
         let warning = theme.warning;
         let radius = theme.radius;
         let hover = theme.accent.opacity(0.5);
+        // Find-bar highlights; copied out of the theme before the grid's
+        // paint closure (which must be 'static) captures them.
+        let search_hit = theme.selection.opacity(0.55);
+        let search_active = theme.warning.opacity(0.55);
         let header = terminal_header(
             pane, mark, name, cwd, note, header_bg, can_close, muted, fg, warning, radius, hover,
-            &tooltips, cx,
+            cx,
         );
         let typeface = Typeface {
             family: font_family,
@@ -754,166 +1010,191 @@ impl Render for TerminalView {
             .child(header)
             .child(
                 div()
-                    .id(term_id)
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .size_full()
-                    .track_focus(&self.focus)
-                    .key_context("Terminal")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                            this.focus.focus(window, cx);
-                            cx.emit(TerminalEvent::Activated);
-                            if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
-                                if this.project.is_some() {
-                                    let pane = this.pane.0;
-                                    this.workspace.update(cx, |workspace, _| {
-                                        workspace.terminal_clear_selection(pane);
-                                    });
-                                }
-                            } else if !this.reported.contains(&ev.button) {
-                                this.start_selection(ev.position, cx);
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                            this.focus.focus(window, cx);
-                            cx.emit(TerminalEvent::Activated);
-                            if !this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
-                                this.paste(cx);
-                            }
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                            this.focus.focus(window, cx);
-                            cx.emit(TerminalEvent::Activated);
-                            this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
-                        this.on_scroll(ev, cx);
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        this.on_key(event, cx);
-                    }))
+                    .overflow_hidden()
                     .child(
-                        canvas(
-                            move |bounds, window, cx| {
-                                let (cell_w, cell_h) = cell_size(window, &typeface_layout);
-                                let scale = window.scale_factor();
-                                let cols = ((f32::from(bounds.size.width) - 2. * PAD_X)
-                                    / f32::from(cell_w))
-                                .floor()
-                                .max(2.) as u16;
-                                let rows = ((f32::from(bounds.size.height) - 2. * PAD_Y)
-                                    / f32::from(cell_h))
-                                .floor()
-                                .max(1.) as u16;
-                                let cell_px = (
-                                    (f32::from(cell_w) * scale).round().max(1.) as u32,
-                                    (f32::from(cell_h) * scale).round().max(1.) as u32,
-                                );
-                                let next = (cols, rows, cell_px.0, cell_px.1);
-                                if sent.get() != next {
-                                    sent.set(next);
-                                    if has_project {
-                                        workspace.update(cx, |workspace, _| {
-                                            workspace.terminal_resize(
-                                                pane_term, cols, rows, cell_px.0, cell_px.1,
-                                            )
-                                        });
-                                    }
-                                }
-                                (cell_w, cell_h)
-                            },
-                            move |bounds, cell, window, cx| {
-                                let origin = paint_grid(
-                                    GridPaint {
-                                        bounds,
-                                        snapshot: &snapshot,
-                                        cell,
-                                        focused,
-                                        marked: marked.as_deref(),
-                                        typeface: &typeface_paint,
-                                        painted: &painted,
-                                        cursor_at: &cursor_at,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                                grid_at.set(GridAt {
-                                    origin,
-                                    cell,
-                                    height: f32::from(cell.1) * snapshot.rows as f32,
-                                    scale: window.scale_factor(),
-                                });
-                                let view = mouse_view.clone();
-                                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    let _ = view.update(cx, |this, cx| {
-                                        if this.selecting {
-                                            if ev.pressed_button == Some(MouseButton::Left) {
-                                                this.apply_select(
-                                                    SelectStep::Drag,
-                                                    ev.position,
-                                                    cx,
-                                                );
-                                            } else {
-                                                this.finish_selection(ev.position, cx);
-                                            }
-                                            return;
+                        div()
+                            .id(term_id)
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .size_full()
+                            .track_focus(&self.focus)
+                            .key_context("Terminal")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                    this.focus.focus(window, cx);
+                                    cx.emit(TerminalEvent::Activated);
+                                    if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
+                                        if this.project.is_some() {
+                                            let pane = this.pane.0;
+                                            this.workspace.update(cx, |workspace, _| {
+                                                workspace.terminal_clear_selection(pane);
+                                            });
                                         }
-                                        if let Some(button) = ev.pressed_button
-                                            && this.reported.contains(&button)
-                                        {
-                                            this.send_mouse(
-                                                MouseAction::Motion,
-                                                Some(button),
-                                                ev.position,
-                                                &ev.modifiers,
+                                    } else if !this.reported.contains(&ev.button) {
+                                        this.start_selection(ev.position, cx);
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                    this.focus.focus(window, cx);
+                                    cx.emit(TerminalEvent::Activated);
+                                    if !this.press_mouse(ev.button, ev.position, &ev.modifiers, cx)
+                                    {
+                                        this.paste(cx);
+                                    }
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                    this.focus.focus(window, cx);
+                                    cx.emit(TerminalEvent::Activated);
+                                    this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                                }),
+                            )
+                            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
+                                this.on_scroll(ev, cx);
+                            }))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                this.on_key(event, window, cx);
+                            }))
+                            .child(
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let (cell_w, cell_h) = cell_size(window, &typeface_layout);
+                                        let scale = window.scale_factor();
+                                        let cols = ((f32::from(bounds.size.width) - 2. * PAD_X)
+                                            / f32::from(cell_w))
+                                        .floor()
+                                        .max(2.)
+                                            as u16;
+                                        let rows = ((f32::from(bounds.size.height) - 2. * PAD_Y)
+                                            / f32::from(cell_h))
+                                        .floor()
+                                        .max(1.)
+                                            as u16;
+                                        let cell_px = (
+                                            (f32::from(cell_w) * scale).round().max(1.) as u32,
+                                            (f32::from(cell_h) * scale).round().max(1.) as u32,
+                                        );
+                                        let next = (cols, rows, cell_px.0, cell_px.1);
+                                        if sent.get() != next {
+                                            sent.set(next);
+                                            if has_project {
+                                                workspace.update(cx, |workspace, _| {
+                                                    workspace.terminal_resize(
+                                                        pane_term, cols, rows, cell_px.0, cell_px.1,
+                                                    )
+                                                });
+                                            }
+                                        }
+                                        (cell_w, cell_h)
+                                    },
+                                    move |bounds, cell, window, cx| {
+                                        let origin = paint_grid(
+                                            GridPaint {
+                                                bounds,
+                                                snapshot: &snapshot,
+                                                cell,
+                                                focused,
+                                                marked: marked.as_deref(),
+                                                typeface: &typeface_paint,
+                                                painted: &painted,
+                                                cursor_at: &cursor_at,
+                                                search_hit,
+                                                search_active,
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                        grid_at.set(GridAt {
+                                            origin,
+                                            cell,
+                                            height: f32::from(cell.1) * snapshot.rows as f32,
+                                            scale: window.scale_factor(),
+                                        });
+                                        let view = mouse_view.clone();
+                                        window.on_mouse_event(
+                                            move |ev: &MouseMoveEvent, phase, _, cx| {
+                                                if phase != DispatchPhase::Capture {
+                                                    return;
+                                                }
+                                                let _ = view.update(cx, |this, cx| {
+                                                    if this.selecting {
+                                                        if ev.pressed_button
+                                                            == Some(MouseButton::Left)
+                                                        {
+                                                            this.apply_select(
+                                                                SelectStep::Drag,
+                                                                ev.position,
+                                                                cx,
+                                                            );
+                                                        } else {
+                                                            this.finish_selection(ev.position, cx);
+                                                        }
+                                                        return;
+                                                    }
+                                                    if let Some(button) = ev.pressed_button
+                                                        && this.reported.contains(&button)
+                                                    {
+                                                        this.send_mouse(
+                                                            MouseAction::Motion,
+                                                            Some(button),
+                                                            ev.position,
+                                                            &ev.modifiers,
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            },
+                                        );
+                                        let view = mouse_view.clone();
+                                        window.on_mouse_event(
+                                            move |ev: &MouseUpEvent, phase, _, cx| {
+                                                if phase != DispatchPhase::Capture {
+                                                    return;
+                                                }
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.release_mouse(
+                                                        ev.button,
+                                                        ev.position,
+                                                        &ev.modifiers,
+                                                        cx,
+                                                    );
+                                                    if this.selecting
+                                                        && ev.button == MouseButton::Left
+                                                    {
+                                                        this.finish_selection(ev.position, cx);
+                                                        cx.stop_propagation();
+                                                    }
+                                                });
+                                            },
+                                        );
+                                        if focused {
+                                            window.handle_input(
+                                                &input_focus,
+                                                ElementInputHandler::new(
+                                                    bounds,
+                                                    input_view.clone(),
+                                                ),
                                                 cx,
                                             );
                                         }
-                                    });
-                                });
-                                let view = mouse_view.clone();
-                                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    let _ = view.update(cx, |this, cx| {
-                                        this.release_mouse(
-                                            ev.button,
-                                            ev.position,
-                                            &ev.modifiers,
-                                            cx,
-                                        );
-                                        if this.selecting && ev.button == MouseButton::Left {
-                                            this.finish_selection(ev.position, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    });
-                                });
-                                if focused {
-                                    window.handle_input(
-                                        &input_focus,
-                                        ElementInputHandler::new(bounds, input_view.clone()),
-                                        cx,
-                                    );
-                                }
-                            },
-                        )
-                        .size_full(),
-                    ),
+                                    },
+                                )
+                                .size_full(),
+                            ),
+                    )
+                    .when_some(self.render_find_bar(cx), |wrapper, bar| wrapper.child(bar)),
             )
     }
 }
@@ -940,7 +1221,6 @@ fn terminal_header(
     warning: Hsla,
     radius: Pixels,
     hover: Hsla,
-    tooltips: &Entity<Tooltips>,
     cx: &mut Context<TerminalView>,
 ) -> impl IntoElement {
     let path = short_cwd(&cwd);
@@ -993,7 +1273,6 @@ fn terminal_header(
             muted,
             radius,
             hover,
-            tooltips,
             cx.listener(|_, _, _, cx| {
                 cx.emit(TerminalEvent::SplitRight);
                 cx.stop_propagation();
@@ -1006,7 +1285,6 @@ fn terminal_header(
             muted,
             radius,
             hover,
-            tooltips,
             cx.listener(|_, _, _, cx| {
                 cx.emit(TerminalEvent::SplitDown);
                 cx.stop_propagation();
@@ -1020,7 +1298,6 @@ fn terminal_header(
                 muted,
                 radius,
                 hover,
-                tooltips,
                 cx.listener(|_, _, _, cx| {
                     cx.emit(TerminalEvent::Close);
                     cx.stop_propagation();
@@ -1037,7 +1314,6 @@ fn chrome_button(
     muted: Hsla,
     radius: Pixels,
     hover: Hsla,
-    tooltips: &Entity<Tooltips>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -1047,7 +1323,7 @@ fn chrome_button(
         .cursor_pointer()
         .text_color(muted)
         .hover(move |style| style.bg(hover))
-        .hover_label(tooltips, label)
+        .hover_label(label)
         .on_click(on_click)
         .child(
             Icon::empty()
@@ -1055,6 +1331,37 @@ fn chrome_button(
                 .with_size(px(14.))
                 .text_color(muted),
         )
+}
+
+/// One direction button in the find bar. Clicking it keeps the input focused,
+/// so Enter keeps walking from the same place.
+#[allow(clippy::too_many_arguments)]
+fn find_step_button(
+    id: String,
+    icon: IconName,
+    label: &'static str,
+    older: bool,
+    opacity: f32,
+    muted: Hsla,
+    radius: Pixels,
+    hover: Hsla,
+    cx: &mut Context<TerminalView>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex_none()
+        .rounded(radius)
+        .p_0p5()
+        .opacity(opacity)
+        .cursor_pointer()
+        .text_color(muted)
+        .hover(move |style| style.bg(hover))
+        .hover_label(label)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.step_find(older, window, cx);
+        }))
+        .child(Icon::new(icon).with_size(px(14.)).text_color(muted))
+        .into_any_element()
 }
 
 fn header_identity(snapshot: &Snapshot, cx: &App) -> (AnyElement, String, String) {
@@ -1399,6 +1706,9 @@ struct GridPaint<'a> {
     typeface: &'a Typeface,
     painted: &'a RefCell<PaintCache>,
     cursor_at: &'a Cell<CursorAt>,
+    /// Find-bar highlight for a match and for the selected one.
+    search_hit: Hsla,
+    search_active: Hsla,
 }
 
 fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<Pixels> {
@@ -1411,6 +1721,8 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         typeface,
         painted,
         cursor_at,
+        search_hit,
+        search_active,
     } = grid;
     window.paint_quad(fill(bounds, paint_color(snapshot.bg)));
     let scale = window.scale_factor();
@@ -1468,6 +1780,23 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         }
     }
     let cell_bounds = size(cell_w, cell_h);
+    if let Some(search) = &snapshot.search {
+        for hit in &search.hits {
+            if hit.to <= hit.from {
+                continue;
+            }
+            let b = Bounds::new(
+                at(hit.from as usize, hit.row as usize),
+                size(cell_w * (hit.to - hit.from) as f32, cell_h),
+            );
+            let color = if hit.selected {
+                search_active
+            } else {
+                search_hit
+            };
+            window.paint_quad(fill(snap_box(b), color));
+        }
+    }
     for (y, (_, ops)) in cache.rows.iter().enumerate() {
         for op in ops {
             match op {

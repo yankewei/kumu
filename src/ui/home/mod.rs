@@ -13,8 +13,6 @@ use std::path::PathBuf;
 
 use super::SettingsWindow;
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
-use crate::ui::layers;
-use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
@@ -39,7 +37,7 @@ pub struct KumuApp {
     workspace: Entity<Workspace>,
     /// Owned by the home window so closing Settings does not interrupt an update.
     updater: Entity<Updater>,
-    settings_window: Option<WindowHandle<Root>>,
+    settings_window: Option<AnyWindowHandle>,
     /// Project currently shown in the content area.
     selected: Option<i64>,
     /// Terminals that requested attention while unattended, mapped to their
@@ -48,8 +46,6 @@ pub struct KumuApp {
     /// A persistence failure the workspace reported, shown above the panes
     /// until dismissed.
     store_error: Option<String>,
-    /// Hover labels for the sidebar (see [`Tooltips`]).
-    tooltips: Entity<Tooltips>,
     /// Terminal views keyed by pane id.
     panes: HashMap<PaneId, Entity<TerminalView>>,
     /// Each project owns an independent pane tree.
@@ -75,7 +71,6 @@ impl KumuApp {
         let startup_error = workspace.update(cx, |workspace, _| workspace.take_startup_error());
         let saved_workspace = workspace.update(cx, |workspace, _| workspace.take_saved_workspace());
         let last_saved_layout = saved_workspace.clone();
-        let tooltips = cx.new(|cx| Tooltips::new(cx));
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
         cx.subscribe_in(&workspace, window, |this, _, ev, window, cx| match ev {
@@ -197,7 +192,6 @@ impl KumuApp {
             selected: None,
             unread_notifications: HashMap::new(),
             store_error: startup_error,
-            tooltips,
             panes: HashMap::new(),
             layouts: HashMap::new(),
             focused_by_project: HashMap::new(),
@@ -301,8 +295,7 @@ impl KumuApp {
     /// Create and subscribe one pane's terminal view.
     fn install_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Entity<TerminalView> {
         let workspace = self.workspace.clone();
-        let tooltips = self.tooltips.clone();
-        let terminal = cx.new(|cx| TerminalView::new(pane, workspace, tooltips, cx));
+        let terminal = cx.new(|cx| TerminalView::new(pane, workspace, cx));
         cx.subscribe(&terminal, move |this, _, ev, cx| {
             this.on_terminal_event(pane, ev, cx);
         })
@@ -699,6 +692,7 @@ impl KumuApp {
                         true
                     }
                 })
+                .centered()
         });
         input.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -780,6 +774,7 @@ impl KumuApp {
                         true
                     }
                 })
+                .centered()
         });
         input.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -826,6 +821,7 @@ impl KumuApp {
                     let _ = weak.update(cx, move |app, cx| app.delete_project(project_id, cx));
                     true
                 })
+                .centered()
         });
     }
 
@@ -868,8 +864,11 @@ impl KumuApp {
     /// Focus the settings window if it's open, else open a new one (resizable,
     /// opens at its minimum size).
     fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
-        let activate = |root: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
-            if show_updates && let Ok(settings) = root.view().clone().downcast::<SettingsWindow>() {
+        let activate = |view: AnyView, window: &mut Window, cx: &mut App| {
+            if show_updates
+                && let Ok(root) = view.downcast::<Root>()
+                && let Ok(settings) = root.read(cx).view().clone().downcast::<SettingsWindow>()
+            {
                 settings.update(cx, |settings, cx| settings.show_updates(window, cx));
             }
             window.activate_window();
@@ -883,9 +882,8 @@ impl KumuApp {
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
-        if let Ok(handle) = cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| SettingsWindow::new(updater, window, cx));
-            cx.new(|cx| Root::new(view, window, cx))
+        if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| SettingsWindow::new(updater, window, cx))
         }) {
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
@@ -934,8 +932,7 @@ impl KumuApp {
         }
     }
 
-    fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(&self.tooltips, window, cx);
+    fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let warning = theme.warning;
         let workspace = self.workspace.read(cx);
@@ -1028,7 +1025,6 @@ impl KumuApp {
                     .child(div().w_px().h_full().bg(theme.border))
                     .child(right),
             )
-            .child(overlays)
     }
 }
 

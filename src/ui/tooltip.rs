@@ -4,9 +4,10 @@
 //! `Switch`, the sidebar menu), but those ask the overlay `Root` mounts, and
 //! that overlay is crate-private: the tooltip surface is public while the trait
 //! that requests it (`ManagedTooltipExt`) is not, so an app element cannot
-//! borrow that wiring. The app therefore mounts an overlay of its own — through
-//! [`crate::ui::layers::window_layers`], like every other overlay — and asks it
-//! the way the library's own helper does.
+//! borrow that wiring. The app therefore registers an overlay of its own as a
+//! [`RootPlugin`](gpui_kit::base::RootPlugin); every window's `Root` creates one
+//! and mounts it above the app's content, and elements ask it the way the
+//! library's own helper does.
 //!
 //! Everything a tooltip decides for itself stays with the library: the surface,
 //! the placement (above the trigger, flipped below it when there is no room
@@ -66,7 +67,7 @@ impl Tooltips {
                     // The overlay would prefer this side on its own; asking for
                     // it keeps "above the trigger" a property of the label
                     // rather than of a default.
-                    .placement(Placement::Top),
+                    .with_placement(Placement::Top),
                     window,
                     cx,
                 );
@@ -83,20 +84,25 @@ impl Render for Tooltips {
     }
 }
 
-/// A hover label on a stateful element: `div().id("x").hover_label(&tooltips, "…")`.
+/// [`Root`](gpui_kit::base::Root) mounts one tooltip overlay per window.
+impl gpui_kit::base::RootPlugin for Tooltips {}
+
+/// A hover label on a stateful element: `div().id("x").hover_label("…")`.
 pub trait HoverLabel: StatefulInteractiveElement + ElementExt + Sized {
     /// Show `text` above this element while the pointer is on it.
-    fn hover_label(
-        self,
-        tooltips: &Entity<Tooltips>,
-        text: impl Into<SharedString> + 'static,
-    ) -> Self {
+    fn hover_label(self, text: impl Into<SharedString> + 'static) -> Self {
         let trigger = Rc::new(Cell::new(Bounds::default()));
         let capture = trigger.clone();
         let text = text.into();
-        let tooltips = tooltips.clone();
         self.on_prepaint(move |bounds, _, _| capture.set(bounds))
             .on_hover(move |hovered, window, cx| {
+                let tooltips = window
+                    .root::<gpui_kit::base::Root>()
+                    .flatten()
+                    .and_then(|root| root.read(cx).plugin::<Tooltips>());
+                let Some(tooltips) = tooltips else {
+                    return;
+                };
                 tooltips.update(cx, |tooltips, cx| {
                     tooltips.hover(*hovered, trigger.get(), text.clone(), window, cx)
                 });

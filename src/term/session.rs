@@ -56,6 +56,12 @@ enum Msg {
     },
     ClearSelection,
     SelectionText(Sender<Option<String>>),
+    /// Find bar: set the needle (empty clears), or walk matches.
+    SearchSet(String),
+    SearchStep {
+        older: bool,
+    },
+    SearchClear,
     /// Scroll the viewport (primary screen) or send arrows / mouse wheel.
     Scroll {
         lines: isize,
@@ -221,6 +227,21 @@ impl Term {
 
     pub fn clear_selection(&self) {
         let _ = self.tx.send(Msg::ClearSelection);
+    }
+
+    /// Search the terminal for `needle` and select the newest match. An empty
+    /// needle closes the find bar's highlights.
+    pub fn search_set(&self, needle: impl Into<String>) {
+        let _ = self.tx.send(Msg::SearchSet(needle.into()));
+    }
+
+    /// Move the selected match toward older (`older`) or newer content.
+    pub fn search_step(&self, older: bool) {
+        let _ = self.tx.send(Msg::SearchStep { older });
+    }
+
+    pub fn search_clear(&self) {
+        let _ = self.tx.send(Msg::SearchClear);
     }
 
     /// Currently selected plain text, if any.
@@ -434,6 +455,19 @@ impl Running {
                 Some(Msg::SelectionText(reply)) => {
                     let _ = reply.send(self.vt.selection_text());
                 }
+                Some(Msg::SearchSet(needle)) => {
+                    self.vt.search_set(&needle);
+                    self.publish();
+                }
+                Some(Msg::SearchStep { older }) => {
+                    self.vt.search_step(older);
+                    self.publish();
+                }
+                Some(Msg::SearchClear) => {
+                    if self.vt.search_clear() {
+                        self.publish();
+                    }
+                }
                 Some(Msg::Scroll {
                     lines,
                     x,
@@ -532,6 +566,9 @@ impl Running {
             pending.push_back(notification);
         }
         drop(pending);
+        // A running find bar has to see new output and viewport scrolls; with
+        // no needle this is a no-op.
+        self.vt.search_feed();
         self.live
             .publish(self.vt.snapshot(&self.command, &self.cwd, self.exited));
     }
@@ -694,6 +731,45 @@ mod tests {
                 .any(|line| line.trim() == "kumu-alpha  kumu-beta"),
             "completion candidates were not listed:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_find_needle_highlights_matches_on_the_live_terminal() {
+        let (term, _wake) = Term::launch(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                "printf 'alpha\\nbeta\\nalpha\\n'; sleep 2".into(),
+            ],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        assert!(wait_text(&term, "beta").contains("beta"));
+        term.search_set("alpha");
+        let start = Instant::now();
+        let search = loop {
+            if let Some(search) = term.snapshot().search
+                && search.total == 2
+            {
+                break search;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "find needle never reached the terminal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(search.selected, Some(0));
+        assert!(!search.hits.is_empty());
+        term.search_clear();
+        let start = Instant::now();
+        while term.snapshot().search.is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "clearing the needle left highlights"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

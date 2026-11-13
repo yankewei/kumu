@@ -1,7 +1,6 @@
 //! Frontend UI: one module per window, shared widgets in `widgets`.
 
 mod home;
-mod layers;
 mod settings;
 mod tooltip;
 pub mod widgets;
@@ -10,6 +9,11 @@ pub use home::KumuApp;
 pub use settings::SettingsWindow;
 
 pub fn init(cx: &mut gpui_kit::App) {
+    // Every window's Root mounts one tooltip overlay; elements find it
+    // through `Root::read(window, cx).plugin::<Tooltips>()`.
+    gpui_kit::base::Root::register_plugin::<tooltip::Tooltips>(cx, |_, cx| {
+        tooltip::Tooltips::new(cx)
+    });
     if !cx.has_global::<crate::app::NotificationSettings>() {
         cx.set_global(crate::app::NotificationSettings {
             enabled: crate::db::get_setting(crate::db::SETTING_NOTIFICATIONS).as_deref()
