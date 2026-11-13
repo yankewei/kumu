@@ -8,12 +8,14 @@
 //! Layout:
 //!   - this module  — the facade;
 //!   - `config`     — executable resolution and install detection;
+//!   - `launch`     — pane launch choice and resume arguments;
 //!   - `registry`   — the static list of agents;
 //!   - `integration` — persistent notification registration.
 
 mod config;
 pub mod integration;
+pub mod launch;
 mod registry;
 
-pub use config::installed;
-pub use registry::AGENTS;
+pub use config::{executable, installed};
+pub use registry::{AGENTS, id_for};

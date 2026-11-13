@@ -1,4 +1,4 @@
-import { notify } from "../notify.js";
+import { notify, notifySession } from "../notify.js";
 
 // OpenCode 2's TUI owns the PTY even when its server is shared or remote.
 export default {
@@ -26,7 +26,11 @@ export default {
       notify("OpenCode", message);
     };
     const dispose = [
-      ctx.data.on("session.execution.started", (event) => ended.delete(event.data.sessionID)),
+      ctx.data.on("session.execution.started", (event) => {
+        const id = event.data.sessionID;
+        if (relevant(id)) notifySession("OpenCode", id);
+        ended.delete(id);
+      }),
       ctx.data.on("session.execution.succeeded", (event) => end(event, "本轮任务已完成")),
       ctx.data.on("session.execution.failed", (event) => end(event, "任务执行失败，请查看终端")),
       ctx.data.on("session.execution.interrupted", (event) => ended.add(event.data.sessionID)),

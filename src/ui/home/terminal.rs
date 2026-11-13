@@ -12,12 +12,16 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::panes::{PaneDirection, PaneId};
+use crate::agent::launch::PaneLaunch;
+use crate::agent::{AGENTS, installed};
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::{
     Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
@@ -38,6 +42,8 @@ pub enum TerminalEvent {
     Focus(PaneDirection),
     /// Close this pane and its shell.
     Close,
+    /// Split this pane to the right and run an agent in the new pane.
+    AgentPane(String),
 }
 
 /// Direction for a ⌘⌥arrow focus move.
@@ -200,8 +206,8 @@ impl TerminalView {
         self.focus.focus(window, cx);
     }
 
-    /// Show `project_id`, starting its shell if it is not already running.
-    pub fn show(&mut self, project_id: i64, cx: &mut Context<Self>) {
+    /// Show `project_id`, starting `launch` if nothing runs in this pane yet.
+    pub fn show(&mut self, project_id: i64, launch: &PaneLaunch, cx: &mut Context<Self>) {
         // Selecting the project that is already shown is a no-op: the terminal
         // and its find bar stay exactly where they are. A failed spawn is the
         // exception — selecting the project again retries it, as it did before.
@@ -210,7 +216,7 @@ impl TerminalView {
         }
         let pane = self.pane.0;
         let snapshot = self.workspace.update(cx, |workspace, cx| {
-            workspace.show_terminal(pane, project_id, cx)
+            workspace.show_terminal(pane, project_id, launch, cx)
         });
         self.attach(project_id, snapshot, cx);
     }
@@ -1266,6 +1272,7 @@ fn terminal_header(
         .when_some(note, |row, text| {
             row.child(div().flex_none().text_xs().text_color(warning).child(text))
         })
+        .child(agent_menu_button(pane, muted, hover, cx))
         .child(chrome_button(
             format!("split-right-{}", pane.0),
             "split-right.svg",
@@ -1303,6 +1310,40 @@ fn terminal_header(
                     cx.stop_propagation();
                 }),
             ))
+        })
+}
+
+/// The agent picker: a menu rather than a second split button, because a new
+/// pane is a shell unless the user names an agent.
+fn agent_menu_button(
+    pane: PaneId,
+    muted: Hsla,
+    hover: Hsla,
+    cx: &mut Context<TerminalView>,
+) -> impl IntoElement {
+    let view = cx.entity();
+    Button::new(format!("agent-menu-{}", pane.0))
+        .ghost()
+        .compact()
+        .icon(IconName::Bot)
+        .text_color(muted)
+        .hover(move |style| style.bg(hover))
+        .tooltip("新建 Agent 窗格")
+        .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+            let available: Vec<_> = AGENTS.iter().filter(|agent| installed(agent.id)).collect();
+            if available.is_empty() {
+                return menu.item(PopupMenuItem::new("未安装 Agent").disabled(true));
+            }
+            let mut menu = menu;
+            for agent in available {
+                let view = view.clone();
+                menu = menu.item(PopupMenuItem::new(agent.name).on_click(move |_, _, cx| {
+                    view.update(cx, |_, cx| {
+                        cx.emit(TerminalEvent::AgentPane(agent.id.to_string()));
+                    });
+                }));
+            }
+            menu
         })
 }
 

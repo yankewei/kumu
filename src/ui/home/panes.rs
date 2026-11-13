@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui_kit::Axis;
 
+use crate::agent::launch::PaneLaunch;
+
 /// Stable id for one terminal pane in the home window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
@@ -56,6 +58,11 @@ pub enum SavedNode {
     ProjectLayouts {
         selected: Option<i64>,
         projects: Vec<SavedProjectLayout>,
+        /// Pane id → what it runs, for panes that are not plain shells.
+        /// Omitted when empty, so a shell-only layout looks exactly like one
+        /// written before agent panes existed.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        launches: HashMap<u64, PaneLaunch>,
     },
 }
 
@@ -83,6 +90,8 @@ pub struct RestoredWorkspace {
     /// Group id → normalized child sizes. Every restored group has an entry;
     /// an empty vector means "no usable sizes, divide evenly".
     pub group_sizes: HashMap<u64, Vec<f32>>,
+    /// Pane id → the agent pane it restores as. Panes absent here are shells.
+    pub launches: HashMap<PaneId, PaneLaunch>,
     pub next_pane: u64,
     pub next_group: u64,
 }
@@ -114,16 +123,22 @@ impl SavedWorkspace {
         if state.version != WORKSPACE_STATE_VERSION {
             return None;
         }
-        let SavedNode::ProjectLayouts { selected, projects } = &state.layout else {
+        let SavedNode::ProjectLayouts {
+            selected,
+            projects,
+            launches,
+        } = &state.layout
+        else {
             return None;
         };
-        restore_project_layouts(projects, *selected, project_exists)
+        restore_project_layouts(projects, *selected, launches, project_exists)
     }
 }
 
 fn restore_project_layouts(
     saved_projects: &[SavedProjectLayout],
     selected: Option<i64>,
+    saved_launches: &HashMap<u64, PaneLaunch>,
     project_exists: impl Fn(i64) -> bool,
 ) -> Option<RestoredWorkspace> {
     let mut next_group = 1;
@@ -191,11 +206,24 @@ fn restore_project_layouts(
     if selected.is_none() && !saved_projects.is_empty() {
         return None;
     }
+    // A launch belongs to the pane tree that survived validation: a stale or
+    // duplicate entry would otherwise start a process no pane owns.
+    let launches: HashMap<PaneId, PaneLaunch> = saved_launches
+        .iter()
+        .filter(|(pane, launch)| {
+            !launch.is_shell()
+                && layouts
+                    .values()
+                    .any(|layout| layout.panes().contains(&PaneId(**pane)))
+        })
+        .map(|(pane, launch)| (PaneId(*pane), launch.clone()))
+        .collect();
     Some(RestoredWorkspace {
         layouts,
         focused_by_project,
         selected,
         group_sizes,
+        launches,
         next_pane,
         next_group,
     })
@@ -789,6 +817,7 @@ mod tests {
                         focused: 2,
                     },
                 ],
+                launches: HashMap::new(),
             },
             focused: 2,
         }
@@ -834,7 +863,10 @@ mod tests {
     #[test]
     fn an_invalid_project_layout_does_not_discard_later_projects() {
         let mut state = two_project_state();
-        if let SavedNode::ProjectLayouts { projects, selected } = &mut state.layout {
+        if let SavedNode::ProjectLayouts {
+            projects, selected, ..
+        } = &mut state.layout
+        {
             *selected = Some(10);
             projects[0].layout = SavedNode::Group {
                 horizontal: true,
@@ -893,11 +925,103 @@ mod tests {
                 },
                 focused: 1,
             }],
+            launches: HashMap::new(),
         };
         let json = serde_json::to_string(&duplicate).unwrap();
         assert!(
             SavedWorkspace::restore(&json, |_| true).is_none(),
             "two leaves cannot share a pane"
+        );
+    }
+
+    /// Layouts written before agent panes existed carry no `launches`, and a
+    /// shell-only layout writes none back: upgrading must not rewrite or drop
+    /// the user's trees.
+    #[test]
+    fn a_layout_without_launches_restores_as_shells() {
+        let json = r#"{"version":3,"focused":7,"layout":{"ProjectLayouts":{"selected":3,"projects":[{"project":3,"layout":{"Leaf":{"pane":7}},"focused":7}]}}}"#;
+        let restored = SavedWorkspace::restore(json, |_| true).unwrap();
+        assert!(restored.launches.is_empty());
+        assert_eq!(restored.layouts[&3].panes(), vec![PaneId(7)]);
+
+        let saved = SavedWorkspace {
+            version: WORKSPACE_STATE_VERSION,
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(3),
+                projects: vec![SavedProjectLayout {
+                    project: 3,
+                    layout: SavedNode::Leaf { pane: 7 },
+                    focused: 7,
+                }],
+                launches: HashMap::new(),
+            },
+            focused: 7,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("launches"), "shells write no launch data");
+    }
+
+    #[test]
+    fn an_agent_pane_survives_a_save_and_restore() {
+        let launch = PaneLaunch::Agent {
+            agent: "codex".into(),
+            session: Some("session-1".into()),
+        };
+        let saved = SavedWorkspace {
+            version: WORKSPACE_STATE_VERSION,
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(3),
+                projects: vec![SavedProjectLayout {
+                    project: 3,
+                    layout: SavedNode::Leaf { pane: 7 },
+                    focused: 7,
+                }],
+                launches: HashMap::from([(7, launch.clone())]),
+            },
+            focused: 7,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(restored.launches[&PaneId(7)], launch);
+    }
+
+    /// A launch whose pane is no longer in any tree must not start a process
+    /// no pane can show.
+    #[test]
+    fn a_launch_for_a_missing_pane_is_dropped() {
+        let saved = SavedWorkspace {
+            version: WORKSPACE_STATE_VERSION,
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(3),
+                projects: vec![SavedProjectLayout {
+                    project: 3,
+                    layout: SavedNode::Leaf { pane: 7 },
+                    focused: 7,
+                }],
+                launches: HashMap::from([
+                    (
+                        7,
+                        PaneLaunch::Agent {
+                            agent: "codex".into(),
+                            session: None,
+                        },
+                    ),
+                    (
+                        99,
+                        PaneLaunch::Agent {
+                            agent: "opencode".into(),
+                            session: None,
+                        },
+                    ),
+                ]),
+            },
+            focused: 7,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
+        assert_eq!(
+            restored.launches.keys().copied().collect::<Vec<_>>(),
+            [PaneId(7)]
         );
     }
 }

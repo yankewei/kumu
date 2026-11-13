@@ -79,6 +79,8 @@ pub struct SettingsWindow {
     updater: Entity<Updater>,
     integrations: HashMap<&'static str, Result<integration::Status, String>>,
     integration_busy: Option<&'static str>,
+    /// Whether panes resume their agent conversations on the next launch.
+    auto_resume: bool,
 }
 
 impl SettingsWindow {
@@ -146,6 +148,7 @@ impl SettingsWindow {
                 })
                 .collect(),
             integration_busy: None,
+            auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
         }
     }
 
@@ -722,6 +725,27 @@ impl SettingsWindow {
                 window.refresh();
             })
             .into_any_element();
+        let auto_resume = {
+            let this = cx.entity();
+            Switch::new("auto-resume")
+                .checked(self.auto_resume)
+                .on_click(move |checked, window, cx| {
+                    if let Err(error) =
+                        db::set_setting(db::SETTING_AUTO_RESUME, if *checked { "1" } else { "0" })
+                    {
+                        window.push_notification(
+                            Notification::error(format!("保存会话恢复设置失败：{error}")),
+                            cx,
+                        );
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        this.auto_resume = *checked;
+                        cx.notify();
+                    });
+                })
+                .into_any_element()
+        };
         let notification_sound = Switch::new("notification-sound")
             .checked(cx.global::<NotificationSettings>().sound)
             .on_click(|checked, window, cx| {
@@ -795,6 +819,13 @@ impl SettingsWindow {
                 "通知提示音",
                 "提醒时播放 macOS 提示音；仅在 Agent 通知开启时生效。",
                 notification_sound,
+                border,
+                false,
+            ))
+            .child(row(
+                "恢复 Agent 会话",
+                "启动时让 Agent 窗格回到上次的对话；关闭后只恢复窗格，以新对话开始。",
+                auto_resume,
                 border,
                 false,
             ))

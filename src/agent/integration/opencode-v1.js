@@ -1,4 +1,4 @@
-import { notify } from "./notify.js";
+import { notify, notifySession } from "./notify.js";
 
 export const KumuNotifications = async ({ client }) => {
   if (process.env.KUMU_TERMINAL !== "1") return {};
@@ -19,7 +19,10 @@ export const KumuNotifications = async ({ client }) => {
       if (event.type === "question.asked") message = "需要你输入、确认或选择";
       if (!message) return;
       const response = await client.session.get({ path: { id } });
-      if (response.data && !response.data.parentID) notify("OpenCode", message);
+      if (response.data && !response.data.parentID) {
+        notifySession("OpenCode", id);
+        notify("OpenCode", message);
+      }
     },
   };
 };

@@ -1812,6 +1812,21 @@ mod tests {
         );
     }
 
+    /// Agent session updates ride the notification channel: the app reads the
+    /// body prefix and records the id instead of showing it.
+    #[test]
+    fn a_session_update_keeps_its_agent_and_prefix() {
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"\x1b]777;notify;codex;kumu-session:abc-1\x07");
+        assert_eq!(
+            vt.take_notification(),
+            Some(TermNotification {
+                title: "codex".into(),
+                body: "kumu-session:abc-1".into(),
+            })
+        );
+    }
+
     #[test]
     fn terminal_titles_progress_and_bells_do_not_request_attention() {
         let mut vt = Vt::new(80, 24);

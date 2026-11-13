@@ -2,6 +2,13 @@ import { openSync, writeSync, closeSync } from "node:fs";
 
 // Hook stdout belongs to the agent's protocol. Write to the PTY device Kumu
 // injected; agent hooks may have no controlling terminal to fall back on.
+export function notifySession(agent, session) {
+  // Session ids travel as a notification-shaped OSC; Kumu records them
+  // instead of showing them. Drop anything that could break the sequence.
+  const id = String(session ?? "").replace(/[^\w.-]/g, "").slice(0, 128);
+  if (id) notify(agent, `kumu-session:${id}`);
+}
+
 export function notify(agent, message) {
   if (process.env.KUMU_TERMINAL !== "1") return;
   const path = process.env.KUMU_TTY || "/dev/tty";

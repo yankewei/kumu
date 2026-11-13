@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter, Global};
 
+use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX};
 use crate::db::{Project, Store, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
@@ -23,6 +24,20 @@ pub struct NotificationSettings {
 }
 
 impl Global for NotificationSettings {}
+
+/// A resumed conversation that dies almost immediately usually names a session
+/// that no longer exists. One fresh-conversation retry is better than dropping
+/// the pane to a shell on the first bad id; a second failure still becomes a
+/// shell, so a broken agent cannot loop.
+fn resume_failed(launch: &PaneLaunch, started: Instant) -> bool {
+    matches!(
+        launch,
+        PaneLaunch::Agent {
+            session: Some(_),
+            ..
+        }
+    ) && started.elapsed() < Duration::from_secs(5)
+}
 
 /// How many terminal processes may stay running at once.
 ///
@@ -50,6 +65,21 @@ pub enum WorkspaceEvent {
     /// A pane's shell exited cleanly. The home window closes that pane. The
     /// project stays; with no pane left, its tree is empty.
     PaneExited { pane: u64, project: i64 },
+    /// A pane's agent exited. The pane stays: it restarts the same agent with
+    /// a new conversation when `resume_failed`, otherwise it becomes a shell
+    /// and the old conversation is not resumed again.
+    AgentExited {
+        pane: u64,
+        project: i64,
+        resume_failed: bool,
+    },
+    /// An agent reported the conversation it is running, for the pane that
+    /// owns its terminal. The home window stores it with the pane.
+    Session {
+        pane: u64,
+        agent: String,
+        session: String,
+    },
 }
 
 /// One native TUI process and where it is drawn.
@@ -63,13 +93,20 @@ struct LiveTerm {
     pane: Option<u64>,
     /// Pane that owned this process before its project was hidden.
     parked_for: Option<u64>,
+    /// What this process was started with. An agent exit turns the pane into
+    /// a shell; a shell exit closes the pane.
+    launch: PaneLaunch,
+    /// When the process started, so an immediate failure can be told from a
+    /// conversation the user actually ended.
+    started: Instant,
     last_notification: Option<(Instant, TermNotification)>,
 }
 
 /// Projects and each live terminal.
 ///
-/// One per app, owned by the home window. Nothing in here renders. Every pane
-/// runs the user's shell in the project's directory.
+/// One per app, owned by the home window. Nothing in here renders. A pane runs
+/// the user's shell in the project's directory, or an agent TUI when the pane
+/// was launched as one.
 ///
 /// A project may occupy several panes; each pane has its own PTY. Switching
 /// projects parks those processes rather than killing them, so a hidden shell
@@ -202,16 +239,21 @@ impl Workspace {
         Some(id)
     }
 
-    /// The pane's screen, after making sure a shell is running in `project_id`.
+    /// The pane's screen, after making sure its process is running in
+    /// `project_id`.
     ///
-    /// An exited shell closes the pane (see [`Self::watch_terminal`]). Hiding
-    /// the project parks the process and reattaches it when that project is
-    /// shown again. Starting a process past the cap stops the parked one shown
-    /// least recently; a pane's visible terminal is never stopped.
+    /// `launch` says what to start when this pane has no process yet: a shell,
+    /// or an agent TUI (with a conversation to resume or a fresh one). An
+    /// exited shell closes the pane and an exited agent becomes a shell (see
+    /// [`Self::watch_terminal`]). Hiding the project parks the process and
+    /// reattaches it when that project is shown again. Starting a process past
+    /// the cap stops the parked one shown least recently; a pane's visible
+    /// terminal is never stopped.
     pub fn show_terminal(
         &mut self,
         pane: u64,
         project_id: i64,
+        launch: &PaneLaunch,
         cx: &mut Context<Self>,
     ) -> Snapshot {
         // A clean exit is still owned by its pane until the watcher reports
@@ -244,26 +286,96 @@ impl Workspace {
             return term.snapshot();
         }
         self.reclaim_terminals();
+        let (program, args, launch) = self.command(launch);
+        let term = self.spawn(pane, project_id, &path, program, args, launch, cx);
+        term.snapshot()
+    }
+
+    /// Start a pane's process without drawing it, parked until its project is
+    /// selected. Used at startup so every project's agent panes are already
+    /// warm at the moment the user looks at them.
+    ///
+    /// Returns false when the cap is full or there is nothing to start; the
+    /// pane then starts lazily on selection, exactly as before.
+    pub fn prestart(
+        &mut self,
+        pane: u64,
+        project_id: i64,
+        launch: &PaneLaunch,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pane_term.contains_key(&pane)
+            || self
+                .terms
+                .values()
+                .any(|live| live.parked_for == Some(pane) && live.project == project_id)
+        {
+            return true;
+        }
+        if self.terms.len() >= MAX_LIVE_TERMINALS {
+            return false;
+        }
+        let Some(path) = self.project(project_id).map(|project| project.path.clone()) else {
+            return false;
+        };
+        let (program, args, launch) = self.command(launch);
+        let _ = self.spawn(pane, project_id, &path, program, args, launch, cx);
+        let Some(term_id) = self.pane_term.remove(&pane) else {
+            return false;
+        };
+        // `spawn` attached it; keeping it parked is the whole point.
+        if let Some(live) = self.terms.get_mut(&term_id) {
+            live.pane = None;
+            live.parked_for = Some(pane);
+        }
+        self.touch_terminal(term_id);
+        true
+    }
+
+    /// The program and arguments for a pane's launch, falling back to the
+    /// user's shell when the requested agent cannot run here.
+    fn command(&self, launch: &PaneLaunch) -> (String, Vec<String>, PaneLaunch) {
+        match launch.agent_command() {
+            Some(AgentCommand { program, args, .. }) => (program, args, launch.clone()),
+            None => {
+                let (program, args) = crate::term::default_shell();
+                (program, args, PaneLaunch::Shell)
+            }
+        }
+    }
+
+    /// Start `program` in `path` and remember it as `pane`'s process.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &mut self,
+        pane: u64,
+        project_id: i64,
+        path: &str,
+        program: String,
+        args: Vec<String>,
+        launch: PaneLaunch,
+        cx: &mut Context<Self>,
+    ) -> Term {
         let colors = theme::term_colors(cx);
-        let (program, args) = crate::term::default_shell();
-        let (term, wake) = Term::launch(program, args, PathBuf::from(&path), colors);
-        let snapshot = term.snapshot();
+        let (term, wake) = Term::launch(program, args, PathBuf::from(path), colors);
         let term_id = self.next_term;
         self.next_term += 1;
         self.terms.insert(
             term_id,
             LiveTerm {
-                term,
+                term: term.clone(),
                 project: project_id,
                 pane: Some(pane),
                 parked_for: None,
+                launch,
+                started: Instant::now(),
                 last_notification: None,
             },
         );
         self.pane_term.insert(pane, term_id);
         self.touch_terminal(term_id);
         self.watch_terminal(term_id, project_id, wake, cx);
-        snapshot
+        term
     }
 
     /// A removed terminal or the terminal being read no longer needs attention.
@@ -525,8 +637,23 @@ impl Workspace {
                         let snapshot = live.term.snapshot();
                         let pane = live.pane;
                         let owning_pane = pane.or(live.parked_for);
+                        let agent_pane = !live.launch.is_shell();
+                        let resume_failed = resume_failed(&live.launch, live.started);
                         let term = live.term.clone();
                         while let Some(notification) = term.take_notification() {
+                            // A session update travels as a notification but
+                            // is not one: record it with the pane and stay
+                            // silent.
+                            if let Some(session) = notification.body.strip_prefix(SESSION_PREFIX)
+                                && let Some(pane) = owning_pane
+                            {
+                                cx.emit(WorkspaceEvent::Session {
+                                    pane,
+                                    agent: notification.title.clone(),
+                                    session: session.to_string(),
+                                });
+                                continue;
+                            }
                             let now = Instant::now();
                             if !live
                                 .last_notification
@@ -544,17 +671,26 @@ impl Workspace {
                                 });
                             }
                         }
-                        // `exit` (or any clean shell death) closes this pane.
-                        // The project stays. Spawn failures keep the pane so
-                        // the header can show why.
+                        // A clean shell death closes this pane; an agent death
+                        // turns it back into a shell. The project stays.
+                        // Spawn failures keep the pane so the header can show
+                        // why.
                         let shell_done = snapshot.exited && snapshot.spawn_error.is_none();
                         if shell_done {
                             workspace.drop_term(term_id);
                             if let Some(pane) = owning_pane {
-                                cx.emit(WorkspaceEvent::PaneExited {
-                                    pane,
-                                    project: project_id,
-                                });
+                                if agent_pane {
+                                    cx.emit(WorkspaceEvent::AgentExited {
+                                        pane,
+                                        project: project_id,
+                                        resume_failed,
+                                    });
+                                } else {
+                                    cx.emit(WorkspaceEvent::PaneExited {
+                                        pane,
+                                        project: project_id,
+                                    });
+                                }
                             }
                             return false;
                         }
@@ -734,11 +870,33 @@ fn terminal_evictions(order: &[u64], alive: usize, cap: usize) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use super::{
         ProjectPick, first_run_dir_from, project_name, resolve_project_pick, terminal_evictions,
     };
+    use crate::agent::launch::PaneLaunch;
     use crate::db::Project;
+
+    #[test]
+    fn only_an_immediately_failed_resume_gets_a_fresh_retry() {
+        let now = Instant::now();
+        let resumed = PaneLaunch::Agent {
+            agent: "codex".into(),
+            session: Some("abc".into()),
+        };
+        assert!(super::resume_failed(&resumed, now));
+        assert!(!super::resume_failed(
+            &resumed,
+            now - Duration::from_secs(10)
+        ));
+        let fresh = PaneLaunch::Agent {
+            agent: "codex".into(),
+            session: None,
+        };
+        assert!(!super::resume_failed(&fresh, now));
+        assert!(!super::resume_failed(&PaneLaunch::Shell, now));
+    }
 
     fn project(id: i64, path: &str) -> Project {
         Project {
@@ -774,6 +932,8 @@ mod tests {
                     project,
                     pane,
                     parked_for,
+                    launch: PaneLaunch::Shell,
+                    started: Instant::now(),
                     last_notification: None,
                 },
             );
@@ -872,6 +1032,8 @@ mod tests {
                         project: 10,
                         pane: Some(id),
                         parked_for: None,
+                        launch: PaneLaunch::Shell,
+                        started: Instant::now(),
                         last_notification: None,
                     },
                 );
@@ -887,7 +1049,11 @@ mod tests {
             workspace.hide_terminal(2);
             workspace.reclaim_terminals();
             assert_eq!(workspace.parked_terminal(10, 2), Some(2));
-            assert!(workspace.show_terminal(1, 10, cx).exited);
+            assert!(
+                workspace
+                    .show_terminal(1, 10, &PaneLaunch::Shell, cx)
+                    .exited
+            );
             workspace
         });
         let events: Entity<Vec<(u64, i64)>> = cx.new(|cx| {

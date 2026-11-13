@@ -1,9 +1,10 @@
 //! Where each local coding agent's executable lives, and whether it can run.
 //!
-//! kumu does not speak any agent protocol itself. The user starts an agent's
-//! TUI inside a project pane. This module only resolves the executable — a
-//! GUI-launched process does not inherit the shell's PATH — and checks that it
-//! is actually runnable, so the settings list can tell supported from installed.
+//! kumu does not speak any agent protocol itself: it starts the agent's TUI in
+//! a project pane (see [`super::launch`]). This module only resolves the
+//! executable — a GUI-launched process does not inherit the shell's PATH — and
+//! checks that it is actually runnable, so the settings list can tell supported
+//! from installed.
 //!
 //! Each agent has a `*_BIN` environment override; otherwise the usual install
 //! locations are tried before falling back to a bare name on PATH.
@@ -14,13 +15,13 @@ use std::path::{Path, PathBuf};
 ///
 /// The registry says what kumu supports, not what is installed. This asks the
 /// executable resolver, so a listed agent and a launchable one stay the same.
-pub fn installed(id: &'static str) -> bool {
+pub fn installed(id: &str) -> bool {
     executable(id).is_some_and(|command| is_executable(&command))
 }
 
 /// The resolved executable for a registry agent id, or `None` when the id is
 /// not one kumu knows.
-fn executable(agent: &str) -> Option<String> {
+pub fn executable(agent: &str) -> Option<String> {
     Some(match agent {
         "opencode" => opencode_bin(),
         "omp" => omp_bin(),
