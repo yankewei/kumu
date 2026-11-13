@@ -26,9 +26,11 @@ pub enum PaneDirection {
 /// changes; an unknown version is ignored rather than guessed at.
 pub const WORKSPACE_STATE_VERSION: u32 = 3;
 
-/// A saved layout is restored only up to this many panes: every restored pane
-/// starts a process, so a corrupt document must not be able to launch hundreds.
-const MAX_RESTORED_PANES: usize = 12;
+/// A saved layout is restored only up to this many panes per project, so a
+/// corrupt document cannot ask for hundreds of processes. This is a sanity
+/// bound, not a working limit: a real layout above the old 12-pane cap used to
+/// be dropped on the floor, taking the whole project tree with it.
+const MAX_RESTORED_PANES: usize = 64;
 
 /// Saved pane ids are kept below this bound so `next_pane` cannot overflow on
 /// the next split after a corrupt document.
@@ -693,6 +695,34 @@ mod tests {
             n.neighbor_in(PaneId(2), PaneDirection::Right),
             Some(PaneId(4))
         );
+    }
+
+    /// A setup with more splits than the old 12-pane sanity cap must still
+    /// restore: dropping the project's tree silently reset the window to one
+    /// pane on the next launch.
+    #[test]
+    fn a_layout_beyond_the_old_pane_cap_still_restores() {
+        let leaves = (1..=13).map(|pane| SavedNode::Leaf { pane }).collect();
+        let saved = SavedWorkspace {
+            version: WORKSPACE_STATE_VERSION,
+            layout: SavedNode::ProjectLayouts {
+                selected: Some(3),
+                projects: vec![SavedProjectLayout {
+                    project: 3,
+                    layout: SavedNode::Group {
+                        horizontal: true,
+                        sizes: Vec::new(),
+                        children: leaves,
+                    },
+                    focused: 1,
+                }],
+                launches: HashMap::new(),
+            },
+            focused: 1,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let restored = SavedWorkspace::restore(&json, |_| true).expect("layout restores");
+        assert_eq!(restored.layouts[&3].panes().len(), 13);
     }
 
     /// A saved tree comes back with the same leaves and split axes, even though

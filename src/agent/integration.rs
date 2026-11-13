@@ -549,6 +549,17 @@ pub fn install(agent: &str) -> io::Result<()> {
     if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
         return update_hook_file(&paths.registration, agent, false);
     }
+    write_assets(&paths, agent)?;
+    register_link(
+        &paths.registration,
+        &paths.assets.join("extension"),
+        &paths.managed,
+    )?;
+    Ok(())
+}
+
+/// Copy this build's extension files into Kumu's managed directory.
+fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
     for (relative, contents) in asset_files(agent) {
         let file = paths.assets.join(relative);
         std::fs::create_dir_all(file.parent().expect("asset directory"))?;
@@ -556,12 +567,52 @@ pub fn install(agent: &str) -> io::Result<()> {
             std::fs::write(file, contents)?;
         }
     }
+    Ok(())
+}
+
+/// Bring Kumu's own extension files up to date at startup, for an agent whose
+/// registration already points at them.
+///
+/// Hook-based agents need nothing here: their handler runs this binary, so a
+/// new app build is used immediately. Native extensions are copied files, and
+/// only the settings toggle rewrites them — without this, an app update would
+/// leave a registered agent running last version's plugin, and an older
+/// OpenCode plugin never reports session ids, silently turning auto resume
+/// into a no-op. This only touches Kumu's managed directory, never a foreign
+/// registration; a link left by an older Kumu layout is re-pointed, exactly as
+/// an explicit install would.
+pub fn refresh_native() {
+    for agent in ["opencode", "pi", "omp"] {
+        let Ok(paths) = paths(agent) else {
+            continue;
+        };
+        if registration_is_ours(&paths)
+            && let Err(error) = refresh_registered(&paths, agent)
+        {
+            // Startup must not die over this; the settings row still reports
+            // NeedsRepair, and this line says why.
+            eprintln!("[agent] 刷新 {agent} 扩展失败：{error}");
+        }
+    }
+}
+
+/// Whether the registration is Kumu's own link (current or from an older
+/// layout). Anything else — a user's file, another tool's symlink, no entry at
+/// all — must be left alone by a background refresh.
+fn registration_is_ours(paths: &Paths) -> bool {
+    std::fs::read_link(&paths.registration).is_ok_and(|current| {
+        current == paths.assets.join("extension") || current.starts_with(&paths.managed)
+    })
+}
+
+/// Rewrite the managed files and point the link at this build's extension.
+fn refresh_registered(paths: &Paths, agent: &str) -> io::Result<()> {
+    write_assets(paths, agent)?;
     register_link(
         &paths.registration,
         &paths.assets.join("extension"),
         &paths.managed,
-    )?;
-    Ok(())
+    )
 }
 
 pub fn uninstall(agent: &str) -> io::Result<()> {
@@ -1058,6 +1109,70 @@ mod tests {
         register_link(&entry, &target, &dir).expect("repair");
         assert_eq!(std::fs::read_link(&entry).expect("repaired link"), target);
         remove_link(&entry, &target, &dir).expect("remove");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    fn native_paths(dir: &Path) -> Paths {
+        let managed = dir.join("managed");
+        Paths {
+            assets: managed.join("opencode"),
+            managed,
+            registration: dir.join("plugins/kumu-notifications"),
+        }
+    }
+
+    /// Startup refresh must bring a registered native extension up to this
+    /// build, repoint an older Kumu link, and leave anything that is not ours
+    /// exactly as it is. Hook-based agents need none of this: their handler
+    /// runs the current binary.
+    #[test]
+    fn startup_refresh_updates_our_extension_and_leaves_foreign_entries_alone() {
+        let dir = fixture_dir();
+        let paths = native_paths(&dir);
+        let extension = paths.assets.join("extension");
+        std::fs::create_dir_all(&extension).expect("managed extension");
+        std::fs::create_dir_all(paths.registration.parent().expect("plugin dir")).expect("dir");
+        std::fs::write(paths.assets.join("notify.js"), "old plugin").expect("stale asset");
+        symlink(&extension, &paths.registration).expect("registered link");
+        assert!(registration_is_ours(&paths));
+
+        refresh_registered(&paths, "opencode").expect("refresh");
+        for (relative, contents) in asset_files("opencode") {
+            assert_eq!(
+                std::fs::read_to_string(paths.assets.join(relative)).expect("asset"),
+                contents,
+                "{relative}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_link(&paths.registration).expect("link"),
+            extension
+        );
+
+        // A link from an older Kumu layout is ours and gets re-pointed.
+        let old = paths.managed.join("old/extension");
+        std::fs::create_dir_all(&old).expect("old target");
+        std::fs::remove_file(&paths.registration).expect("replace link");
+        symlink(&old, &paths.registration).expect("old link");
+        assert!(registration_is_ours(&paths));
+        refresh_registered(&paths, "opencode").expect("repair");
+        assert_eq!(
+            std::fs::read_link(&paths.registration).expect("repaired link"),
+            extension
+        );
+
+        // A file and another tool's link are not ours and stay untouched.
+        std::fs::remove_file(&paths.registration).expect("remove link");
+        std::fs::write(&paths.registration, "another plugin").expect("foreign file");
+        assert!(!registration_is_ours(&paths));
+        assert_eq!(
+            std::fs::read_to_string(&paths.registration).expect("foreign untouched"),
+            "another plugin"
+        );
+        std::fs::remove_file(&paths.registration).expect("remove file");
+        symlink(dir.join("elsewhere/extension"), &paths.registration).expect("foreign link");
+        assert!(!registration_is_ours(&paths));
+
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }

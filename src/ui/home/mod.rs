@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::SettingsWindow;
-use crate::agent::launch::PaneLaunch;
+use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -229,19 +229,27 @@ impl KumuApp {
                 };
                 let pane = PaneId(*pane);
                 // A stale process from before the pane was repurposed must not
-                // overwrite the spec of the agent that runs in it now.
-                match this.launches.get_mut(&pane) {
-                    Some(PaneLaunch::Agent {
-                        agent: current,
-                        session: current_session,
-                    }) if current == agent => {
-                        if current_session.as_deref() == Some(session.as_str()) {
-                            return;
-                        }
-                        *current_session = Some(session.clone());
-                    }
-                    _ => return,
+                // overwrite the spec of the agent that runs in it now. Only a
+                // shell pane may switch agents: that is the user starting a
+                // different one in the same shell.
+                let shell_pane = this
+                    .workspace
+                    .read(cx)
+                    .pane_is_shell(pane.0)
+                    .unwrap_or(false);
+                let Some(launch) = session_launch(
+                    this.launches.get(&pane),
+                    agent,
+                    session,
+                    this.auto_resume,
+                    shell_pane,
+                ) else {
+                    return;
+                };
+                if this.launches.get(&pane) == Some(&launch) {
+                    return;
                 }
+                this.launches.insert(pane, launch);
                 this.persist_workspace(cx);
             }
             _ => {}
@@ -267,12 +275,25 @@ impl KumuApp {
         // Save the window's geometry when it closes. The app-quit path does not
         // hand the callback a window, so it reads the same bounds through the
         // handle; either path can fire first and they write the same value.
-        window.on_window_should_close(cx, |window, _cx| {
+        // Closing the window also ends the panes' processes, so this is the
+        // last moment the process tree can say which adopted agents were real.
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
             crate::window_state::save(window);
+            let _ = weak.update(cx, |app, cx| {
+                app.release_finished_agent_panes(cx);
+                app.persist_workspace(cx);
+            });
             true
         });
         let window_handle = window.window_handle();
-        cx.on_app_quit(move |_, cx| {
+        cx.on_app_quit(move |app, cx| {
+            // The last word on the layout: a quit is also the moment a pane's
+            // launch or a split ratio is most likely to differ from what was
+            // last written, and a failed earlier write gets one more chance
+            // before the process is gone.
+            app.release_finished_agent_panes(cx);
+            app.persist_workspace(cx);
             if let Ok(bounds) = window_handle.update(cx, |_, window, _| window.window_bounds()) {
                 crate::window_state::save_bounds(bounds);
             }
@@ -379,7 +400,7 @@ impl KumuApp {
             .selected
             .and_then(|project| self.focused_by_project.get(&project).copied())
             .unwrap_or(PaneId(1));
-        self.queue_agent_restores(cx);
+        self.queue_pane_restores(cx);
         true
     }
 
@@ -401,14 +422,13 @@ impl KumuApp {
         }
     }
 
-    /// Bring back every other project's agent panes at startup, one spawn at a
-    /// time.
+    /// Start every pane in the other projects' trees at startup, one spawn at
+    /// a time, so switching to a project finds its panes already running.
     ///
     /// The live-terminal cap still applies: when it is reached the queue
     /// stops, and the remaining panes start lazily when their project is
-    /// selected. Shell panes are left out — a shell has no state to bring
-    /// back, and warming one would only evict an agent.
-    fn queue_agent_restores(&mut self, cx: &mut Context<Self>) {
+    /// selected.
+    fn queue_pane_restores(&mut self, cx: &mut Context<Self>) {
         let order: Vec<i64> = self
             .workspace
             .read(cx)
@@ -416,7 +436,12 @@ impl KumuApp {
             .iter()
             .map(|project| project.id)
             .collect();
-        let mut queue: Vec<(u64, i64, PaneLaunch)> = Vec::new();
+        // Agents first: their conversations already exist and a warm pane is
+        // what the user came back for. A shell only needs to avoid a cold
+        // start, so it must not take the last slot from an agent when the live
+        // cap is reached.
+        let mut agents: Vec<(u64, i64, PaneLaunch)> = Vec::new();
+        let mut shells: Vec<(u64, i64, PaneLaunch)> = Vec::new();
         for project in order {
             if Some(project) == self.selected {
                 continue;
@@ -425,14 +450,18 @@ impl KumuApp {
                 continue;
             };
             for pane in layout.panes() {
-                if let Some(launch @ PaneLaunch::Agent { .. }) = self.launches.get(&pane) {
-                    queue.push((pane.0, project, launch.clone()));
+                let launch = self.launches.get(&pane).cloned().unwrap_or_default();
+                if launch.is_shell() {
+                    shells.push((pane.0, project, launch));
+                } else {
+                    agents.push((pane.0, project, launch));
                 }
             }
         }
-        if queue.is_empty() {
+        if agents.is_empty() && shells.is_empty() {
             return;
         }
+        let queue: Vec<(u64, i64, PaneLaunch)> = agents.into_iter().chain(shells).collect();
         cx.spawn(async move |this, cx| {
             for (pane, project, launch) in queue {
                 cx.background_executor()
@@ -460,7 +489,14 @@ impl KumuApp {
         launch: &PaneLaunch,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.launches.get(&PaneId(pane)) != Some(launch) {
+        // Absent from `launches` means a shell, so compare against the
+        // default instead of requiring an entry a shell never has.
+        let current = self
+            .launches
+            .get(&PaneId(pane))
+            .cloned()
+            .unwrap_or_default();
+        if &current != launch {
             return true;
         }
         self.workspace.update(cx, |workspace, cx| {
@@ -494,6 +530,36 @@ impl KumuApp {
             });
         }
         state
+    }
+
+    /// Forget launches borrowed from an agent that is no longer running.
+    ///
+    /// A pane started as an agent reports its own exit and turns back into a
+    /// shell (see [`WorkspaceEvent::AgentExited`]). A shell pane only borrowed
+    /// the launch from the conversation inside it, and nothing reports that
+    /// agent leaving, so the process tree decides at quit. When it cannot
+    /// answer, the launch is kept rather than risk dropping a live
+    /// conversation.
+    fn release_finished_agent_panes(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.workspace.read(cx);
+        let finished: Vec<PaneId> = self
+            .launches
+            .iter()
+            .filter_map(|(pane, launch)| {
+                let PaneLaunch::Agent { agent, .. } = launch else {
+                    return None;
+                };
+                let program = crate::agent::executable(agent)?;
+                let program = std::path::Path::new(&program)
+                    .file_name()?
+                    .to_string_lossy()
+                    .into_owned();
+                (workspace.pane_runs_program(pane.0, &program) == Some(false)).then_some(*pane)
+            })
+            .collect();
+        for pane in finished {
+            self.launches.remove(&pane);
+        }
     }
 
     /// Write each project's pane tree and the focused pane for the next

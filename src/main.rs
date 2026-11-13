@@ -40,6 +40,10 @@ fn main() {
     if let Some(code) = agent::integration::run_cli() {
         std::process::exit(code);
     }
+    // A registered native extension (OpenCode, Pi, OMP) is a copy of this
+    // build's files, so an app update has to refresh it before any agent pane
+    // starts. Hook-based agents run this binary and need nothing here.
+    agent::integration::refresh_native();
     let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
 
     // Closing the last window on macOS leaves the app running. A Dock click

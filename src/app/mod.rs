@@ -4,7 +4,7 @@
 //! The UI hears about changes through [`WorkspaceEvent`] rather than a blanket
 //! notify: a terminal frame only concerns that pane.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -292,8 +292,9 @@ impl Workspace {
     }
 
     /// Start a pane's process without drawing it, parked until its project is
-    /// selected. Used at startup so every project's agent panes are already
-    /// warm at the moment the user looks at them.
+    /// selected. Used at startup so every project's panes are already warm at
+    /// the moment the user looks at them — agent panes first, shells as the
+    /// live-terminal cap allows.
     ///
     /// Returns false when the cap is full or there is nothing to start; the
     /// pane then starts lazily on selection, exactly as before.
@@ -330,6 +331,34 @@ impl Workspace {
         }
         self.touch_terminal(term_id);
         true
+    }
+
+    /// Whether the process in `pane` was started as a shell rather than as an
+    /// agent. `None` when the pane has no live process to inspect.
+    pub fn pane_is_shell(&self, pane: u64) -> Option<bool> {
+        self.live_for_pane(pane).map(|live| live.launch.is_shell())
+    }
+
+    /// Whether `program` (an executable file name) still runs below the shell
+    /// shown in `pane`. `None` when there is nothing to inspect — a pane
+    /// started as an agent reports its own exit, and a pane with no process
+    /// has no evidence either way.
+    pub fn pane_runs_program(&self, pane: u64, program: &str) -> Option<bool> {
+        let live = self.live_for_pane(pane)?;
+        if !live.launch.is_shell() {
+            return None;
+        }
+        descendant_runs(live.term.child_pid()?, program)
+    }
+
+    /// The live terminal a pane shows, or the one parked for it.
+    fn live_for_pane(&self, pane: u64) -> Option<&LiveTerm> {
+        if let Some(term_id) = self.pane_term.get(&pane) {
+            return self.terms.get(term_id);
+        }
+        self.terms
+            .values()
+            .find(|live| live.parked_for == Some(pane))
     }
 
     /// The program and arguments for a pane's launch, falling back to the
@@ -867,6 +896,68 @@ fn terminal_evictions(order: &[u64], alive: usize, cap: usize) -> Vec<u64> {
     order.iter().copied().take(needed).collect()
 }
 
+/// Whether `program` (a file name) runs anywhere below `root` in `ps -axo
+/// pid=,ppid=,command=` output.
+///
+/// A shell pane's launch is borrowed from the agent the user started inside it.
+/// Nothing reports that agent leaving, so at quit this is the evidence that
+/// the conversation is still there to resume. Matching is by executable name
+/// because agents are launched by path, alias, or through a runtime.
+fn tree_runs(ps: &str, root: u32, program: &str) -> bool {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut commands: HashMap<u32, &str> = HashMap::new();
+    for line in ps.lines() {
+        let Some((pid, rest)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let Some((ppid, command)) = rest.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Ok(ppid) = ppid.parse::<u32>() else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+        commands.insert(pid, command.trim());
+    }
+    // Start below the root: the shell itself is never the agent, even if the
+    // program name happens to match its own.
+    let mut stack: Vec<u32> = children.get(&root).cloned().unwrap_or_default();
+    let mut seen = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if commands.get(&pid).is_some_and(|command| {
+            command.split_whitespace().any(|token| {
+                Path::new(token)
+                    .file_name()
+                    .is_some_and(|name| name.to_str() == Some(program))
+            })
+        }) {
+            return true;
+        }
+        stack.extend(children.get(&pid).into_iter().flatten().copied());
+    }
+    false
+}
+
+/// Ask `ps` whether `program` is still a descendant of `root`. `None` when the
+/// question cannot be answered; callers keep the saved choice in that case.
+fn descendant_runs(root: u32, program: &str) -> Option<bool> {
+    // Absolute path: a Finder-launched app has a minimal PATH.
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| tree_runs(&String::from_utf8_lossy(&output.stdout), root, program))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1075,6 +1166,26 @@ mod tests {
             assert_eq!(workspace.pane_term, HashMap::from([(3, 3)]));
             assert_eq!(workspace.term_lru, vec![3]);
         });
+    }
+
+    /// A shell pane's adopted launch survives only while the agent is still a
+    /// child of that shell.
+    #[test]
+    fn the_process_tree_finds_an_agent_below_its_shell() {
+        let ps = "\
+    1     0 /sbin/launchd
+  100     1 /bin/zsh -l
+  101   100 /Users/me/.opencode/bin/opencode --session abc
+  102   101 /usr/bin/git status
+  200     1 /Applications/Other.app/Contents/MacOS/opencode-helper
+";
+        assert!(super::tree_runs(ps, 100, "opencode"));
+        assert!(super::tree_runs(ps, 1, "opencode"));
+        assert!(!super::tree_runs(ps, 100, "claude"));
+        assert!(
+            !super::tree_runs(ps, 100, "zsh"),
+            "the shell itself is not a descendant"
+        );
     }
 
     #[test]
