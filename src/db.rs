@@ -663,6 +663,10 @@ pub const SETTING_SEEDED: &str = "seeded";
 /// Setting key holding the main window's last geometry as JSON.
 pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 
+/// Setting key holding the sidebar's width in px, chosen by dragging the
+/// divider beside it.
+pub const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
+
 /// Settings use a short-lived connection instead of the UI-owned Store: they
 /// are read once at startup (before any window exists) and written rarely
 /// from the settings window. A busy timeout covers collisions with Store
