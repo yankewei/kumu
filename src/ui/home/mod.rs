@@ -13,7 +13,6 @@ use std::path::PathBuf;
 
 use super::SettingsWindow;
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
-use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
@@ -47,8 +46,6 @@ pub struct KumuApp {
     /// A persistence failure the workspace reported, shown above the panes
     /// until dismissed.
     store_error: Option<String>,
-    /// Hover labels for the sidebar (see [`Tooltips`]).
-    tooltips: Entity<Tooltips>,
     /// Terminal views keyed by pane id.
     panes: HashMap<PaneId, Entity<TerminalView>>,
     /// Each project owns an independent pane tree.
@@ -74,7 +71,6 @@ impl KumuApp {
         let startup_error = workspace.update(cx, |workspace, _| workspace.take_startup_error());
         let saved_workspace = workspace.update(cx, |workspace, _| workspace.take_saved_workspace());
         let last_saved_layout = saved_workspace.clone();
-        let tooltips = cx.new(|cx| Tooltips::new(cx));
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
         cx.subscribe_in(&workspace, window, |this, _, ev, window, cx| match ev {
@@ -196,7 +192,6 @@ impl KumuApp {
             selected: None,
             unread_notifications: HashMap::new(),
             store_error: startup_error,
-            tooltips,
             panes: HashMap::new(),
             layouts: HashMap::new(),
             focused_by_project: HashMap::new(),
@@ -300,8 +295,7 @@ impl KumuApp {
     /// Create and subscribe one pane's terminal view.
     fn install_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Entity<TerminalView> {
         let workspace = self.workspace.clone();
-        let tooltips = self.tooltips.clone();
-        let terminal = cx.new(|cx| TerminalView::new(pane, workspace, tooltips, cx));
+        let terminal = cx.new(|cx| TerminalView::new(pane, workspace, cx));
         cx.subscribe(&terminal, move |this, _, ev, cx| {
             this.on_terminal_event(pane, ev, cx);
         })
@@ -698,6 +692,7 @@ impl KumuApp {
                         true
                     }
                 })
+                .centered()
         });
         input.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -779,6 +774,7 @@ impl KumuApp {
                         true
                     }
                 })
+                .centered()
         });
         input.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -825,6 +821,7 @@ impl KumuApp {
                     let _ = weak.update(cx, move |app, cx| app.delete_project(project_id, cx));
                     true
                 })
+                .centered()
         });
     }
 
@@ -936,7 +933,6 @@ impl KumuApp {
     }
 
     fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = self.tooltips.clone();
         let theme = cx.theme();
         let warning = theme.warning;
         let workspace = self.workspace.read(cx);
@@ -1029,7 +1025,6 @@ impl KumuApp {
                     .child(div().w_px().h_full().bg(theme.border))
                     .child(right),
             )
-            .child(overlays)
     }
 }
 

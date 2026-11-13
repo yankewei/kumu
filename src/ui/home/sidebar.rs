@@ -196,7 +196,18 @@ impl KumuApp {
             // closes its terminals, so it confirms first.
             .context_menu({
                 let weak = weak.clone();
-                move |menu, _, _| {
+                let path = project.path.clone();
+                let name = project_name.clone();
+                move |menu, window, cx| {
+                    let new_terminal = PopupMenuItem::new("新建终端").on_click({
+                        let weak = weak.clone();
+                        move |_, window, cx| {
+                            let _ = weak.update(cx, move |app, cx| {
+                                app.add_terminal(Some(project_id), cx);
+                                app.focus_terminal(window, cx);
+                            });
+                        }
+                    });
                     let rename = PopupMenuItem::new("重命名").on_click({
                         let weak = weak.clone();
                         move |_, window, cx| {
@@ -214,10 +225,14 @@ impl KumuApp {
                                 });
                             }
                         });
-                    let menu = menu.item(rename);
-                    if worktree {
-                        menu.item(delete)
-                    } else {
+                    let reveal = PopupMenuItem::new("在 Finder 中显示").on_click({
+                        let path = path.clone();
+                        move |_, _, _| reveal_in_finder(&path)
+                    });
+                    let copy_path = path.clone();
+                    let copy_name = name.clone();
+                    let mut menu = menu.item(new_terminal);
+                    if !worktree {
                         let create = PopupMenuItem::new("新建 worktree").on_click({
                             let weak = weak.clone();
                             move |_, window, cx| {
@@ -226,8 +241,25 @@ impl KumuApp {
                                 });
                             }
                         });
-                        menu.item(create).item(delete)
+                        menu = menu.item(create);
                     }
+                    menu.item(reveal)
+                        .submenu("复制", window, cx, move |menu, _, _| {
+                            let path = copy_path.clone();
+                            let name = copy_name.clone();
+                            menu.item(PopupMenuItem::new("复制路径").on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                            }))
+                            .item(
+                                PopupMenuItem::new("复制名称").on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
+                                }),
+                            )
+                        })
+                        .separator()
+                        .item(rename)
+                        .separator()
+                        .item(delete)
                 }
             })
             .child(
@@ -258,7 +290,7 @@ impl KumuApp {
                     .text_color(fg)
                     // The tree shows the name alone; where the project
                     // actually lives is a hover label above it.
-                    .hover_label(&self.tooltips, project.path.clone())
+                    .hover_label(project.path.clone())
                     .child(project_name),
             )
             .when(
@@ -281,14 +313,11 @@ impl KumuApp {
                             .opacity(0.)
                             .group_hover(group.clone(), |style| style.opacity(1.))
                             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .hover_label(
-                                &self.tooltips,
-                                if worktree {
-                                    "移除 worktree"
-                                } else {
-                                    "移除项目"
-                                },
-                            )
+                            .hover_label(if worktree {
+                                "移除 worktree"
+                            } else {
+                                "移除项目"
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.confirm_delete_project(project_id, window, cx);
                                 cx.stop_propagation();
@@ -306,7 +335,7 @@ impl KumuApp {
                             .opacity(0.)
                             .group_hover(group, |style| style.opacity(1.))
                             .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                            .hover_label(&self.tooltips, "新建终端")
+                            .hover_label("新建终端")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.add_terminal(Some(project_id), cx);
                                 this.focus_terminal(window, cx);
@@ -318,4 +347,10 @@ impl KumuApp {
             )
             .into_any_element()
     }
+}
+
+/// Show `path` in a Finder window. `open` handles files and directories; the
+/// app is macOS-only, so there is no other platform to branch on.
+fn reveal_in_finder(path: &str) {
+    let _ = std::process::Command::new("open").arg(path).spawn();
 }

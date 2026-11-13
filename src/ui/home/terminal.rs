@@ -24,7 +24,7 @@ use crate::term::{
     MouseInput, MouseMods, Rgb, SelectStep, Snapshot,
 };
 use crate::theme::{self, ThemeRevision};
-use crate::ui::tooltip::{HoverLabel as _, Tooltips};
+use crate::ui::tooltip::HoverLabel as _;
 
 /// Chrome / focus messages from a pane up to the home window.
 pub enum TerminalEvent {
@@ -82,8 +82,6 @@ struct GridAt {
 pub struct TerminalView {
     pane: PaneId,
     workspace: Entity<Workspace>,
-    /// Hover labels for the pane chrome buttons.
-    tooltips: Entity<Tooltips>,
     project: Option<i64>,
     snapshot: Snapshot,
     focus: FocusHandle,
@@ -122,12 +120,7 @@ struct FindBar {
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl TerminalView {
-    pub fn new(
-        pane: PaneId,
-        workspace: Entity<Workspace>,
-        tooltips: Entity<Tooltips>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(pane: PaneId, workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&workspace, |this, _, ev, cx| {
             if let WorkspaceEvent::Frame(pane) = ev
                 && *pane == this.pane.0
@@ -140,7 +133,6 @@ impl TerminalView {
         Self {
             pane,
             workspace,
-            tooltips,
             project: None,
             snapshot: Snapshot::blank("", ""),
             focus,
@@ -686,7 +678,6 @@ impl TerminalView {
             }
         };
         let dim = if total == 0 { 0.4 } else { 1. };
-        let tooltips = &self.tooltips;
         let older = find_step_button(
             format!("find-older-{}", self.pane.0),
             IconName::ChevronUp,
@@ -696,7 +687,6 @@ impl TerminalView {
             muted,
             radius,
             hover,
-            tooltips,
             cx,
         );
         let newer = find_step_button(
@@ -708,7 +698,6 @@ impl TerminalView {
             muted,
             radius,
             hover,
-            tooltips,
             cx,
         );
 
@@ -754,7 +743,7 @@ impl TerminalView {
                         .cursor_pointer()
                         .text_color(muted)
                         .hover(move |style| style.bg(hover))
-                        .hover_label(&self.tooltips, "关闭查找")
+                        .hover_label("关闭查找")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.close_find(window, cx);
                         }))
@@ -930,7 +919,6 @@ impl Render for TerminalView {
         let active = self.active;
         let can_close = self.can_close;
         let pane = self.pane;
-        let tooltips = self.tooltips.clone();
         let border = if active {
             theme.border
         } else {
@@ -952,7 +940,7 @@ impl Render for TerminalView {
         let search_active = theme.warning.opacity(0.55);
         let header = terminal_header(
             pane, mark, name, cwd, note, header_bg, can_close, muted, fg, warning, radius, hover,
-            &tooltips, cx,
+            cx,
         );
         let typeface = Typeface {
             family: font_family,
@@ -1183,7 +1171,6 @@ fn terminal_header(
     warning: Hsla,
     radius: Pixels,
     hover: Hsla,
-    tooltips: &Entity<Tooltips>,
     cx: &mut Context<TerminalView>,
 ) -> impl IntoElement {
     let path = short_cwd(&cwd);
@@ -1236,7 +1223,6 @@ fn terminal_header(
             muted,
             radius,
             hover,
-            tooltips,
             cx.listener(|_, _, _, cx| {
                 cx.emit(TerminalEvent::SplitRight);
                 cx.stop_propagation();
@@ -1249,7 +1235,6 @@ fn terminal_header(
             muted,
             radius,
             hover,
-            tooltips,
             cx.listener(|_, _, _, cx| {
                 cx.emit(TerminalEvent::SplitDown);
                 cx.stop_propagation();
@@ -1263,7 +1248,6 @@ fn terminal_header(
                 muted,
                 radius,
                 hover,
-                tooltips,
                 cx.listener(|_, _, _, cx| {
                     cx.emit(TerminalEvent::Close);
                     cx.stop_propagation();
@@ -1280,7 +1264,6 @@ fn chrome_button(
     muted: Hsla,
     radius: Pixels,
     hover: Hsla,
-    tooltips: &Entity<Tooltips>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -1290,7 +1273,7 @@ fn chrome_button(
         .cursor_pointer()
         .text_color(muted)
         .hover(move |style| style.bg(hover))
-        .hover_label(tooltips, label)
+        .hover_label(label)
         .on_click(on_click)
         .child(
             Icon::empty()
@@ -1312,7 +1295,6 @@ fn find_step_button(
     muted: Hsla,
     radius: Pixels,
     hover: Hsla,
-    tooltips: &Entity<Tooltips>,
     cx: &mut Context<TerminalView>,
 ) -> AnyElement {
     div()
@@ -1324,7 +1306,7 @@ fn find_step_button(
         .cursor_pointer()
         .text_color(muted)
         .hover(move |style| style.bg(hover))
-        .hover_label(tooltips, label)
+        .hover_label(label)
         .on_click(cx.listener(move |this, _, window, cx| {
             this.step_find(older, window, cx);
         }))
