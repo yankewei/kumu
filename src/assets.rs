@@ -52,6 +52,8 @@ mod tests {
         assert!(KumuAssetSource.load("codex.svg").unwrap().is_some());
         assert!(KumuAssetSource.load("pi.png").unwrap().is_some());
         assert!(KumuAssetSource.load("claude.png").unwrap().is_some());
+        assert!(KumuAssetSource.load("cursor.svg").unwrap().is_some());
+        assert!(KumuAssetSource.load("grok.svg").unwrap().is_some());
         assert!(KumuAssetSource.load("split-right.svg").unwrap().is_some());
         assert!(KumuAssetSource.load("split-down.svg").unwrap().is_some());
         assert!(

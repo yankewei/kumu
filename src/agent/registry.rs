@@ -53,6 +53,6 @@ pub const AGENTS: [AgentDef; 7] = [
         id: "grok",
         name: "Grok Build",
         desc: "xAI 的终端编码 Agent",
-        logo: None,
+        logo: Some("grok.svg"),
     },
 ];
