@@ -362,6 +362,24 @@ impl Workspace {
         }
     }
 
+    pub fn terminal_search_set(&self, pane: u64, needle: &str) {
+        if let Some(live) = self.shown_term(pane) {
+            live.term.search_set(needle);
+        }
+    }
+
+    pub fn terminal_search_step(&self, pane: u64, older: bool) {
+        if let Some(live) = self.shown_term(pane) {
+            live.term.search_step(older);
+        }
+    }
+
+    pub fn terminal_search_clear(&self, pane: u64) {
+        if let Some(live) = self.shown_term(pane) {
+            live.term.search_clear();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn terminal_scroll(
         &self,
