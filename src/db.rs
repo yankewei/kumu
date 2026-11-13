@@ -655,6 +655,10 @@ pub const SETTING_NOTIFICATIONS: &str = "notifications";
 /// Whether attention notifications play the macOS alert sound (`"0"` mutes).
 pub const SETTING_NOTIFICATION_SOUND: &str = "notification_sound";
 
+/// Whether agent panes resume their previous conversation at startup
+/// (`"0"` starts a new one in each restored pane).
+pub const SETTING_AUTO_RESUME: &str = "auto_resume";
+
 /// Setting key marking that the first-run project was seeded. It stays
 /// after the user deletes them, so an intentionally empty workspace is not
 /// refilled on the next launch.

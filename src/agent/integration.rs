@@ -1,12 +1,14 @@
 //! Persistent agent registration, independent of how the user launches a CLI.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
 use serde_json::{Value, json};
+
+use super::launch::{SESSION_PREFIX, clean_session};
 
 const MARKER: &str = " # kumu-notifications";
 
@@ -696,7 +698,16 @@ pub fn run_cli() -> Option<i32> {
     if std::env::var("KUMU_TERMINAL").as_deref() != Ok("1") {
         return Some(0);
     }
-    let sequence = format!("\x1b]777;notify;{agent};{message}\x07");
+    // Hooks run with the event's JSON on stdin, which is where Claude, Codex
+    // and Cursor put the session id. The session update is another OSC on the
+    // same channel, framed as a notification so the pane can tell it apart.
+    let mut sequence = String::new();
+    if let Some(session) = hook_payload().as_ref().and_then(session_id)
+        && let Some(update) = session_sequence(&agent, &session)
+    {
+        sequence.push_str(&update);
+    }
+    sequence.push_str(&format!("\x1b]777;notify;{agent};{message}\x07"));
     match agent.as_str() {
         // Claude runs command hooks in their own session without a controlling
         // terminal. Its documented channel is `terminalSequence` on stdout.
@@ -718,6 +729,54 @@ pub fn run_cli() -> Option<i32> {
     Some(0)
 }
 
+/// The hook event as JSON, or `None` when stdin is a terminal or stays silent.
+///
+/// Hooks close stdin after writing, but a shell this binary is run from by hand
+/// has no payload at all: the wait is bounded so an interactive run cannot
+/// hang the hook's timeout.
+fn hook_payload() -> Option<Value> {
+    use std::io::IsTerminal;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    if io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut payload = String::new();
+        let _ = io::stdin().read_to_string(&mut payload);
+        let _ = tx.send(payload);
+    });
+    let payload = rx.recv_timeout(Duration::from_millis(300)).ok()?;
+    serde_json::from_str(&payload).ok()
+}
+
+/// The OSC that reports a conversation id, framed as a notification so it
+/// travels the channel every hook already writes to.
+fn session_sequence(agent: &str, session: &str) -> Option<String> {
+    let session = clean_session(session)?;
+    Some(format!(
+        "\x1b]777;notify;{agent};{SESSION_PREFIX}{session}\x07"
+    ))
+}
+
+/// The conversation id in a hook payload. Every shape Kumu registers uses
+/// `session_id`; the other spellings cover CLIs that name it differently.
+fn session_id(payload: &Value) -> Option<String> {
+    const KEYS: [&str; 6] = [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "thread_id",
+        "threadId",
+    ];
+    KEYS.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 fn open_notification_tty() -> Option<std::fs::File> {
     let path = std::env::var_os("KUMU_TTY")
         .map(PathBuf::from)
@@ -729,6 +788,31 @@ fn open_notification_tty() -> Option<std::fs::File> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_conversation_id_travels_as_a_silent_osc() {
+        assert_eq!(
+            session_sequence("codex", "abc-1").as_deref(),
+            Some("\x1b]777;notify;codex;kumu-session:abc-1\x07")
+        );
+        assert!(session_sequence("codex", "a;b").is_none());
+        assert!(session_sequence("codex", "a\x07b").is_none());
+    }
+
+    #[test]
+    fn a_hook_payloads_session_id_is_found_under_its_known_names() {
+        assert_eq!(
+            session_id(&json!({"session_id": "a"})).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            session_id(&json!({"conversation_id": "b"})).as_deref(),
+            Some("b")
+        );
+        assert_eq!(session_id(&json!({"threadId": "c"})).as_deref(), Some("c"));
+        assert_eq!(session_id(&json!({"session_id": 3})), None);
+        assert_eq!(session_id(&json!({})), None);
+    }
 
     fn fixture_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

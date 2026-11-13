@@ -4,6 +4,8 @@ A macOS workspace that runs local coding agents in their own terminal interfaces
 ## Tech stack
 - gpui-kit, the entire UI: GPUI rendering engine (wgpu drawing, text layout), declarative element tree, component library (Button/Input/Switch/TitleBar/Root), theme system (ThemeRegistry + semantic tokens), multi-window management. Hover labels on app elements go through a RootPlugin of the app's own (src/ui/tooltip.rs, one overlay per window) because the one `Root` mounts is crate-private — the tooltip surface and the overlay are both public API, the trait that asks the overlay for a tooltip is not. Dialogs, sheets and notifications are mounted by the Base `Root` from gpui-kit 0.7 on, so windows no longer add those layers themselves
 
+- Agent panes: kumu can start a registry agent in a pane instead of a shell (`src/agent/launch.rs` saves the launch choice with the layout). A pane remembers the agent-side session id and resumes the conversation on restart; an agent that exits leaves a shell behind. `src/agent/integration` reports the id over the same OSC channel as notifications (`kumu-session:` prefix).
+
 ## Constraints
 1. Build the UI with gpui-kit components first
 2. 在写测试的时候只需要写有必要的测试，没有必要覆盖非常边缘的可能性

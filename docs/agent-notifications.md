@@ -52,6 +52,16 @@ Claude Code 和 Codex 都会把 command hook 放到没有控制终端的新 sess
 
 后代进程会继承这些环境变量。不向 hook 的标准输出写入协议内容，也不替用户回答、选择或批准操作。
 
+### 会话 id 也走这条通道
+
+Agent 窗格需要记住“这是哪个对话”，重启后才知道带哪条 `--resume`／`resume`／`--session` 参数。会话 id 因此复用同一个 OSC 通道：
+
+- command hook 从 stdin 的事件 JSON 里读 `session_id`（Claude、Codex；Cursor／Grok 的 `conversation_id`／`thread_id` 也认），在正常通知之前先发一条 `OSC 777;notify;<agent>;kumu-session:<id>`；
+- OpenCode 插件在根会话开始时发同样的序列；
+- Kumu 看到 body 以 `kumu-session:` 开头就把它记到窗格上，**不弹提醒**。
+
+id 只允许字母、数字和 `-_.`，超长或含其他字符时整条丢弃，避免终止或拆分转义序列。读取 stdin 有 300ms 上限，手动运行同一个二进制时不会挂住 hook 的超时。
+
 全局扩展在其他终端中不注册事件处理器；全局 hooks 的命令在非 Kumu 环境中立即返回。脱离原终端、清空环境或把 OpenCode 服务放到另一台机器时不能保证送达。
 
 - 正在查看的终端不弹提醒；其他终端在前台显示应用内提示和侧栏未读标记。

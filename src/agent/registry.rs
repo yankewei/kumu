@@ -56,3 +56,15 @@ pub const AGENTS: [AgentDef; 7] = [
         logo: Some("grok.svg"),
     },
 ];
+
+/// The registry id behind a name an agent reported about itself.
+///
+/// Hooks pass the lowercase id (`--kumu-notify codex`), while the in-process
+/// plugins use the display name ("OpenCode"). Both mean the same agent, so the
+/// pane can tell which spec the session belongs to.
+pub fn id_for(name: &str) -> Option<&'static str> {
+    AGENTS
+        .iter()
+        .find(|agent| agent.id.eq_ignore_ascii_case(name) || agent.name.eq_ignore_ascii_case(name))
+        .map(|agent| agent.id)
+}

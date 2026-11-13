@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::SettingsWindow;
+use crate::agent::launch::PaneLaunch;
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -25,6 +26,11 @@ use panes::{
     PaneDirection, PaneId, PaneNode, SavedProjectLayout, SavedWorkspace, WORKSPACE_STATE_VERSION,
 };
 use terminal::{TerminalEvent, TerminalView};
+
+/// Whether panes come back with the conversation they were running.
+fn auto_resume_enabled() -> bool {
+    crate::db::get_setting(crate::db::SETTING_AUTO_RESUME).as_deref() != Some("0")
+}
 
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
 /// ratios. Only the relative values matter: the group rescales them to the
@@ -67,6 +73,12 @@ pub struct KumuApp {
     pending_focus: Option<PaneId>,
     next_pane: u64,
     next_group: u64,
+    /// What each pane runs. Absent panes are shells, so a workspace restored
+    /// from before agent panes existed needs no entries.
+    launches: HashMap<PaneId, PaneLaunch>,
+    /// Whether panes come back with their old conversations. Read once at
+    /// startup; the settings window's switch applies on the next launch.
+    auto_resume: bool,
     /// The JSON last written for this layout, so repeated focus/select calls do
     /// not rewrite identical state.
     last_saved_layout: Option<String>,
@@ -165,6 +177,73 @@ impl KumuApp {
                     this.close_pane(pane, cx);
                 }
             }
+            WorkspaceEvent::AgentExited {
+                pane,
+                project,
+                resume_failed,
+            } => {
+                // The agent is gone but the pane stays. A resume that failed
+                // immediately gets one fresh conversation; anything else
+                // becomes a shell, and its conversation is not resumed again.
+                let pane = PaneId(*pane);
+                // A prestarted pane has no view yet; its event is still the
+                // truth. Only a view that now shows another project is stale.
+                if let Some(view) = this.panes.get(&pane)
+                    && view.read(cx).project_id() != Some(*project)
+                {
+                    return;
+                }
+                let next = match (resume_failed, this.launches.get(&pane).cloned()) {
+                    (true, Some(PaneLaunch::Agent { agent, .. })) => PaneLaunch::Agent {
+                        agent,
+                        session: None,
+                    },
+                    _ => PaneLaunch::Shell,
+                };
+                if next.is_shell() {
+                    this.launches.remove(&pane);
+                } else {
+                    this.launches.insert(pane, next.clone());
+                }
+                // Only the selected project's panes are on screen. Restarting
+                // a hidden one would spend a process nobody can see; it starts
+                // when the project is selected.
+                if this.selected == Some(*project)
+                    && let Some(terminal) = this.panes.get(&pane).cloned()
+                {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.hide(cx);
+                        terminal.show(*project, &next, cx);
+                    });
+                }
+                this.persist_workspace(cx);
+                cx.notify();
+            }
+            WorkspaceEvent::Session {
+                pane,
+                agent,
+                session,
+            } => {
+                let Some(agent) = crate::agent::id_for(agent) else {
+                    return;
+                };
+                let pane = PaneId(*pane);
+                // A stale process from before the pane was repurposed must not
+                // overwrite the spec of the agent that runs in it now.
+                match this.launches.get_mut(&pane) {
+                    Some(PaneLaunch::Agent {
+                        agent: current,
+                        session: current_session,
+                    }) if current == agent => {
+                        if current_session.as_deref() == Some(session.as_str()) {
+                            return;
+                        }
+                        *current_session = Some(session.clone());
+                    }
+                    _ => return,
+                }
+                this.persist_workspace(cx);
+            }
             _ => {}
         })
         .detach();
@@ -216,6 +295,8 @@ impl KumuApp {
             pending_focus: None,
             next_pane: 1,
             next_group: 1,
+            launches: HashMap::new(),
+            auto_resume: auto_resume_enabled(),
             last_saved_layout,
             sidebar_width,
         };
@@ -269,10 +350,19 @@ impl KumuApp {
             focused_by_project,
             selected,
             group_sizes,
+            launches,
             next_pane,
             next_group,
         } = restored;
         self.layouts = layouts;
+        self.launches = launches;
+        if !self.auto_resume {
+            // The panes still come back as agent panes; only the conversations
+            // stay behind.
+            for launch in self.launches.values_mut() {
+                *launch = launch.clone().fresh();
+            }
+        }
         self.focused_by_project = focused_by_project;
         self.selected = selected;
         self.next_pane = next_pane;
@@ -289,6 +379,7 @@ impl KumuApp {
             .selected
             .and_then(|project| self.focused_by_project.get(&project).copied())
             .unwrap_or(PaneId(1));
+        self.queue_agent_restores(cx);
         true
     }
 
@@ -305,8 +396,76 @@ impl KumuApp {
             } else {
                 self.install_pane(pane, cx)
             };
-            terminal.update(cx, |terminal, cx| terminal.show(project, cx));
+            let launch = self.launches.get(&pane).cloned().unwrap_or_default();
+            terminal.update(cx, |terminal, cx| terminal.show(project, &launch, cx));
         }
+    }
+
+    /// Bring back every other project's agent panes at startup, one spawn at a
+    /// time.
+    ///
+    /// The live-terminal cap still applies: when it is reached the queue
+    /// stops, and the remaining panes start lazily when their project is
+    /// selected. Shell panes are left out — a shell has no state to bring
+    /// back, and warming one would only evict an agent.
+    fn queue_agent_restores(&mut self, cx: &mut Context<Self>) {
+        let order: Vec<i64> = self
+            .workspace
+            .read(cx)
+            .projects()
+            .iter()
+            .map(|project| project.id)
+            .collect();
+        let mut queue: Vec<(u64, i64, PaneLaunch)> = Vec::new();
+        for project in order {
+            if Some(project) == self.selected {
+                continue;
+            }
+            let Some(layout) = self.layouts.get(&project) else {
+                continue;
+            };
+            for pane in layout.panes() {
+                if let Some(launch @ PaneLaunch::Agent { .. }) = self.launches.get(&pane) {
+                    queue.push((pane.0, project, launch.clone()));
+                }
+            }
+        }
+        if queue.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for (pane, project, launch) in queue {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let started = this
+                    .update(cx, |home, cx| {
+                        home.prestart_pane(pane, project, &launch, cx)
+                    })
+                    .unwrap_or(false);
+                if !started {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Start one queued pane unless it changed or disappeared while waiting.
+    /// A skipped pane keeps the queue going; only a full cap stops it.
+    fn prestart_pane(
+        &mut self,
+        pane: u64,
+        project: i64,
+        launch: &PaneLaunch,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.launches.get(&PaneId(pane)) != Some(launch) {
+            return true;
+        }
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.prestart(pane, project, launch, cx)
+        })
     }
 
     /// Create and subscribe one pane's terminal view.
@@ -367,6 +526,11 @@ impl KumuApp {
                     .then_some((*group, ratios))
             })
             .collect();
+        self.launches.retain(|pane, _| {
+            self.layouts
+                .values()
+                .any(|layout| layout.panes().contains(pane))
+        });
         let mut projects: Vec<SavedProjectLayout> = self
             .layouts
             .iter()
@@ -390,6 +554,12 @@ impl KumuApp {
             layout: panes::SavedNode::ProjectLayouts {
                 selected: self.selected,
                 projects,
+                launches: self
+                    .launches
+                    .iter()
+                    .filter(|(_, launch)| !launch.is_shell())
+                    .map(|(pane, launch)| (pane.0, launch.clone()))
+                    .collect(),
             },
             focused: self.focused.0,
         };
@@ -411,6 +581,15 @@ impl KumuApp {
             TerminalEvent::Activated => self.focus_pane(pane, cx),
             TerminalEvent::SplitRight => self.split_pane(pane, Axis::Horizontal, cx),
             TerminalEvent::SplitDown => self.split_pane(pane, Axis::Vertical, cx),
+            TerminalEvent::AgentPane(agent) => self.split_pane_with(
+                pane,
+                Axis::Horizontal,
+                PaneLaunch::Agent {
+                    agent: agent.clone(),
+                    session: None,
+                },
+                cx,
+            ),
             TerminalEvent::Focus(direction) => self.focus_neighbor(pane, *direction, cx),
             TerminalEvent::Close => self.close_pane(pane, cx),
         }
@@ -514,6 +693,17 @@ impl KumuApp {
     /// Split `pane` along `axis`, open another shell in the same project, and
     /// focus the new pane.
     fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
+        self.split_pane_with(pane, axis, PaneLaunch::Shell, cx);
+    }
+
+    /// Split `pane` and run `launch` in the new pane.
+    fn split_pane_with(
+        &mut self,
+        pane: PaneId,
+        axis: Axis,
+        launch: PaneLaunch,
+        cx: &mut Context<Self>,
+    ) {
         if !self.panes.contains_key(&pane) {
             return;
         }
@@ -541,8 +731,13 @@ impl KumuApp {
             self.group_states.insert(group_id, state);
         }
 
+        if launch.is_shell() {
+            self.launches.remove(&new_id);
+        } else {
+            self.launches.insert(new_id, launch.clone());
+        }
         let terminal = self.install_pane(new_id, cx);
-        terminal.update(cx, |terminal, cx| terminal.show(project_id, cx));
+        terminal.update(cx, |terminal, cx| terminal.show(project_id, &launch, cx));
         self.focused = new_id;
         self.selected = Some(project_id);
         self.focused_by_project.insert(project_id, new_id);
@@ -586,6 +781,7 @@ impl KumuApp {
         self.workspace
             .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
         self.panes.remove(&pane);
+        self.launches.remove(&pane);
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
         cx.notify();

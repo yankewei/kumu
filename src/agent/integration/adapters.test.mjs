@@ -14,6 +14,8 @@ fs.writeSync = (_fd, message) => messages.push(message);
 fs.closeSync = () => {};
 syncBuiltinESMExports();
 process.env.KUMU_TERMINAL = "1";
+// Session updates travel on the same channel but are not shown to the user.
+const visible = () => messages.filter((message) => !message.includes(";kumu-session:"));
 process.env.KUMU_TTY = "/dev/fake-kumu-tty";
 after(() => {
   Object.assign(fs, originals);
@@ -124,10 +126,17 @@ test("OpenCode 2 scopes events to root sessions and cleans up subscriptions", ()
   handlers["session.execution.succeeded"]({ data: { sessionID: "root" } });
   handlers["session.execution.started"]({ data: { sessionID: "sub" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "sub" } });
-  assert.equal(messages.length, 3);
-  assert.match(messages[0], /确认操作权限/);
-  assert.match(messages[1], /输入、确认或选择/);
-  assert.match(messages[2], /任务已完成/);
+  assert.equal(visible().length, 3);
+  assert.match(visible()[0], /确认操作权限/);
+  assert.match(visible()[1], /输入、确认或选择/);
+  assert.match(visible()[2], /任务已完成/);
+  const sessionMessages = messages.filter((message) => message.includes("kumu-session:"));
+  assert.equal(sessionMessages.length, 1);
+  assert.match(sessionMessages[0], /kumu-session:root\x07$/);
+  assert.ok(
+    sessionMessages.every((message) => !message.includes("kumu-session:sub")),
+    "a sub-session is never reported as the pane's conversation",
+  );
   cleanup();
   assert.equal(disposed, 6);
 });
@@ -151,8 +160,13 @@ test("OpenCode 2 ignores sessions in another TUI's project", () => {
   handlers["session.execution.succeeded"]({ data: { sessionID: "elsewhere" } });
   handlers["permission.asked"]({ data: { sessionID: "elsewhere" } });
   handlers["form.created"]({ data: { form: { sessionID: "elsewhere" } } });
-  assert.equal(messages.length, 1, "only this TUI's project notifies");
-  assert.match(messages[0], /任务已完成/);
+  assert.equal(visible().length, 1, "only this TUI's project notifies");
+  assert.match(visible()[0], /任务已完成/);
+  assert.equal(
+    messages.filter((message) => message.includes("kumu-session:")).length,
+    1,
+    "only this TUI's project reports a conversation",
+  );
   cleanup();
 });
 
@@ -171,7 +185,7 @@ test("OpenCode 2 matches the directory when project IDs are unavailable", () => 
   assert.equal(messages.length, 0);
   handlers["session.execution.started"]({ data: { sessionID: "here" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "here" } });
-  assert.equal(messages.length, 1);
+  assert.equal(visible().length, 1);
   cleanup();
 });
 
@@ -191,13 +205,13 @@ test("OpenCode 2 reads the TUI directory when the event fires", () => {
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/elsewhere" } });
   handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
-  assert.equal(messages.length, 1, "startup directory applies before location info loads");
+  assert.equal(visible().length, 1, "startup directory applies before location info loads");
   location.directory = "/work/next";
   handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
   handlers["session.execution.started"]({ data: { sessionID: "/work/next" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/next" } });
-  assert.equal(messages.length, 2, "a later directory change is not ignored");
+  assert.equal(visible().length, 2, "a later directory change is not ignored");
   cleanup();
 });
 
@@ -216,9 +230,14 @@ test("OpenCode 1 distinguishes completion, questions, permissions and failures",
   await emit("session.status", { status: { type: "busy" } });
   await emit("session.error");
   await emit("session.idle");
-  assert.equal(messages.length, 4);
-  assert.match(messages[0], /已完成/);
-  assert.match(messages[3], /失败/);
+  assert.equal(visible().length, 4);
+  assert.match(visible()[0], /已完成/);
+  assert.match(visible()[3], /失败/);
+  assert.equal(
+    messages.filter((message) => message.includes("kumu-session:root")).length,
+    4,
+    "root completions, prompts and failures all report the conversation",
+  );
 });
 
 test("globally installed integrations leave other terminals untouched", async () => {
@@ -229,5 +248,7 @@ test("globally installed integrations leave other terminals untouched", async ()
     assert.deepEqual(await KumuNotifications({}), {});
   } finally {
     process.env.KUMU_TERMINAL = "1";
+// Session updates travel on the same channel but are not shown to the user.
+const visible = () => messages.filter((message) => !message.includes(";kumu-session:"));
   }
 });
