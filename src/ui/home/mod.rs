@@ -124,7 +124,11 @@ impl KumuApp {
                 let note = Notification::info(message)
                     .title(title)
                     .id1::<NotificationSettings>(terminal.to_string())
-                    .delivery(NotificationDelivery::InApp)
+                    .delivery(if window.is_window_active() {
+                        NotificationDelivery::InApp
+                    } else {
+                        NotificationDelivery::System
+                    })
                     .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             let target = this
@@ -143,16 +147,11 @@ impl KumuApp {
                             }
                         });
                     });
-                // Keep a toast available when OS delivery is denied or when
-                // developing with an unbundled `cargo run` binary.
-                window.push_notification(
-                    if window.is_window_active() {
-                        note
-                    } else {
-                        note.in_app_and_system()
-                    },
-                    cx,
-                );
+                // A background window posts only to Notification Center: one
+                // event should not surface as both a banner and a toast. The
+                // sidebar's unread marker is the in-app fallback when macOS
+                // declines delivery or kumu runs unbundled.
+                window.push_notification(note, cx);
                 cx.notify();
             }
             WorkspaceEvent::PaneExited { pane, project } => {
