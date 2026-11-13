@@ -63,9 +63,10 @@ impl KumuApp {
         }
 
         v_flex()
-            .w_64()
+            // The resizable panel beside the workspace owns the width; the
+            // column just fills it.
+            .w_full()
             .h_full()
-            .flex_shrink_0()
             .bg(sidebar)
             .text_color(sidebar_fg)
             .child(

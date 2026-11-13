@@ -31,6 +31,13 @@ use terminal::{TerminalEvent, TerminalView};
 /// container's real size on its first paint.
 const RATIO_SCALE: f32 = 10_000.;
 
+/// The sidebar's opening width and the range the divider beside it lets the
+/// user drag it through. The maximum still leaves room for the panes on the
+/// app's minimum window width.
+const SIDEBAR_WIDTH: f32 = 256.;
+const SIDEBAR_MIN_WIDTH: f32 = 180.;
+const SIDEBAR_MAX_WIDTH: f32 = 520.;
+
 pub struct KumuApp {
     /// Projects and their live shells; the home view draws it and hands it
     /// every user action.
@@ -63,6 +70,8 @@ pub struct KumuApp {
     /// The JSON last written for this layout, so repeated focus/select calls do
     /// not rewrite identical state.
     last_saved_layout: Option<String>,
+    /// Sidebar width in px, restored from the last drag of the divider.
+    sidebar_width: f32,
 }
 
 impl KumuApp {
@@ -169,6 +178,14 @@ impl KumuApp {
         let updater = crate::updates::init(cx);
         cx.observe(&updater, |_, _, cx| cx.notify()).detach();
 
+        // A width saved by an older launch, falling back to the default when
+        // the setting is missing, unreadable, or outside the draggable range.
+        let sidebar_width = crate::db::get_setting(crate::db::SETTING_SIDEBAR_WIDTH)
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|width| width.is_finite())
+            .map(|width| width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
+            .unwrap_or(SIDEBAR_WIDTH);
+
         // Save the window's geometry when it closes. The app-quit path does not
         // hand the callback a window, so it reads the same bounds through the
         // handle; either path can fire first and they write the same value.
@@ -201,6 +218,7 @@ impl KumuApp {
             next_pane: 1,
             next_group: 1,
             last_saved_layout,
+            sidebar_width,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
@@ -1018,12 +1036,39 @@ impl KumuApp {
                     )
             }))
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    .child(div().w_px().h_full().bg(theme.border))
-                    .child(right),
+                // The sidebar and panes share one resizable group, so the
+                // divider between them is a real drag handle rather than a
+                // painted line. The sidebar keeps its width when the window
+                // resizes; only dragging its handle changes it.
+                div().flex_1().min_h_0().min_w_0().child(
+                    h_resizable("home-split")
+                        .child(
+                            resizable_panel()
+                                .size(px(self.sidebar_width))
+                                .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
+                                .fixed()
+                                .child(self.render_sidebar(cx)),
+                        )
+                        .child(resizable_panel().child(right))
+                        // Persist the width once the drag ends, the same way
+                        // the pane splits save their ratios.
+                        .on_resize({
+                            let weak = cx.entity().downgrade();
+                            move |state, _, cx| {
+                                let Some(width) = state.read(cx).sizes().first().copied() else {
+                                    return;
+                                };
+                                let width =
+                                    f32::from(width).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                                crate::db::set_setting(
+                                    crate::db::SETTING_SIDEBAR_WIDTH,
+                                    &format!("{width}"),
+                                )
+                                .ok();
+                                let _ = weak.update(cx, |app, _| app.sidebar_width = width);
+                            }
+                        }),
+                ),
             )
     }
 }
