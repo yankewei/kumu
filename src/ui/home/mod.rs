@@ -13,7 +13,6 @@ use std::path::PathBuf;
 
 use super::SettingsWindow;
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
-use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -39,7 +38,7 @@ pub struct KumuApp {
     workspace: Entity<Workspace>,
     /// Owned by the home window so closing Settings does not interrupt an update.
     updater: Entity<Updater>,
-    settings_window: Option<WindowHandle<Root>>,
+    settings_window: Option<AnyWindowHandle>,
     /// Project currently shown in the content area.
     selected: Option<i64>,
     /// Terminals that requested attention while unattended, mapped to their
@@ -868,8 +867,11 @@ impl KumuApp {
     /// Focus the settings window if it's open, else open a new one (resizable,
     /// opens at its minimum size).
     fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
-        let activate = |root: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
-            if show_updates && let Ok(settings) = root.view().clone().downcast::<SettingsWindow>() {
+        let activate = |view: AnyView, window: &mut Window, cx: &mut App| {
+            if show_updates
+                && let Ok(root) = view.downcast::<Root>()
+                && let Ok(settings) = root.read(cx).view().clone().downcast::<SettingsWindow>()
+            {
                 settings.update(cx, |settings, cx| settings.show_updates(window, cx));
             }
             window.activate_window();
@@ -883,9 +885,8 @@ impl KumuApp {
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
-        if let Ok(handle) = cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| SettingsWindow::new(updater, window, cx));
-            cx.new(|cx| Root::new(view, window, cx))
+        if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| SettingsWindow::new(updater, window, cx))
         }) {
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
@@ -934,8 +935,8 @@ impl KumuApp {
         }
     }
 
-    fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(&self.tooltips, window, cx);
+    fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let overlays = self.tooltips.clone();
         let theme = cx.theme();
         let warning = theme.warning;
         let workspace = self.workspace.read(cx);

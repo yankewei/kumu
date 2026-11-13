@@ -613,7 +613,7 @@ impl TerminalView {
         })
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         if self.project.is_none() {
             return;
         }
@@ -1023,7 +1023,7 @@ impl Render for TerminalView {
                                     this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
                                 }),
                             )
-                            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
                                 this.on_scroll(ev, cx);
                             }))
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {

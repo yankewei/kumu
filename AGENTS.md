@@ -2,7 +2,7 @@
 A macOS workspace that runs local coding agents in their own terminal interfaces, one project list and a splitable grid of PTYs per project.
 
 ## Tech stack
-- gpui-kit, the entire UI: GPUI rendering engine (wgpu drawing, text layout), declarative element tree, component library (Button/Input/Switch/TitleBar/Root), theme system (ThemeRegistry + semantic tokens), multi-window management. Hover labels on app elements go through an overlay of the app's own (src/ui/tooltip.rs, mounted by src/ui/layers.rs::`window_layers`) because the one `Root` mounts is crate-private — the tooltip surface and the overlay are both public API, the trait that asks the overlay for a tooltip is not
+- gpui-kit, the entire UI: GPUI rendering engine (wgpu drawing, text layout), declarative element tree, component library (Button/Input/Switch/TitleBar/Root), theme system (ThemeRegistry + semantic tokens), multi-window management. Hover labels on app elements go through an overlay of the app's own (src/ui/tooltip.rs, rendered by each window) because the one `Root` mounts is crate-private — the tooltip surface and the overlay are both public API, the trait that asks the overlay for a tooltip is not. Dialogs, sheets and notifications are mounted by the Base `Root` from gpui-kit 0.7 on, so windows no longer add those layers themselves
 
 ## Constraints
 1. Build the UI with gpui-kit components first

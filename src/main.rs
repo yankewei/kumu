@@ -75,9 +75,8 @@ fn open_main_window(cx: &mut App) {
         px(window_state::MIN_HEIGHT),
     ));
 
-    match cx.open_window(window_options, |window, cx| {
-        let view = cx.new(|cx| KumuApp::new(window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+    match gpui_kit::open_window(window_options, cx, |window, cx| {
+        cx.new(|cx| KumuApp::new(window, cx))
     }) {
         Ok(_) => eprintln!("[ui] window opened"),
         Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),

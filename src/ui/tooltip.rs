@@ -4,9 +4,8 @@
 //! `Switch`, the sidebar menu), but those ask the overlay `Root` mounts, and
 //! that overlay is crate-private: the tooltip surface is public while the trait
 //! that requests it (`ManagedTooltipExt`) is not, so an app element cannot
-//! borrow that wiring. The app therefore mounts an overlay of its own — through
-//! [`crate::ui::layers::window_layers`], like every other overlay — and asks it
-//! the way the library's own helper does.
+//! borrow that wiring. The app therefore mounts an overlay of its own, rendered
+//! by each window, and asks it the way the library's own helper does.
 //!
 //! Everything a tooltip decides for itself stays with the library: the surface,
 //! the placement (above the trigger, flipped below it when there is no room
@@ -66,7 +65,7 @@ impl Tooltips {
                     // The overlay would prefer this side on its own; asking for
                     // it keeps "above the trigger" a property of the label
                     // rather than of a default.
-                    .placement(Placement::Top),
+                    .with_placement(Placement::Top),
                     window,
                     cx,
                 );

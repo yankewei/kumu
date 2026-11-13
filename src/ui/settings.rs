@@ -8,7 +8,6 @@ use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
 use crate::theme;
-use crate::ui::layers;
 use crate::ui::tooltip::Tooltips;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -252,8 +251,8 @@ impl SettingsWindow {
         theme::set_font_size(cx, *size as f32);
     }
 
-    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let overlays = layers::window_layers(&self.tooltips, window, cx);
+    fn render_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let overlays = self.tooltips.clone();
         let theme = cx.theme();
         let font_family = theme.font_family.clone();
         let (foreground, muted_fg) = (theme.foreground, theme.muted_foreground);
