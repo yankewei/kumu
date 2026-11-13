@@ -89,6 +89,42 @@ fn resume_args(agent: &str, session: Option<&str>) -> Vec<String> {
     }
 }
 
+/// The launch a pane should remember after `agent` reports it is running
+/// `session` there.
+///
+/// A pane already running this agent takes the newer id. A shell pane is
+/// adopted when `adopt_shell` *and* this CLI can resume the id: the picker is
+/// not the only way to start an agent, and a session reported from a pane's
+/// own PTY is the same evidence as one picked there. Adopting an agent with no
+/// resume syntax would only replace the user's shell with a fresh agent.
+///
+/// `shell_pane` says the live process in the pane is a shell. An agent pane
+/// ignores a different agent's report — that is a stale process. A shell pane
+/// accepts it, because the report proves the pane now hosts that conversation
+/// (the user switched agents).
+pub fn session_launch(
+    current: Option<&PaneLaunch>,
+    agent: &str,
+    session: &str,
+    adopt_shell: bool,
+    shell_pane: bool,
+) -> Option<PaneLaunch> {
+    match current {
+        Some(PaneLaunch::Agent { agent: running, .. }) if running == agent => {}
+        Some(PaneLaunch::Agent { .. }) if shell_pane => {}
+        Some(PaneLaunch::Agent { .. }) => return None,
+        Some(PaneLaunch::Shell) | None => {
+            if !adopt_shell || resume_args(agent, Some(session)).is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(PaneLaunch::Agent {
+        agent: agent.to_string(),
+        session: Some(session.to_string()),
+    })
+}
+
 /// Session ids are agent-generated, but they end up inside a terminal escape
 /// sequence, so only characters that cannot terminate or split it are kept.
 pub fn clean_session(id: &str) -> Option<&str> {
@@ -147,6 +183,65 @@ mod tests {
     #[test]
     fn shell_never_has_an_agent_command() {
         assert!(PaneLaunch::Shell.agent_command().is_none());
+    }
+
+    #[test]
+    fn a_reported_session_updates_a_pane_and_adopts_resumable_shells() {
+        let picked = agent("codex", Some("old"));
+        assert_eq!(
+            session_launch(Some(&picked), "codex", "new", true, false),
+            Some(agent("codex", Some("new")))
+        );
+        // An agent started by hand in a shell pane becomes resumable.
+        assert_eq!(
+            session_launch(None, "opencode", "ses-1", true, true),
+            Some(agent("opencode", Some("ses-1")))
+        );
+        assert_eq!(
+            session_launch(Some(&PaneLaunch::Shell), "opencode", "ses-1", true, true),
+            Some(agent("opencode", Some("ses-1")))
+        );
+        assert_eq!(
+            session_launch(None, "opencode", "ses-1", false, true),
+            None,
+            "auto resume off leaves the shell alone"
+        );
+        assert_eq!(
+            session_launch(None, "grok", "ses-1", true, true),
+            None,
+            "an agent with no resume syntax keeps its shell"
+        );
+        assert_eq!(
+            session_launch(
+                Some(&agent("grok", Some("old"))),
+                "grok",
+                "new",
+                true,
+                false
+            ),
+            Some(agent("grok", Some("new"))),
+            "a picked pane still records an id its CLI cannot resume"
+        );
+    }
+
+    #[test]
+    fn only_a_shell_pane_may_switch_agents() {
+        let picked = agent("opencode", Some("old"));
+        assert_eq!(
+            session_launch(Some(&picked), "claude", "new", true, false),
+            None,
+            "a stale process must not repurpose an agent pane"
+        );
+        assert_eq!(
+            session_launch(Some(&picked), "claude", "new", true, true),
+            Some(agent("claude", Some("new"))),
+            "the same shell now runs another agent"
+        );
+        assert_eq!(
+            session_launch(Some(&picked), "claude", "new", false, true),
+            Some(agent("claude", Some("new"))),
+            "switching agents does not need the resume setting"
+        );
     }
 
     #[test]

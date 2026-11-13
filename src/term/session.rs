@@ -21,6 +21,10 @@ struct Live {
     notifications: Mutex<VecDeque<TermNotification>>,
     generation: AtomicU64,
     queued: AtomicBool,
+    /// The PTY child (the shell), or 0 before it is spawned. Lets the app
+    /// inspect what the user started inside it, e.g. an agent that should not
+    /// outlive the choice to resume it.
+    pid: AtomicU64,
     wake: futures::channel::mpsc::UnboundedSender<()>,
 }
 
@@ -123,6 +127,7 @@ impl Term {
             notifications: Mutex::new(VecDeque::new()),
             generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
+            pid: AtomicU64::new(0),
             wake,
         });
         let thread_tx = tx.clone();
@@ -158,6 +163,12 @@ impl Term {
 
     pub fn generation(&self) -> u64 {
         self.live.generation.load(Ordering::Acquire)
+    }
+
+    /// The pid of the PTY child, once it has spawned.
+    pub fn child_pid(&self) -> Option<u32> {
+        let pid = self.live.pid.load(Ordering::Acquire);
+        (pid != 0).then_some(pid as u32)
     }
 
     /// The UI has started handling a wake. A publish that arrives after this
@@ -321,6 +332,9 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
             return;
         }
     };
+    if let Some(pid) = pty.child.process_id() {
+        live.pid.store(pid as u64, Ordering::Release);
+    }
     let mut session = Running {
         pty,
         vt: Vt::with_colors(80, 24, colors),
