@@ -250,6 +250,9 @@ impl KumuApp {
                     .id(format!("project-name-{project_id}"))
                     .flex_1()
                     .min_w_0()
+                    // A long name ends in an ellipsis instead of wrapping onto a
+                    // second line and growing the row.
+                    .truncate()
                     .text_xs()
                     .font_medium()
                     .text_color(fg)
