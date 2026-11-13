@@ -83,6 +83,10 @@ pub struct TerminalView {
     pane: PaneId,
     workspace: Entity<Workspace>,
     project: Option<i64>,
+    /// Whether the workspace currently shows this pane's terminal here. A
+    /// project row click re-shows every pane, and an already shown one must
+    /// keep its find bar and painted frame.
+    shown: bool,
     snapshot: Snapshot,
     focus: FocusHandle,
     /// Whether the home window treats this pane as the focused one.
@@ -115,6 +119,8 @@ pub struct TerminalView {
 struct FindBar {
     input: Entity<InputState>,
     sent: String,
+    /// Dropped with the bar, so a closed bar leaves no listener behind.
+    _subscription: Subscription,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -134,6 +140,7 @@ impl TerminalView {
             pane,
             workspace,
             project: None,
+            shown: false,
             snapshot: Snapshot::blank("", ""),
             focus,
             active: true,
@@ -195,6 +202,12 @@ impl TerminalView {
 
     /// Show `project_id`, starting its shell if it is not already running.
     pub fn show(&mut self, project_id: i64, cx: &mut Context<Self>) {
+        // Selecting the project that is already shown is a no-op: the terminal
+        // and its find bar stay exactly where they are. A failed spawn is the
+        // exception — selecting the project again retries it, as it did before.
+        if self.shown && self.project == Some(project_id) && self.snapshot.spawn_error.is_none() {
+            return;
+        }
         let pane = self.pane.0;
         let snapshot = self.workspace.update(cx, |workspace, cx| {
             workspace.show_terminal(pane, project_id, cx)
@@ -204,6 +217,7 @@ impl TerminalView {
 
     /// Keep this pane's process while its project is hidden.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.shown = false;
         self.find = None;
         let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
@@ -216,12 +230,17 @@ impl TerminalView {
     /// Notification navigation reattaches the process that sent the request.
     pub fn attach(&mut self, project_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.reset_gesture();
-        // A find bar belongs to the terminal it was opened on; the process now
-        // in this pane starts without one.
-        self.find = None;
-        let pane = self.pane.0;
-        self.workspace
-            .update(cx, |workspace, _| workspace.terminal_search_clear(pane));
+        // A find bar belongs to the terminal it was opened on. Reattaching
+        // the pane's own terminal (clicking the selected project, a
+        // notification from the same pane) keeps it; a different terminal
+        // starts without one.
+        if self.project != Some(project_id) {
+            self.find = None;
+            let pane = self.pane.0;
+            self.workspace
+                .update(cx, |workspace, _| workspace.terminal_search_clear(pane));
+        }
+        self.shown = true;
         self.project = Some(project_id);
         self.sent.set((0, 0, 0, 0));
         self.marked = None;
@@ -259,6 +278,17 @@ impl TerminalView {
                 break;
             }
         }
+        // Frames cross from the session thread asynchronously: a snapshot can
+        // still carry the previous needle's matches after the input moved on.
+        if let Some(sent) = self.find.as_ref().map(|bar| bar.sent.clone())
+            && self
+                .snapshot
+                .search
+                .as_ref()
+                .is_some_and(|search| search.needle != sent)
+        {
+            self.snapshot.search = None;
+        }
         cx.notify();
     }
 
@@ -279,6 +309,13 @@ impl TerminalView {
         }
         let mods = &event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
+        // Esc closes the find bar wherever focus is; once the user clicks the
+        // grid the bar's own key handler no longer sees the event.
+        if self.find.is_some() && key == "escape" && !mods.platform && !mods.control && !mods.alt {
+            self.close_find(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if mods.platform {
             // ⌘⌥arrows move focus between panes; ⌘D / ⌘⇧D split the focused
             // pane, matching the split buttons in the pane chrome.
@@ -386,14 +423,14 @@ impl TerminalView {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("在当前终端中查找"));
-        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+        let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
             this.on_find_event(&input, event, cx);
-        })
-        .detach();
+        });
         input.update(cx, |input, cx| input.focus(window, cx));
         self.find = Some(FindBar {
             input,
             sent: String::new(),
+            _subscription: subscription,
         });
         cx.notify();
     }
@@ -414,6 +451,10 @@ impl TerminalView {
                     return;
                 }
                 bar.sent = value.clone();
+                // A result frame from the previous needle must not paint or
+                // report itself as this query's answer while the session
+                // thread still works on the new one.
+                self.snapshot.search = None;
                 let pane = self.pane.0;
                 self.workspace.update(cx, |workspace, _| {
                     workspace.terminal_search_set(pane, &value);
@@ -666,9 +707,15 @@ impl TerminalView {
         );
         let (border, background) = (theme.border, theme.secondary);
         let search = self.snapshot.search.as_ref();
-        let total = search.map_or(0, |search| search.total);
+        // The session thread answers a query a frame or more later; until its
+        // result for this needle arrives, say nothing rather than "no
+        // results" or the previous query's count.
+        let current = search.is_some_and(|search| search.needle == bar.sent);
+        let total = search.filter(|_| current).map_or(0, |search| search.total);
         let count = if bar.sent.is_empty() {
             String::new()
+        } else if !current {
+            "…".to_string()
         } else if total == 0 {
             "无结果".to_string()
         } else {
@@ -677,7 +724,7 @@ impl TerminalView {
                 None => format!("0/{total}"),
             }
         };
-        let dim = if total == 0 { 0.4 } else { 1. };
+        let dim = if !current || total == 0 { 0.4 } else { 1. };
         let older = find_step_button(
             format!("find-older-{}", self.pane.0),
             IconName::ChevronUp,
@@ -708,6 +755,9 @@ impl TerminalView {
                 .top_2()
                 .right_3()
                 .w(px(340.))
+                // Narrow split panes must keep the input reachable instead of
+                // clipping the bar's left edge.
+                .max_w(relative(0.9))
                 .items_center()
                 .gap_1()
                 .px_2()

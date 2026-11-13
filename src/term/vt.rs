@@ -175,6 +175,10 @@ pub struct SearchHit {
 /// one is selected, and the visible runs to highlight.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchView {
+    /// The query these results answer. The find bar compares it with what it
+    /// sent, because a frame can cross from the session thread before the
+    /// results for the newest keystroke exist.
+    pub needle: String,
     /// Matches on the active screen, scrollback included.
     pub total: usize,
     /// 0-based index of the selected match, newest first.
@@ -1078,7 +1082,9 @@ impl Vt {
             self.search_clear();
             return;
         }
-        let search = self.ensure_search();
+        let Some(search) = self.ensure_search() else {
+            return;
+        };
         let value = GhosttyString {
             ptr: needle.as_ptr(),
             len: needle.len(),
@@ -1146,9 +1152,9 @@ impl Vt {
         }
     }
 
-    fn ensure_search(&mut self) -> GhosttySearch {
+    fn ensure_search(&mut self) -> Option<GhosttySearch> {
         if let Some(search) = self.search {
-            return search;
+            return Some(search);
         }
         let mut search = std::ptr::null_mut();
         unsafe {
@@ -1157,8 +1163,13 @@ impl Vt {
                 "search_new",
             )
         };
+        // A successful call always yields a handle. Refuse to cache a null one
+        // so a later query can try again instead of silently searching nothing.
+        if search.is_null() {
+            return None;
+        }
         self.search = Some(search);
-        search
+        Some(search)
     }
 
     /// Read the current search state and translate visible matches into
@@ -1206,6 +1217,7 @@ impl Vt {
             );
             if needed.len == 0 {
                 return Some(SearchView {
+                    needle: self.needle.clone(),
                     total,
                     selected,
                     hits: Vec::new(),
@@ -1213,6 +1225,7 @@ impl Vt {
             }
             if status != GHOSTTY_SUCCESS && status != GHOSTTY_OUT_OF_SPACE {
                 return Some(SearchView {
+                    needle: self.needle.clone(),
                     total,
                     selected,
                     hits: Vec::new(),
@@ -1231,6 +1244,7 @@ impl Vt {
             ) != GHOSTTY_SUCCESS
             {
                 return Some(SearchView {
+                    needle: self.needle.clone(),
                     total,
                     selected,
                     hits: Vec::new(),
@@ -1316,6 +1330,7 @@ impl Vt {
                 }
             }
             Some(SearchView {
+                needle: self.needle.clone(),
                 total,
                 selected,
                 hits,
@@ -2026,8 +2041,10 @@ mod tests {
             total > 0,
             "the scrollback holds matches, search found {total}"
         );
+        // This guards against a pathological search, not a latency budget: a
+        // loaded CI machine must not turn it into a flaky benchmark.
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < std::time::Duration::from_secs(2),
             "a keystroke waited {elapsed:?} for the search"
         );
     }
