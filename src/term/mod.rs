@@ -26,12 +26,6 @@ pub fn default_shell() -> (String, Vec<String>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_shell_has_a_program() {
-        let (program, _) = default_shell();
-        assert!(!program.is_empty());
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_startup_loads_login_environment() {

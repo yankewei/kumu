@@ -135,10 +135,6 @@ pub struct Cursor {
 /// One published screen. Rows that libghostty kept clean reuse the same [`Arc`].
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    /// Grid width in cells; kept for resize/IME callers even when a frame only
-    /// paints `cells`.
-    #[allow(dead_code)]
-    pub cols: u16,
     pub rows: u16,
     pub bg: Rgb,
     pub cells: Vec<Arc<Vec<Cell>>>,
@@ -207,7 +203,6 @@ impl Snapshot {
 
     pub fn blank_with(command: &str, cwd: &str, bg: Rgb) -> Self {
         Self {
-            cols: 80,
             rows: 24,
             bg,
             cells: Vec::new(),
@@ -848,7 +843,6 @@ impl Vt {
             });
             ghostty_render_state_clean(state);
             Snapshot {
-                cols: self.cols,
                 rows: self.rows,
                 bg,
                 cells: rows,
@@ -1872,9 +1866,14 @@ mod tests {
         let mut vt = Vt::new(16, 4);
         vt.write(b"\x1b[c");
         let reply = vt.take_replies();
+        let reply = String::from_utf8_lossy(&reply);
         assert!(
-            reply.windows(2).any(|pair| pair == [0x1b, b'[']),
-            "reply {reply:?}"
+            reply.starts_with("\x1b[?")
+                && reply.ends_with('c')
+                && reply[3..reply.len() - 1]
+                    .split(';')
+                    .all(|field| field.parse::<u16>().is_ok()),
+            "DA1 reply {reply:?}"
         );
     }
 
@@ -1895,28 +1894,18 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_letter_encodes_as_itself() {
+    fn completion_keys_encode_for_the_shell() {
         let mut vt = Vt::new(16, 4);
-        let bytes = vt.encode_input(&KeyInput {
+        let mut input = KeyInput {
             key: "a".into(),
             key_char: Some("a".into()),
             shift: false,
             control: false,
             alt: false,
-        });
-        assert_eq!(bytes, b"a");
-    }
-
-    #[test]
-    fn completion_keys_encode_for_the_shell() {
-        let mut vt = Vt::new(16, 4);
-        let mut input = KeyInput {
-            key: "tab".into(),
-            key_char: Some("\t".into()),
-            shift: false,
-            control: false,
-            alt: false,
         };
+        assert_eq!(vt.encode_input(&input), b"a", "a plain letter is itself");
+        input.key = "tab".into();
+        input.key_char = Some("\t".into());
         assert_eq!(vt.encode_input(&input), b"\t");
         input.shift = true;
         assert_eq!(vt.encode_input(&input), b"\x1b[Z");

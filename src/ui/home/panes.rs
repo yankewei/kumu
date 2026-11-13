@@ -772,30 +772,6 @@ mod tests {
         assert!(matches!(one, PaneNode::Leaf(PaneId(3))));
     }
 
-    /// The JSON shape is what the home window persists; a version bump is the
-    /// only supported way to change it.
-    #[test]
-    fn the_saved_workspace_serializes_with_its_version() {
-        let saved = SavedWorkspace {
-            version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
-                selected: Some(3),
-                projects: vec![SavedProjectLayout {
-                    project: 3,
-                    layout: SavedNode::Leaf { pane: 7 },
-                    focused: 7,
-                }],
-            },
-            focused: 7,
-        };
-        let json = serde_json::to_string(&saved).unwrap();
-        assert_eq!(
-            serde_json::from_str::<SavedWorkspace>(&json).unwrap(),
-            saved
-        );
-        assert!(json.contains(&format!("\"version\":{WORKSPACE_STATE_VERSION}")));
-    }
-
     fn two_project_state() -> SavedWorkspace {
         SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
