@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::*;
@@ -1323,11 +1323,15 @@ fn agent_menu_button(
 ) -> impl IntoElement {
     let view = cx.entity();
     Button::new(format!("agent-menu-{}", pane.0))
-        .ghost()
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(cx.theme().transparent)
+                .foreground(muted)
+                .hover(hover),
+        )
         .compact()
         .icon(IconName::Bot)
         .text_color(muted)
-        .hover(move |style| style.bg(hover))
         .tooltip("新建 Agent 窗格")
         .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
             let available: Vec<_> = AGENTS.iter().filter(|agent| installed(agent.id)).collect();
