@@ -18,6 +18,13 @@ use super::vt::{
     TermNotification, Vt,
 };
 
+/// How many rows above the viewport an attach replays so the phone can scroll
+/// back. The Mac keeps more, but one protocol frame carries the replay.
+const REPLAY_HISTORY_LINES: usize = 1_000;
+/// A replay beyond this drops the history rather than failing the attach:
+/// the whole replay must fit one [`super::protocol::MAX_BINARY`] frame.
+const REPLAY_MAX_BYTES: usize = 1_500_000;
+
 struct Live {
     screen: Mutex<Snapshot>,
     notifications: Mutex<VecDeque<TermNotification>>,
@@ -650,12 +657,31 @@ impl Running {
                             bar.offset as usize
                         })
                     });
+                    let mut history = self.vt.history_cells(REPLAY_HISTORY_LINES);
                     let snapshot = self.vt.snapshot(&self.command, &self.cwd, self.exited);
                     if let Some(row) = restore {
                         self.vt.scroll_to_row(row);
                     }
-                    let replay =
-                        snapshot.ansi_replay(self.vt.alt_screen(), self.vt.bracketed_paste());
+                    let alt_screen = self.vt.alt_screen();
+                    let bracketed_paste = self.vt.bracketed_paste();
+                    let mut replay =
+                        snapshot.ansi_replay_with_history(&history, alt_screen, bracketed_paste);
+                    // The newest history matters most: halve it until the
+                    // whole replay fits one frame.
+                    while replay.len() > REPLAY_MAX_BYTES && !history.is_empty() {
+                        let keep = history.len() / 2;
+                        history.drain(..history.len() - keep);
+                        replay = snapshot.ansi_replay_with_history(
+                            &history,
+                            alt_screen,
+                            bracketed_paste,
+                        );
+                    }
+                    let replay = if replay.len() > REPLAY_MAX_BYTES {
+                        snapshot.ansi_replay(alt_screen, bracketed_paste)
+                    } else {
+                        replay
+                    };
                     let _ = reply.send(Some(RemoteAttach {
                         tap,
                         cols,

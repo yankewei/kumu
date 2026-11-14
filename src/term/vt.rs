@@ -285,6 +285,22 @@ impl Snapshot {
     /// frame. The second column of a wide character is not written: the glyph
     /// already advanced the phone's cursor past it.
     pub fn ansi_replay(&self, alt_screen: bool, bracketed_paste: bool) -> Vec<u8> {
+        self.ansi_replay_with_history(&[], alt_screen, bracketed_paste)
+    }
+
+    /// An ANSI replay with `history`, the rows scrolled above the viewport
+    /// (oldest first), so the phone can scroll back through them too.
+    ///
+    /// The history rows are printed as ordinary lines first, which puts them
+    /// in the phone's scrollback; the viewport rows follow as the screen. The
+    /// alternate screen has no scrollback, so it always replays the viewport
+    /// alone.
+    pub fn ansi_replay_with_history(
+        &self,
+        history: &[Arc<Vec<Cell>>],
+        alt_screen: bool,
+        bracketed_paste: bool,
+    ) -> Vec<u8> {
         use std::fmt::Write as _;
 
         let mut out = String::new();
@@ -303,42 +319,34 @@ impl Snapshot {
         } else {
             out.push_str("\x1b[?1000l\x1b[?1006l");
         }
-        out.push_str("\x1b[0m\x1b[2J\x1b[H");
+        // Clear the screen and the old scrollback: this terminal may have
+        // shown another pane, or the same pane before a reattach.
+        out.push_str("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
         let mut current: Option<ReplayStyle> = None;
-        for (row, cells) in self.cells.iter().enumerate() {
-            // Everything past the last painted cell is already blank.
-            let width = cells
-                .iter()
-                .rposition(|cell| {
-                    !cell.text.is_empty() || cell.bg.is_some() || cell.underline || cell.strike
-                })
-                .map_or(0, |last| last + 1);
-            if width == 0 {
-                continue;
+        if !alt_screen && !history.is_empty() {
+            // Lines printed one after another leave the earlier ones in the
+            // scrollback; the viewport rows then land on the screen.
+            for cells in history {
+                write_replay_row(&mut out, cells, &mut current);
+                out.push_str("\x1b[0m\r\n");
+                current = None;
             }
-            let _ = write!(out, "\x1b[{};1H", row + 1);
-            let mut spacer = false;
-            for cell in cells.iter().take(width) {
-                if spacer {
-                    spacer = false;
+            for (row, cells) in self.cells.iter().enumerate() {
+                write_replay_row(&mut out, cells, &mut current);
+                if row + 1 < self.cells.len() {
+                    out.push_str("\x1b[0m\r\n");
+                    current = None;
+                }
+            }
+        } else {
+            for (row, cells) in self.cells.iter().enumerate() {
+                // Everything past the last painted cell is already blank.
+                let width = replay_width(cells);
+                if width == 0 {
                     continue;
                 }
-                spacer = cell.wide;
-                let style = ReplayStyle::of(cell);
-                if current != Some(style) {
-                    style.write(&mut out);
-                    current = Some(style);
-                }
-                if cell.text.is_empty() {
-                    out.push(' ');
-                    // A wide cell whose glyph is hidden still holds two
-                    // columns; the spacer is skipped like any other.
-                    if cell.wide {
-                        out.push(' ');
-                    }
-                } else {
-                    out.push_str(&cell.text);
-                }
+                let _ = write!(out, "\x1b[{};1H", row + 1);
+                write_replay_cells(&mut out, cells, width, &mut current);
             }
         }
         out.push_str("\x1b[0m");
@@ -364,6 +372,58 @@ impl Snapshot {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+/// The cells of a row up to its last painted cell: everything past it is
+/// already blank.
+fn replay_width(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .rposition(|cell| {
+            !cell.text.is_empty() || cell.bg.is_some() || cell.underline || cell.strike
+        })
+        .map_or(0, |last| last + 1)
+}
+
+/// Writes one whole row as a line (no cursor positioning, no line break).
+fn write_replay_row(out: &mut String, cells: &[Cell], current: &mut Option<ReplayStyle>) {
+    let width = replay_width(cells);
+    if width == 0 {
+        return;
+    }
+    write_replay_cells(out, cells, width, current);
+}
+
+/// Writes the first `width` cells of a row, styling only where it changes.
+fn write_replay_cells(
+    out: &mut String,
+    cells: &[Cell],
+    width: usize,
+    current: &mut Option<ReplayStyle>,
+) {
+    let mut spacer = false;
+    for cell in cells.iter().take(width) {
+        if spacer {
+            spacer = false;
+            continue;
+        }
+        spacer = cell.wide;
+        let style = ReplayStyle::of(cell);
+        if *current != Some(style) {
+            style.write(out);
+            *current = Some(style);
+        }
+        if cell.text.is_empty() {
+            out.push(' ');
+            // A wide cell whose glyph is hidden still holds two columns; the
+            // spacer is skipped like any other.
+            if cell.wide {
+                out.push(' ');
+            }
+        } else {
+            out.push_str(&cell.text);
+        }
     }
 }
 
@@ -919,22 +979,7 @@ impl Vt {
                     .map(|(row, _)| Arc::clone(row));
                 let row = match reuse {
                     Some(row) => row,
-                    None => {
-                        ghostty_render_state_row_get(
-                            self.rows_it,
-                            GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                            &mut self.cells_it as *mut _ as *mut c_void,
-                        );
-                        let mut row = Vec::with_capacity(self.cols as usize);
-                        let mut x: u16 = 0;
-                        while ghostty_render_state_row_cells_next(self.cells_it) {
-                            let in_sel = selected && x >= sel.start_x && x <= sel.end_x;
-                            row.push(self.read_cell(fg_default, in_sel));
-                            x = x.saturating_add(1);
-                        }
-                        row.resize(self.cols as usize, blank_cell(fg_default));
-                        Arc::new(row)
-                    }
+                    None => self.read_row_cells(fg_default, selection),
                 };
                 if known {
                     seen.insert(id.bits, (Arc::clone(&row), selection));
@@ -989,6 +1034,30 @@ impl Vt {
                 mouse_tracking: self.mouse_tracking(),
                 search,
             }
+        }
+    }
+
+    /// Reads the cells of the row the render-state iterator is on.
+    unsafe fn read_row_cells(
+        &mut self,
+        fg_default: Rgb,
+        selection: Option<(u16, u16)>,
+    ) -> Arc<Vec<Cell>> {
+        unsafe {
+            ghostty_render_state_row_get(
+                self.rows_it,
+                GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+                &mut self.cells_it as *mut _ as *mut c_void,
+            );
+            let mut row = Vec::with_capacity(self.cols as usize);
+            let mut x: u16 = 0;
+            while ghostty_render_state_row_cells_next(self.cells_it) {
+                let in_sel = selection.is_some_and(|(start, end)| x >= start && x <= end);
+                row.push(self.read_cell(fg_default, in_sel));
+                x = x.saturating_add(1);
+            }
+            row.resize(self.cols as usize, blank_cell(fg_default));
+            Arc::new(row)
         }
     }
 
@@ -1141,6 +1210,70 @@ impl Vt {
         };
         scroll.value.row = row;
         unsafe { ghostty_terminal_scroll_viewport(self.term, scroll) };
+    }
+
+    /// The last `limit` rows above the viewport, oldest first: what a remote
+    /// viewer needs to scroll back without its own copy of the session.
+    ///
+    /// The rows are read by paging the viewport up, so the caller's scroll
+    /// position is put back before this returns. The alternate screen has no
+    /// scrollback; it gives none.
+    pub fn history_cells(&mut self, limit: usize) -> Vec<Arc<Vec<Cell>>> {
+        if limit == 0 || self.alt_screen() {
+            return Vec::new();
+        }
+        let Some(bar) = self.scrollbar() else {
+            return Vec::new();
+        };
+        let view = bar.len as usize;
+        let bottom = (bar.total as usize).saturating_sub(view);
+        let want = bottom.min(limit);
+        if want == 0 {
+            return Vec::new();
+        }
+        let saved = bar.offset as usize;
+        let start = bottom - want;
+        let state = self.shared.state;
+        let mut rows = Vec::with_capacity(want);
+        let mut at = start;
+        unsafe {
+            while at < bottom {
+                self.scroll_to_row(at);
+                ghostty_render_state_update(state, self.term);
+                let mut colors = GhosttyRenderStateColors {
+                    size: std::mem::size_of::<GhosttyRenderStateColors>(),
+                    ..Default::default()
+                };
+                ghostty_render_state_get(
+                    state,
+                    GHOSTTY_RENDER_STATE_DATA_COLORS,
+                    &mut colors as *mut _ as *mut c_void,
+                );
+                let fg_default = Rgb(
+                    colors.foreground.r,
+                    colors.foreground.g,
+                    colors.foreground.b,
+                );
+                ghostty_render_state_get(
+                    state,
+                    GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                    &mut self.rows_it as *mut _ as *mut c_void,
+                );
+                let mut page = Vec::with_capacity(view);
+                while ghostty_render_state_row_iterator_next(self.rows_it) {
+                    page.push(self.read_row_cells(fg_default, None));
+                }
+                let take = (bottom - at).min(page.len());
+                if take == 0 {
+                    break;
+                }
+                rows.extend(page.into_iter().take(take));
+                at += take;
+            }
+            self.scroll_to_row(saved);
+            ghostty_render_state_update(state, self.term);
+        }
+        rows
     }
 
     /// Whether the terminal currently owns a selection.
@@ -2260,6 +2393,52 @@ mod tests {
             restored.cells, original.cells,
             "the phone's grid must match the Mac's cell for cell"
         );
+    }
+
+    #[test]
+    fn a_replay_carries_the_scrollback() {
+        let mut vt = Vt::new(20, 4);
+        for line in 0..20 {
+            vt.write(format!("line {line}\r\n").as_bytes());
+        }
+        let snapshot = vt.snapshot("sh", "/", false);
+        let history = vt.history_cells(10);
+        assert_eq!(history.len(), 10, "ten rows above the viewport");
+
+        let mut phone = Vt::new(20, 4);
+        phone.write(&snapshot.ansi_replay_with_history(&history, false, false));
+        let restored = phone.snapshot("sh", "/", false);
+        assert_eq!(restored.plain_text(), snapshot.plain_text());
+        let bar = phone.scrollbar().expect("the phone has a scrollback");
+        assert!(
+            bar.total > bar.len,
+            "the phone keeps the replayed history above the screen"
+        );
+
+        phone.scroll_to_row(0);
+        let top = phone.snapshot("sh", "/", false);
+        assert!(
+            top.plain_text().contains("line 9"),
+            "the oldest replayed row is in the phone's scrollback: {:?}",
+            top.plain_text()
+        );
+    }
+
+    #[test]
+    fn an_alternate_screen_replay_has_no_scrollback() {
+        let mut vt = Vt::new(20, 4);
+        vt.write(b"\x1b[?1049h");
+        for line in 0..20 {
+            vt.write(format!("alt {line}\r\n").as_bytes());
+        }
+        let snapshot = vt.snapshot("sh", "/", false);
+        let history = vt.history_cells(10);
+        assert!(history.is_empty(), "the alternate screen keeps none");
+
+        let mut phone = Vt::new(20, 4);
+        phone.write(&snapshot.ansi_replay_with_history(&history, true, false));
+        let bar = phone.scrollbar().expect("a scrollbar");
+        assert_eq!(bar.total, bar.len, "nothing above the alternate screen");
     }
 
     /// A find bar restarts the search on every keystroke, so one search over a

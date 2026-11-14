@@ -435,11 +435,12 @@ iPhone                    Mac remote                 session thread
 
 重放内容：
 
-- 清屏、光标归位。
+- 清屏、清空旧 scrollback、光标归位。
 - alternate screen、DECCKM、bracketed paste、mouse tracking 等模式。
+- 最近 1000 行桌面 scrollback：先按普通行输出，滚入手机端本地 scrollback。
 - 每一行的 SGR 颜色/样式和文本。
 - 光标位置和可见性。
-- **不包含**桌面 scrollback；v1 手机历史从 attach 开始。
+- alternate screen 没有 scrollback，只重放当前屏幕。单帧放不下时丢弃历史，只保证当前屏幕。
 
 三种可选方案：
 
@@ -667,7 +668,7 @@ v1 的状态是启发式的，不承诺准确区分 Agent 的“思考/执行/�
 | 两个终端模拟器都回答查询 | PTY 收到重复 DSR/DA 应答 | 先接受；TUI 乱码时提前换 native Ghostty 或过滤 |
 | NSH Terminal reflow | 复杂 TUI 的行宽/光标可能异常 | 实测 Codex/Claude/Opencode；记录失败样例 |
 | 无相机组件 | 不能扫码配对 | v1 粘贴链接 + 配对码；后续 native 组件 |
-| 滚动历史不同步 | 手机上只能看 attach 之后的输出 | 明确为本地滚动；不同步桌面 scrollback |
+| 滚动历史不同步 | 手机上只能看 attach 之后的输出 | attach 时带上最近 1000 行桌面 scrollback；更早的历史仍在 Mac |
 | 后台挂起 | WebSocket/QUIC 会被切断 | 后台立即 detach；回前台重新 attach |
 | 无 APNs | 后台不能实时提醒 | v1 只做前台提醒；后续评估 APNs |
 
@@ -720,7 +721,7 @@ M1 已知限制：
 - 心跳间隔 10 秒、租约超时 30 秒；last-wins 保证重连不会卡住。
 - 桌面设置页、设备撤销和二维码尚未接入。
 - 手机不发送 CREDIT 之外的背压控制；溢出会断开通道。
-- 终端查询应答重复、scrollback 不同步仍按 6.7 的风险处理。
+- 终端查询应答重复仍需实测；attach 只同步最近 1000 行 scrollback。
 
 ## 13. 待定
 
