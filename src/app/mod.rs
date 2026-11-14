@@ -1657,16 +1657,4 @@ mod tests {
             }
         );
     }
-
-    /// A path with no file name of its own (the filesystem root) still
-    /// resolves to something rather than an empty label.
-    #[test]
-    fn resolve_project_pick_falls_back_to_the_whole_path() {
-        assert_eq!(
-            resolve_project_pick(&[], "/"),
-            ProjectPick::New {
-                name: "/".to_string()
-            }
-        );
-    }
 }

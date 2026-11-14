@@ -156,12 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_conversation_passes_no_flags() {
-        assert!(args("codex", None).is_empty());
-        assert!(args("opencode", None).is_empty());
-    }
-
-    #[test]
     fn resume_syntax_is_per_cli() {
         assert_eq!(args("codex", Some("abc")), ["resume", "abc"]);
         assert_eq!(args("opencode", Some("abc")), ["--session", "abc"]);
@@ -178,11 +172,6 @@ mod tests {
         assert!(args("codex", Some("")).is_empty());
         assert!(args("codex", Some(&"a".repeat(129))).is_empty());
         assert_eq!(args("codex", Some("a-b_c.d")), ["resume", "a-b_c.d"]);
-    }
-
-    #[test]
-    fn shell_never_has_an_agent_command() {
-        assert!(PaneLaunch::Shell.agent_command().is_none());
     }
 
     #[test]

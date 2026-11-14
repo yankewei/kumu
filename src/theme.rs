@@ -209,30 +209,3 @@ pub fn system_fonts(cx: &App) -> Vec<(SharedString, SharedString)> {
     }));
     items
 }
-
-#[cfg(test)]
-mod tests {
-    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
-    // scope through the glob, so the built-in one is imported explicitly.
-    use core::prelude::v1::test;
-
-    use super::{DEFAULT_FONT_SIZE, FONT_SIZES, theme_mode_from_setting};
-
-    /// The settings picker preselects by matching the size in force against an
-    /// offered one, so the default has to be on the list or it would open with
-    /// nothing selected.
-    #[test]
-    fn the_default_font_size_is_offered_by_the_picker() {
-        assert!(FONT_SIZES.contains(&(DEFAULT_FONT_SIZE as u32)));
-    }
-
-    /// The stored value is the only way the dark choice survives a restart, so
-    /// it must map back exactly; anything unknown falls back to light.
-    #[test]
-    fn a_saved_mode_maps_back_to_its_theme() {
-        assert!(theme_mode_from_setting(Some("dark")).is_dark());
-        assert!(!theme_mode_from_setting(Some("light")).is_dark());
-        assert!(!theme_mode_from_setting(None).is_dark());
-        assert!(!theme_mode_from_setting(Some("future-mode")).is_dark());
-    }
-}

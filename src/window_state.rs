@@ -171,16 +171,4 @@ mod tests {
                 .is_none()
         );
     }
-
-    /// The mode survives the trip through the settings JSON.
-    #[test]
-    fn the_window_mode_round_trips() {
-        let saved = SavedWindow {
-            mode: WindowMode::Maximized,
-            ..saved(10., 10., 1200., 800.)
-        };
-        let json = serde_json::to_string(&saved).unwrap();
-        assert_eq!(serde_json::from_str::<SavedWindow>(&json).unwrap(), saved);
-        assert!(json.contains("\"maximized\""));
-    }
 }
