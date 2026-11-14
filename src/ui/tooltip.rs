@@ -131,8 +131,7 @@ impl Tooltips {
                     // The trigger left the tree (so no hover-out will come),
                     // the pointer moved off it, or the window went inactive.
                     this.clear_watch();
-                    this.overlay
-                        .update(cx, |overlay, cx| overlay.hide(cx));
+                    this.overlay.update(cx, |overlay, cx| overlay.hide(cx));
                     false
                 });
                 if !matches!(keep_watching, Ok(true)) {
