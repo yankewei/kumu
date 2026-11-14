@@ -42,7 +42,6 @@ struct DevicesFile {
 }
 
 pub struct Auth {
-    dir: PathBuf,
     file: PathBuf,
     devices: Mutex<DevicesFile>,
     pairing: Mutex<Pairing>,
@@ -82,7 +81,6 @@ impl Auth {
         let (revocations, _) = broadcast::channel(64);
         let (pairing_changes, _) = broadcast::channel(8);
         let auth = Self {
-            dir: dir.to_owned(),
             file,
             devices: Mutex::new(devices),
             pairing: Mutex::new(Pairing {
@@ -95,11 +93,6 @@ impl Auth {
         };
         auth.rotate_code()?;
         Ok(auth)
-    }
-
-    #[allow(dead_code)]
-    pub fn state_dir(&self) -> &Path {
-        &self.dir
     }
 
     pub fn bridge_id(&self) -> String {
@@ -129,7 +122,7 @@ impl Auth {
         code
     }
 
-    #[allow(dead_code)]
+    /// When the current code stops working, for the Mac's pairing card.
     pub fn pairing_expires_ms(&self) -> u64 {
         ms(self.pairing.lock().expect("pairing mutex poisoned").expires)
     }
@@ -237,6 +230,8 @@ impl Auth {
         Some(device)
     }
 
+    /// Every paired device. Kept for the Mac settings list, which does not
+    /// exist yet, so nothing calls this today.
     #[allow(dead_code)]
     pub fn devices(&self) -> Vec<Device> {
         self.devices
@@ -246,6 +241,8 @@ impl Auth {
             .clone()
     }
 
+    /// Drop a paired device and cut off its reconnects. Only tests call this
+    /// until the settings list can revoke a device.
     #[allow(dead_code)]
     pub fn revoke(&self, id: &str) -> Result<()> {
         let mut devices = self.devices.lock().expect("devices mutex poisoned");

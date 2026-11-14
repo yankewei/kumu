@@ -1,7 +1,9 @@
 //! Left column: projects and the settings entry.
 
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -147,37 +149,121 @@ impl KumuApp {
                             )
                             .when_some(
                                 self.remote.as_ref().and_then(|remote| {
-                                    remote.pairing_link().map(|link| (link, remote.auth.code()))
+                                    remote.pairing_link().map(|link| {
+                                        (link, remote.auth.code(), remote.auth.pairing_expires_ms())
+                                    })
                                 }),
-                                |row, (link, code)| {
-                                    row.child(
-                                        div()
-                                            .id("remote-pairing")
-                                            .rounded(radius)
-                                            .p_1()
-                                            .cursor_pointer()
-                                            .text_color(muted_fg)
-                                            .hover(move |style| {
-                                                style.bg(sidebar_accent.opacity(0.5))
-                                            })
-                                            .hover_label(format!(
-                                                "远程配对 · {code} · 点击复制链接"
-                                            ))
-                                            .on_click(cx.listener(move |_, _, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    link.clone(),
-                                                ));
-                                            }))
-                                            .child(
-                                                Icon::empty()
-                                                    .path("icons/smartphone.svg")
-                                                    .small(),
-                                            ),
-                                    )
+                                |row, (link, code, expires)| {
+                                    row.child(self.render_pairing_entry(link, code, expires, cx))
                                 },
                             ),
                     ),
             )
+    }
+
+    /// The footer's phone entry: a button that opens the pairing card, so the
+    /// link and the current code are both on screen instead of going silently
+    /// to the clipboard. `expires` is when the one-use code stops working.
+    fn render_pairing_entry(
+        &self,
+        link: String,
+        code: String,
+        expires: u64,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted_fg, sidebar_accent) = (theme.muted_foreground, theme.sidebar_accent);
+        Popover::new("remote-pairing-popover")
+            .anchor(Anchor::BottomRight)
+            .trigger(
+                Button::new("remote-pairing")
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.transparent)
+                            .foreground(muted_fg)
+                            .hover(sidebar_accent.opacity(0.5)),
+                    )
+                    .compact()
+                    .icon(Icon::empty().path("icons/smartphone.svg"))
+                    .text_color(muted_fg)
+                    .tooltip("远程控制"),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                let (muted_fg, muted) = (theme.muted_foreground, theme.muted);
+                // One labelled value with its own copy button. The value is
+                // shown truncated; the button copies all of it.
+                let field = |id: &'static str,
+                             label: &'static str,
+                             value: String,
+                             copied: &'static str| {
+                    let copy = value.clone();
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(rems(3.5))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted_fg)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .font_medium()
+                                .child(value),
+                        )
+                        .child(
+                            Button::new(id)
+                                .compact()
+                                .ghost()
+                                .icon(IconName::Copy)
+                                .tooltip("复制")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                                    window.push_notification(Notification::success(copied), cx);
+                                }),
+                        )
+                };
+                v_flex()
+                    .w(rems(16.))
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().font_medium().child("远程控制"))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(pairing_expiry_label(expires)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .rounded(theme.radius)
+                            .bg(muted)
+                            .px_2()
+                            .py_1p5()
+                            .child(field("copy-pairing-code", "配对码", code.clone(), "已复制配对码"))
+                            .child(field("copy-pairing-link", "配对链接", link.clone(), "已复制配对链接")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child("在 iPhone 上打开 Kumu，粘贴链接并输入配对码。配对码一次有效，配对后自动更新。"),
+                    )
+            })
+            .into_any_element()
     }
 
     /// One project or worktree row. A worktree is indented under its
@@ -389,6 +475,21 @@ impl KumuApp {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// How long the current one-use pairing code stays valid, rounded up to whole
+/// minutes so the card never shows a shorter life than the code has. The card
+/// only repaints when the app does, so this reads as a hint rather than a
+/// countdown.
+fn pairing_expiry_label(expires: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    match expires.saturating_sub(now) {
+        0 => "配对码即将更新".to_string(),
+        left if left < 60_000 => "不到 1 分钟内有效".to_string(),
+        left => format!("{} 分钟内有效", left.div_ceil(60_000)),
     }
 }
 
