@@ -13,6 +13,7 @@ use gpui_kit::{Context, EventEmitter, Global};
 
 use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX};
 use crate::db::{Project, Store, db_path};
+use crate::remote::{MAX_GRID, RemoteError};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
 
@@ -129,6 +130,47 @@ pub struct Workspace {
     startup_error: Option<String>,
     /// The home window's last layout JSON, handed to the view once at startup.
     saved_workspace: Option<String>,
+    /// Grid size the desktop last measured for each pane. A remote lease keeps
+    /// this aside and restores it when the phone detaches.
+    desktop_sizes: HashMap<u64, PaneSize>,
+    /// Panes whose PTY size is currently owned by a phone.
+    remote_sizes: HashMap<u64, RemoteLease>,
+    /// The next attach attempt's id. Distinguishes a phone that took a pane
+    /// over from one whose attach was already superseded.
+    next_remote_attach: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaneSize {
+    cols: u16,
+    rows: u16,
+    cell_w: u32,
+    cell_h: u32,
+}
+
+impl PaneSize {
+    fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self {
+            cols: snapshot
+                .cells
+                .first()
+                .map(|row| row.len().clamp(1, u16::MAX as usize) as u16)
+                .unwrap_or(80),
+            rows: snapshot.rows.max(1),
+            cell_w: 8,
+            cell_h: 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RemoteLease {
+    /// Identifies this attach attempt. A phone that was superseded while its
+    /// attach was still in flight must not take the pane over when it lands.
+    attach: u64,
+    /// The tap id from the terminal thread; `None` while the phone is still
+    /// completing the attach.
+    tap: Option<u64>,
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -163,6 +205,9 @@ impl Workspace {
             next_term: 1,
             startup_error,
             saved_workspace,
+            desktop_sizes: HashMap::new(),
+            remote_sizes: HashMap::new(),
+            next_remote_attach: 1,
         };
         workspace.bootstrap();
         workspace
@@ -444,6 +489,14 @@ impl Workspace {
         self.terms.get(self.pane_term.get(&pane)?)
     }
 
+    fn live_term_for_pane(&self, pane: u64) -> Option<&LiveTerm> {
+        self.shown_term(pane).or_else(|| {
+            self.terms
+                .values()
+                .find(|live| live.pane.is_none() && live.parked_for == Some(pane))
+        })
+    }
+
     pub fn terminal_snapshot(&self, pane: u64) -> Option<Snapshot> {
         self.shown_term(pane).map(|live| live.term.snapshot())
     }
@@ -477,6 +530,22 @@ impl Workspace {
         if let Some(live) = self.shown_term(pane) {
             live.term.write(bytes);
         }
+    }
+
+    /// Raw bytes from the device that owns the pane's remote lease.
+    pub fn remote_write(&self, pane: u64, tap: u64, bytes: impl Into<Vec<u8>>) -> bool {
+        if !self
+            .remote_sizes
+            .get(&pane)
+            .is_some_and(|lease| lease.tap == Some(tap))
+        {
+            return false;
+        }
+        let Some(live) = self.live_term_for_pane(pane) else {
+            return false;
+        };
+        live.term.write(bytes);
+        true
     }
 
     pub fn terminal_paste(&self, pane: u64, text: impl Into<Vec<u8>>) {
@@ -537,14 +606,153 @@ impl Workspace {
         }
     }
 
-    pub fn terminal_resize(&self, pane: u64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+    pub fn terminal_resize(&mut self, pane: u64, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+        self.desktop_sizes.insert(
+            pane,
+            PaneSize {
+                cols,
+                rows,
+                cell_w,
+                cell_h,
+            },
+        );
+        // A phone owns the PTY size until it detaches. The desktop keeps its
+        // measurement so the pane can snap back without waiting for a layout.
+        if self.remote_sizes.contains_key(&pane) {
+            return;
+        }
         if let Some(live) = self.shown_term(pane) {
             live.term.resize(cols, rows, cell_w, cell_h);
         }
     }
 
+    /// A pane's terminal for remote control, whether the project is showing
+    /// or the process is parked behind another project.
+    pub fn terminal_for_pane(&self, pane: u64) -> Option<Term> {
+        self.live_term_for_pane(pane).map(|live| live.term.clone())
+    }
+
+    /// The terminal id a pane shows, for attention lookups.
+    pub fn term_id_for_pane(&self, pane: u64) -> Option<u64> {
+        self.pane_term.get(&pane).copied().or_else(|| {
+            self.terms
+                .iter()
+                .find(|(_, live)| live.pane.is_none() && live.parked_for == Some(pane))
+                .map(|(id, _)| *id)
+        })
+    }
+
+    /// Reserve `pane` for a phone's control lease. The caller attaches the
+    /// terminal on a background thread; `confirm_remote_attach` records the
+    /// tap id, and `cancel_remote_attach` undoes the reservation.
+    ///
+    /// The returned id identifies this attempt: only it may confirm or cancel
+    /// the lease, so a phone whose attach was superseded halfway through
+    /// cannot take the pane from the phone that replaced it.
+    pub fn begin_remote_attach(&mut self, pane: u64) -> Result<(Term, u64), RemoteError> {
+        // A reconnect, a second phone, or a stale lease from a connection the
+        // Mac has not noticed closing: the newest attach wins. The old tap is
+        // released first so the desktop size is restored before the new grid
+        // is applied. An attach that has not confirmed yet has no tap to
+        // release; its own confirm will find itself superseded.
+        if let Some(lease) = self.remote_sizes.get(&pane).copied()
+            && let Some(tap) = lease.tap
+        {
+            self.release_remote_attach(pane, tap);
+        }
+        let Some(live) = self.live_term_for_pane(pane) else {
+            return Err(RemoteError::new(
+                "pane_gone",
+                "the pane has no running terminal",
+            ));
+        };
+        let term = live.term.clone();
+        let snapshot = term.snapshot();
+        if snapshot.exited {
+            return Err(RemoteError::new("pane_gone", "the terminal has exited"));
+        }
+        let attach = self.next_remote_attach;
+        self.next_remote_attach += 1;
+        self.desktop_sizes
+            .entry(pane)
+            .or_insert_with(|| PaneSize::from_snapshot(&snapshot));
+        self.remote_sizes
+            .insert(pane, RemoteLease { attach, tap: None });
+        Ok((term, attach))
+    }
+
+    /// Record the tap of an attach that finished. False when another attach
+    /// took the pane over in the meantime.
+    pub fn confirm_remote_attach(&mut self, pane: u64, attach: u64, tap: u64) -> bool {
+        let Some(lease) = self.remote_sizes.get_mut(&pane) else {
+            return false;
+        };
+        if lease.attach != attach {
+            return false;
+        }
+        lease.tap = Some(tap);
+        true
+    }
+
+    /// Drop a reservation whose attach failed or was superseded. True when
+    /// this attempt still owned the pane; false when a newer attach replaced it
+    /// while the terminal was being prepared.
+    pub fn cancel_remote_attach(&mut self, pane: u64, attach: u64) -> bool {
+        let Some(lease) = self.remote_sizes.get(&pane).copied() else {
+            return false;
+        };
+        if lease.attach != attach {
+            return false;
+        }
+        self.remote_sizes.remove(&pane);
+        let Some(term) = self.terminal_for_pane(pane) else {
+            return true;
+        };
+        if let Some(size) = self.desktop_sizes.get(&pane).copied() {
+            term.resize(size.cols, size.rows, size.cell_w, size.cell_h);
+        }
+        true
+    }
+
+    /// Release a phone's size ownership. A stale tap from a previous
+    /// connection must not release a newer lease.
+    pub fn release_remote_attach(&mut self, pane: u64, tap: u64) {
+        let Some(lease) = self.remote_sizes.get(&pane).copied() else {
+            return;
+        };
+        if lease.tap != Some(tap) {
+            return;
+        }
+        self.remote_sizes.remove(&pane);
+        let Some(term) = self.terminal_for_pane(pane) else {
+            return;
+        };
+        term.detach_remote(tap);
+        if let Some(size) = self.desktop_sizes.get(&pane).copied() {
+            term.resize(size.cols, size.rows, size.cell_w, size.cell_h);
+        }
+    }
+
+    pub fn resize_remote(&mut self, pane: u64, tap: u64, cols: u16, rows: u16) {
+        let Some(lease) = self.remote_sizes.get(&pane) else {
+            return;
+        };
+        if lease.tap != Some(tap) {
+            return;
+        }
+        // A phone's grid has the same bounds as an attach: an unclamped size
+        // reaches libghostty as rows × cols cells.
+        let cols = cols.clamp(1, MAX_GRID);
+        let rows = rows.clamp(1, MAX_GRID);
+        if let Some(term) = self.terminal_for_pane(pane) {
+            term.resize(cols, rows, 8, 16);
+        }
+    }
+
     /// Stop the process shown in `pane`, and any process parked for that pane.
     pub fn drop_terminal(&mut self, pane: u64) {
+        self.desktop_sizes.remove(&pane);
+        self.remote_sizes.remove(&pane);
         if let Some(term_id) = self.pane_term.remove(&pane) {
             self.drop_term(term_id);
         }
@@ -625,10 +833,16 @@ impl Workspace {
     /// Only parked terminals are candidates. Dropping a visible one would
     /// remove its pane's mapping and leave a pane that still believes it has a
     /// shell while nothing answers its input; the cap is soft when every
-    /// running process is on screen.
+    /// running process is on screen. A terminal a phone is controlling is kept
+    /// for the same reason, even while its project is hidden.
     fn reclaim_terminals(&mut self) {
         // The watcher owns exit cleanup and must still report the pane to the
         // UI. Reclaiming it here would consume that exit before it is handled.
+        let leased: Vec<u64> = self
+            .remote_sizes
+            .keys()
+            .filter_map(|pane| self.term_id_for_pane(*pane))
+            .collect();
         let alive: Vec<u64> = self
             .term_lru
             .iter()
@@ -642,7 +856,9 @@ impl Workspace {
         let parked: Vec<u64> = alive
             .iter()
             .copied()
-            .filter(|id| self.terms.get(id).is_some_and(|live| live.pane.is_none()))
+            .filter(|id| {
+                !leased.contains(id) && self.terms.get(id).is_some_and(|live| live.pane.is_none())
+            })
             .collect();
         for id in terminal_evictions(&parked, alive.len(), MAX_LIVE_TERMINALS) {
             self.drop_term(id);
@@ -1072,6 +1288,9 @@ mod tests {
             next_term: 4,
             startup_error: None,
             saved_workspace: None,
+            desktop_sizes: HashMap::new(),
+            remote_sizes: HashMap::new(),
+            next_remote_attach: 1,
         };
         assert!(!workspace.notification_is_read(1, None), "inactive window");
         assert!(
@@ -1128,6 +1347,9 @@ mod tests {
                 next_term: 4,
                 startup_error: None,
                 saved_workspace: None,
+                desktop_sizes: HashMap::new(),
+                remote_sizes: HashMap::new(),
+                next_remote_attach: 1,
             };
             for id in 1..=3 {
                 let (program, args) = if id == 3 {
@@ -1198,6 +1420,127 @@ mod tests {
             assert_eq!(workspace.terms.len(), 1);
             assert_eq!(workspace.pane_term, HashMap::from([(3, 3)]));
             assert_eq!(workspace.term_lru, vec![3]);
+        });
+    }
+
+    /// A phone that loses the pane to a newer attach while its own attach is
+    /// still landing must not take the pane over, and a detach carrying the
+    /// superseded tap must not release the lease that replaced it.
+    #[gpui::test]
+    fn a_superseded_remote_attach_cannot_claim_the_pane(cx: &mut gpui_kit::TestAppContext) {
+        use super::{LiveTerm, Workspace};
+        use crate::agent::launch::PaneLaunch;
+        use crate::term::{Term, TermColors};
+        use gpui_kit::AppContext;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        fn wait_for_cols(term: &Term, cols: usize, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while term.snapshot().cells.first().map_or(0, |row| row.len()) != cols {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: the terminal never reached {cols} columns"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let workspace = cx.new(|_| {
+            let (term, _wake) = Term::launch(
+                "/bin/cat".into(),
+                Vec::new(),
+                std::env::temp_dir(),
+                TermColors::default(),
+            );
+            Workspace {
+                store: crate::db::Store::in_memory().expect("test store"),
+                persistent: false,
+                projects: Vec::new(),
+                terms: HashMap::from([(
+                    1,
+                    LiveTerm {
+                        term,
+                        project: 10,
+                        pane: Some(1),
+                        parked_for: None,
+                        launch: PaneLaunch::Shell,
+                        started: Instant::now(),
+                        last_notification: None,
+                    },
+                )]),
+                pane_term: HashMap::from([(1, 1)]),
+                term_lru: vec![1],
+                next_term: 2,
+                startup_error: None,
+                saved_workspace: None,
+                desktop_sizes: HashMap::new(),
+                remote_sizes: HashMap::new(),
+                next_remote_attach: 1,
+            }
+        });
+        let term = workspace
+            .update(cx, |workspace, _| workspace.terminal_for_pane(1))
+            .expect("pane 1's terminal");
+
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, _| {
+                workspace.terminal_resize(1, 100, 30, 8, 16)
+            });
+            wait_for_cols(&term, 100, "the desktop size");
+
+            let (first_term, first) = workspace
+                .update(cx, |workspace, _| workspace.begin_remote_attach(1))
+                .expect("the first attach");
+            let first_tap = first_term
+                .attach_remote(first, 40, 20)
+                .expect("the first tap")
+                .tap;
+            wait_for_cols(&term, 40, "the first phone's grid");
+
+            let (second_term, second) = workspace
+                .update(cx, |workspace, _| workspace.begin_remote_attach(1))
+                .expect("the second attach");
+            let second_tap = second_term
+                .attach_remote(second, 50, 25)
+                .expect("the second tap")
+                .tap;
+            wait_for_cols(&term, 50, "the second phone's grid");
+            assert!(
+                first_term.attach_remote(first, 40, 20).is_none(),
+                "an attach older than the one already applied is refused"
+            );
+            wait_for_cols(&term, 50, "a stale attach must not resize the shell");
+
+            assert!(
+                !workspace.update(cx, |workspace, _| {
+                    workspace.confirm_remote_attach(1, first, first_tap)
+                }),
+                "a superseded attach cannot confirm the lease"
+            );
+            assert!(workspace.update(cx, |workspace, _| {
+                workspace.confirm_remote_attach(1, second, second_tap)
+            }));
+            workspace.update(cx, |workspace, _| {
+                workspace.release_remote_attach(1, first_tap)
+            });
+            assert!(
+                workspace.update(cx, |workspace, _| {
+                    workspace.remote_write(1, second_tap, b"x".to_vec())
+                }),
+                "a stale tap must not release the current lease"
+            );
+
+            workspace.update(cx, |workspace, _| {
+                workspace.release_remote_attach(1, second_tap)
+            });
+            assert!(
+                !workspace.update(cx, |workspace, _| {
+                    workspace.remote_write(1, second_tap, b"x".to_vec())
+                }),
+                "the released tap no longer owns the pane"
+            );
+            wait_for_cols(&term, 100, "the desktop size restored");
         });
     }
 

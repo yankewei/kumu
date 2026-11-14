@@ -183,6 +183,61 @@ pub struct SearchView {
     pub hits: Vec<SearchHit>,
 }
 
+/// The SGR state an ANSI replay has written so far. A run of cells that share
+/// it costs one byte each instead of a full escape sequence per cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReplayStyle {
+    bold: bool,
+    faint: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    fg: Rgb,
+    bg: Option<Rgb>,
+}
+
+impl ReplayStyle {
+    fn of(cell: &Cell) -> Self {
+        Self {
+            bold: cell.bold,
+            faint: cell.faint,
+            italic: cell.italic,
+            underline: cell.underline,
+            strike: cell.strike,
+            fg: cell.fg,
+            bg: cell.bg,
+        }
+    }
+
+    fn write(self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        out.push_str("\x1b[0m");
+        if self.bold {
+            out.push_str("\x1b[1m");
+        }
+        if self.faint {
+            out.push_str("\x1b[2m");
+        }
+        if self.italic {
+            out.push_str("\x1b[3m");
+        }
+        if self.underline {
+            out.push_str("\x1b[4m");
+        }
+        if self.strike {
+            out.push_str("\x1b[9m");
+        }
+        let _ = write!(out, "\x1b[38;2;{};{};{}m", self.fg.0, self.fg.1, self.fg.2);
+        match self.bg {
+            Some(bg) => {
+                let _ = write!(out, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+            }
+            None => out.push_str("\x1b[49m"),
+        }
+    }
+}
+
 impl Snapshot {
     /// What the program calls itself: its OSC title (an agent TUI names itself
     /// there), else the command it was launched as, else an empty string.
@@ -217,6 +272,83 @@ impl Snapshot {
             mouse_tracking: false,
             search: None,
         }
+    }
+
+    /// A self-contained ANSI screen for a terminal that joined mid-stream.
+    ///
+    /// This is the viewport only: scrollback stays on the Mac. The caller
+    /// supplies the modes that are not part of a cell grid (alternate screen,
+    /// bracketed paste), so the phone's encoder starts in the same state.
+    ///
+    /// Style is written only where it changes and trailing blank cells are
+    /// left to the clear above, which keeps a full screen inside one protocol
+    /// frame. The second column of a wide character is not written: the glyph
+    /// already advanced the phone's cursor past it.
+    pub fn ansi_replay(&self, alt_screen: bool, bracketed_paste: bool) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        if alt_screen {
+            out.push_str("\x1b[?1049h");
+        } else {
+            out.push_str("\x1b[?1049l");
+        }
+        if bracketed_paste {
+            out.push_str("\x1b[?2004h");
+        } else {
+            out.push_str("\x1b[?2004l");
+        }
+        if self.mouse_tracking {
+            out.push_str("\x1b[?1000h\x1b[?1006h");
+        } else {
+            out.push_str("\x1b[?1000l\x1b[?1006l");
+        }
+        out.push_str("\x1b[0m\x1b[2J\x1b[H");
+        let mut current: Option<ReplayStyle> = None;
+        for (row, cells) in self.cells.iter().enumerate() {
+            // Everything past the last painted cell is already blank.
+            let width = cells
+                .iter()
+                .rposition(|cell| {
+                    !cell.text.is_empty() || cell.bg.is_some() || cell.underline || cell.strike
+                })
+                .map_or(0, |last| last + 1);
+            if width == 0 {
+                continue;
+            }
+            let _ = write!(out, "\x1b[{};1H", row + 1);
+            let mut spacer = false;
+            for cell in cells.iter().take(width) {
+                if spacer {
+                    spacer = false;
+                    continue;
+                }
+                spacer = cell.wide;
+                let style = ReplayStyle::of(cell);
+                if current != Some(style) {
+                    style.write(&mut out);
+                    current = Some(style);
+                }
+                if cell.text.is_empty() {
+                    out.push(' ');
+                    // A wide cell whose glyph is hidden still holds two
+                    // columns; the spacer is skipped like any other.
+                    if cell.wide {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push_str(&cell.text);
+                }
+            }
+        }
+        out.push_str("\x1b[0m");
+        match self.cursor {
+            Some(cursor) => {
+                let _ = write!(out, "\x1b[?25h\x1b[{};{}H", cursor.y + 1, cursor.x + 1);
+            }
+            None => out.push_str("\x1b[?25l"),
+        }
+        out.into_bytes()
     }
 
     #[cfg(test)]
@@ -983,6 +1115,31 @@ impl Vt {
             ..Default::default()
         };
         scroll.value.delta = delta;
+        unsafe { ghostty_terminal_scroll_viewport(self.term, scroll) };
+    }
+
+    /// Where the viewport sits in the scrollable area, when the terminal
+    /// reports it.
+    pub fn scrollbar(&mut self) -> Option<GhosttyTerminalScrollbar> {
+        let mut bar = GhosttyTerminalScrollbar::default();
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.term,
+                GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                &mut bar as *mut _ as *mut c_void,
+            )
+        };
+        (result == GHOSTTY_SUCCESS).then_some(bar)
+    }
+
+    /// Move the viewport to an absolute row of the scrollable area. Row 0 is
+    /// the oldest scrollback row; the library clamps the value.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        let mut scroll = GhosttyTerminalScrollViewport {
+            tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_ROW,
+            ..Default::default()
+        };
+        scroll.value.row = row;
         unsafe { ghostty_terminal_scroll_viewport(self.term, scroll) };
     }
 
@@ -2023,6 +2180,86 @@ mod tests {
         for hit in &search.hits {
             assert!(hit.row < snapshot.rows, "hit {hit:?} outside the viewport");
         }
+    }
+
+    #[test]
+    fn a_replay_keeps_a_wide_character_on_its_own_columns() {
+        let fg = Rgb(0xdd, 0xdd, 0xdd);
+        let mut cells = vec![blank_cell(fg); 4];
+        cells[0].text = "中".into();
+        cells[0].wide = true;
+        // cells[1] is the wide character's spacer: still blank.
+        cells[2].text = "a".into();
+        let replay = Snapshot {
+            rows: 1,
+            bg: fg,
+            cells: vec![Arc::new(cells)],
+            all: true,
+            cursor: None,
+            cursor_cell: None,
+            command: "sh".into(),
+            cwd: "/".into(),
+            title: String::new(),
+            exited: false,
+            spawn_error: None,
+            mouse_tracking: false,
+            search: None,
+        }
+        .ansi_replay(false, false);
+        let text = String::from_utf8(replay).expect("utf-8 replay");
+        assert!(
+            text.contains("中a"),
+            "the spacer after a wide character must not write a column: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_replay_styles_only_where_the_cell_changes() {
+        let fg = Rgb(0xdd, 0xdd, 0xdd);
+        let mut cells = vec![blank_cell(fg); 3];
+        cells[0].text = "a".into();
+        cells[1].text = "b".into();
+        cells[2].text = "c".into();
+        let replay = Snapshot {
+            rows: 1,
+            bg: fg,
+            cells: vec![Arc::new(cells)],
+            all: true,
+            cursor: None,
+            cursor_cell: None,
+            command: "sh".into(),
+            cwd: "/".into(),
+            title: String::new(),
+            exited: false,
+            spawn_error: None,
+            mouse_tracking: false,
+            search: None,
+        }
+        .ansi_replay(false, false);
+        let text = String::from_utf8(replay).expect("utf-8 replay");
+        assert_eq!(
+            text.matches("\x1b[38;2;").count(),
+            1,
+            "a run of identical cells shares one escape sequence: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_replay_rebuilds_the_same_screen() {
+        let mut vt = Vt::new(20, 4);
+        vt.write("echo 中文 ok\r\n".as_bytes());
+        vt.write("\x1b[31mred\x1b[0m plain\r\n".as_bytes());
+        let original = vt.snapshot("sh", "/", false);
+
+        let mut phone = Vt::new(20, 4);
+        phone.write(&original.ansi_replay(false, false));
+        let restored = phone.snapshot("sh", "/", false);
+
+        assert_eq!(restored.plain_text(), original.plain_text());
+        assert_eq!(
+            restored.cells, original.cells,
+            "the phone's grid must match the Mac's cell for cell"
+        );
     }
 
     /// A find bar restarts the search on every keystroke, so one search over a

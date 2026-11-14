@@ -1,12 +1,14 @@
 //! The thread that owns one PTY and its terminal emulator.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures::channel::mpsc as futures_mpsc;
 use futures::channel::mpsc::UnboundedReceiver;
 use portable_pty::PtySize;
 
@@ -26,7 +28,14 @@ struct Live {
     /// outlive the choice to resume it.
     pid: AtomicU64,
     wake: futures::channel::mpsc::UnboundedSender<()>,
+    /// Remote viewers of the raw PTY stream. A viewer that cannot keep up is
+    /// dropped instead of stalling the terminal.
+    taps: Mutex<HashMap<u64, futures_mpsc::Sender<Vec<u8>>>>,
 }
+
+/// Tap ids are unique across every terminal in the process. A pane whose
+/// terminal is replaced must not hand a stale id to a viewer of the new one.
+static NEXT_TAP: AtomicU64 = AtomicU64::new(1);
 
 impl Live {
     fn publish(&self, snapshot: Snapshot) {
@@ -36,6 +45,20 @@ impl Live {
             let _ = self.wake.unbounded_send(());
         }
     }
+
+    fn forward(&self, bytes: &[u8]) {
+        let mut taps = self.taps.lock().unwrap();
+        taps.retain(|_, tap| tap.try_send(bytes.to_vec()).is_ok());
+    }
+}
+
+/// One remote viewer: a screen replay plus the live bytes that follow it.
+pub struct RemoteAttach {
+    pub tap: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub replay: Vec<u8>,
+    pub output: futures_mpsc::Receiver<Vec<u8>>,
 }
 
 enum Msg {
@@ -83,6 +106,19 @@ enum Msg {
         cell_h: u32,
     },
     Colors(TermColors),
+    /// A remote viewer joins at this grid size. The reply carries the replay
+    /// and the live stream; the session thread registers the tap before it
+    /// takes the snapshot, so no bytes fall between the two.
+    ///
+    /// `attach` orders concurrent attempts: the newest one wins the grid even
+    /// when an older background attach reaches this thread last.
+    Attach {
+        attach: u64,
+        cols: u16,
+        rows: u16,
+        reply: Sender<Option<RemoteAttach>>,
+    },
+    DetachTap(u64),
     Eof,
     Shutdown,
 }
@@ -129,6 +165,7 @@ impl Term {
             queued: AtomicBool::new(false),
             pid: AtomicU64::new(0),
             wake,
+            taps: Mutex::new(HashMap::new()),
         });
         let thread_tx = tx.clone();
         let thread_live = Arc::clone(&live);
@@ -282,6 +319,29 @@ impl Term {
         });
     }
 
+    /// Attach a remote viewer at `cols` × `rows`.
+    ///
+    /// Blocks until the session thread has resized, registered the tap and
+    /// produced the replay. Call this off the UI thread.
+    ///
+    /// `attach` orders concurrent requests: a request older than one this
+    /// terminal already applied is refused, so the last attach to reach the
+    /// thread cannot leave a newer viewer on the wrong grid.
+    pub fn attach_remote(&self, attach: u64, cols: u16, rows: u16) -> Option<RemoteAttach> {
+        let (reply, wait) = mpsc::channel();
+        let _ = self.tx.send(Msg::Attach {
+            attach,
+            cols,
+            rows,
+            reply,
+        });
+        wait.recv_timeout(Duration::from_secs(2)).ok().flatten()
+    }
+
+    pub fn detach_remote(&self, tap: u64) {
+        let _ = self.tx.send(Msg::DetachTap(tap));
+    }
+
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
         let _ = self.tx.send(Msg::Resize {
             cols,
@@ -342,6 +402,7 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
         cwd: cwd_text,
         exited: false,
         live,
+        last_attach: 0,
     };
     session.vt.resize(80, 24, 8, 16);
     session.publish();
@@ -388,6 +449,8 @@ struct Running {
     cwd: String,
     exited: bool,
     live: Arc<Live>,
+    /// The newest remote attach this terminal has applied — see [`Msg::Attach`].
+    last_attach: u64,
 }
 
 impl Running {
@@ -409,6 +472,7 @@ impl Running {
                 Some(Msg::Bytes(bytes)) => {
                     self.vt.write(&bytes);
                     self.flush_replies();
+                    self.live.forward(&bytes);
                     self.publish();
                 }
                 Some(Msg::Key(input)) => {
@@ -547,6 +611,61 @@ impl Running {
                 Some(Msg::Colors(colors)) => {
                     self.vt.set_colors(colors);
                     self.publish();
+                }
+                Some(Msg::Attach {
+                    attach,
+                    cols,
+                    rows,
+                    reply,
+                }) => {
+                    if attach < self.last_attach {
+                        // A newer attach already took the grid. This attempt
+                        // lost the race to reach the session thread; its lease
+                        // was superseded, so it must not resize the terminal.
+                        let _ = reply.send(None);
+                        continue;
+                    }
+                    self.last_attach = attach;
+                    let cols = cols.max(1);
+                    let rows = rows.max(1);
+                    let _ = self.pty.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 8 * cols,
+                        pixel_height: 16 * rows,
+                    });
+                    self.vt.resize(cols, rows, 8, 16);
+                    self.flush_replies();
+                    self.publish();
+                    let (tap_tx, output) = futures_mpsc::channel(256);
+                    let tap = NEXT_TAP.fetch_add(1, Ordering::AcqRel);
+                    self.live.taps.lock().unwrap().insert(tap, tap_tx);
+                    // The replay is the live screen, not wherever the Mac left
+                    // the viewport. Put the viewport back afterwards so the
+                    // desktop's scroll position is undisturbed.
+                    let restore = self.vt.scrollbar().and_then(|bar| {
+                        let bottom = bar.total.saturating_sub(bar.len);
+                        (bar.offset < bottom).then(|| {
+                            self.vt.scroll_to_row(bottom as usize);
+                            bar.offset as usize
+                        })
+                    });
+                    let snapshot = self.vt.snapshot(&self.command, &self.cwd, self.exited);
+                    if let Some(row) = restore {
+                        self.vt.scroll_to_row(row);
+                    }
+                    let replay =
+                        snapshot.ansi_replay(self.vt.alt_screen(), self.vt.bracketed_paste());
+                    let _ = reply.send(Some(RemoteAttach {
+                        tap,
+                        cols,
+                        rows,
+                        replay,
+                        output,
+                    }));
+                }
+                Some(Msg::DetachTap(tap)) => {
+                    self.live.taps.lock().unwrap().remove(&tap);
                 }
                 Some(Msg::Eof) => {
                     self.exited = true;

@@ -26,6 +26,7 @@ mod db;
 mod dock_icon;
 mod fonts;
 mod git;
+mod remote;
 mod term;
 mod theme;
 mod ui;

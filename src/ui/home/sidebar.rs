@@ -128,6 +128,35 @@ impl KumuApp {
                                 })),
                         )
                     })
+                    .when_some(
+                        self.remote.as_ref().and_then(|remote| {
+                            remote.pairing_link().map(|link| (link, remote.auth.code()))
+                        }),
+                        |footer, (link, code)| {
+                            footer.child(
+                                div()
+                                    .id("remote-pairing")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(radius)
+                                    .cursor_pointer()
+                                    .text_color(theme.link)
+                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                    .hover_label("点击复制配对链接")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            link.clone(),
+                                        ));
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .child(format!("远程 · {code}")),
+                                    ),
+                            )
+                        },
+                    )
                     .child(
                         h_flex().child(
                             div()
