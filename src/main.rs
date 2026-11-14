@@ -13,7 +13,8 @@
 //!     window), `widgets` (theme-token helpers shared across windows);
 //!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
 //!   - `app/`     projects and live terminals;
-//!   - `git.rs`   worktree creation beside a repository;
+//!   - `plugins/` right-hand plugin panels opened from the title bar;
+//!   - `git.rs`   worktree creation and commit history;
 //!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
 //!   - `term/`    PTY + VT for shells and the agent TUIs they launch;
 //!   - `agent/`   registry and executable lookup;
@@ -26,6 +27,7 @@ mod db;
 mod dock_icon;
 mod fonts;
 mod git;
+mod plugins;
 mod remote;
 mod term;
 mod theme;

@@ -1,4 +1,4 @@
-//! Git worktrees for projects.
+//! Git worktrees and commit history for projects.
 //!
 //! Kumu splits one repository into several projects without copying it: each
 //! worktree is a sibling directory of the repository and a project row of its
@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// A worktree created beside the repository it belongs to.
 pub struct Worktree {
@@ -22,6 +23,139 @@ pub struct WorktreeEntry {
     pub path: PathBuf,
     /// The repository's own checkout, which is the project itself.
     pub main: bool,
+}
+
+/// One commit as the history panel shows it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Commit {
+    /// Full hash, for copying or a future detail view.
+    pub hash: String,
+    /// Abbreviated hash shown in the row.
+    pub short: String,
+    /// `%D` decorations split into individual names (`HEAD -> main`, `tag: v1`,
+    /// a remote branch, or a local branch).
+    pub refs: Vec<String>,
+    pub author: String,
+    pub email: String,
+    pub date: String,
+    pub subject: String,
+    /// Commit message body without the subject line.
+    pub body: String,
+    /// Parent count: more than one means the commit is a merge.
+    pub parents: usize,
+}
+
+/// The checked-out branch and its commits, newest first.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct History {
+    /// Current branch, or a short hash for a detached HEAD. Never empty.
+    pub branch: String,
+    /// Shared with the panel's list instead of copied, so the rows exist once.
+    pub commits: Arc<Vec<Commit>>,
+}
+
+/// Read the full history of `dir`'s checked-out branch. The panel virtualizes
+/// the rows, so there is no limit here: "all commits" means every commit git
+/// reaches from `HEAD`.
+pub fn history(dir: &Path) -> Result<History, String> {
+    let root = repo_root(dir)?;
+    let branch = current_branch(&root);
+    // One commit is nine NUL-separated fields. NUL cannot appear inside a
+    // commit field, so subjects and bodies never need quoting.
+    let output = match git_raw(
+        &root,
+        &[
+            "--no-optional-locks",
+            "log",
+            "-z",
+            "--date=short",
+            "--pretty=format:%H%x00%h%x00%D%x00%an%x00%ae%x00%cd%x00%s%x00%P%x00%b",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            // An unborn branch has no commits to log. That is an empty
+            // history, not a failure to show as an error.
+            if git(&root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() {
+                return Ok(History {
+                    branch,
+                    commits: Arc::default(),
+                });
+            }
+            return Err(error);
+        }
+    };
+    let mut fields = output.split(|byte| *byte == 0);
+    let mut commits = Vec::new();
+    while let Some(hash) = fields.next() {
+        if hash.is_empty() {
+            break;
+        }
+        let short = text(fields.next());
+        let refs = text(fields.next());
+        let author = text(fields.next());
+        let email = text(fields.next());
+        let date = text(fields.next());
+        let subject = text(fields.next());
+        let parents = text(fields.next());
+        let body = text(fields.next());
+        commits.push(Commit {
+            hash: text(Some(hash)),
+            short,
+            refs: refs
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect(),
+            author,
+            email,
+            date,
+            subject,
+            body,
+            parents: parents.split_whitespace().count(),
+        });
+    }
+    Ok(History {
+        branch,
+        commits: Arc::new(commits),
+    })
+}
+
+/// A cheap fingerprint of what [`history`] would show: the checked-out branch
+/// and every branch, tag and remote ref. Reading it costs three small git
+/// commands instead of a walk over the whole log, so a panel that polls can
+/// keep the history it has until something it draws changes.
+pub fn fingerprint(dir: &Path) -> Result<String, String> {
+    let root = repo_root(dir)?;
+    let branch = current_branch(&root);
+    let refs = git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/tags",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(format!("{branch}\n{refs}"))
+}
+
+fn text(bytes: Option<&[u8]>) -> String {
+    bytes
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default()
+}
+
+/// The checked-out branch, falling back to a short commit for a detached HEAD
+/// and to `HEAD` in a repository with no commits yet.
+fn current_branch(root: &Path) -> String {
+    if let Ok(branch) = git(root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        && !branch.is_empty()
+    {
+        return branch;
+    }
+    git(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string())
 }
 
 /// Create `branch` in a directory next to the repository that contains
@@ -120,6 +254,14 @@ fn path_arg(path: &Path) -> String {
 
 /// Run git in `dir` and return trimmed stdout, or its stderr on failure.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&git_raw(dir, args)?)
+        .trim()
+        .to_string())
+}
+
+/// Run git in `dir` and return stdout exactly as git wrote it, NUL separators
+/// included.
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -130,12 +272,17 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
         return Err(if message.is_empty() {
-            format!("git {} 失败（退出码 {}）", args[0], output.status)
+            let command = args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .copied()
+                .unwrap_or("git");
+            format!("git {command} 失败（退出码 {}）", output.status)
         } else {
             message.to_string()
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -219,6 +366,58 @@ mod tests {
             .expect("a detached worktree is named after its directory");
         assert_eq!(detached.path, detached_path.canonicalize().unwrap());
         assert!(!detached.main);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Commit history is newest first, carries decorations and parent counts,
+    /// and includes a root commit with no parents.
+    #[test]
+    fn lists_commits_newest_first_with_their_refs() {
+        let (dir, repo) = fixture();
+        std::fs::write(repo.join("a"), "changed").unwrap();
+        git(&repo, &["add", "a"]).unwrap();
+        git(&repo, &["commit", "-qm", "second", "-m", "Second body."]).unwrap();
+        git(&repo, &["tag", "v1"]).unwrap();
+
+        let history = history(&repo).unwrap();
+        assert_eq!(
+            history.branch,
+            git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap()
+        );
+        assert_eq!(history.commits.len(), 2);
+        let newest = &history.commits[0];
+        assert_eq!(newest.subject, "second");
+        assert_eq!(newest.body.trim(), "Second body.");
+        assert_eq!(newest.parents, 1);
+        assert!(newest.hash.starts_with(&newest.short));
+        assert!(!newest.author.is_empty());
+        assert!(newest.email.contains('@'));
+        assert!(!newest.date.is_empty());
+        assert!(newest.refs.iter().any(|name| name == "tag: v1"));
+        let root = &history.commits[1];
+        assert_eq!(root.subject, "init");
+        assert_eq!(root.parents, 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The poll's fingerprint holds still while the repository does, and moves
+    /// for a new commit and for a new ref.
+    #[test]
+    fn fingerprint_follows_commits_and_refs() {
+        let (dir, repo) = fixture();
+        let before = fingerprint(&repo).unwrap();
+        assert_eq!(before, fingerprint(&repo).unwrap());
+
+        std::fs::write(repo.join("a"), "changed").unwrap();
+        git(&repo, &["add", "a"]).unwrap();
+        git(&repo, &["commit", "-qm", "second"]).unwrap();
+        let committed = fingerprint(&repo).unwrap();
+        assert_ne!(before, committed);
+
+        git(&repo, &["tag", "v1"]).unwrap();
+        assert_ne!(committed, fingerprint(&repo).unwrap());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

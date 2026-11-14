@@ -17,12 +17,13 @@ use super::SettingsWindow;
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::git::WorktreeEntry;
+use crate::plugins::{PluginProject, PluginSpec};
 use crate::remote::{
     self, Action, AgentInfo, AttachHandle, Command as RemoteCommand, ComputerInfo, MAX_GRID,
     PaneInfo, PaneStatus, ProjectInfo, RemoteConfig, RemoteError, RemoteHandle, RemoteState,
 };
 use futures::StreamExt;
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
@@ -51,6 +52,11 @@ const RATIO_SCALE: f32 = 10_000.;
 const SIDEBAR_WIDTH: f32 = 256.;
 const SIDEBAR_MIN_WIDTH: f32 = 180.;
 const SIDEBAR_MAX_WIDTH: f32 = 520.;
+
+/// The plugin panel's opening width and the range its divider allows.
+const PLUGIN_WIDTH: f32 = 280.;
+const PLUGIN_MIN_WIDTH: f32 = 220.;
+const PLUGIN_MAX_WIDTH: f32 = 480.;
 
 pub struct KumuApp {
     /// Projects and their live shells; the home view draws it and hands it
@@ -92,6 +98,13 @@ pub struct KumuApp {
     last_saved_layout: Option<String>,
     /// Sidebar width in px, restored from the last drag of the divider.
     sidebar_width: f32,
+    /// Open right-hand plugin panel, by registry id.
+    open_plugin: Option<&'static str>,
+    /// Live plugin panels. A panel is created when it opens and dropped when
+    /// it closes, so a closed panel's refresh loop stops.
+    plugin_views: HashMap<&'static str, AnyView>,
+    /// Width of the open plugin panel in px, chosen by dragging its divider.
+    plugin_width: f32,
     /// Remote control service, when it has been enabled for this run.
     remote: Option<RemoteHandle>,
     /// Workspace facts the phone can read. The service holds the same Arc.
@@ -354,6 +367,9 @@ impl KumuApp {
             auto_resume: auto_resume_enabled(),
             last_saved_layout,
             sidebar_width,
+            open_plugin: None,
+            plugin_views: HashMap::new(),
+            plugin_width: PLUGIN_WIDTH,
             remote: None,
             remote_state: Arc::new(RwLock::new(RemoteState::default())),
             last_remote_publish: Instant::now(),
@@ -1114,6 +1130,10 @@ impl KumuApp {
         }
         self.focused = pane;
         self.sync_pane_chrome(cx);
+        // Focusing a pane can switch the selected project without going
+        // through `select_project` (a notification for another project's
+        // shell, say), so open panels are told here too.
+        self.sync_plugin_project(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
@@ -1150,9 +1170,139 @@ impl KumuApp {
         self.pending_focus = self.layouts.contains_key(&id).then_some(self.focused);
         self.show_project_panes(id, cx);
         self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
         self.persist_workspace(cx);
         self.publish_remote_state(cx);
         cx.notify();
+    }
+
+    /// The project a plugin panel shows, if one is selected.
+    fn plugin_project(&self, cx: &App) -> Option<PluginProject> {
+        self.selected
+            .and_then(|id| self.workspace.read(cx).project(id))
+            .map(PluginProject::from)
+    }
+
+    /// Open `spec`'s panel, or close it when it is already the open one. The
+    /// panel is built on first open and dropped on close so its refresh loop
+    /// stops with it.
+    fn toggle_plugin(&mut self, spec: PluginSpec, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_plugin == Some(spec.id) {
+            self.open_plugin = None;
+            self.plugin_views.clear();
+        } else {
+            self.open_plugin = Some(spec.id);
+            self.plugin_views
+                .retain(|id, _| Some(*id) == self.open_plugin);
+            if !self.plugin_views.contains_key(spec.id) {
+                let project = self.plugin_project(cx);
+                let view = spec.create(project, window, cx);
+                self.plugin_views.insert(spec.id, view);
+            }
+        }
+        self.sync_plugin_project(cx);
+        cx.notify();
+    }
+
+    /// Tell the open panel which project is selected. The panel ignores a
+    /// project it is already showing.
+    fn sync_plugin_project(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.open_plugin else {
+            return;
+        };
+        let Some(view) = self.plugin_views.get(id).cloned() else {
+            return;
+        };
+        let Some(spec) = crate::plugins::spec(id) else {
+            return;
+        };
+        let project = self.plugin_project(cx);
+        spec.set_project(&view, project, cx);
+    }
+
+    /// One title-bar entry per registered plugin; the open panel's entry stays
+    /// highlighted.
+    fn render_plugin_button(&self, spec: PluginSpec, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let active = self.open_plugin == Some(spec.id);
+        let background = if active {
+            theme.accent
+        } else {
+            theme.transparent
+        };
+        let foreground = if active {
+            theme.link
+        } else {
+            theme.muted_foreground
+        };
+        Button::new(format!("plugin-toggle-{}", spec.id))
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(background)
+                    .foreground(foreground)
+                    .hover(theme.accent.opacity(0.5)),
+            )
+            .compact()
+            .icon(Icon::empty().path(spec.icon))
+            .tooltip(spec.title)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_plugin(spec.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The open plugin panel: host chrome (title and close) above the plugin's
+    /// own content.
+    fn render_plugin_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(id) = self.open_plugin else {
+            return div().into_any_element();
+        };
+        let Some(spec) = crate::plugins::spec(id) else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.sidebar_border);
+        v_flex()
+            .size_full()
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(Icon::empty().path(spec.icon).small().text_color(muted))
+                    .child(div().text_xs().font_medium().child(spec.title))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(format!("plugin-close-{}", spec.id))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(theme.transparent)
+                                    .foreground(muted)
+                                    .hover(theme.accent.opacity(0.5)),
+                            )
+                            .compact()
+                            .icon(IconName::Close)
+                            .tooltip("收起面板")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_plugin = None;
+                                this.plugin_views.clear();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .children(self.plugin_views.get(id).cloned().map(|view| {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(view.cached(StyleRefinement::default().size_full().min_h_0().min_w_0()))
+            }))
+            .into_any_element()
     }
 
     fn ensure_project_layout(&mut self, project: i64, cx: &mut Context<Self>) {
@@ -1230,6 +1380,7 @@ impl KumuApp {
         self.focused_by_project.insert(project_id, new_id);
         self.pending_focus = Some(new_id);
         self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
         self.persist_workspace(cx);
         self.publish_remote_state(cx);
         cx.notify();
@@ -1742,6 +1893,7 @@ impl KumuApp {
             self.focused = PaneId(1);
         }
         self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
@@ -1868,8 +2020,16 @@ impl KumuApp {
             };
 
         // Full-width title bar strip: brand on the left (traffic lights float
-        // to its left); the settings entry lives in the sidebar's bottom-left.
-        let title_bar = TitleBar::new().child(div().text_sm().font_bold().child("kumu"));
+        // to its left), plugin entries on the right; the settings entry lives
+        // in the sidebar's bottom-left.
+        let plugins = h_flex()
+            .items_center()
+            .gap_1()
+            .pr_2()
+            .children(crate::plugins::specs().map(|spec| self.render_plugin_button(spec, cx)));
+        let title_bar = TitleBar::new()
+            .child(div().text_sm().font_bold().child("kumu"))
+            .child(plugins);
 
         v_flex()
             .size_full()
@@ -1903,12 +2063,12 @@ impl KumuApp {
                     )
             }))
             .child(
-                // The sidebar and panes share one resizable group, so the
-                // divider between them is a real drag handle rather than a
-                // painted line. The sidebar keeps its width when the window
-                // resizes; only dragging its handle changes it.
-                div().flex_1().min_h_0().min_w_0().child(
-                    h_resizable("home-split")
+                // The sidebar, panes and open plugin panel share one resizable
+                // group, so the dividers are real drag handles rather than
+                // painted lines. The two side panels keep their widths when
+                // the window resizes; only dragging their handles changes them.
+                div().flex_1().min_h_0().min_w_0().child({
+                    let mut split = h_resizable("home-split")
                         .child(
                             resizable_panel()
                                 .size(px(self.sidebar_width))
@@ -1916,26 +2076,45 @@ impl KumuApp {
                                 .fixed()
                                 .child(self.render_sidebar(cx)),
                         )
-                        .child(resizable_panel().child(right))
-                        // Persist the width once the drag ends, the same way
-                        // the pane splits save their ratios.
-                        .on_resize({
-                            let weak = cx.entity().downgrade();
-                            move |state, _, cx| {
-                                let Some(width) = state.read(cx).sizes().first().copied() else {
-                                    return;
-                                };
-                                let width =
-                                    f32::from(width).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
-                                crate::db::set_setting(
-                                    crate::db::SETTING_SIDEBAR_WIDTH,
-                                    &format!("{width}"),
-                                )
-                                .ok();
-                                let _ = weak.update(cx, |app, _| app.sidebar_width = width);
-                            }
-                        }),
-                ),
+                        .child(resizable_panel().child(right));
+                    if self.open_plugin.is_some() {
+                        split = split.child(
+                            resizable_panel()
+                                .size(px(self.plugin_width))
+                                .size_range(px(PLUGIN_MIN_WIDTH)..px(PLUGIN_MAX_WIDTH))
+                                .fixed()
+                                .child(self.render_plugin_panel(cx)),
+                        );
+                    }
+                    // Persist the sidebar width once the drag ends, the same
+                    // way the pane splits save their ratios. The plugin width
+                    // only has to survive a re-render, so it stays in memory.
+                    split.on_resize({
+                        let weak = cx.entity().downgrade();
+                        move |state, _, cx| {
+                            let sizes = state.read(cx).sizes().clone();
+                            let Some(width) = sizes.first().copied() else {
+                                return;
+                            };
+                            let width =
+                                f32::from(width).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                            let plugin_width = sizes.get(2).copied().map(|width| {
+                                f32::from(width).clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH)
+                            });
+                            crate::db::set_setting(
+                                crate::db::SETTING_SIDEBAR_WIDTH,
+                                &format!("{width}"),
+                            )
+                            .ok();
+                            let _ = weak.update(cx, move |app, _| {
+                                app.sidebar_width = width;
+                                if let Some(width) = plugin_width {
+                                    app.plugin_width = width;
+                                }
+                            });
+                        }
+                    })
+                }),
             )
     }
 }
