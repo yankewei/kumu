@@ -242,7 +242,15 @@ impl KumuApp {
                                 });
                             }
                         });
-                        menu = menu.item(create);
+                        let open = PopupMenuItem::new("打开已有 worktree").on_click({
+                            let weak = weak.clone();
+                            move |_, window, cx| {
+                                let _ = weak.update(cx, move |app, cx| {
+                                    app.prompt_open_worktree(project_id, window, cx)
+                                });
+                            }
+                        });
+                        menu = menu.item(create).item(open);
                     }
                     menu.item(reveal)
                         .submenu("复制", window, cx, move |menu, _, _| {

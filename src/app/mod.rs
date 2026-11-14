@@ -785,6 +785,27 @@ impl Workspace {
         Some(id)
     }
 
+    /// The project that already points at `path`, if any.
+    pub fn project_by_path(&self, path: &Path) -> Option<i64> {
+        project_for_path(&self.projects, path)
+    }
+
+    /// Attach a worktree that already exists on disk. Returns the project
+    /// that owns the path when it was opened before, so picking it again
+    /// selects the existing row instead of inserting a duplicate.
+    pub fn open_worktree(
+        &mut self,
+        parent_id: i64,
+        name: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<i64> {
+        if let Some(existing) = project_for_path(&self.projects, Path::new(path)) {
+            return Some(existing);
+        }
+        self.add_worktree(parent_id, name, path, cx)
+    }
+
     /// A project and every worktree below it. Deleting the project removes
     /// all of these rows, so the caller must clean up each one.
     pub fn project_tree_ids(&self, project_id: i64) -> Vec<i64> {
@@ -849,6 +870,18 @@ fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
     ProjectPick::New { name }
+}
+
+/// The project that already points at `path`, comparing canonical paths so a
+/// worktree opened through a symlink or a relative path does not become a
+/// duplicate row.
+fn project_for_path(projects: &[Project], path: &Path) -> Option<i64> {
+    let normalize = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let wanted = normalize(path);
+    projects
+        .iter()
+        .find(|project| normalize(Path::new(&project.path)) == wanted)
+        .map(|project| project.id)
 }
 
 /// The directory a first-run project opens in.
@@ -1243,6 +1276,31 @@ mod tests {
             resolve_project_pick(&projects, "/repo/b"),
             ProjectPick::Existing(2)
         );
+    }
+
+    /// A worktree opened through a path that differs only in its written form
+    /// still resolves to the row that owns it.
+    #[test]
+    fn a_worktree_path_matches_the_project_that_owns_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "kumu-open-worktree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = dir.join("repo-feat");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let projects = vec![project(1, "/repo"), project(2, &worktree.to_string_lossy())];
+        assert_eq!(
+            super::project_for_path(&projects, &worktree.join(".")),
+            Some(2),
+            "a path written differently still names the same directory"
+        );
+        assert_eq!(super::project_for_path(&projects, &dir.join("other")), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A folder not seen before is a new project named after itself.

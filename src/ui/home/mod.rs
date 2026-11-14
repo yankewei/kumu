@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use super::SettingsWindow;
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
+use crate::git::WorktreeEntry;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
@@ -1013,6 +1014,188 @@ impl KumuApp {
             });
         })
         .detach();
+    }
+
+    /// List the repository's existing worktrees and let the user attach one
+    /// to this project. Listing runs off the UI thread because worktree
+    /// metadata can live on a slow volume.
+    fn prompt_open_worktree(&self, project_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let path = PathBuf::from(&project.path);
+            let entries = cx
+                .background_executor()
+                .spawn(async move { crate::git::list_worktrees(&path) })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| match entries {
+                Ok(entries) => app.show_worktree_picker(project_id, entries, window, cx),
+                Err(message) => {
+                    app.store_error = Some(format!("读取 worktree 失败：{message}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Offer the worktrees git already knows about. A worktree Kumu shows
+    /// already is labelled and selected instead of being added twice.
+    fn show_worktree_picker(
+        &mut self,
+        project_id: i64,
+        entries: Vec<WorktreeEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
+            return;
+        };
+        // The main checkout is the project itself, and an entry whose
+        // directory is gone cannot be opened. Git keeps listing a worktree
+        // until it is pruned.
+        let items: Vec<(String, PathBuf, Option<i64>)> = entries
+            .into_iter()
+            .filter(|entry| !entry.main && entry.path.exists())
+            .map(|entry| {
+                let open = self.workspace.read(cx).project_by_path(&entry.path);
+                (entry.name, entry.path, open)
+            })
+            .collect();
+        if items.is_empty() {
+            window.open_dialog(cx, move |dialog, _, cx| {
+                dialog
+                    .title("打开已有 worktree")
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "「{}」没有其他 worktree。可在项目右键菜单中新建一个。",
+                                project.name
+                            )),
+                    )
+                    .button_props(
+                        DialogButtonProps::default()
+                            .ok_text("关闭")
+                            .show_cancel(false),
+                    )
+                    .centered()
+            });
+            return;
+        }
+
+        let weak = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, hover, radius) = (theme.muted_foreground, theme.accent, theme.radius);
+            let rows = items.iter().enumerate().map(|(index, (name, path, open))| {
+                let shown = path.to_string_lossy().into_owned();
+                let row_name = name.clone();
+                let row_path = path.clone();
+                let open = *open;
+                let weak = weak.clone();
+                v_flex()
+                    .id(("open-worktree", index))
+                    .w_full()
+                    .px_2()
+                    .py_1p5()
+                    .gap_0p5()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover.opacity(0.5)))
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |app, cx| match open {
+                            Some(id) => {
+                                app.ensure_project_layout(id, cx);
+                                app.select_project(id, cx);
+                            }
+                            None => app.attach_worktree(
+                                project_id,
+                                row_name.clone(),
+                                row_path.clone(),
+                                cx,
+                            ),
+                        });
+                        window.close_dialog(cx);
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_medium()
+                                    .child(name.clone()),
+                            )
+                            .when_some(open, |row, _| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("已打开"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(shown),
+                    )
+            });
+            dialog
+                .title("打开已有 worktree")
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "选择要加入「{}」的 worktree，它会作为子项目出现在侧栏。",
+                            project.name
+                        )),
+                )
+                .child(
+                    div()
+                        .id("open-worktree-list")
+                        .w_full()
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .child(v_flex().w_full().children(rows)),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("关闭")
+                        .show_cancel(false),
+                )
+                .centered()
+        });
+    }
+
+    /// Attach an existing worktree below its repository and show it.
+    fn attach_worktree(
+        &mut self,
+        parent_id: i64,
+        name: String,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.to_string_lossy().into_owned();
+        let id = self.workspace.update(cx, |workspace, cx| {
+            workspace.open_worktree(parent_id, &name, &path, cx)
+        });
+        let Some(id) = id else {
+            return;
+        };
+        self.ensure_project_layout(id, cx);
+        self.select_project(id, cx);
     }
 
     /// Rename a project: the dialog starts on the current name.
