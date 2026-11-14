@@ -131,8 +131,7 @@ impl KumuApp {
                     .child(
                         h_flex()
                             .w_full()
-                            .justify_end()
-                            .gap_1()
+                            .justify_between()
                             .child(
                                 div()
                                     .id("open-settings")

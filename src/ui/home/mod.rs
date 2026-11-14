@@ -369,13 +369,9 @@ impl KumuApp {
         app
     }
 
-    /// Start the remote endpoint when the launch environment asks for it.
-    /// The settings page will own this switch in a later milestone; for now
-    /// `KUMU_REMOTE=1` is the explicit opt-in.
+    /// Start the remote endpoint. It always runs so a phone can pair without
+    /// a launch environment flag; the sidebar exposes the pairing link.
     fn start_remote(&mut self, cx: &mut Context<Self>) {
-        if std::env::var("KUMU_REMOTE").as_deref() != Ok("1") {
-            return;
-        }
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         // No command can arrive before the endpoint exists, so the actor can
         // run from the start.
