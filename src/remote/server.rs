@@ -25,7 +25,10 @@ use super::{Action, Command, MAX_GRID, RemoteError};
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a silent phone keeps its pane at the phone's grid. The phone
+/// pings every 5 s, so this tolerates three lost pings while still giving the
+/// desktop its size back soon after the phone is gone.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a control reply may wait for room behind terminal data before it
 /// is dropped: only a phone that stopped reading gets here.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
