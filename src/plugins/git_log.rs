@@ -7,11 +7,12 @@
 //! panel when the user opens it and drops it when they close it, so a closed
 //! panel costs nothing.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::hover_card::HoverCard;
+use gpui_kit::component::diff::{Diff, DiffFile, DiffParseOptions, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
@@ -248,7 +249,63 @@ impl GitLogPanel {
             .map_or(self.commits.len(), |filter| filter.len())
     }
 
-    fn render_commit(index: usize, total: usize, commit: &Commit, theme: &Theme) -> AnyElement {
+    /// Show the commit's patch in a sheet. The sheet's view owns the read, so
+    /// closing the sheet drops the work with it and this panel keeps none of it.
+    fn open_commit(&mut self, commit: Commit, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let view = cx.new(|cx| CommitDiffView::new(project.path, commit, cx));
+        window.open_sheet(cx, move |sheet, window, cx| {
+            let theme = cx.theme();
+            let (subject, meta) = {
+                let view = view.read(cx);
+                let commit = &view.commit;
+                (
+                    commit.subject.clone(),
+                    if commit.email.is_empty() {
+                        format!("{} · {} · {}", commit.short, commit.author, commit.date)
+                    } else {
+                        format!(
+                            "{} · {} <{}> · {}",
+                            commit.short, commit.author, commit.email, commit.date
+                        )
+                    },
+                )
+            };
+            // The sheet is right-anchored at a fixed width, so a narrow window
+            // has to shrink it: the diff's line numbers sit on the left edge.
+            let width = px(760.).min(window.viewport_size().width - px(96.));
+            sheet
+                .size(width.max(px(320.)))
+                .title(
+                    v_flex()
+                        .gap_0p5()
+                        .min_w_0()
+                        .child(div().text_sm().truncate().child(subject))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_normal()
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(meta),
+                        ),
+                )
+                .child(
+                    view.clone()
+                        .cached(StyleRefinement::default().size_full().min_h_0().min_w_0()),
+                )
+        });
+    }
+
+    fn render_commit(
+        index: usize,
+        total: usize,
+        commit: &Commit,
+        theme: &Theme,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
         let line = theme.sidebar_border;
         let first = index == 0;
         let last = index + 1 == total;
@@ -291,6 +348,7 @@ impl GitLogPanel {
             .gap_1()
             .items_center()
             .hover(move |style| style.bg(theme.accent.opacity(0.35)))
+            .on_click(on_click)
             .child(lane)
             .child(
                 div()
@@ -311,17 +369,111 @@ impl GitLogPanel {
                     .child(commit.subject.clone()),
             );
 
-        let detail = commit.clone();
-        HoverCard::new(format!("git-log-hover-{}", commit.hash))
-            .anchor(Anchor::RightCenter)
-            .open_delay(Duration::from_millis(250))
-            .trigger_style(StyleRefinement::default().w_full())
-            .trigger(row)
-            .content(move |_, _, cx| {
-                let theme = cx.theme();
-                commit_detail(&detail, theme)
+        row.into_any_element()
+    }
+}
+
+/// The sheet body: one commit's patch. The read and the patch parse run on the
+/// background executor; the diff state is built on the UI thread once the files
+/// are in hand, because it prepares syntax off-thread itself.
+struct CommitDiffView {
+    commit: Commit,
+    state: Option<Entity<DiffState>>,
+    truncated: bool,
+    error: Option<String>,
+}
+
+impl CommitDiffView {
+    fn new(project: PathBuf, commit: Commit, cx: &mut Context<Self>) -> Self {
+        let hash = commit.hash.clone();
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_spawn(async move {
+                    let diff = crate::git::commit_diff(&project, &hash)?;
+                    // A cut patch ends in the middle of a hunk, which the
+                    // parser takes when it is told to count the lines present.
+                    let files = DiffFile::parse_with(
+                        &diff.patch,
+                        DiffParseOptions::new().truncated_hunks(diff.truncated),
+                    )
+                    .map_err(|error| format!("无法解析这次提交的补丁：{error}"))?;
+                    Ok::<_, String>((diff.truncated, files))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match read {
+                    Ok((truncated, files)) => {
+                        let state = cx.new(|cx| DiffState::new(files, cx));
+                        // Scrolling and selection notify the state; this view
+                        // rebuilds the element so the new frame is painted.
+                        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+                        view.truncated = truncated;
+                        view.state = Some(state);
+                    }
+                    Err(error) => view.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        Self {
+            commit,
+            state: None,
+            truncated: false,
+            error: None,
+        }
+    }
+}
+
+impl Render for CommitDiffView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let message = self.commit.body.trim_end();
+        let body: AnyElement = match (&self.error, &self.state) {
+            (Some(error), _) => empty(error, theme.danger),
+            (None, Some(state)) if state.read(cx).files().is_empty() => {
+                empty("这次提交没有内容变更", muted)
+            }
+            (None, Some(state)) => div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(Diff::new(state).size_full())
+                .into_any_element(),
+            (None, None) => empty("正在读取补丁…", muted),
+        };
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .text_color(theme.sidebar_foreground)
+            // The commit message lives here now that rows no longer open a
+            // hover card, which would have been drawn over this sheet.
+            .when(!message.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("commit-diff-message")
+                        .w_full()
+                        .max_h(rems(12.))
+                        .overflow_y_scroll()
+                        .pb_2()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(message.to_string()),
+                )
             })
-            .into_any_element()
+            .when(self.truncated, |this| {
+                this.child(
+                    div()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("补丁过大，只显示了前面的一部分"),
+                )
+            })
+            .child(body)
     }
 }
 
@@ -393,12 +545,26 @@ impl Render for GitLogPanel {
         } else {
             let commits = self.commits.clone();
             let filter = self.filter.clone();
+            let panel = cx.entity();
             uniform_list("git-log-list", visible, move |range, _window, cx| {
                 let theme = cx.theme();
                 range
                     .map(|row| {
                         let index = filter.as_ref().map_or(row, |filter| filter[row]);
-                        Self::render_commit(row, visible, &commits[index], theme)
+                        let commit = &commits[index];
+                        let panel = panel.clone();
+                        let clicked = commit.clone();
+                        Self::render_commit(
+                            row,
+                            visible,
+                            commit,
+                            theme,
+                            move |_, window: &mut Window, cx: &mut App| {
+                                panel.update(cx, |panel, cx| {
+                                    panel.open_commit(clicked.clone(), window, cx);
+                                });
+                            },
+                        )
                     })
                     .collect()
             })
@@ -415,57 +581,6 @@ impl Render for GitLogPanel {
             .children(toolbar)
             .child(body)
     }
-}
-
-/// The hover card: the whole message and who wrote it.
-fn commit_detail(commit: &Commit, theme: &Theme) -> Div {
-    let muted = theme.muted_foreground;
-    let body = commit.body.trim_end();
-    v_flex()
-        .w(rems(20.))
-        .gap_2()
-        .child(div().text_sm().font_medium().child(commit.subject.clone()))
-        .when(!body.is_empty(), |card| {
-            card.child(
-                div()
-                    .id("git-log-detail-body")
-                    .max_h(rems(14.))
-                    .overflow_y_scroll()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(body.to_string()),
-            )
-        })
-        .child(
-            v_flex()
-                .gap_0p5()
-                .border_t_1()
-                .border_color(theme.border)
-                .pt_2()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_xs().font_medium().child(commit.author.clone()))
-                        .child(div().text_xs().text_color(muted).child("·"))
-                        .child(div().text_xs().text_color(muted).child(commit.date.clone())),
-                )
-                .when(!commit.email.is_empty(), |meta| {
-                    meta.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(commit.email.clone()),
-                    )
-                })
-                .child(
-                    div()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .text_color(theme.link)
-                        .child(commit.short.clone()),
-                ),
-        )
 }
 
 /// Branch, tag and remote refs on a commit, capped so a busy commit cannot
@@ -519,4 +634,98 @@ fn empty(message: &str, color: Hsla) -> AnyElement {
         .text_color(color)
         .child(message.to_string())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use gpui_kit::{
+        AppContext, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
+        TestAppContext, Window, div,
+    };
+
+    use super::CommitDiffView;
+
+    /// Run git in `repo`, failing the test with git's own message.
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repository with one commit, plus the directory that owns it.
+    fn fixture() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kumu-panel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "test"]);
+        std::fs::write(repo.join("a"), "a\n").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        (dir, repo)
+    }
+
+    struct Host {
+        view: Entity<CommitDiffView>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.view.clone())
+        }
+    }
+
+    /// The view reads the commit on the background executor and hands git's
+    /// own patch to the diff parser, which is what the sheet draws.
+    #[gpui::test]
+    fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (dir, path) = fixture();
+        let history = crate::git::history(&path).unwrap();
+        let commit = history.commits[0].clone();
+
+        let view = cx.new(|cx| CommitDiffView::new(path, commit, cx));
+        cx.run_until_parked();
+
+        let (files, error) = view.read_with(cx, |view, cx| {
+            (
+                view.state
+                    .as_ref()
+                    .map(|state| state.read(cx).files().len()),
+                view.error.clone(),
+            )
+        });
+        assert_eq!(error, None);
+        assert_eq!(files, Some(1));
+
+        // The sheet only adds chrome around this view, so drawing the view is
+        // what proves the parsed patch reaches the diff component.
+        let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

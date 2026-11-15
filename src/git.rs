@@ -5,9 +5,11 @@
 //! own. A worktree created elsewhere can be attached to the same project list;
 //! removing its row from Kumu leaves the directory alone.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 /// A worktree created beside the repository it belongs to.
 pub struct Worktree {
@@ -53,6 +55,19 @@ pub struct History {
     /// Shared with the panel's list instead of copied, so the rows exist once.
     pub commits: Arc<Vec<Commit>>,
 }
+
+/// What one commit changed, as a patch the diff view can parse.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct CommitDiff {
+    /// Unified patch in git's own format, possibly cut at [`MAX_PATCH_BYTES`].
+    pub patch: String,
+    /// The patch was cut, so the view has to say that it is incomplete.
+    pub truncated: bool,
+}
+
+/// A commit that rewrites a generated file can produce a patch far bigger than
+/// anyone reads, so the panel stops at this many bytes of patch text.
+const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Read the full history of `dir`'s checked-out branch. The panel virtualizes
 /// the rows, so there is no limit here: "all commits" means every commit git
@@ -119,6 +134,98 @@ pub fn history(dir: &Path) -> Result<History, String> {
         branch,
         commits: Arc::new(commits),
     })
+}
+
+/// The patch `hash` introduced, cut at [`MAX_PATCH_BYTES`].
+///
+/// `--format=` leaves the commit message out and `-m --first-parent` gives a
+/// merge the diff against the commit it was merged into, which plain `show`
+/// prints nothing for; `--no-color` keeps a `color.ui=always` configuration
+/// from putting escape codes in the patch.
+pub fn commit_diff(dir: &Path, hash: &str) -> Result<CommitDiff, String> {
+    let root = repo_root(dir)?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "--no-optional-locks",
+            "show",
+            "--format=",
+            "--patch",
+            "--no-color",
+            "-m",
+            "--first-parent",
+            hash,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法运行 git：{error}"))?;
+
+    // stderr is drained on its own thread: a chatty git must not fill the pipe
+    // and block while the patch is read.
+    let stderr = child.stderr.take().map(drain);
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(MAX_PATCH_BYTES as u64 + 1)
+            .read_to_end(&mut output)
+            .map_err(|error| format!("无法读取 git 输出：{error}"))?;
+    }
+    // Everything past the cap would be thrown away, so stop git instead of
+    // waiting for output nobody reads.
+    let truncated = output.len() > MAX_PATCH_BYTES;
+    if truncated {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("无法等待 git：{error}"))?;
+    let stderr = stderr
+        .map(|stderr| stderr.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !truncated && !status.success() {
+        return Err(git_failure("show", status, &stderr));
+    }
+    let patch = String::from_utf8_lossy(&output).into_owned();
+    Ok(CommitDiff {
+        patch: if truncated { trim_patch(patch) } else { patch },
+        truncated,
+    })
+}
+
+/// Read a child's stderr to the end on its own thread.
+fn drain(mut pipe: ChildStderr) -> JoinHandle<String> {
+    thread::spawn(move || {
+        let mut message = String::new();
+        let _ = pipe.read_to_string(&mut message);
+        message
+    })
+}
+
+/// Cut a capped patch to the start of its last file, so every file the view
+/// shows is complete. A single file larger than the cap is cut mid-hunk, which
+/// the diff parser accepts as a truncated hunk.
+fn trim_patch(patch: String) -> String {
+    trim_patch_at(patch, MAX_PATCH_BYTES)
+}
+
+fn trim_patch_at(mut patch: String, limit: usize) -> String {
+    let limit = prefix_boundary(&patch, limit);
+    let cut = patch[..limit]
+        .rfind("\ndiff --git ")
+        .map_or(limit, |index| index + 1);
+    patch.truncate(cut);
+    patch
+}
+
+/// The largest index at or below `limit` that is on a char boundary of `text`.
+fn prefix_boundary(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// A cheap fingerprint of what [`history`] would show: the checked-out branch
@@ -269,20 +376,26 @@ fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .output()
         .map_err(|error| format!("无法运行 git：{error}"))?;
     if !output.status.success() {
+        let command = args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .copied()
+            .unwrap_or("git");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr.trim();
-        return Err(if message.is_empty() {
-            let command = args
-                .iter()
-                .find(|arg| !arg.starts_with('-'))
-                .copied()
-                .unwrap_or("git");
-            format!("git {command} 失败（退出码 {}）", output.status)
-        } else {
-            message.to_string()
-        });
+        return Err(git_failure(command, output.status, &stderr));
     }
     Ok(output.stdout)
+}
+
+/// The message for a git run that exited with `status`: git's stderr when it
+/// said anything, otherwise just the command and its exit code.
+fn git_failure(command: &str, status: ExitStatus, stderr: &str) -> String {
+    let message = stderr.trim();
+    if message.is_empty() {
+        format!("git {command} 失败（退出码 {status}）")
+    } else {
+        message.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +511,70 @@ mod tests {
         let root = &history.commits[1];
         assert_eq!(root.subject, "init");
         assert_eq!(root.parents, 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A merge commit's patch is its first parent's diff, and the commit
+    /// message never ends up inside the patch.
+    #[test]
+    fn shows_a_commits_patch_but_not_its_message() {
+        let (dir, repo) = fixture();
+        let main = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        git(&repo, &["checkout", "-qb", "side"]).unwrap();
+        std::fs::write(repo.join("b"), "b").unwrap();
+        git(&repo, &["add", "b"]).unwrap();
+        git(&repo, &["commit", "-qm", "side"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        std::fs::write(repo.join("c"), "c").unwrap();
+        git(&repo, &["add", "c"]).unwrap();
+        git(&repo, &["commit", "-qm", "main"]).unwrap();
+        git(
+            &repo,
+            &["merge", "-q", "--no-ff", "side", "-m", "merged side"],
+        )
+        .unwrap();
+        let head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let diff = commit_diff(&repo, &head).unwrap();
+        assert!(!diff.truncated);
+        assert!(diff.patch.contains("+++ b/b"));
+        assert!(!diff.patch.contains("merged side"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An oversized patch stops at the last complete file, and one too big for
+    /// that keeps its start.
+    #[test]
+    fn cuts_an_oversized_patch_at_a_file_boundary() {
+        let first = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n";
+        let second = "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-c\n+d\n";
+        let patch = format!("{first}{second}");
+
+        assert_eq!(
+            trim_patch_at(patch.clone(), patch.len() - second.len() / 2),
+            first
+        );
+
+        let trimmed = trim_patch_at(patch, 30);
+        assert!(trimmed.len() <= 30);
+        assert!(trimmed.starts_with("diff --git a/a"));
+    }
+
+    /// The read stops at the cap instead of buffering the whole patch, and git
+    /// is killed rather than being waited on.
+    #[test]
+    fn stops_reading_a_patch_past_the_cap() {
+        let (dir, repo) = fixture();
+        let lines = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n".repeat(100_000);
+        std::fs::write(repo.join("big"), lines).unwrap();
+        git(&repo, &["add", "big"]).unwrap();
+        git(&repo, &["commit", "-qm", "big"]).unwrap();
+
+        let diff = commit_diff(&repo, "HEAD").unwrap();
+        assert!(diff.truncated);
+        assert!(diff.patch.len() <= MAX_PATCH_BYTES);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
