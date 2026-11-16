@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use super::home::KumuApp;
 use super::widgets::{PillTone, agent_logo, pill};
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
@@ -81,10 +82,19 @@ pub struct SettingsWindow {
     integration_busy: Option<&'static str>,
     /// Whether panes resume their agent conversations on the next launch.
     auto_resume: bool,
+    /// The home window, so the remote switch can start or stop the service.
+    home: WeakEntity<KumuApp>,
+    /// Whether the remote-control service is on.
+    remote: bool,
 }
 
 impl SettingsWindow {
-    pub fn new(updater: Entity<Updater>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        updater: Entity<Updater>,
+        home: WeakEntity<KumuApp>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&updater, |_, updater, cx| {
             if let UpdateStatus::Errored(error) = updater.read(cx).status() {
                 eprintln!("[updates] {error}");
@@ -149,6 +159,8 @@ impl SettingsWindow {
                 .collect(),
             integration_busy: None,
             auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
+            home,
+            remote: db::get_setting(db::SETTING_REMOTE).as_deref() == Some("1"),
         }
     }
 
@@ -746,6 +758,29 @@ impl SettingsWindow {
                 })
                 .into_any_element()
         };
+        let remote = {
+            let this = cx.entity().downgrade();
+            let home = self.home.clone();
+            Switch::new("remote-control")
+                .checked(self.remote)
+                .on_click(move |checked, window, cx| {
+                    if let Err(error) =
+                        db::set_setting(db::SETTING_REMOTE, if *checked { "1" } else { "0" })
+                    {
+                        window.push_notification(
+                            Notification::error(format!("保存远程控制设置失败：{error}")),
+                            cx,
+                        );
+                        return;
+                    }
+                    let _ = this.update(cx, |this, cx| {
+                        this.remote = *checked;
+                        cx.notify();
+                    });
+                    home.update(cx, |app, cx| app.set_remote(*checked, cx)).ok();
+                })
+                .into_any_element()
+        };
         let notification_sound = Switch::new("notification-sound")
             .checked(cx.global::<NotificationSettings>().sound)
             .on_click(|checked, window, cx| {
@@ -826,6 +861,13 @@ impl SettingsWindow {
                 "恢复 Agent 会话",
                 "启动时让 Agent 窗格回到上次的对话；关闭后只恢复窗格，以新对话开始。",
                 auto_resume,
+                border,
+                false,
+            ))
+            .child(row(
+                "远程控制",
+                "用手机查看和操作终端；开启后本机开始监听，侧栏显示配对码。",
+                remote,
                 border,
                 false,
             ))

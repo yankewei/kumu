@@ -41,6 +41,12 @@ fn auto_resume_enabled() -> bool {
     crate::db::get_setting(crate::db::SETTING_AUTO_RESUME).as_deref() != Some("0")
 }
 
+/// Remote control is opt-in: the endpoint only runs after the settings switch
+/// is on, so an unpaired Mac listens for nothing by default.
+fn remote_enabled() -> bool {
+    crate::db::get_setting(crate::db::SETTING_REMOTE).as_deref() == Some("1")
+}
+
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
 /// ratios. Only the relative values matter: the group rescales them to the
 /// container's real size on its first paint.
@@ -107,6 +113,9 @@ pub struct KumuApp {
     plugin_width: f32,
     /// Remote control service, when it has been enabled for this run.
     remote: Option<RemoteHandle>,
+    /// Bumped whenever the service is turned off or back on, so a start that
+    /// is still binding the endpoint cannot install itself afterwards.
+    remote_epoch: u64,
     /// Workspace facts the phone can read. The service holds the same Arc.
     remote_state: Arc<RwLock<RemoteState>>,
     /// When the snapshot above was last written. Terminal output arrives far
@@ -371,6 +380,7 @@ impl KumuApp {
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
             remote: None,
+            remote_epoch: 0,
             remote_state: Arc::new(RwLock::new(RemoteState::default())),
             last_remote_publish: Instant::now(),
             pane_activity: HashMap::new(),
@@ -378,16 +388,22 @@ impl KumuApp {
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
         }
-        app.start_remote(cx);
+        if remote_enabled() {
+            app.start_remote(cx);
+        }
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
         app.persist_workspace(cx);
         app
     }
 
-    /// Start the remote endpoint. It always runs so a phone can pair without
-    /// a launch environment flag; the sidebar exposes the pairing link.
+    /// Start the remote endpoint for a phone to pair with; the sidebar then
+    /// exposes the pairing link. Only the settings switch asks for this.
     fn start_remote(&mut self, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            return;
+        }
+        let epoch = self.remote_epoch;
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         // No command can arrive before the endpoint exists, so the actor can
         // run from the start.
@@ -405,18 +421,32 @@ impl KumuApp {
             let started = cx
                 .background_spawn(async move { remote::start(RemoteConfig::default(), state, tx) })
                 .await;
-            let handle = match started {
-                Ok(handle) => handle,
+            let mut pending = match started {
+                Ok(handle) => Some(handle),
                 Err(error) => {
                     eprintln!("[remote] failed to start: {error:#}");
                     return;
                 }
             };
-            let mut pairing = handle.auth.subscribe_pairing();
+            let mut pairing = None;
             let _ = this.update(cx, |app, cx| {
+                // Switched off (or on again) while the endpoint was binding:
+                // this start no longer belongs to the current wish.
+                if app.remote_epoch != epoch {
+                    return;
+                }
+                let handle = pending.take().expect("started handle");
+                pairing = Some(handle.auth.subscribe_pairing());
                 app.remote = Some(handle);
                 app.publish_remote_state(cx);
+                // The sidebar's pairing entry appears with the service.
+                cx.notify();
             });
+            let Some(mut pairing) = pairing else {
+                // Dropping the handle stops the endpoint that was not wanted.
+                drop(pending);
+                return;
+            };
             // The sidebar shows the pairing code, which rotates after a phone
             // pairs. Repaint so it never shows a code that was already used.
             use tokio::sync::broadcast::error::RecvError;
@@ -427,10 +457,28 @@ impl KumuApp {
         .detach();
     }
 
+    /// Turn the remote-control service on or off for this run. The settings
+    /// window persists the choice and calls this; dropping the handle closes
+    /// the endpoint, so an off Mac accepts no connection at all.
+    pub(crate) fn set_remote(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.remote_epoch += 1;
+        if enabled {
+            self.start_remote(cx);
+            return;
+        }
+        self.remote = None;
+        cx.notify();
+    }
+
     /// Copy the parts of the workspace a phone can see into the shared
     /// snapshot. Terminal bytes are separate; this is only the facts around
     /// them (projects, panes, titles, status, size).
     fn publish_remote_state(&mut self, cx: &mut Context<Self>) {
+        // Nothing reads the snapshot while the service is off, and the phone
+        // only needs it once the endpoint exists.
+        if self.remote.is_none() {
+            return;
+        }
         self.last_remote_publish = Instant::now();
         let workspace = self.workspace.read(cx);
         let mut state = RemoteState {
@@ -1919,8 +1967,9 @@ impl KumuApp {
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
+        let home = cx.entity().downgrade();
         if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| SettingsWindow::new(updater, window, cx))
+            cx.new(|cx| SettingsWindow::new(updater, home, window, cx))
         }) {
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);

@@ -659,6 +659,10 @@ pub const SETTING_NOTIFICATION_SOUND: &str = "notification_sound";
 /// (`"0"` starts a new one in each restored pane).
 pub const SETTING_AUTO_RESUME: &str = "auto_resume";
 
+/// Whether the remote-control service listens for a phone (`"1"` turns it on;
+/// unset keeps it off until the settings switch enables it).
+pub const SETTING_REMOTE: &str = "remote";
+
 /// Setting key marking that the first-run project was seeded. It stays
 /// after the user deletes them, so an intentionally empty workspace is not
 /// refilled on the next launch.
