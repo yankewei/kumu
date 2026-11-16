@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::UpdateStatus;
 
-use super::KumuApp;
+use super::{KumuApp, pairing_expiry_label};
 use crate::ui::tooltip::HoverLabel as _;
 
 impl KumuApp {
@@ -475,21 +475,6 @@ impl KumuApp {
                     ),
             )
             .into_any_element()
-    }
-}
-
-/// How long the current one-use pairing code stays valid, rounded up to whole
-/// minutes so the card never shows a shorter life than the code has. The card
-/// only repaints when the app does, so this reads as a hint rather than a
-/// countdown.
-fn pairing_expiry_label(expires: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    match expires.saturating_sub(now) {
-        0 => "配对码即将更新".to_string(),
-        left if left < 60_000 => "不到 1 分钟内有效".to_string(),
-        left => format!("{} 分钟内有效", left.div_ceil(60_000)),
     }
 }
 

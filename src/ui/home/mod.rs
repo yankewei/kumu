@@ -64,6 +64,43 @@ const PLUGIN_WIDTH: f32 = 280.;
 const PLUGIN_MIN_WIDTH: f32 = 220.;
 const PLUGIN_MAX_WIDTH: f32 = 480.;
 
+/// What the settings window's remote page shows. Copied out of the service so
+/// the page never holds an auth lock while it draws.
+#[derive(Default)]
+pub struct RemoteStatus {
+    /// The endpoint is binding the relay right now.
+    pub starting: bool,
+    /// The endpoint is up and pairing codes are live.
+    pub running: bool,
+    pub bridge_id: String,
+    pub code: Option<String>,
+    pub expires_ms: u64,
+    pub pairing_link: Option<String>,
+    pub devices: Vec<RemoteDevice>,
+}
+
+/// One paired phone, without its token hash.
+pub struct RemoteDevice {
+    pub id: String,
+    pub name: String,
+    pub last_seen_ms: u64,
+}
+
+/// How long the current one-use pairing code stays valid, rounded up to whole
+/// minutes so the card never shows a shorter life than the code has. The card
+/// only repaints when the app does, so this reads as a hint rather than a
+/// countdown.
+pub(crate) fn pairing_expiry_label(expires: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    match expires.saturating_sub(now) {
+        0 => "配对码即将更新".to_string(),
+        left if left < 60_000 => "不到 1 分钟内有效".to_string(),
+        left => format!("{} 分钟内有效", left.div_ceil(60_000)),
+    }
+}
+
 pub struct KumuApp {
     /// Projects and their live shells; the home view draws it and hands it
     /// every user action.
@@ -113,6 +150,8 @@ pub struct KumuApp {
     plugin_width: f32,
     /// Remote control service, when it has been enabled for this run.
     remote: Option<RemoteHandle>,
+    /// Whether a start request is still binding the endpoint.
+    remote_starting: bool,
     /// Bumped whenever the service is turned off or back on, so a start that
     /// is still binding the endpoint cannot install itself afterwards.
     remote_epoch: u64,
@@ -380,6 +419,7 @@ impl KumuApp {
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
             remote: None,
+            remote_starting: false,
             remote_epoch: 0,
             remote_state: Arc::new(RwLock::new(RemoteState::default())),
             last_remote_publish: Instant::now(),
@@ -403,6 +443,8 @@ impl KumuApp {
         if self.remote.is_some() {
             return;
         }
+        self.remote_starting = true;
+        self.refresh_settings(cx);
         let epoch = self.remote_epoch;
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         // No command can arrive before the endpoint exists, so the actor can
@@ -425,6 +467,12 @@ impl KumuApp {
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     eprintln!("[remote] failed to start: {error:#}");
+                    let _ = this.update(cx, |app, cx| {
+                        if app.remote_epoch == epoch {
+                            app.remote_starting = false;
+                            app.refresh_settings(cx);
+                        }
+                    });
                     return;
                 }
             };
@@ -438,9 +486,11 @@ impl KumuApp {
                 let handle = pending.take().expect("started handle");
                 pairing = Some(handle.auth.subscribe_pairing());
                 app.remote = Some(handle);
+                app.remote_starting = false;
                 app.publish_remote_state(cx);
                 // The sidebar's pairing entry appears with the service.
                 cx.notify();
+                app.refresh_settings(cx);
             });
             let Some(mut pairing) = pairing else {
                 // Dropping the handle stops the endpoint that was not wanted.
@@ -451,7 +501,11 @@ impl KumuApp {
             // pairs. Repaint so it never shows a code that was already used.
             use tokio::sync::broadcast::error::RecvError;
             while let Ok(()) | Err(RecvError::Lagged(_)) = pairing.recv().await {
-                let _ = this.update(cx, |app, cx| app.publish_remote_state(cx));
+                let _ = this.update(cx, |app, cx| {
+                    app.publish_remote_state(cx);
+                    // The settings page shows the code a phone has not used.
+                    app.refresh_settings(cx);
+                });
             }
         })
         .detach();
@@ -467,7 +521,75 @@ impl KumuApp {
             return;
         }
         self.remote = None;
+        self.remote_starting = false;
         cx.notify();
+        self.refresh_settings(cx);
+    }
+
+    /// The facts the settings window's remote page draws.
+    pub(crate) fn remote_status(&self) -> RemoteStatus {
+        let Some(remote) = &self.remote else {
+            return RemoteStatus {
+                starting: self.remote_starting,
+                ..RemoteStatus::default()
+            };
+        };
+        RemoteStatus {
+            starting: false,
+            running: true,
+            bridge_id: remote.auth.bridge_id(),
+            code: Some(remote.auth.code()),
+            expires_ms: remote.auth.pairing_expires_ms(),
+            pairing_link: remote.pairing_link(),
+            devices: remote
+                .auth
+                .devices()
+                .into_iter()
+                .map(|device| RemoteDevice {
+                    id: device.id,
+                    name: device.name,
+                    last_seen_ms: device.last_seen_ms,
+                })
+                .collect(),
+        }
+    }
+
+    /// Replace the one-use pairing code; a phone that already saw the old one
+    /// must not pair with it.
+    pub(crate) fn remote_rotate_code(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        if let Some(remote) = &self.remote {
+            remote.auth.rotate_code()?;
+            self.publish_remote_state(cx);
+        }
+        cx.notify();
+        self.refresh_settings(cx);
+        Ok(())
+    }
+
+    /// Forget a paired phone and cut off its reconnects.
+    pub(crate) fn remote_revoke(&mut self, id: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        if let Some(remote) = &self.remote {
+            remote.auth.revoke(id)?;
+            self.publish_remote_state(cx);
+        }
+        cx.notify();
+        self.refresh_settings(cx);
+        Ok(())
+    }
+
+    /// Repaint an open settings window after the remote service changed. The
+    /// settings window itself is what starts and stops it, so a nested update
+    /// (same window) simply finds nothing to do.
+    fn refresh_settings(&self, cx: &mut App) {
+        let Some(handle) = self.settings_window else {
+            return;
+        };
+        let _ = handle.update(cx, |view, window, cx| {
+            if let Ok(settings) = view.clone().downcast::<SettingsWindow>() {
+                settings.update(cx, |_, cx| cx.notify());
+            }
+            window.refresh();
+        });
     }
 
     /// Copy the parts of the workspace a phone can see into the shared
