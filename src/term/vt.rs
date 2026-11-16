@@ -141,7 +141,8 @@ pub struct Snapshot {
     /// Every row changed (scroll, resize, new colors): none of the arcs is kept.
     pub all: bool,
     pub cursor: Option<Cursor>,
-    /// Cursor cell even when the program hides it — where IME puts its preview.
+    /// Cursor cell even when the program hides it — where the IME candidate
+    /// window anchors.
     pub cursor_cell: Option<(u16, u16)>,
     pub command: String,
     pub cwd: String,

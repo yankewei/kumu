@@ -5,7 +5,8 @@
 //! Powerline / braille as geometry ([`super::sprites`]), fall back to the
 //! bundled Nerd symbols font for missing icons, and reuse a row's shaped ops
 //! while its [`Arc`] is unchanged. IME composition (Pinyin and friends) goes
-//! through [`EntityInputHandler`].
+//! through [`EntityInputHandler`], which hands the half-typed text to the
+//! system candidate window; the grid only ever paints committed cells.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -101,7 +102,9 @@ pub struct TerminalView {
     can_close: bool,
     /// Theme revision last pushed into the live terminals.
     theme_rev: u64,
-    /// IME composition preview ("nihao" before 你好).
+    /// IME composition state ("nihao" before 你好). Only the system candidate
+    /// window shows it: the grid paints committed cells, never a half-typed
+    /// character.
     marked: Option<String>,
     cursor_at: Rc<Cell<CursorAt>>,
     grid_at: Rc<Cell<GridAt>>,
@@ -957,7 +960,6 @@ impl Render for TerminalView {
         let theme = cx.theme();
         let (font_family, font_px) = theme::term_font(cx);
         let snapshot = self.snapshot.clone();
-        let marked = self.marked.clone();
         let workspace = self.workspace.clone();
         let project = self.project;
         let pane_term = self.pane.0;
@@ -1112,7 +1114,6 @@ impl Render for TerminalView {
                                                 snapshot: &snapshot,
                                                 cell,
                                                 focused,
-                                                marked: marked.as_deref(),
                                                 typeface: &typeface_paint,
                                                 painted: &painted,
                                                 cursor_at: &cursor_at,
@@ -1747,7 +1748,6 @@ struct GridPaint<'a> {
     snapshot: &'a Snapshot,
     cell: (Pixels, Pixels),
     focused: bool,
-    marked: Option<&'a str>,
     typeface: &'a Typeface,
     painted: &'a RefCell<PaintCache>,
     cursor_at: &'a Cell<CursorAt>,
@@ -1762,7 +1762,6 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         snapshot,
         cell: (cell_w, cell_h),
         focused,
-        marked,
         typeface,
         painted,
         cursor_at,
@@ -1921,41 +1920,11 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
             }
         }
     } else if let Some((x, y)) = snapshot.cursor_cell {
-        // Hidden cursor still hosts the IME preview.
+        // A hidden cursor still anchors the IME candidate window.
         cursor_bounds = Some(Bounds::new(
             at(x as usize, y as usize),
             size(cell_w, cell_h),
         ));
-    }
-
-    // Composition preview at the cursor, underlined on the terminal background.
-    if let (Some(bounds), Some(text)) = (cursor_bounds, marked.filter(|t| !t.is_empty())) {
-        let fg = paint_color(
-            snapshot
-                .cursor
-                .map(|c| c.color)
-                .unwrap_or(Rgb(0xdd, 0xdd, 0xdd)),
-        );
-        let run = TextRun {
-            len: text.len(),
-            font: cell_font(typeface, false, false),
-            color: fg,
-            background_color: None,
-            underline: Some(UnderlineStyle {
-                thickness: px(1.0),
-                color: Some(fg),
-                wavy: false,
-            }),
-            strikethrough: None,
-        };
-        let line = window
-            .text_system()
-            .shape_line(text.into(), px(typeface.size), &[run], None);
-        window.paint_quad(fill(
-            snap_box(Bounds::new(bounds.origin, size(line.width, cell_h))),
-            paint_color(snapshot.bg),
-        ));
-        let _ = line.paint(bounds.origin, cell_h, TextAlign::Left, None, window, cx);
     }
 
     cursor_at.set(CursorAt {
