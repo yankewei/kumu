@@ -166,7 +166,9 @@ impl Term {
             .unwrap_or(program.clone());
         let cwd_text = cwd.display().to_string();
         let live = Arc::new(Live {
-            screen: Mutex::new(Snapshot::blank_with(&command, &cwd_text, colors.bg)),
+            screen: Mutex::new(Snapshot::blank_with(
+                &command, &cwd_text, colors.fg, colors.bg,
+            )),
             notifications: Mutex::new(VecDeque::new()),
             generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
@@ -392,7 +394,7 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
     let pty = match pty::open(&program, &args, &cwd, size) {
         Ok(pty) => pty,
         Err(error) => {
-            let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.bg);
+            let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.fg, colors.bg);
             snapshot.exited = true;
             snapshot.spawn_error = Some(error.to_string());
             live.publish(snapshot);

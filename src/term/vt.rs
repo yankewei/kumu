@@ -137,12 +137,15 @@ pub struct Cursor {
 pub struct Snapshot {
     pub rows: u16,
     pub bg: Rgb,
+    /// Default foreground, for text the UI adds on top of the cells (the IME
+    /// preview where a hidden cursor leaves no color behind).
+    pub fg: Rgb,
     pub cells: Vec<Arc<Vec<Cell>>>,
     /// Every row changed (scroll, resize, new colors): none of the arcs is kept.
     pub all: bool,
     pub cursor: Option<Cursor>,
-    /// Cursor cell even when the program hides it — where the IME candidate
-    /// window anchors.
+    /// Cursor cell even when the program hides it — where the IME preview is
+    /// painted and its candidate window anchors.
     pub cursor_cell: Option<(u16, u16)>,
     pub command: String,
     pub cwd: String,
@@ -254,13 +257,15 @@ impl Snapshot {
     }
 
     pub fn blank(command: &str, cwd: &str) -> Self {
-        Self::blank_with(command, cwd, TermColors::default().bg)
+        let colors = TermColors::default();
+        Self::blank_with(command, cwd, colors.fg, colors.bg)
     }
 
-    pub fn blank_with(command: &str, cwd: &str, bg: Rgb) -> Self {
+    pub fn blank_with(command: &str, cwd: &str, fg: Rgb, bg: Rgb) -> Self {
         Self {
             rows: 24,
             bg,
+            fg,
             cells: Vec::new(),
             all: true,
             cursor: None,
@@ -1023,6 +1028,7 @@ impl Vt {
             Snapshot {
                 rows: self.rows,
                 bg,
+                fg: fg_default,
                 cells: rows,
                 all,
                 cursor,
@@ -2327,6 +2333,7 @@ mod tests {
         let replay = Snapshot {
             rows: 1,
             bg: fg,
+            fg,
             cells: vec![Arc::new(cells)],
             all: true,
             cursor: None,
@@ -2357,6 +2364,7 @@ mod tests {
         let replay = Snapshot {
             rows: 1,
             bg: fg,
+            fg,
             cells: vec![Arc::new(cells)],
             all: true,
             cursor: None,
