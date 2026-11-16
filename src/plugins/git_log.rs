@@ -1,11 +1,12 @@
-//! The Git panel: the selected project's commit history.
+//! The Git panel: the selected project's uncommitted changes and its commit
+//! history.
 //!
-//! The panel reads the log on the background executor and polls while it is
-//! alive, but a poll reads a cheap fingerprint first and only takes the full
-//! log when a ref moved. Rows stay virtualized, so a repository with a long
-//! history costs the same to draw as a short one. The home window creates a
-//! panel when the user opens it and drops it when they close it, so a closed
-//! panel costs nothing.
+//! The panel reads both on the background executor and polls while it is
+//! alive: a poll reads a cheap ref fingerprint and the status listing, and only
+//! takes the full log when a ref moved. Rows stay virtualized, so a repository
+//! with a long history costs the same to draw as a short one. The home window
+//! creates a panel when the user opens it and drops it when they close it, so a
+//! closed panel costs nothing.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,12 +15,13 @@ use std::time::Duration;
 
 use gpui_kit::component::diff::{Diff, DiffFile, DiffParseOptions, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{Plugin, PluginProject};
-use crate::git::{Commit, History};
+use crate::git::{Change, Changes, Commit, History};
 
 /// How often an open panel checks whether the repository moved. Polling rather
 /// than a filesystem watcher stays correct for commits a terminal's git
@@ -30,11 +32,34 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// virtualize a full history. One compact line: refs, hash and subject.
 const ROW_HEIGHT: f32 = 32.;
 
+/// A change row and its section heading share this height, because the list of
+/// both draws through one uniform list.
+const CHANGE_ROW_HEIGHT: f32 = 28.;
+
+/// Which of the panel's two lists is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    Changes,
+    History,
+}
+
+/// One poll's read of the repository: the ref fingerprint, the uncommitted
+/// changes, and the log only when a ref moved since the previous poll.
+struct RepoRead {
+    fingerprint: String,
+    changes: Changes,
+    history: Option<History>,
+}
+
 pub struct GitLogPanel {
     project: Option<PluginProject>,
     history: Option<History>,
     /// The same commits as `history`, shared with the list closure.
     commits: Arc<Vec<Commit>>,
+    /// The uncommitted changes, refreshed by every poll.
+    changes: Changes,
+    /// Which list the panel shows; changes are what a working session reads.
+    tab: PanelTab,
     /// What the repository looked like when the rows were read. A poll that
     /// reads the same fingerprint leaves the log alone.
     fingerprint: Option<String>,
@@ -57,7 +82,7 @@ pub struct GitLogPanel {
 
 impl Plugin for GitLogPanel {
     const ID: &'static str = "git-log";
-    const TITLE: &'static str = "Git 历史";
+    const TITLE: &'static str = "Git";
     const ICON: &'static str = "icons/git-branch.svg";
 
     fn new(project: Option<PluginProject>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -74,6 +99,8 @@ impl Plugin for GitLogPanel {
             project,
             history: None,
             commits: Arc::default(),
+            changes: Changes::default(),
+            tab: PanelTab::Changes,
             fingerprint: None,
             filter: None,
             filter_generation: 0,
@@ -129,6 +156,7 @@ impl GitLogPanel {
     fn clear_rows(&mut self) {
         self.history = None;
         self.commits = Arc::default();
+        self.changes = Changes::default();
         self.fingerprint = None;
         self.filter = None;
         self.filter_generation += 1;
@@ -151,10 +179,19 @@ impl GitLogPanel {
                     // The fingerprint is read first: one taken after the log
                     // could be newer than the rows it would be stored with.
                     let fingerprint = crate::git::fingerprint(&project.path)?;
-                    if known.as_deref() == Some(fingerprint.as_str()) {
-                        return Ok(None);
-                    }
-                    crate::git::history(&project.path).map(|history| Some((fingerprint, history)))
+                    let history = if known.as_deref() == Some(fingerprint.as_str()) {
+                        None
+                    } else {
+                        Some(crate::git::history(&project.path)?)
+                    };
+                    // Read last so the changes reflect everything the user
+                    // saved while the log was being walked.
+                    let changes = crate::git::changes(&project.path)?;
+                    Ok::<_, String>(RepoRead {
+                        fingerprint,
+                        changes,
+                        history,
+                    })
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
@@ -171,20 +208,25 @@ impl GitLogPanel {
         .detach();
     }
 
-    /// Take one read: nothing new, a new history, or the error to show instead.
-    fn apply(&mut self, read: Result<Option<(String, History)>, String>, cx: &mut Context<Self>) {
+    /// Take one read: nothing new, a new history, new changes, or the error to
+    /// show instead.
+    fn apply(&mut self, read: Result<RepoRead, String>, cx: &mut Context<Self>) {
         match read {
-            // Same fingerprint: nothing the panel draws has changed.
-            Ok(None) => {}
-            Ok(Some((fingerprint, history))) => {
-                self.fingerprint = Some(fingerprint);
+            Ok(read) => {
                 let mut changed = self.error.take().is_some();
-                if self.history.as_ref() != Some(&history) {
-                    self.commits = history.commits.clone();
-                    self.history = Some(history);
-                    // The filter indexes the commits that just went away.
-                    self.filter = None;
-                    self.rebuild_filter(cx);
+                if let Some(history) = read.history {
+                    self.fingerprint = Some(read.fingerprint);
+                    if self.history.as_ref() != Some(&history) {
+                        self.commits = history.commits.clone();
+                        self.history = Some(history);
+                        // The filter indexes the commits that just went away.
+                        self.filter = None;
+                        self.rebuild_filter(cx);
+                        changed = true;
+                    }
+                }
+                if self.changes != read.changes {
+                    self.changes = read.changes;
                     changed = true;
                 }
                 if changed {
@@ -193,7 +235,7 @@ impl GitLogPanel {
             }
             Err(error) => {
                 // A failed read says nothing about the fingerprint, so the next
-                // poll tries the log again.
+                // poll tries the repository again.
                 self.clear_rows();
                 if self.error.as_ref() != Some(&error) {
                     self.error = Some(error);
@@ -255,24 +297,70 @@ impl GitLogPanel {
         let Some(project) = self.project.clone() else {
             return;
         };
-        let view = cx.new(|cx| CommitDiffView::new(project.path, commit, cx));
+        let meta = if commit.email.is_empty() {
+            format!("{} · {} · {}", commit.short, commit.author, commit.date)
+        } else {
+            format!(
+                "{} · {} <{}> · {}",
+                commit.short, commit.author, commit.email, commit.date
+            )
+        };
+        Self::open_patch(
+            commit.subject.clone(),
+            meta,
+            PatchSource::Commit {
+                root: project.path,
+                hash: commit.hash.clone(),
+            },
+            commit.body.clone(),
+            window,
+            cx,
+        );
+    }
+
+    /// Show one uncommitted change's patch in a sheet, read from the index for
+    /// a staged change and from the working tree for an unstaged one.
+    fn open_change(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let mut meta = format!(
+            "{} · {}",
+            if change.staged {
+                "已暂存"
+            } else {
+                "未暂存"
+            },
+            status_label(change.status)
+        );
+        if let Some(original) = &change.original {
+            meta.push_str(&format!(" · 原路径 {original}"));
+        }
+        Self::open_patch(
+            change.path.clone(),
+            meta,
+            PatchSource::Change {
+                root: project.path,
+                change,
+            },
+            String::new(),
+            window,
+            cx,
+        );
+    }
+
+    /// Open a sheet around a [`PatchView`], which reads the patch itself.
+    fn open_patch(
+        title: String,
+        meta: String,
+        source: PatchSource,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| PatchView::new(source, message, cx));
         window.open_sheet(cx, move |sheet, window, cx| {
             let theme = cx.theme();
-            let (subject, meta) = {
-                let view = view.read(cx);
-                let commit = &view.commit;
-                (
-                    commit.subject.clone(),
-                    if commit.email.is_empty() {
-                        format!("{} · {} · {}", commit.short, commit.author, commit.date)
-                    } else {
-                        format!(
-                            "{} · {} <{}> · {}",
-                            commit.short, commit.author, commit.email, commit.date
-                        )
-                    },
-                )
-            };
             // The sheet is right-anchored at a fixed width, so a narrow window
             // has to shrink it: the diff's line numbers sit on the left edge.
             let width = px(760.).min(window.viewport_size().width - px(96.));
@@ -282,14 +370,14 @@ impl GitLogPanel {
                     v_flex()
                         .gap_0p5()
                         .min_w_0()
-                        .child(div().text_sm().truncate().child(subject))
+                        .child(div().text_sm().truncate().child(title.clone()))
                         .child(
                             div()
                                 .text_xs()
                                 .font_normal()
                                 .text_color(theme.muted_foreground)
                                 .truncate()
-                                .child(meta),
+                                .child(meta.clone()),
                         ),
                 )
                 .child(
@@ -373,30 +461,43 @@ impl GitLogPanel {
     }
 }
 
-/// The sheet body: one commit's patch. The read and the patch parse run on the
+/// Where a [`PatchView`] reads its patch from.
+enum PatchSource {
+    /// One commit in the repository at `root`.
+    Commit { root: PathBuf, hash: String },
+    /// One uncommitted change in the repository at `root`.
+    Change { root: PathBuf, change: Change },
+}
+
+/// The sheet body: one patch. The read and the patch parse run on the
 /// background executor; the diff state is built on the UI thread once the files
 /// are in hand, because it prepares syntax off-thread itself.
-struct CommitDiffView {
-    commit: Commit,
+struct PatchView {
+    /// The commit message, shown above the patch; empty for a change.
+    message: String,
     state: Option<Entity<DiffState>>,
     truncated: bool,
     error: Option<String>,
 }
 
-impl CommitDiffView {
-    fn new(project: PathBuf, commit: Commit, cx: &mut Context<Self>) -> Self {
-        let hash = commit.hash.clone();
+impl PatchView {
+    fn new(source: PatchSource, message: String, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
             let read = cx
                 .background_spawn(async move {
-                    let diff = crate::git::commit_diff(&project, &hash)?;
+                    let diff = match source {
+                        PatchSource::Commit { root, hash } => crate::git::commit_diff(&root, &hash),
+                        PatchSource::Change { root, change } => {
+                            crate::git::change_diff(&root, &change)
+                        }
+                    }?;
                     // A cut patch ends in the middle of a hunk, which the
                     // parser takes when it is told to count the lines present.
                     let files = DiffFile::parse_with(
                         &diff.patch,
                         DiffParseOptions::new().truncated_hunks(diff.truncated),
                     )
-                    .map_err(|error| format!("无法解析这次提交的补丁：{error}"))?;
+                    .map_err(|error| format!("无法解析补丁：{error}"))?;
                     Ok::<_, String>((diff.truncated, files))
                 })
                 .await;
@@ -417,7 +518,7 @@ impl CommitDiffView {
         })
         .detach();
         Self {
-            commit,
+            message,
             state: None,
             truncated: false,
             error: None,
@@ -425,15 +526,15 @@ impl CommitDiffView {
     }
 }
 
-impl Render for CommitDiffView {
+impl Render for PatchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let message = self.commit.body.trim_end();
+        let message = self.message.trim_end();
         let body: AnyElement = match (&self.error, &self.state) {
             (Some(error), _) => empty(error, theme.danger),
             (None, Some(state)) if state.read(cx).files().is_empty() => {
-                empty("这次提交没有内容变更", muted)
+                empty("没有内容变更", muted)
             }
             (None, Some(state)) => div()
                 .flex_1()
@@ -485,49 +586,82 @@ impl Render for GitLogPanel {
         let branch = self.history.as_ref().map(|history| history.branch.clone());
         let total = self.commits.len();
         let visible = self.visible_count();
+        let changes = self.changes.len();
+        let changes_label = if changes > 0 {
+            format!("改动 {changes}")
+        } else {
+            "改动".to_string()
+        };
+        let history_label = if total > 0 {
+            format!("历史 {total}")
+        } else {
+            "历史".to_string()
+        };
 
         let toolbar = self.project.is_some().then(|| {
+            let panel = cx.entity();
             v_flex()
                 .child(
                     h_flex()
                         .px_3()
                         .pt_1p5()
                         .pb_1()
-                        .gap_1p5()
+                        .gap_2()
                         .items_center()
-                        .child(div().flex_none().text_xs().text_color(muted).child("分支"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .font_medium()
-                                .child(branch.unwrap_or_else(|| "—".to_string())),
-                        )
-                        .when(total > 0, |row| {
-                            row.child(div().flex_none().text_xs().text_color(muted).child(
-                                if visible == total {
-                                    format!("{total} 个提交")
-                                } else {
-                                    format!("{visible} / {total}")
-                                },
-                            ))
-                        }),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .pb_1p5()
                         .border_b_1()
                         .border_color(border)
                         .child(
-                            Input::new(&self.search)
-                                .small()
-                                .cleanable(true)
-                                .prefix(Icon::new(IconName::Search).small().text_color(muted)),
+                            TabBar::new("git-panel-tabs")
+                                .xsmall()
+                                .flex_none()
+                                .segmented()
+                                .selected_index(match self.tab {
+                                    PanelTab::Changes => 0,
+                                    PanelTab::History => 1,
+                                })
+                                .child(Tab::new().label(changes_label))
+                                .child(Tab::new().label(history_label))
+                                .on_click(move |index, _, cx| {
+                                    let tab = match index {
+                                        0 => PanelTab::Changes,
+                                        _ => PanelTab::History,
+                                    };
+                                    panel.update(cx, |panel, cx| {
+                                        if panel.tab != tab {
+                                            panel.tab = tab;
+                                            cx.notify();
+                                        }
+                                    });
+                                }),
+                        )
+                        .child(
+                            // The branch gives way to the tabs when the panel
+                            // is dragged narrow.
+                            div().flex_1().min_w_0().flex().justify_end().child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(branch.unwrap_or_else(|| "—".to_string())),
+                            ),
                         ),
                 )
+                .when(self.tab == PanelTab::History, |this| {
+                    this.child(
+                        div()
+                            .px_2()
+                            .py_1p5()
+                            .border_b_1()
+                            .border_color(border)
+                            .child(
+                                Input::new(&self.search)
+                                    .small()
+                                    .cleanable(true)
+                                    .prefix(Icon::new(IconName::Search).small().text_color(muted)),
+                            ),
+                    )
+                })
         });
 
         let body: AnyElement = if self.project.is_none() {
@@ -536,6 +670,40 @@ impl Render for GitLogPanel {
             empty(error, theme.danger)
         } else if self.history.is_none() {
             empty("正在读取…", muted)
+        } else if self.tab == PanelTab::Changes {
+            if self.changes.is_empty() {
+                empty("工作区没有未提交的改动", muted)
+            } else {
+                let rows = Rc::new(self.change_rows());
+                let panel = cx.entity();
+                uniform_list("git-change-list", rows.len(), move |range, _window, cx| {
+                    let theme = cx.theme();
+                    range
+                        .map(|row| {
+                            let row = &rows[row];
+                            let panel = panel.clone();
+                            let clicked = match row {
+                                ChangeRow::File(change) => Some(change.clone()),
+                                ChangeRow::Header(_) => None,
+                            };
+                            Self::render_change(
+                                row,
+                                theme,
+                                move |_, window: &mut Window, cx: &mut App| {
+                                    if let Some(change) = clicked.clone() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.open_change(change, window, cx);
+                                        });
+                                    }
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            }
         } else if visible == 0 {
             if self.filter.is_some() {
                 empty("没有匹配的提交", muted)
@@ -580,6 +748,103 @@ impl Render for GitLogPanel {
             .text_color(theme.sidebar_foreground)
             .children(toolbar)
             .child(body)
+    }
+}
+
+/// A row of the changes tab: a section heading or one file.
+enum ChangeRow {
+    Header(&'static str),
+    File(Change),
+}
+
+impl GitLogPanel {
+    /// The changes tab's rows: a heading above each non-empty section.
+    fn change_rows(&self) -> Vec<ChangeRow> {
+        let mut rows = Vec::with_capacity(self.changes.len() + 2);
+        for (label, changes) in [
+            ("已暂存", &self.changes.staged),
+            ("未暂存", &self.changes.unstaged),
+        ] {
+            if changes.is_empty() {
+                continue;
+            }
+            rows.push(ChangeRow::Header(label));
+            rows.extend(changes.iter().cloned().map(ChangeRow::File));
+        }
+        rows
+    }
+
+    fn render_change(
+        row: &ChangeRow,
+        theme: &Theme,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let change = match row {
+            ChangeRow::Header(label) => {
+                return h_flex()
+                    .w_full()
+                    .h(px(CHANGE_ROW_HEIGHT))
+                    .px_2()
+                    .items_center()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(muted)
+                    .child(*label)
+                    .into_any_element();
+            }
+            ChangeRow::File(change) => change,
+        };
+
+        // The name keeps the room; the directory (or where a rename came from)
+        // gives way when the panel is narrow.
+        let trailing = match &change.original {
+            Some(original) => format!("← {original}"),
+            None => parent_dir(&change.path).to_string(),
+        };
+        h_flex()
+            .id(format!(
+                "git-change-{}-{}",
+                if change.staged { "index" } else { "worktree" },
+                change.path
+            ))
+            .w_full()
+            .h(px(CHANGE_ROW_HEIGHT))
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .hover(move |style| style.bg(theme.accent.opacity(0.35)))
+            .on_click(on_click)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(12.))
+                    .font_family(theme.mono_font_family.clone())
+                    .text_xs()
+                    .font_medium()
+                    .text_color(status_color(change.status, theme))
+                    .child(change.status.to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .child(file_name(&change.path).to_string()),
+            )
+            .when(!trailing.is_empty(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .max_w(relative(0.5))
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(trailing),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -636,16 +901,55 @@ fn empty(message: &str, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+/// The last component of a repository-relative path.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Everything before a repository-relative path's last component, or an empty
+/// string for a file at the root.
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The color of a change's status letter: what happened to the file, not which
+/// side it was read from.
+fn status_color(status: char, theme: &Theme) -> Hsla {
+    match status {
+        'M' | 'T' => theme.warning,
+        'A' | '?' => theme.success,
+        'D' | 'U' => theme.danger,
+        'R' | 'C' => theme.link,
+        _ => theme.muted_foreground,
+    }
+}
+
+/// The status of a change in words, for the sheet's subtitle.
+fn status_label(status: char) -> &'static str {
+    match status {
+        'M' => "已修改",
+        'A' => "已添加",
+        'D' => "已删除",
+        'R' => "已重命名",
+        'C' => "已复制",
+        'T' => "类型变更",
+        'U' => "有冲突",
+        '?' => "新文件",
+        _ => "已修改",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use gpui_kit::{
         AppContext, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
         TestAppContext, Window, div,
     };
 
-    use super::CommitDiffView;
+    use super::{PatchSource, PatchView, Plugin};
 
     /// Run git in `repo`, failing the test with git's own message.
     fn git(repo: &Path, args: &[&str]) {
@@ -662,11 +966,16 @@ mod tests {
         );
     }
 
+    /// Parallel tests can read the clock in the same tick, so a counter keeps
+    /// their fixture directories apart.
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
     /// A repository with one commit, plus the directory that owns it.
     fn fixture() -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "kumu-panel-{}-{}",
+            "kumu-panel-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -684,7 +993,7 @@ mod tests {
     }
 
     struct Host {
-        view: Entity<CommitDiffView>,
+        view: Entity<PatchView>,
     }
 
     impl Render for Host {
@@ -702,7 +1011,11 @@ mod tests {
         let history = crate::git::history(&path).unwrap();
         let commit = history.commits[0].clone();
 
-        let view = cx.new(|cx| CommitDiffView::new(path, commit, cx));
+        let source = PatchSource::Commit {
+            root: path,
+            hash: commit.hash.clone(),
+        };
+        let view = cx.new(|cx| PatchView::new(source, commit.body.clone(), cx));
         cx.run_until_parked();
 
         let (files, error) = view.read_with(cx, |view, cx| {
@@ -719,6 +1032,92 @@ mod tests {
         // The sheet only adds chrome around this view, so drawing the view is
         // what proves the parsed patch reaches the diff component.
         let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A working tree change reads without a commit to name it: the sheet for
+    /// an untracked file gets its patch from `--no-index`.
+    #[gpui::test]
+    fn the_diff_view_parses_an_uncommitted_change(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (dir, path) = fixture();
+        std::fs::write(path.join("new"), "new\n").unwrap();
+        let changes = crate::git::changes(&path).unwrap();
+        let change = changes.unstaged[0].clone();
+
+        let source = PatchSource::Change { root: path, change };
+        let view = cx.new(|cx| PatchView::new(source, String::new(), cx));
+        cx.run_until_parked();
+
+        let (files, error) = view.read_with(cx, |view, cx| {
+            (
+                view.state
+                    .as_ref()
+                    .map(|state| state.read(cx).files().len()),
+                view.error.clone(),
+            )
+        });
+        assert_eq!(error, None);
+        assert_eq!(files, Some(1));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct PanelHost {
+        panel: Entity<super::GitLogPanel>,
+    }
+
+    impl Render for PanelHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(gpui_kit::px(320.))
+                .h(gpui_kit::px(600.))
+                .child(self.panel.clone())
+        }
+    }
+
+    /// Drawing is what would catch a broken row or list: the panel shows the
+    /// changes it read, then the history on the other tab.
+    #[gpui::test]
+    fn the_panel_draws_changes_and_history(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (dir, path) = fixture();
+        std::fs::write(path.join("b"), "b\n").unwrap();
+        let project = super::PluginProject {
+            id: 1,
+            path: path.clone(),
+        };
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let panel = cx.new(|cx| super::GitLogPanel::new(Some(project.clone()), window, cx));
+            PanelHost { panel }
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+        }
+        // One heading and one file, which is what the changes tab drew.
+        host.update(cx, |host, cx| {
+            assert_eq!(host.panel.read(cx).change_rows().len(), 2);
+        });
+
+        cx.update(|_, cx| {
+            host.update(cx, |host, cx| {
+                host.panel.update(cx, |panel, cx| {
+                    panel.tab = super::PanelTab::History;
+                    cx.notify();
+                });
+            });
+        });
         cx.run_until_parked();
         for _ in 0..3 {
             cx.update(|window, cx| {

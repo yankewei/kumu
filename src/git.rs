@@ -56,9 +56,40 @@ pub struct History {
     pub commits: Arc<Vec<Commit>>,
 }
 
-/// What one commit changed, as a patch the diff view can parse.
+/// One file with changes that are not committed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Change {
+    /// Path relative to the repository root; for a rename, the new path.
+    pub path: String,
+    /// The path the file had before a rename or copy.
+    pub original: Option<String>,
+    /// The status git reports for this side: `M`, `A`, `D`, `R`, `C`, `T`,
+    /// `U` for an unmerged file, or `?` for an untracked one.
+    pub status: char,
+    /// The change is in the index; otherwise it is only in the working tree.
+    pub staged: bool,
+}
+
+/// The repository's uncommitted changes, in the order git lists them.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct CommitDiff {
+pub struct Changes {
+    pub staged: Vec<Change>,
+    pub unstaged: Vec<Change>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.staged.is_empty() && self.unstaged.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.staged.len() + self.unstaged.len()
+    }
+}
+
+/// A patch the diff view can parse.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Patch {
     /// Unified patch in git's own format, possibly cut at [`MAX_PATCH_BYTES`].
     pub patch: String,
     /// The patch was cut, so the view has to say that it is incomplete.
@@ -142,12 +173,11 @@ pub fn history(dir: &Path) -> Result<History, String> {
 /// merge the diff against the commit it was merged into, which plain `show`
 /// prints nothing for; `--no-color` keeps a `color.ui=always` configuration
 /// from putting escape codes in the patch.
-pub fn commit_diff(dir: &Path, hash: &str) -> Result<CommitDiff, String> {
+pub fn commit_diff(dir: &Path, hash: &str) -> Result<Patch, String> {
     let root = repo_root(dir)?;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args([
+    read_patch(
+        &root,
+        &[
             "--no-optional-locks",
             "show",
             "--format=",
@@ -156,7 +186,66 @@ pub fn commit_diff(dir: &Path, hash: &str) -> Result<CommitDiff, String> {
             "-m",
             "--first-parent",
             hash,
-        ])
+        ],
+        false,
+    )
+}
+
+/// Read what the index and the working tree changed.
+///
+/// `-uall` lists every untracked file instead of folding a new directory into
+/// one row, and `--no-optional-locks` keeps a poll from refreshing and writing
+/// the index under the git commands the user runs in a terminal.
+pub fn changes(dir: &Path) -> Result<Changes, String> {
+    let root = repo_root(dir)?;
+    let output = git_raw(
+        &root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "-uall",
+        ],
+    )?;
+    Ok(parse_status(&output))
+}
+
+/// The patch one uncommitted change introduced, cut at [`MAX_PATCH_BYTES`].
+///
+/// A staged change is read from the index and an unstaged one from the working
+/// tree. An untracked file has nothing to diff against, so git compares it with
+/// an empty file; that run exits 1 because the files differ, which is the patch
+/// rather than a failure. A rename is filtered by both of its paths so git can
+/// pair the two sides.
+pub fn change_diff(dir: &Path, change: &Change) -> Result<Patch, String> {
+    let root = repo_root(dir)?;
+    let untracked = change.status == '?';
+    let mut args = vec!["--no-optional-locks", "diff", "--no-color"];
+    if untracked {
+        args.push("--no-index");
+    } else if change.staged {
+        args.push("--cached");
+    }
+    args.push("--");
+    if untracked {
+        args.push("/dev/null");
+    }
+    if let Some(original) = &change.original {
+        args.push(original);
+    }
+    args.push(&change.path);
+    read_patch(&root, &args, untracked)
+}
+
+/// Read the patch `args` print, stopped at [`MAX_PATCH_BYTES`]. `diff --no-index`
+/// exits 1 when it found differences, which `differences_are_ok` accepts as a
+/// patch instead of an error.
+fn read_patch(dir: &Path, args: &[&str], differences_are_ok: bool) -> Result<Patch, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -184,14 +273,101 @@ pub fn commit_diff(dir: &Path, hash: &str) -> Result<CommitDiff, String> {
     let stderr = stderr
         .map(|stderr| stderr.join().unwrap_or_default())
         .unwrap_or_default();
-    if !truncated && !status.success() {
-        return Err(git_failure("show", status, &stderr));
+    let changed = differences_are_ok && status.code() == Some(1);
+    if !truncated && !status.success() && !changed {
+        let command = args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .copied()
+            .unwrap_or("git");
+        return Err(git_failure(command, status, &stderr));
     }
     let patch = String::from_utf8_lossy(&output).into_owned();
-    Ok(CommitDiff {
+    Ok(Patch {
         patch: if truncated { trim_patch(patch) } else { patch },
         truncated,
     })
+}
+
+/// Split porcelain v2 output into the staged and unstaged lists. Records are
+/// NUL-terminated and a rename's old path is the record right after it, which
+/// is what lets every path be read as-is instead of git's quoted form.
+fn parse_status(output: &[u8]) -> Changes {
+    let mut changes = Changes::default();
+    let mut records = output.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        let record = String::from_utf8_lossy(record);
+        let record = record.as_ref();
+        match record.as_bytes().first() {
+            // An ordinary change: `1 XY sub mH mI mW hH hI path`.
+            Some(b'1') => {
+                let mut fields = record.splitn(9, ' ');
+                let xy = fields.nth(1).unwrap_or("");
+                // sub, mH, mI, mW, hH and hI sit between the status and path.
+                let path = fields.nth(6).unwrap_or("");
+                push_xy(&mut changes, xy, path, None);
+            }
+            // A rename or copy: `2 XY sub mH mI mW hH hI Xscore path`, with
+            // the original path as the next record.
+            Some(b'2') => {
+                let mut fields = record.splitn(10, ' ');
+                let xy = fields.nth(1).unwrap_or("");
+                // sub, mH, mI, mW, hH, hI and Xscore sit before the path.
+                let path = fields.nth(7).unwrap_or("");
+                let original = records
+                    .next()
+                    .map(|path| String::from_utf8_lossy(path).into_owned());
+                push_xy(&mut changes, xy, path, original.as_deref());
+            }
+            // An unmerged file: `u XY sub m1 m2 m3 mW h1 h2 h3 path`.
+            Some(b'u') => {
+                let mut fields = record.splitn(11, ' ');
+                let xy = fields.nth(1).unwrap_or("");
+                // sub, the three stage modes, mW and the three stage hashes
+                // sit before the path.
+                let path = fields.nth(8).unwrap_or("");
+                push_xy(&mut changes, xy, path, None);
+            }
+            Some(b'?') => {
+                if let Some(path) = record.strip_prefix("? ") {
+                    changes.unstaged.push(Change {
+                        path: path.to_string(),
+                        original: None,
+                        status: '?',
+                        staged: false,
+                    });
+                }
+            }
+            // Ignored entries stay out of the list; `--ignored` was not asked
+            // for, so this only guards against a record nobody draws.
+            _ => {}
+        }
+    }
+    changes
+}
+
+/// Record both sides of a porcelain `XY` pair: `X` is the index and `Y` the
+/// working tree, and `.` means that side is unchanged.
+fn push_xy(changes: &mut Changes, xy: &str, path: &str, original: Option<&str>) {
+    let mut letters = xy.chars();
+    let index = letters.next().unwrap_or('.');
+    let worktree = letters.next().unwrap_or('.');
+    for (status, staged) in [(index, true), (worktree, false)] {
+        if status == '.' {
+            continue;
+        }
+        let change = Change {
+            path: path.to_string(),
+            original: original.map(str::to_string),
+            status,
+            staged,
+        };
+        if staged {
+            changes.staged.push(change);
+        } else {
+            changes.unstaged.push(change);
+        }
+    }
 }
 
 /// Read a child's stderr to the end on its own thread.
@@ -400,14 +576,21 @@ fn git_failure(command: &str, status: ExitStatus, stderr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Parallel tests can read the clock in the same tick, so a counter keeps
+    /// their fixture directories apart.
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     /// A repository with one commit in a fresh temporary directory, plus the
     /// directory that owns it so the caller can clean up both.
     fn fixture() -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "kumu-git-{}-{}",
+            "kumu-git-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -575,6 +758,66 @@ mod tests {
         let diff = commit_diff(&repo, "HEAD").unwrap();
         assert!(diff.truncated);
         assert!(diff.patch.len() <= MAX_PATCH_BYTES);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Staged, worktree-only and untracked files land in the section they
+    /// belong to, and each patch is read from that side.
+    #[test]
+    fn lists_uncommitted_changes_and_reads_their_patches() {
+        let (dir, repo) = fixture();
+        // `a` is changed in the index and again in the working tree; `b` is a
+        // staged new file; the untracked file's name has a space in it, which
+        // the status format must not split on.
+        std::fs::write(repo.join("a"), "staged\n").unwrap();
+        git(&repo, &["add", "a"]).unwrap();
+        std::fs::write(repo.join("a"), "worktree\n").unwrap();
+        std::fs::write(repo.join("b"), "b\n").unwrap();
+        git(&repo, &["add", "b"]).unwrap();
+        std::fs::write(repo.join("new file"), "c\n").unwrap();
+
+        let changes = changes(&repo).unwrap();
+        assert_eq!(changes.len(), 4);
+        let staged_a = changes.staged.iter().find(|c| c.path == "a").unwrap();
+        assert_eq!(staged_a.status, 'M');
+        assert!(staged_a.staged);
+        let unstaged_a = changes.unstaged.iter().find(|c| c.path == "a").unwrap();
+        assert_eq!(unstaged_a.status, 'M');
+        let untracked = changes
+            .unstaged
+            .iter()
+            .find(|c| c.path == "new file")
+            .unwrap();
+        assert_eq!(untracked.status, '?');
+
+        // The index side and the working tree side are different patches.
+        let staged = change_diff(&repo, staged_a).unwrap();
+        assert!(staged.patch.contains("+staged\n"));
+        assert!(!staged.patch.contains("+worktree\n"));
+        let worktree = change_diff(&repo, unstaged_a).unwrap();
+        assert!(worktree.patch.contains("+worktree\n"));
+        let new_file = change_diff(&repo, untracked).unwrap();
+        assert!(new_file.patch.contains("+c\n"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A rename is one row that remembers the path it came from, and both paths
+    /// let git print the rename instead of a delete plus an add.
+    #[test]
+    fn lists_a_rename_with_its_original_path() {
+        let (dir, repo) = fixture();
+        git(&repo, &["mv", "a", "renamed"]).unwrap();
+
+        let changes = changes(&repo).unwrap();
+        assert_eq!(changes.staged.len(), 1);
+        let rename = &changes.staged[0];
+        assert_eq!(rename.path, "renamed");
+        assert_eq!(rename.original.as_deref(), Some("a"));
+        assert_eq!(rename.status, 'R');
+        let patch = change_diff(&repo, rename).unwrap();
+        assert!(patch.patch.contains("rename to renamed"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
