@@ -12,11 +12,56 @@
 mod git_log;
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::db::Project;
+
+/// What happened to text a panel handed to a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The pane runs an agent, so the text was pasted and submitted.
+    Submitted,
+    /// The pane is a shell, or nothing could say otherwise, so the text waits
+    /// on the command line for the user's Enter.
+    Pasted,
+}
+
+/// The window's send function, erased so a panel holds no window type.
+type SendFn = dyn Fn(i64, &str, &mut App) -> Result<SendOutcome, String>;
+
+/// The host's focused terminal, as a panel sees it.
+///
+/// A panel shows facts about a project; when the user wants the agent working
+/// in that project to act on them, the panel hands the text here and the window
+/// routes it to whichever pane has focus. The closure keeps plugins free of the
+/// window type.
+#[derive(Clone)]
+pub struct PluginHost {
+    send: Rc<SendFn>,
+}
+
+impl PluginHost {
+    pub fn new(
+        send: impl Fn(i64, &str, &mut App) -> Result<SendOutcome, String> + 'static,
+    ) -> Self {
+        Self {
+            send: Rc::new(send),
+        }
+    }
+
+    /// Write `text` into the focused pane of `project`.
+    pub fn send_to_focused_pane(
+        &self,
+        project: i64,
+        text: &str,
+        cx: &mut App,
+    ) -> Result<SendOutcome, String> {
+        (self.send)(project, text, cx)
+    }
+}
 
 /// The project a plugin panel is showing.
 #[derive(Clone, PartialEq, Eq)]
@@ -45,7 +90,12 @@ pub trait Plugin: Render + 'static {
     /// Asset path for the title-bar button and the panel header.
     const ICON: &'static str;
 
-    fn new(project: Option<PluginProject>, window: &mut Window, cx: &mut Context<Self>) -> Self;
+    fn new(
+        project: Option<PluginProject>,
+        host: PluginHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self;
 
     fn set_project(&mut self, project: Option<PluginProject>, cx: &mut Context<Self>);
 }
@@ -57,7 +107,7 @@ pub struct PluginSpec {
     pub id: &'static str,
     pub title: &'static str,
     pub icon: &'static str,
-    create: fn(Option<PluginProject>, &mut Window, &mut App) -> AnyView,
+    create: fn(Option<PluginProject>, PluginHost, &mut Window, &mut App) -> AnyView,
     set_project: fn(&AnyView, Option<PluginProject>, &mut App),
 }
 
@@ -67,7 +117,9 @@ impl PluginSpec {
             id: P::ID,
             title: P::TITLE,
             icon: P::ICON,
-            create: |project, window, cx| cx.new(|cx| P::new(project, window, cx)).into(),
+            create: |project, host, window, cx| {
+                cx.new(|cx| P::new(project, host, window, cx)).into()
+            },
             set_project: |view, project, cx| {
                 let Ok(panel) = view.clone().downcast::<P>() else {
                     return;
@@ -80,10 +132,11 @@ impl PluginSpec {
     pub fn create(
         &self,
         project: Option<PluginProject>,
+        host: PluginHost,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        (self.create)(project, window, cx)
+        (self.create)(project, host, window, cx)
     }
 
     pub fn set_project(&self, view: &AnyView, project: Option<PluginProject>, cx: &mut App) {

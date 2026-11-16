@@ -17,11 +17,12 @@ use super::SettingsWindow;
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::git::WorktreeEntry;
-use crate::plugins::{PluginProject, PluginSpec};
+use crate::plugins::{PluginHost, PluginProject, PluginSpec, SendOutcome};
 use crate::remote::{
     self, Action, AgentInfo, AttachHandle, Command as RemoteCommand, ComputerInfo, MAX_GRID,
     PaneInfo, PaneStatus, ProjectInfo, RemoteConfig, RemoteError, RemoteHandle, RemoteState,
 };
+use crate::term::KeyInput;
 use futures::StreamExt;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -45,6 +46,19 @@ fn auto_resume_enabled() -> bool {
 /// is on, so an unpaired Mac listens for nothing by default.
 fn remote_enabled() -> bool {
     crate::db::get_setting(crate::db::SETTING_REMOTE).as_deref() == Some("1")
+}
+
+/// Whether a pasted prompt should be submitted. Only a pane started as an
+/// agent takes the Enter; a shell keeps the text on its command line, where
+/// Enter would run it. `None` (no live process) is treated like a shell.
+fn submits_after_paste(pane_is_shell: Option<bool>) -> bool {
+    pane_is_shell == Some(false)
+}
+
+/// A shell without bracketed paste runs each line of a multi-line paste, so
+/// its copy of the message arrives as one line of space-separated words.
+fn shell_prompt(message: &str) -> String {
+    message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
@@ -1353,6 +1367,70 @@ impl KumuApp {
             .map(PluginProject::from)
     }
 
+    /// How plugins hand text to the user's terminal. The target is resolved
+    /// when the panel sends, so a comment reaches whichever pane has focus at
+    /// that moment rather than the one focused when the panel opened.
+    fn plugin_host(&self, cx: &Context<Self>) -> PluginHost {
+        let home = cx.entity().downgrade();
+        PluginHost::new(move |project, text, cx| {
+            let Some(home) = home.upgrade() else {
+                return Err("窗口已关闭".to_string());
+            };
+            home.update(cx, |app, cx| {
+                app.send_text_to_focused_pane(project, text, cx)
+            })
+        })
+    }
+
+    /// Paste `text` into the focused pane of `project`. An agent pane also
+    /// receives Enter, because the user is handing the agent an instruction;
+    /// a shell keeps the text on its command line, where Enter would run it.
+    /// Without bracketed paste a shell would run each pasted line, so a shell
+    /// gets the message folded onto one line.
+    fn send_text_to_focused_pane(
+        &self,
+        project: i64,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<SendOutcome, String> {
+        if self.selected != Some(project) {
+            return Err("请先切回该项目再发送".to_string());
+        }
+        let pane = self
+            .focused_by_project
+            .get(&project)
+            .copied()
+            .unwrap_or(self.focused);
+        let Some(term) = self.workspace.read(cx).terminal_handle(pane.0) else {
+            return Err("当前窗格没有运行中的终端".to_string());
+        };
+        let shell = self.workspace.read(cx).pane_is_shell(pane.0);
+        if shell == Some(true) {
+            term.paste(shell_prompt(text));
+        } else {
+            term.paste(text);
+        }
+        if !submits_after_paste(shell) {
+            return Ok(SendOutcome::Pasted);
+        }
+        // A large bracketed paste can keep the TUI busy long enough to swallow
+        // an Enter that arrives in the same read, so submit after it settles.
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            term.key(KeyInput {
+                key: "enter".into(),
+                key_char: Some("\r".into()),
+                shift: false,
+                control: false,
+                alt: false,
+            });
+        })
+        .detach();
+        Ok(SendOutcome::Submitted)
+    }
+
     /// Open `spec`'s panel, or close it when it is already the open one. The
     /// panel is built on first open and dropped on close so its refresh loop
     /// stops with it.
@@ -1366,7 +1444,8 @@ impl KumuApp {
                 .retain(|id, _| Some(*id) == self.open_plugin);
             if !self.plugin_views.contains_key(spec.id) {
                 let project = self.plugin_project(cx);
-                let view = spec.create(project, window, cx);
+                let host = self.plugin_host(cx);
+                let view = spec.create(project, host, window, cx);
                 self.plugin_views.insert(spec.id, view);
             }
         }
@@ -2334,5 +2413,29 @@ impl Render for KumuApp {
             window.remove_notification1::<NotificationSettings>(terminal.to_string(), cx);
         }
         self.render_home(window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shell_prompt, submits_after_paste};
+
+    /// Only a pane started as an agent may receive Enter after the paste; a
+    /// shell would run the review notes as a command.
+    #[test]
+    fn only_an_agent_pane_takes_the_enter_after_a_paste() {
+        assert!(submits_after_paste(Some(false)));
+        assert!(!submits_after_paste(Some(true)));
+        assert!(!submits_after_paste(None));
+    }
+
+    /// Without bracketed paste a shell would run every line, so its copy of
+    /// the message is one line.
+    #[test]
+    fn a_shell_copy_of_a_message_stays_on_one_line() {
+        assert_eq!(
+            shell_prompt("请修改：\n\nsrc/a.rs:12\n这里先检查\n"),
+            "请修改： src/a.rs:12 这里先检查"
+        );
     }
 }

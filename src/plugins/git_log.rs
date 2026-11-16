@@ -13,14 +13,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::diff::{Diff, DiffFile, DiffParseOptions, DiffState};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::diff::{
+    Diff, DiffAnnotation, DiffFile, DiffLinePosition, DiffLineRange, DiffParseOptions, DiffSide,
+    DiffState,
+};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{Plugin, PluginProject};
+use super::{Plugin, PluginHost, PluginProject, SendOutcome};
 use crate::git::{Change, Changes, Commit, History};
 
 /// How often an open panel checks whether the repository moved. Polling rather
@@ -78,6 +82,8 @@ pub struct GitLogPanel {
     /// Changes when the selected project changes, so a read from the previous
     /// project cannot overwrite the log.
     generation: u64,
+    /// How a patch sheet hands its review comments to the focused terminal.
+    host: PluginHost,
 }
 
 impl Plugin for GitLogPanel {
@@ -85,7 +91,12 @@ impl Plugin for GitLogPanel {
     const TITLE: &'static str = "Git";
     const ICON: &'static str = "icons/git-branch.svg";
 
-    fn new(project: Option<PluginProject>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        project: Option<PluginProject>,
+        host: PluginHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索提交信息"));
         cx.subscribe(&search, |panel, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -110,6 +121,7 @@ impl Plugin for GitLogPanel {
             loading: false,
             dirty: false,
             generation: 0,
+            host,
         };
         panel.reload(cx);
         Self::watch(cx);
@@ -305,14 +317,20 @@ impl GitLogPanel {
                 commit.short, commit.author, commit.email, commit.date
             )
         };
-        Self::open_patch(
-            commit.subject.clone(),
-            meta,
-            PatchSource::Commit {
-                root: project.path,
-                hash: commit.hash.clone(),
+        self.open_patch(
+            PatchRequest {
+                project: project.id,
+                title: commit.subject.clone(),
+                meta,
+                source: PatchSource::Commit {
+                    root: project.path,
+                    hash: commit.hash.clone(),
+                },
+                message: commit.body.clone(),
+                // The patch's line numbers belong to this commit, not to the
+                // working tree the agent will edit.
+                context: format!("提交 {}", commit.short),
             },
-            commit.body.clone(),
             window,
             cx,
         );
@@ -324,41 +342,45 @@ impl GitLogPanel {
         let Some(project) = self.project.clone() else {
             return;
         };
-        let mut meta = format!(
-            "{} · {}",
-            if change.staged {
-                "已暂存"
-            } else {
-                "未暂存"
-            },
-            status_label(change.status)
-        );
+        let status = if change.staged {
+            "已暂存改动"
+        } else {
+            "未暂存改动"
+        };
+        let mut meta = format!("{status} · {}", status_label(change.status));
         if let Some(original) = &change.original {
             meta.push_str(&format!(" · 原路径 {original}"));
         }
-        Self::open_patch(
-            change.path.clone(),
-            meta,
-            PatchSource::Change {
-                root: project.path,
-                change,
+        self.open_patch(
+            PatchRequest {
+                project: project.id,
+                title: change.path.clone(),
+                meta,
+                source: PatchSource::Change {
+                    root: project.path,
+                    change,
+                },
+                message: String::new(),
+                context: status.to_string(),
             },
-            String::new(),
             window,
             cx,
         );
     }
 
     /// Open a sheet around a [`PatchView`], which reads the patch itself.
-    fn open_patch(
-        title: String,
-        meta: String,
-        source: PatchSource,
-        message: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let view = cx.new(|cx| PatchView::new(source, message, cx));
+    fn open_patch(&self, request: PatchRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let PatchRequest {
+            project,
+            title,
+            meta,
+            source,
+            message,
+            context,
+        } = request;
+        let view =
+            cx.new(|cx| PatchView::new(project, source, message, context, self.host.clone(), cx));
+        let footer = cx.new(|cx| PatchFooter::new(view.clone(), cx));
         window.open_sheet(cx, move |sheet, window, cx| {
             let theme = cx.theme();
             // The sheet is right-anchored at a fixed width, so a narrow window
@@ -384,6 +406,7 @@ impl GitLogPanel {
                     view.clone()
                         .cached(StyleRefinement::default().size_full().min_h_0().min_w_0()),
                 )
+                .footer(footer.clone())
         });
     }
 
@@ -469,10 +492,36 @@ enum PatchSource {
     Change { root: PathBuf, change: Change },
 }
 
+/// Everything a patch sheet needs before it reads the patch.
+struct PatchRequest {
+    project: i64,
+    title: String,
+    meta: String,
+    source: PatchSource,
+    /// The commit message, shown above the patch; empty for a change.
+    message: String,
+    /// Where the patch's line numbers point, named when they are sent to the
+    /// agent: a commit's numbers are not the working tree's.
+    context: String,
+}
+
 /// The sheet body: one patch. The read and the patch parse run on the
 /// background executor; the diff state is built on the UI thread once the files
 /// are in hand, because it prepares syntax off-thread itself.
 struct PatchView {
+    /// The project whose focused pane receives the review comments.
+    project: i64,
+    /// How this sheet reaches that pane.
+    host: PluginHost,
+    /// Review comments, each anchored to the patch lines it discusses.
+    comments: Vec<ReviewComment>,
+    /// Distinguishes comment element ids after a removal and a new comment.
+    next_comment: u64,
+    /// What the patch belongs to, so the agent knows which line numbers the
+    /// comments refer to.
+    context: String,
+    /// Why the last send did not go through, shown beside the send button.
+    notice: Option<SendNotice>,
     /// The commit message, shown above the patch; empty for a change.
     message: String,
     state: Option<Entity<DiffState>>,
@@ -480,8 +529,37 @@ struct PatchView {
     error: Option<String>,
 }
 
+/// One review comment, edited beneath the line it targets.
+struct ReviewComment {
+    /// Distinguishes this comment's elements from an earlier one's.
+    index: u64,
+    range: DiffLineRange,
+    input: Entity<TextareaState>,
+}
+
+impl ReviewComment {
+    fn annotation_id(&self) -> ElementId {
+        ElementId::named_usize("git-diff-comment", self.index as usize)
+    }
+}
+
+/// Why the sheet could not submit, or why it left the text on a shell's
+/// command line instead.
+enum SendNotice {
+    /// The text is on a shell's command line, where Enter would run it.
+    Pasted,
+    Hint(String),
+}
+
 impl PatchView {
-    fn new(source: PatchSource, message: String, cx: &mut Context<Self>) -> Self {
+    fn new(
+        project: i64,
+        source: PatchSource,
+        message: String,
+        context: String,
+        host: PluginHost,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.spawn(async move |this, cx| {
             let read = cx
                 .background_spawn(async move {
@@ -518,10 +596,113 @@ impl PatchView {
         })
         .detach();
         Self {
+            project,
+            host,
+            comments: Vec::new(),
+            next_comment: 0,
+            context,
+            notice: None,
             message,
             state: None,
             truncated: false,
             error: None,
+        }
+    }
+
+    /// Anchor a comment beneath `range`, or focus the comment already there.
+    fn add_comment(&mut self, range: DiffLineRange, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(comment) = self.comments.iter().find(|comment| comment.range == range) {
+            let focus = comment.input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        let input = cx.new(|cx| {
+            TextareaState::new(&mut *window, cx)
+                .placeholder("写下对这个改动片段的意见")
+                .auto_grow(1, 6)
+        });
+        // A notice describes the previous text, so editing makes it stale.
+        cx.subscribe(&input, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && view.notice.is_some() {
+                view.notice = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        let index = self.next_comment;
+        self.next_comment += 1;
+        self.notice = None;
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        self.comments.push(ReviewComment {
+            index,
+            range,
+            input,
+        });
+        cx.notify();
+    }
+
+    fn remove_comment(&mut self, index: u64, cx: &mut Context<Self>) {
+        let before = self.comments.len();
+        self.comments.retain(|comment| comment.index != index);
+        if self.comments.len() != before {
+            self.notice = None;
+            cx.notify();
+        }
+    }
+
+    /// Hand every non-empty comment to the focused terminal as one instruction.
+    /// Returns whether the terminal took it, which is when the sheet can close.
+    fn send_comments(&mut self, cx: &mut Context<Self>) -> bool {
+        let comments = self
+            .comments
+            .iter()
+            .filter_map(|comment| {
+                let text = comment.input.read(cx).value().trim().to_string();
+                (!text.is_empty()).then(|| (comment.range.clone(), text))
+            })
+            .collect::<Vec<_>>();
+        if comments.is_empty() {
+            self.notice = Some(SendNotice::Hint("先写下评论再发送".to_string()));
+            cx.notify();
+            return false;
+        }
+        let message = compose_comments(&self.context, &comments);
+        match self.host.send_to_focused_pane(self.project, &message, cx) {
+            Ok(SendOutcome::Submitted) => {
+                self.comments.clear();
+                cx.notify();
+                true
+            }
+            // The notes sit on a shell's command line. Keeping the editors
+            // lets the user resend them after focusing an agent pane.
+            Ok(SendOutcome::Pasted) => {
+                self.notice = Some(SendNotice::Pasted);
+                cx.notify();
+                false
+            }
+            Err(problem) => {
+                self.notice = Some(SendNotice::Hint(problem));
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// The footer's one line: what to do next, or why the last send stopped.
+    fn footer_hint(&self, theme: &Theme) -> (String, Hsla) {
+        match &self.notice {
+            Some(SendNotice::Pasted) => {
+                ("已粘贴到当前终端，按 Enter 提交".to_string(), theme.warning)
+            }
+            Some(SendNotice::Hint(problem)) => (problem.clone(), theme.danger),
+            None if self.comments.is_empty() => (
+                "悬停 diff 行，点 + 添加评论".to_string(),
+                theme.muted_foreground,
+            ),
+            None => (
+                format!("{} 条评论", self.comments.len()),
+                theme.muted_foreground,
+            ),
         }
     }
 }
@@ -536,12 +717,61 @@ impl Render for PatchView {
             (None, Some(state)) if state.read(cx).files().is_empty() => {
                 empty("没有内容变更", muted)
             }
-            (None, Some(state)) => div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .child(Diff::new(state).size_full())
-                .into_any_element(),
+            (None, Some(state)) => {
+                let comments = Rc::new(
+                    self.comments
+                        .iter()
+                        .map(|comment| {
+                            (
+                                comment.annotation_id(),
+                                comment.index,
+                                comment.range.clone(),
+                                comment.input.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let view = cx.entity().downgrade();
+                let annotations = comments.iter().map(|(id, _, range, _)| {
+                    DiffAnnotation::line(
+                        id.clone(),
+                        DiffLinePosition::new(range.path().clone(), range.side(), range.start()),
+                    )
+                });
+                let annotation_content = {
+                    let comments = comments.clone();
+                    let view = view.clone();
+                    move |annotation: &DiffAnnotation, _window: &mut Window, cx: &mut App| {
+                        let Some((_, index, range, input)) =
+                            comments.iter().find(|(id, _, _, _)| id == annotation.id())
+                        else {
+                            return div().into_any_element();
+                        };
+                        render_comment(*index, range.clone(), input.clone(), view.clone(), cx)
+                    }
+                };
+                let add_annotation = {
+                    let view = view.clone();
+                    move |range: &DiffLineRange, window: &mut Window, cx: &mut App| {
+                        let range = range.clone();
+                        if let Some(view) = view.upgrade() {
+                            view.update(cx, |this, cx| this.add_comment(range, window, cx));
+                        }
+                    }
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(
+                        Diff::new(state)
+                            .annotations(annotations)
+                            .render_annotation(annotation_content)
+                            .on_add_annotation(add_annotation)
+                            .size_full(),
+                    )
+                    .into_any_element()
+            }
             (None, None) => empty("正在读取补丁…", muted),
         };
 
@@ -576,6 +806,152 @@ impl Render for PatchView {
             })
             .child(body)
     }
+}
+
+/// The sheet footer. It lives outside the body's padding, so it is its own
+/// view and follows the patch it belongs to.
+struct PatchFooter {
+    patch: Entity<PatchView>,
+}
+
+impl PatchFooter {
+    fn new(patch: Entity<PatchView>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&patch, |_, _, cx| cx.notify()).detach();
+        Self { patch }
+    }
+}
+
+impl Render for PatchFooter {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let patch = self.patch.clone();
+        let (count, (hint, color)) = {
+            let view = patch.read(cx);
+            (view.comments.len(), view.footer_hint(theme))
+        };
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(color)
+                    .child(hint),
+            )
+            .when(count > 0, |this| {
+                this.child(
+                    Button::new("git-diff-send")
+                        .small()
+                        .primary()
+                        .label("发送到终端")
+                        .on_click({
+                            let patch = patch.clone();
+                            move |_, window, cx| {
+                                if patch.update(cx, |patch, cx| patch.send_comments(cx)) {
+                                    window.close_sheet(cx);
+                                }
+                            }
+                        }),
+                )
+            })
+    }
+}
+
+/// One comment's editor, drawn beneath the line it targets.
+fn render_comment(
+    index: u64,
+    range: DiffLineRange,
+    input: Entity<TextareaState>,
+    view: WeakEntity<PatchView>,
+    cx: &mut App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let delete = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        if let Some(view) = view.upgrade() {
+            view.update(cx, |this, cx| this.remove_comment(index, cx));
+        }
+    };
+    v_flex()
+        .w_full()
+        .gap_1()
+        .p_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_xs()
+                        .font_medium()
+                        .text_color(muted)
+                        .child(comment_location(&range)),
+                )
+                .child(
+                    Button::new(ElementId::named_usize(
+                        "git-diff-comment-delete",
+                        index as usize,
+                    ))
+                    .compact()
+                    .ghost()
+                    .icon(Icon::new(IconName::Close).xsmall())
+                    .tooltip("删除评论")
+                    .on_click(delete),
+                ),
+        )
+        .child(Textarea::new(&input).appearance(false).bordered(false))
+        .into_any_element()
+}
+
+/// Where a comment points, in the form the agent reads in the patch. A range
+/// can start on one side and end on the other in the unified view.
+fn comment_location(range: &DiffLineRange) -> String {
+    let path = range.path();
+    if range.side() != range.end_side() {
+        return format!(
+            "{path}:{}（改动前）-{}（改动后）",
+            range.start(),
+            range.end()
+        );
+    }
+    let lines = if range.start() == range.end() {
+        range.start().to_string()
+    } else {
+        format!("{}-{}", range.start(), range.end())
+    };
+    if range.side() == DiffSide::Original {
+        format!("{path}:{lines}（改动前）")
+    } else {
+        format!("{path}:{lines}")
+    }
+}
+
+/// Every comment as one instruction, each under the line it targets.
+fn compose_comments(context: &str, comments: &[(DiffLineRange, String)]) -> String {
+    let mut message = if context.is_empty() {
+        String::from("请根据以下代码审查意见修改：")
+    } else {
+        format!("请根据以下代码审查意见修改（{context}）：")
+    };
+    for (range, comment) in comments {
+        message.push_str("\n\n");
+        message.push_str(&comment_location(range));
+        message.push('\n');
+        message.push_str(comment);
+    }
+    message
 }
 
 impl Render for GitLogPanel {
@@ -941,7 +1317,9 @@ fn status_label(status: char) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use gpui_kit::{
@@ -949,7 +1327,13 @@ mod tests {
         TestAppContext, Window, div,
     };
 
-    use super::{PatchSource, PatchView, Plugin};
+    use super::{PatchSource, PatchView, Plugin, compose_comments};
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+
+    /// A host whose terminal is never asked for text in these tests.
+    fn test_host() -> super::PluginHost {
+        super::PluginHost::new(|_, _, _| Ok(super::SendOutcome::Pasted))
+    }
 
     /// Run git in `repo`, failing the test with git's own message.
     fn git(repo: &Path, args: &[&str]) {
@@ -1015,7 +1399,16 @@ mod tests {
             root: path,
             hash: commit.hash.clone(),
         };
-        let view = cx.new(|cx| PatchView::new(source, commit.body.clone(), cx));
+        let view = cx.new(|cx| {
+            PatchView::new(
+                1,
+                source,
+                commit.body.clone(),
+                "提交 abc1234".into(),
+                test_host(),
+                cx,
+            )
+        });
         cx.run_until_parked();
 
         let (files, error) = view.read_with(cx, |view, cx| {
@@ -1030,8 +1423,19 @@ mod tests {
         assert_eq!(files, Some(1));
 
         // The sheet only adds chrome around this view, so drawing the view is
-        // what proves the parsed patch reaches the diff component.
+        // what proves the parsed patch reaches the diff component. A comment
+        // is an annotation inside a row, so drawing with one also proves the
+        // editor gets laid out with the code.
         let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.add_comment(
+                    DiffLineRange::new("a", DiffSide::Modified, 1, 1),
+                    window,
+                    cx,
+                );
+            });
+        });
         cx.run_until_parked();
         for _ in 0..3 {
             cx.update(|window, cx| {
@@ -1053,7 +1457,16 @@ mod tests {
         let change = changes.unstaged[0].clone();
 
         let source = PatchSource::Change { root: path, change };
-        let view = cx.new(|cx| PatchView::new(source, String::new(), cx));
+        let view = cx.new(|cx| {
+            PatchView::new(
+                1,
+                source,
+                String::new(),
+                "未暂存改动".into(),
+                test_host(),
+                cx,
+            )
+        });
         cx.run_until_parked();
 
         let (files, error) = view.read_with(cx, |view, cx| {
@@ -1068,6 +1481,86 @@ mod tests {
         assert_eq!(files, Some(1));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A comment points at the line the user marked, so the agent can open the
+    /// patch at the same place. Comments keep the order they were written in.
+    #[test]
+    fn comments_compose_as_one_instruction_with_their_locations() {
+        let comment = |start, end| DiffLineRange::new("src/git.rs", DiffSide::Modified, start, end);
+        let message = compose_comments(
+            "提交 abc1234",
+            &[
+                (comment(120, 124), "这里应该先检查状态".into()),
+                (comment(88, 88), "可以拆成两个函数".into()),
+            ],
+        );
+        assert_eq!(
+            message,
+            "请根据以下代码审查意见修改（提交 abc1234）：\n\n\
+             src/git.rs:120-124\n这里应该先检查状态\n\n\
+             src/git.rs:88\n可以拆成两个函数"
+        );
+    }
+
+    /// A unified selection can run from a deleted line to an added one, and
+    /// the two line numbers mean different things.
+    #[test]
+    fn a_range_across_sides_names_both_sides() {
+        let range = DiffLineRange::new("src/git.rs", DiffSide::Original, 12, 14)
+            .with_end_side(DiffSide::Modified);
+        let message = compose_comments("未暂存改动", &[(range, "这一段要一起看".into())]);
+        assert_eq!(
+            message,
+            "请根据以下代码审查意见修改（未暂存改动）：\n\n\
+             src/git.rs:12（改动前）-14（改动后）\n这一段要一起看"
+        );
+    }
+
+    /// The sheet hands the host one instruction naming each commented range,
+    /// and clears the editors once the terminal took it.
+    #[gpui::test]
+    fn a_review_comment_reaches_the_host_with_its_location(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let sent = Rc::new(RefCell::new(None::<(i64, String)>));
+        let host = super::PluginHost::new({
+            let sent = sent.clone();
+            move |project, text, _| {
+                *sent.borrow_mut() = Some((project, text.to_string()));
+                Ok(super::SendOutcome::Submitted)
+            }
+        });
+        // The patch itself is irrelevant here: the comment is added and sent
+        // before any read could fail or finish.
+        let source = PatchSource::Commit {
+            root: PathBuf::from("/nonexistent"),
+            hash: "HEAD".to_string(),
+        };
+        let view =
+            cx.new(|cx| PatchView::new(3, source, String::new(), "提交 abc1234".into(), host, cx));
+        let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.add_comment(
+                    DiffLineRange::new("src/git.rs", DiffSide::Modified, 12, 14),
+                    window,
+                    cx,
+                );
+                let input = view.comments[0].input.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("这里应该先检查状态".to_string(), window, cx)
+                });
+                view.send_comments(cx);
+                assert!(view.comments.is_empty());
+            });
+        });
+        assert_eq!(
+            sent.borrow().as_ref(),
+            Some(&(
+                3,
+                "请根据以下代码审查意见修改（提交 abc1234）：\n\nsrc/git.rs:12-14\n这里应该先检查状态".to_string()
+            ))
+        );
     }
 
     struct PanelHost {
@@ -1096,7 +1589,8 @@ mod tests {
         };
 
         let (host, cx) = cx.add_window_view(|window, cx| {
-            let panel = cx.new(|cx| super::GitLogPanel::new(Some(project.clone()), window, cx));
+            let panel = cx
+                .new(|cx| super::GitLogPanel::new(Some(project.clone()), test_host(), window, cx));
             PanelHost { panel }
         });
         cx.run_until_parked();
