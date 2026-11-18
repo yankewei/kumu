@@ -24,6 +24,10 @@ const REPLAY_HISTORY_LINES: usize = 1_000;
 /// A replay beyond this drops the history rather than failing the attach:
 /// the whole replay must fit one [`super::protocol::MAX_BINARY`] frame.
 const REPLAY_MAX_BYTES: usize = 1_500_000;
+/// How long a content read waits for the terminal thread. Reading scrollback
+/// pages the viewport, so a terminal in the middle of a flood can take a
+/// moment; a pane that never answers is better reported than hung on.
+const CONTENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Live {
     screen: Mutex<Snapshot>,
@@ -96,6 +100,12 @@ enum Msg {
         older: bool,
     },
     SearchClear,
+    /// The screen and up to `history` rows above it, as plain text. Reading
+    /// scrollback pages the viewport, so only this thread may do it.
+    Content {
+        history: usize,
+        reply: Sender<Option<String>>,
+    },
     /// Scroll the viewport (primary screen) or send arrows / mouse wheel.
     Scroll {
         lines: isize,
@@ -152,7 +162,21 @@ pub struct Term {
 
 impl Term {
     /// Start `program` in `cwd` on a new PTY. The receiver wakes when the grid changes.
+    #[cfg(test)]
     pub fn launch(
+        program: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        colors: TermColors,
+    ) -> (Self, UnboundedReceiver<()>) {
+        Self::launch_in_pane(None, program, args, cwd, colors)
+    }
+
+    /// Start a program that belongs to a Kumu pane: the pane id travels in
+    /// `KUMU_PANE`, so a program can tell which pane it runs in and ask the
+    /// app about its neighbours.
+    pub fn launch_in_pane(
+        pane: Option<u64>,
         program: String,
         args: Vec<String>,
         cwd: PathBuf,
@@ -179,6 +203,7 @@ impl Term {
         let thread_tx = tx.clone();
         let thread_live = Arc::clone(&live);
         let launch = Launch {
+            pane,
             program,
             args,
             cwd,
@@ -327,6 +352,17 @@ impl Term {
         rx.recv().ok().flatten()
     }
 
+    /// The screen and up to `history` rows of scrollback, as plain text.
+    ///
+    /// The terminal thread answers, so this blocks and must run off the UI
+    /// thread. A terminal already buried in output times out instead of
+    /// holding the caller forever.
+    pub fn content(&self, history: usize) -> Option<String> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::Content { history, reply: tx });
+        rx.recv_timeout(CONTENT_TIMEOUT).ok().flatten()
+    }
+
     pub fn scroll(&self, lines: isize, x: f32, y: f32, cell_w: f32, cell_h: f32, mods: MouseMods) {
         if lines == 0 {
             return;
@@ -381,6 +417,8 @@ impl Term {
 /// What a terminal thread needs at start: the command, where it runs, and the
 /// labels its snapshots carry.
 struct Launch {
+    /// Pane this process belongs to, exported as `KUMU_PANE`.
+    pane: Option<u64>,
     program: String,
     args: Vec<String>,
     cwd: PathBuf,
@@ -391,6 +429,7 @@ struct Launch {
 
 fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
     let Launch {
+        pane,
         program,
         args,
         cwd,
@@ -404,7 +443,7 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
         pixel_width: 80 * 8,
         pixel_height: 24 * 16,
     };
-    let pty = match pty::open(&program, &args, &cwd, size) {
+    let pty = match pty::open(&program, &args, &cwd, size, pane) {
         Ok(pty) => pty,
         Err(error) => {
             let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.fg, colors.bg);
@@ -567,6 +606,9 @@ impl Running {
                     if self.vt.search_clear() {
                         self.publish();
                     }
+                }
+                Some(Msg::Content { history, reply }) => {
+                    let _ = reply.send(Some(self.vt.content_text(history)));
                 }
                 Some(Msg::Scroll {
                     lines,

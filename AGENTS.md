@@ -6,6 +6,8 @@ A macOS workspace that runs local coding agents in their own terminal interfaces
 
 - Agent panes: kumu can start a registry agent in a pane instead of a shell (`src/agent/launch.rs` saves the launch choice with the layout). A pane remembers the agent-side session id and resumes the conversation on restart; an agent that exits leaves a shell behind. The same applies to an agent the user started by hand in a shell pane: its session report adopts the pane. `src/agent/integration` reports the id over the same OSC channel as notifications (`kumu-session:` prefix), and refreshes Kumu's managed extension files at startup so an app update cannot leave an old plugin behind.
 
+- Local control: `src/control.rs` serves `~/.kumu/control.sock` so a program in a pane can list the panes, read another pane's screen and scrollback, split a pane into a new agent, and type into an agent pane (never a shell). The caller's pane travels in `KUMU_PANE`; the client is the same binary (`kumu panes`, `kumu pane read right --history 200`, `kumu pane split right --agent codex --prompt "…"`, `kumu pane send right "…"`), and the skill in `skills/kumu-panes` teaches agents to use it.
+
 - Plugin panels: right-hand panels live in `src/plugins`. Implement `plugins::Plugin` and add the type to `plugins::specs()`; the title bar gets its button and the panel follows the selected project. A panel owns its refresh loop and is dropped when the user closes it.
 
 ## Constraints

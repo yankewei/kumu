@@ -431,7 +431,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Term {
         let colors = theme::term_colors(cx);
-        let (term, wake) = Term::launch(program, args, PathBuf::from(path), colors);
+        let (term, wake) =
+            Term::launch_in_pane(Some(pane), program, args, PathBuf::from(path), colors);
         let term_id = self.next_term;
         self.next_term += 1;
         self.terms.insert(

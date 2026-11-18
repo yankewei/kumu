@@ -12,18 +12,34 @@ pub struct Pty {
     pub writer: Box<dyn Write + Send>,
 }
 
-pub fn open(program: &str, args: &[String], cwd: &Path, size: PtySize) -> std::io::Result<Pty> {
+pub fn open(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    size: PtySize,
+    pane: Option<u64>,
+) -> std::io::Result<Pty> {
     let pair = native_pty_system()
         .openpty(size)
         .map_err(std::io::Error::other)?;
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
     cmd.env("KUMU_TERMINAL", "1");
+    // Which pane this process runs in. An agent inside it uses the id to ask
+    // the app about its neighbours ("read the pane on my right").
+    if let Some(pane) = pane {
+        cmd.env("KUMU_PANE", pane.to_string());
+    } else {
+        cmd.env_remove("KUMU_PANE");
+    }
     if let Ok(binary) = std::env::current_exe() {
         cmd.env("KUMU_APP_BINARY", binary);
     } else {
         cmd.env_remove("KUMU_APP_BINARY");
     }
+    // Which Kumu started this pane. Another instance can serve the same socket
+    // path, so a client asks for the app it actually belongs to.
+    cmd.env(crate::control::PID_ENV, std::process::id().to_string());
     // Agent hooks run without a controlling terminal (Claude/Codex detach
     // them), so they cannot rely on `/dev/tty`. The slave's device path is the
     // channel back to this terminal's VT.

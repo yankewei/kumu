@@ -365,20 +365,24 @@ impl Snapshot {
         out.into_bytes()
     }
 
+    /// The visible screen as plain text, one line per row.
     #[cfg(test)]
     pub fn plain_text(&self) -> String {
         self.cells
             .iter()
-            .map(|row| {
-                let mut text = String::new();
-                for cell in row.iter() {
-                    text.push_str(&cell.text);
-                }
-                text.trim_end().to_string()
-            })
+            .map(|row| row_text(row))
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// One row as plain text: cell text concatenated, with the blank tail removed.
+fn row_text(row: &[Cell]) -> String {
+    let mut text = String::new();
+    for cell in row {
+        text.push_str(&cell.text);
+    }
+    text.trim_end().to_string()
 }
 
 /// The cells of a row up to its last painted cell: everything past it is
@@ -1281,6 +1285,37 @@ impl Vt {
             ghostty_render_state_update(state, self.term);
         }
         rows
+    }
+
+    /// The visible screen as plain text, preceded by up to `history` rows of
+    /// scrollback.
+    ///
+    /// Both parts are read from the bottom of the scrollable area, so the
+    /// answer is the newest output whatever the user's viewport currently
+    /// shows. Reading history pages the viewport; the caller's scroll position
+    /// is put back before this returns.
+    pub fn content_text(&mut self, history: usize) -> String {
+        let restore = self.scrollbar().and_then(|bar| {
+            let bottom = bar.total.saturating_sub(bar.len);
+            (bar.offset < bottom).then(|| {
+                self.scroll_to_row(bottom as usize);
+                bar.offset as usize
+            })
+        });
+        let mut lines: Vec<String> = self
+            .history_cells(history)
+            .iter()
+            .map(|row| row_text(row))
+            .collect();
+        let screen = self.snapshot("", "", false);
+        lines.extend(screen.cells.iter().map(|row| row_text(row)));
+        if let Some(offset) = restore {
+            self.scroll_to_row(offset);
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
     }
 
     /// Whether the terminal currently owns a selection.
@@ -2401,6 +2436,49 @@ mod tests {
         assert_eq!(
             restored.cells, original.cells,
             "the phone's grid must match the Mac's cell for cell"
+        );
+    }
+
+    #[test]
+    fn content_text_puts_the_newest_output_after_the_scrollback() {
+        let mut vt = Vt::new(20, 4);
+        for line in 0..10 {
+            vt.write(format!("line {line}\r\n").as_bytes());
+        }
+        let all = vt.content_text(usize::MAX);
+        let rows: Vec<usize> = all
+            .lines()
+            .map(|line| line.trim_start_matches("line ").parse().expect("a row"))
+            .collect();
+        assert!(
+            rows.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "oldest first, newest last: {all:?}"
+        );
+        assert_eq!(rows.last(), Some(&9), "{all:?}");
+
+        // A smaller history keeps only the newest scrollback rows above the
+        // screen; the screen itself is always all there.
+        let tail = vt.content_text(2);
+        assert!(all.ends_with(&tail), "the tail is a suffix of {all:?}");
+        assert!(tail.lines().count() < rows.len(), "{tail:?}");
+        assert_eq!(tail.lines().last(), Some("line 9"), "{tail:?}");
+    }
+
+    #[test]
+    fn content_text_reads_the_tail_whatever_the_viewport_shows() {
+        let mut vt = Vt::new(20, 4);
+        for line in 0..20 {
+            vt.write(format!("line {line}\r\n").as_bytes());
+        }
+        vt.scroll_to_row(0);
+        let before = vt.scrollbar().expect("scrollback").offset;
+
+        let text = vt.content_text(0);
+        assert!(text.contains("line 19"), "{text:?}");
+        assert_eq!(
+            vt.scrollbar().expect("scrollback").offset,
+            before,
+            "the user's scroll position is put back"
         );
     }
 

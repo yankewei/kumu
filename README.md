@@ -67,6 +67,34 @@ Kumu 把每个项目当作独立工作区：它有各自的分屏布局和终端
 
 恢复功能可在 **设置 → 通用 → 恢复 Agent 会话** 关闭。Agent 退出后窗格会变回普通 shell；在 shell 里手动启动的 Agent 也会被接管，同样支持下次恢复。
 
+## 让 Agent 读别的窗格
+
+窗格里的 Agent 可以读同一窗口里其它窗格的内容，也可以在旁边开一个 Agent 窗格并把任务交给它。这些能力由装着 Kumu 本体的同一个可执行文件提供，Kumu 在窗格里启动了 `KUMU_APP_BINARY`、`KUMU_PANE` 两个环境变量：
+
+```sh
+"$KUMU_APP_BINARY" panes                     # 列出窗格：id、项目、标题、cwd、尺寸
+"$KUMU_APP_BINARY" pane read right           # 右边窗格当前的屏幕
+"$KUMU_APP_BINARY" pane read right --history 200 --tail 60   # 带滚动历史，只看最后 60 行
+"$KUMU_APP_BINARY" pane read 3 --json        # 指定窗格，机器可读
+
+"$KUMU_APP_BINARY" pane split right --agent codex --prompt "review 所有改动"
+"$KUMU_APP_BINARY" pane send right "继续，把测试也补上"
+```
+
+目标可以是 `left` / `right` / `up` / `down`（相对自己那一格）、`focused`、`current`，或者 `panes` 里的 id。`pane split` 只支持向右（横向）和向下（纵向），新窗格开在你的旁边、键盘焦点留在原处，`--prompt` 会等新 Agent 画出输入框后自动粘贴并回车。`pane send` 只接受 Agent 窗格——普通 shell 会拒绝，因为在那里输入等于执行命令；文本以 `-` 开头时在它前面加 `--`。
+
+`--history` 读的是终端自己的滚动缓冲：跑在备用屏幕上的全屏 TUI（多数 Agent 界面）没有这一层，只会返回当前屏幕。
+
+命令通过 `~/.kumu/control.sock`（目录 `0700`、socket `0600`，仅当前用户可用）向正在运行的 Kumu 取数据，Kumu 没开时会直接报错。同时开着两个 Kumu 时，第二个实例不会接管控制通道：它窗格里的命令会报错，而不会去操作第一个实例的窗格。
+
+给 Agent 用的话，安装配套的 skill，它会在需要时自己调用上面的命令：
+
+```sh
+npx skills add yankewei/kumu
+```
+
+skill 本身在 [`skills/kumu-panes/SKILL.md`](skills/kumu-panes/SKILL.md)。
+
 ## 终端
 
 | 操作 | 快捷键 |

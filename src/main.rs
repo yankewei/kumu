@@ -23,6 +23,7 @@
 mod agent;
 mod app;
 mod assets;
+mod control;
 mod db;
 mod dock_icon;
 mod fonts;
@@ -40,7 +41,7 @@ use gpui_kit::*;
 use ui::KumuApp;
 
 fn main() {
-    if let Some(code) = agent::integration::run_cli() {
+    if let Some(code) = agent::integration::run_cli().or_else(control::run_cli) {
         std::process::exit(code);
     }
     // A registered native extension (OpenCode, Pi, OMP) is a copy of this
