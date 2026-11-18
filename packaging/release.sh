@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Builds, cloud-signs, notarizes and verifies a distributable Kumu DMG.
+# Builds, signs, notarizes and verifies a distributable Kumu DMG.
 # `--publish` additionally tags the commit and uploads the GitHub Release.
 #
 # Usage: packaging/release.sh [--publish] [--keep]
 #   --publish  tag v<version>, push it, and create the GitHub Release
 #   --keep     keep the intermediate directory even on success
 #
-# Requires a full Xcode signed into an account with Developer ID access for
-# team 3BUD4GCZCQ, and notarization credentials in keychain profile kumu:
-#   xcrun notarytool store-credentials kumu --apple-id <Apple ID> --team-id 3BUD4GCZCQ
-# No local Developer ID private key is needed: the archive is signed with the
-# Apple Development certificate and Xcode swaps in the cloud Developer ID.
-# Signing and export can ask for keychain access; approve it on the desktop.
-# The app and the DMG are notarized separately, then the DMG is verified again
-# from the inside. Artifact names feed the updater's matching: do not rename.
+# Signing, best first:
+#   KUMU_SIGNING_IDENTITY="Developer ID Application: …"   (already in a keychain)
+#   KUMU_SIGNING_P12=path.p12 KUMU_SIGNING_P12_PASSWORD=… (temp keychain)
+#   a "Developer ID Application: …" identity in the keychain
+# Without one the app is exported from an Xcode archive with cloud signing,
+# which needs Xcode and is about a minute slower.
+#
+# Only the DMG is notarized: the app inside is Developer ID signed and covered
+# by the DMG's ticket, and the app is not stapled separately. Credentials:
+#   xcrun notarytool store-credentials kumu --apple-id <Apple ID> --team-id <Team ID>
+# Artifact names feed the updater's matching: do not rename.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=lib.sh
+source packaging/lib.sh
 
 publish=false
 keep=false
@@ -23,7 +28,7 @@ for arg in "$@"; do
     case "$arg" in
         --publish) publish=true ;;
         --keep) keep=true ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
         *)
             echo "usage: $0 [--publish] [--keep]" >&2
             exit 2
@@ -47,18 +52,8 @@ case "$arch" in
     *) die "不支持的架构：$arch" ;;
 esac
 
-# The archive is signed with the local Apple Development certificate; Xcode
-# swaps in the cloud-managed Developer ID during -exportArchive.
-identity="${KUMU_DEVELOPMENT_IDENTITY:-}"
-if [[ -z "$identity" ]]; then
-    identity="$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Apple Development: .*\)"/\1/p' \
-        | head -n1)"
-fi
-[[ -n "$identity" ]] || die "钥匙串里没有 Apple Development 证书；先在 Xcode 登录团队 $team"
-
-step "1/7 预检（${tag}, ${arch}）"
-xcodebuild -version
+step "1/6 预检（${tag}, ${arch}）"
+xcrun --find codesign >/dev/null
 xcrun --find notarytool >/dev/null
 xcrun --find stapler >/dev/null
 if ! history="$(xcrun notarytool history --keychain-profile "$profile" 2>&1)"; then
@@ -78,8 +73,17 @@ if [[ "$publish" == true ]]; then
 fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/kumu-release.XXXXXX")"
+searched=()
+while IFS= read -r entry; do
+    searched+=("$entry")
+done < <(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')
+keychain=""
 cleanup() {
     local status=$?
+    if [[ -n "$keychain" ]]; then
+        security list-keychains -d user -s "${searched[@]}" >/dev/null 2>&1 || true
+        security delete-keychain "$keychain" >/dev/null 2>&1 || true
+    fi
     if ((status != 0)); then
         echo "release: 失败，保留工作目录：$work" >&2
     elif [[ "$keep" == true ]]; then
@@ -90,32 +94,95 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "2/7 编译、归档并用开发证书签名"
-cargo build --release
-KUMU_RELEASE_DIR="$work" KUMU_VERSION="$version" KUMU_TEAM_ID="$team" \
-    KUMU_DEVELOPMENT_IDENTITY="$identity" python3 packaging/make-archive.py
-app="$work/Kumu.xcarchive/Products/Applications/Kumu.app"
-codesign --force --options runtime --timestamp \
-    --entitlements packaging/entitlements.plist \
-    --sign "$identity" \
-    "$app"
+# A Developer ID identity signs the app and the DMG locally, which keeps a
+# release at about two minutes; without one the app goes through Xcode's cloud
+# signing, which is slower and needs Xcode signed in to the team.
+signing_identity=""
+if [[ -n "${KUMU_SIGNING_IDENTITY:-}" ]]; then
+    signing_identity="$KUMU_SIGNING_IDENTITY"
+elif [[ -n "${KUMU_SIGNING_P12:-}" ]]; then
+    [[ -f "$KUMU_SIGNING_P12" ]] || die "KUMU_SIGNING_P12 不是文件：$KUMU_SIGNING_P12"
+    : "${KUMU_SIGNING_P12_PASSWORD:?KUMU_SIGNING_P12 需要 KUMU_SIGNING_P12_PASSWORD}"
+    keychain="$work/signing.keychain-db"
+    keychain_password="$(openssl rand -hex 32)"
+    security create-keychain -p "$keychain_password" "$keychain"
+    security set-keychain-settings -lut 21600 "$keychain"
+    security unlock-keychain -p "$keychain_password" "$keychain"
+    security import "$KUMU_SIGNING_P12" -k "$keychain" \
+        -P "$KUMU_SIGNING_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+    security set-key-partition-list -S apple-tool:,apple: -s \
+        -k "$keychain_password" "$keychain" >/dev/null
+    security list-keychains -d user -s "$keychain" "${searched[@]}"
+    # The p12 is explicit, so read the identity it carries even when its chain
+    # is not one the system trusts yet (certificates, not validity, name it).
+    signing_identity="$(security find-identity -p codesigning "$keychain" 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' \
+        | head -n1)"
+    [[ -n "$signing_identity" ]] || die "p12 里没有 Developer ID Application 身份"
+elif [[ "${CODESIGN_IDENTITY:-}" == "Developer ID Application: "* ]]; then
+    # A general local-build setting is only used when it is a release identity.
+    signing_identity="$CODESIGN_IDENTITY"
+else
+    signing_identity="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' \
+        | head -n1)"
+fi
+if [[ -n "$signing_identity" ]]; then
+    [[ "$signing_identity" == "Developer ID Application: "* ]] \
+        || die "KUMU_SIGNING_IDENTITY 不是 Developer ID Application：$signing_identity"
+    export CODESIGN_IDENTITY="$signing_identity"
+    echo "签名身份：$signing_identity（本地）"
+else
+    echo "没有 Developer ID 身份，改用 Xcode 云端签名；设置 KUMU_SIGNING_P12 可走本地签名"
+fi
 
-step "3/7 Xcode 云端 Developer ID 签名"
-echo "如弹出钥匙串或账号授权，请在桌面上允许。"
-xcodebuild -exportArchive \
-    -archivePath "$work/Kumu.xcarchive" \
-    -exportOptionsPlist "$work/ExportOptions.plist" \
-    -exportPath "$work/export" \
-    -allowProvisioningUpdates
-app="$work/export/Kumu.app"
-codesign --verify --deep --strict "$app"
-signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
-authority="$(sed -n 's/^Authority=//p' <<<"$signature" | head -n1)"
-[[ "$authority" == "Developer ID Application: "* ]] \
-    || die "导出后未使用 Developer ID 签名（Authority=${authority:-无}）"
-grep -q 'flags=.*runtime' <<<"$signature" \
-    || die "导出后的应用没有 hardened runtime"
-echo "签名：$authority"
+check_signed_app() {
+    local app="$1" signature authority
+    codesign --verify --deep --strict "$app"
+    signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
+    authority="$(sed -n 's/^Authority=//p' <<<"$signature" | head -n1)"
+    [[ "$authority" == "Developer ID Application: "* ]] \
+        || die "应用没有使用 Developer ID 签名（Authority=${authority:-无}）"
+    grep -q 'flags=.*runtime' <<<"$signature" \
+        || die "应用没有 hardened runtime"
+    echo "签名：$authority"
+}
+
+step "2/6 编译、组包并签名"
+if [[ -n "$signing_identity" ]]; then
+    packaging/make-app.sh release
+    app="target/release/Kumu.app"
+    check_signed_app "$app"
+else
+    development_identity="${KUMU_DEVELOPMENT_IDENTITY:-}"
+    if [[ -z "$development_identity" ]]; then
+        development_identity="$(security find-identity -v -p codesigning 2>/dev/null \
+            | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' \
+            | head -n1)"
+    fi
+    [[ -n "$development_identity" ]] \
+        || die "钥匙串里没有 Apple Development 证书；先在 Xcode 登录团队 $team"
+    cargo build --release
+    KUMU_RELEASE_DIR="$work" KUMU_VERSION="$version" KUMU_TEAM_ID="$team" \
+        KUMU_DEVELOPMENT_IDENTITY="$development_identity" python3 packaging/make-archive.py
+    app="$work/Kumu.xcarchive/Products/Applications/Kumu.app"
+    codesign --force --options runtime --timestamp \
+        --entitlements packaging/entitlements.plist \
+        --sign "$development_identity" \
+        "$app"
+fi
+
+if [[ -z "$signing_identity" ]]; then
+    step "3/6 Xcode 云端 Developer ID 签名"
+    echo "如弹出钥匙串或账号授权，请在桌面上允许。"
+    xcodebuild -exportArchive \
+        -archivePath "$work/Kumu.xcarchive" \
+        -exportOptionsPlist "$work/ExportOptions.plist" \
+        -exportPath "$work/export" \
+        -allowProvisioningUpdates
+    app="$work/export/Kumu.app"
+    check_signed_app "$app"
+fi
 
 notarize() {
     local file="$1" kind="$2" output="$3" id attempt
@@ -155,30 +222,30 @@ PY
     die "stapler validate 失败：$output"
 }
 
-step "4/7 公证应用并附加票据"
-ditto -c -k --keepParent "$app" "$work/Kumu.zip"
-notarize "$work/Kumu.zip" app "$app"
-gatekeeper="$(spctl --assess --type execute --verbose=2 "$app" 2>&1)"
-grep -q 'source=Notarized Developer ID' <<<"$gatekeeper" \
-    || die "Gatekeeper 未认可应用：$gatekeeper"
-
-step "5/7 制作并公证 DMG"
+step "4/6 制作、签名并公证 DMG"
 mkdir "$work/dmg-stage"
 ditto "$app" "$work/dmg-stage/Kumu.app"
 ln -s /Applications "$work/dmg-stage/Applications"
 dmg="$work/Kumu-${version}-${arch}.dmg"
 hdiutil create -volname Kumu \
     -srcfolder "$work/dmg-stage" -ov -format UDZO "$dmg"
+sign_dmg "$dmg"
 notarize "$dmg" dmg "$dmg"
 hdiutil verify "$dmg"
+if [[ -n "$signing_identity" ]]; then
+    gatekeeper="$(spctl --assess --type open --context context:primary-signature \
+        --verbose=2 "$dmg" 2>&1)"
+    grep -q 'source=Notarized Developer ID' <<<"$gatekeeper" \
+        || die "Gatekeeper 未认可 DMG：$gatekeeper"
+fi
 
-step "6/7 挂载复验并保存产物"
+step "5/6 挂载复验并保存产物"
 KUMU_RELEASE_DIR="$work" KUMU_VERSION="$version" \
     KUMU_APP="$app" KUMU_DMG="$dmg" \
     python3 packaging/verify-release.py
 artifact="target/release/$(basename "$dmg")"
 
-step "7/7 GitHub Release"
+step "6/6 GitHub Release"
 if [[ "$publish" != true ]]; then
     echo "跳过打标签和上传；确认安装包后用 --publish 发布 $tag"
     exit 0

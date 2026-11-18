@@ -15,8 +15,8 @@
 #
 # Signing: set CODESIGN_IDENTITY to a "Developer ID Application: …" identity
 # for a locally signed bundle (hardened runtime). Unset / "-" keeps an ad-hoc
-# seal for local use. Distributable DMGs go through packaging/release.sh,
-# which cloud-signs the exported app instead.
+# seal for local use. packaging/release.sh sets it when it has a Developer ID
+# identity, and falls back to Xcode's cloud signing when it does not.
 #
 # Usage: packaging/make-app.sh [release|debug] [--open]
 set -euo pipefail

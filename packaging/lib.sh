@@ -2,8 +2,8 @@
 # shellcheck shell=bash
 
 # Prefer an explicit CODESIGN_IDENTITY ("-" = ad-hoc).
-# make-app.sh/make-dmg.sh build local test packages, so they default to ad-hoc;
-# a distributable DMG goes through packaging/release.sh and its cloud signing.
+# make-app.sh/make-dmg.sh default to ad-hoc for local packages; release.sh
+# exports a Developer ID identity when it has one and notarizes the DMG.
 codesign_identity() {
     if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
         echo "$CODESIGN_IDENTITY"
