@@ -182,6 +182,8 @@ if [[ -z "$signing_identity" ]]; then
         -allowProvisioningUpdates
     app="$work/export/Kumu.app"
     check_signed_app "$app"
+else
+    step "3/6 本地 Developer ID 已签名，跳过云端导出"
 fi
 
 notarize() {
