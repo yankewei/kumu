@@ -10,18 +10,13 @@ mod terminal;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::SettingsWindow;
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::git::WorktreeEntry;
 use crate::plugins::{PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome};
-use crate::remote::{
-    self, Action, AgentInfo, AttachHandle, Command as RemoteCommand, ComputerInfo, MAX_GRID,
-    PaneInfo, PaneStatus, ProjectInfo, RemoteConfig, RemoteError, RemoteHandle, RemoteState,
-};
 use crate::term::KeyInput;
 use futures::StreamExt;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
@@ -40,12 +35,6 @@ use terminal::{TerminalEvent, TerminalView};
 /// Whether panes come back with the conversation they were running.
 fn auto_resume_enabled() -> bool {
     crate::db::get_setting(crate::db::SETTING_AUTO_RESUME).as_deref() != Some("0")
-}
-
-/// Remote control is opt-in: the endpoint only runs after the settings switch
-/// is on, so an unpaired Mac listens for nothing by default.
-fn remote_enabled() -> bool {
-    crate::db::get_setting(crate::db::SETTING_REMOTE).as_deref() == Some("1")
 }
 
 /// Whether a pasted prompt should be submitted. Only a pane started as an
@@ -86,43 +75,6 @@ const SIDEBAR_MAX_WIDTH: f32 = 520.;
 const PLUGIN_WIDTH: f32 = 280.;
 const PLUGIN_MIN_WIDTH: f32 = 220.;
 const PLUGIN_MAX_WIDTH: f32 = 480.;
-
-/// What the settings window's remote page shows. Copied out of the service so
-/// the page never holds an auth lock while it draws.
-#[derive(Default)]
-pub struct RemoteStatus {
-    /// The endpoint is binding the relay right now.
-    pub starting: bool,
-    /// The endpoint is up and pairing codes are live.
-    pub running: bool,
-    pub bridge_id: String,
-    pub code: Option<String>,
-    pub expires_ms: u64,
-    pub pairing_link: Option<String>,
-    pub devices: Vec<RemoteDevice>,
-}
-
-/// One paired phone, without its token hash.
-pub struct RemoteDevice {
-    pub id: String,
-    pub name: String,
-    pub last_seen_ms: u64,
-}
-
-/// How long the current one-use pairing code stays valid, rounded up to whole
-/// minutes so the card never shows a shorter life than the code has. The card
-/// only repaints when the app does, so this reads as a hint rather than a
-/// countdown.
-pub(crate) fn pairing_expiry_label(expires: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    match expires.saturating_sub(now) {
-        0 => "配对码即将更新".to_string(),
-        left if left < 60_000 => "不到 1 分钟内有效".to_string(),
-        left => format!("{} 分钟内有效", left.div_ceil(60_000)),
-    }
-}
 
 pub struct KumuApp {
     /// Projects and their live shells; the home view draws it and hands it
@@ -171,27 +123,11 @@ pub struct KumuApp {
     plugin_views: HashMap<&'static str, AnyView>,
     /// Width of the open plugin panel in px, chosen by dragging its divider.
     plugin_width: f32,
-    /// Remote control service, when it has been enabled for this run.
-    remote: Option<RemoteHandle>,
-    /// Whether a start request is still binding the endpoint.
-    remote_starting: bool,
-    /// Bumped whenever the service is turned off or back on, so a start that
-    /// is still binding the endpoint cannot install itself afterwards.
-    remote_epoch: u64,
-    /// Workspace facts the phone can read. The service holds the same Arc.
-    remote_state: Arc<RwLock<RemoteState>>,
-    /// When the snapshot above was last written. Terminal output arrives far
-    /// faster than a phone polls, so it refreshes the snapshot on a timer.
-    last_remote_publish: Instant,
-    /// When each pane last wrote, so a phone can see a pane working.
-    pane_activity: HashMap<u64, SystemTime>,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
     control: Option<crate::control::ControlHandle>,
 }
 
-/// A pane counts as working while it has produced a frame this recently.
-const WORKING_WINDOW: Duration = Duration::from_secs(2);
 /// How long a control split waits for the new agent to draw its prompt before
 /// the text is sent anyway. An agent TUI that needs longer than this is still
 /// started; only the prompt is reported as late.
@@ -209,21 +145,8 @@ impl KumuApp {
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
         cx.subscribe_in(&workspace, window, |this, _, ev, window, cx| match ev {
-            WorkspaceEvent::Changed => {
-                this.publish_remote_state(cx);
-                cx.notify();
-            }
-            WorkspaceEvent::Frame(pane) => {
-                // Titles, status and the last line change as the program
-                // writes. The panel redraw is the pane's own, so refresh the
-                // phone's snapshot on a timer instead of per frame.
-                if this.remote.is_some() {
-                    this.pane_activity.insert(*pane, SystemTime::now());
-                    if this.last_remote_publish.elapsed() >= Duration::from_secs(1) {
-                        this.publish_remote_state(cx);
-                    }
-                }
-            }
+            WorkspaceEvent::Changed => cx.notify(),
+            WorkspaceEvent::Frame(_) => {}
             WorkspaceEvent::Failed(message) => {
                 this.store_error = Some(message.clone());
                 cx.notify();
@@ -292,7 +215,6 @@ impl KumuApp {
                 // sidebar's unread marker is the in-app fallback when macOS
                 // declines delivery or kumu runs unbundled.
                 window.push_notification(note, cx);
-                this.publish_remote_state(cx);
                 cx.notify();
             }
             WorkspaceEvent::PaneExited { pane, project } => {
@@ -451,299 +373,16 @@ impl KumuApp {
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
-            remote: None,
-            remote_starting: false,
-            remote_epoch: 0,
-            remote_state: Arc::new(RwLock::new(RemoteState::default())),
-            last_remote_publish: Instant::now(),
-            pane_activity: HashMap::new(),
             control: None,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
-        }
-        if remote_enabled() {
-            app.start_remote(cx);
         }
         app.start_control(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
         app.persist_workspace(cx);
         app
-    }
-
-    /// Start the remote endpoint for a phone to pair with; the sidebar then
-    /// exposes the pairing link. Only the settings switch asks for this.
-    fn start_remote(&mut self, cx: &mut Context<Self>) {
-        if self.remote.is_some() {
-            return;
-        }
-        self.remote_starting = true;
-        self.refresh_settings(cx);
-        let epoch = self.remote_epoch;
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        // No command can arrive before the endpoint exists, so the actor can
-        // run from the start.
-        cx.spawn(async move |this, cx| {
-            while let Some(command) = rx.next().await {
-                let _ = this.update(cx, |app, cx| app.handle_remote_command(command, cx));
-            }
-        })
-        .detach();
-
-        // Binding the endpoint waits on the relay, so it must not run on the
-        // main thread: the window paints while the service comes up.
-        let state = self.remote_state.clone();
-        cx.spawn(async move |this, cx| {
-            let started = cx
-                .background_spawn(async move { remote::start(RemoteConfig::default(), state, tx) })
-                .await;
-            let mut pending = match started {
-                Ok(handle) => Some(handle),
-                Err(error) => {
-                    eprintln!("[remote] failed to start: {error:#}");
-                    let _ = this.update(cx, |app, cx| {
-                        if app.remote_epoch == epoch {
-                            app.remote_starting = false;
-                            app.refresh_settings(cx);
-                        }
-                    });
-                    return;
-                }
-            };
-            let mut pairing = None;
-            let _ = this.update(cx, |app, cx| {
-                // Switched off (or on again) while the endpoint was binding:
-                // this start no longer belongs to the current wish.
-                if app.remote_epoch != epoch {
-                    return;
-                }
-                let handle = pending.take().expect("started handle");
-                pairing = Some(handle.auth.subscribe_pairing());
-                app.remote = Some(handle);
-                app.remote_starting = false;
-                app.publish_remote_state(cx);
-                // The sidebar's pairing entry appears with the service.
-                cx.notify();
-                app.refresh_settings(cx);
-            });
-            let Some(mut pairing) = pairing else {
-                // Dropping the handle stops the endpoint that was not wanted.
-                drop(pending);
-                return;
-            };
-            // The sidebar shows the pairing code, which rotates after a phone
-            // pairs. Repaint so it never shows a code that was already used.
-            use tokio::sync::broadcast::error::RecvError;
-            while let Ok(()) | Err(RecvError::Lagged(_)) = pairing.recv().await {
-                let _ = this.update(cx, |app, cx| {
-                    app.publish_remote_state(cx);
-                    // The settings page shows the code a phone has not used.
-                    app.refresh_settings(cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// Turn the remote-control service on or off for this run. The settings
-    /// window persists the choice and calls this; dropping the handle closes
-    /// the endpoint, so an off Mac accepts no connection at all.
-    pub(crate) fn set_remote(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.remote_epoch += 1;
-        if enabled {
-            self.start_remote(cx);
-            return;
-        }
-        self.remote = None;
-        self.remote_starting = false;
-        cx.notify();
-        self.refresh_settings(cx);
-    }
-
-    /// The facts the settings window's remote page draws.
-    pub(crate) fn remote_status(&self) -> RemoteStatus {
-        let Some(remote) = &self.remote else {
-            return RemoteStatus {
-                starting: self.remote_starting,
-                ..RemoteStatus::default()
-            };
-        };
-        RemoteStatus {
-            starting: false,
-            running: true,
-            bridge_id: remote.auth.bridge_id(),
-            code: Some(remote.auth.code()),
-            expires_ms: remote.auth.pairing_expires_ms(),
-            pairing_link: remote.pairing_link(),
-            devices: remote
-                .auth
-                .devices()
-                .into_iter()
-                .map(|device| RemoteDevice {
-                    id: device.id,
-                    name: device.name,
-                    last_seen_ms: device.last_seen_ms,
-                })
-                .collect(),
-        }
-    }
-
-    /// Replace the one-use pairing code; a phone that already saw the old one
-    /// must not pair with it.
-    pub(crate) fn remote_rotate_code(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        if let Some(remote) = &self.remote {
-            remote.auth.rotate_code()?;
-            self.publish_remote_state(cx);
-        }
-        cx.notify();
-        self.refresh_settings(cx);
-        Ok(())
-    }
-
-    /// Forget a paired phone and cut off its reconnects.
-    pub(crate) fn remote_revoke(&mut self, id: &str, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        if let Some(remote) = &self.remote {
-            remote.auth.revoke(id)?;
-            self.publish_remote_state(cx);
-        }
-        cx.notify();
-        self.refresh_settings(cx);
-        Ok(())
-    }
-
-    /// Repaint an open settings window after the remote service changed. The
-    /// settings window itself is what starts and stops it, so a nested update
-    /// (same window) simply finds nothing to do.
-    fn refresh_settings(&self, cx: &mut App) {
-        let Some(handle) = self.settings_window else {
-            return;
-        };
-        let _ = handle.update(cx, |view, window, cx| {
-            if let Ok(settings) = view.clone().downcast::<SettingsWindow>() {
-                settings.update(cx, |_, cx| cx.notify());
-            }
-            window.refresh();
-        });
-    }
-
-    /// Copy the parts of the workspace a phone can see into the shared
-    /// snapshot. Terminal bytes are separate; this is only the facts around
-    /// them (projects, panes, titles, status, size).
-    fn publish_remote_state(&mut self, cx: &mut Context<Self>) {
-        // Nothing reads the snapshot while the service is off, and the phone
-        // only needs it once the endpoint exists.
-        if self.remote.is_none() {
-            return;
-        }
-        self.last_remote_publish = Instant::now();
-        let workspace = self.workspace.read(cx);
-        let mut state = RemoteState {
-            computer: ComputerInfo {
-                name: remote::hostname(),
-                id: self
-                    .remote
-                    .as_ref()
-                    .map(|handle| handle.auth.bridge_id())
-                    .unwrap_or_default(),
-            },
-            ..RemoteState::default()
-        };
-        state.projects = workspace
-            .projects()
-            .iter()
-            .map(|project| ProjectInfo {
-                id: project.id,
-                name: project.name.clone(),
-                path: project.path.clone(),
-                worktree: project.parent_id.is_some(),
-            })
-            .collect();
-        state.agents = crate::agent::AGENTS
-            .iter()
-            .map(|agent| AgentInfo {
-                id: agent.id.to_owned(),
-                name: agent.name.to_owned(),
-                installed: crate::agent::installed(agent.id),
-            })
-            .collect();
-
-        let mut panes = Vec::new();
-        for (project, layout) in &self.layouts {
-            for pane in layout.panes() {
-                let Some(term) = workspace.terminal_for_pane(pane.0) else {
-                    continue;
-                };
-                let snapshot = term.snapshot();
-                let agent = match self.launches.get(&pane) {
-                    Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
-                    _ => None,
-                };
-                let (status, unread) = self.remote_pane_status(workspace, pane.0, &snapshot);
-                let activity = self.pane_activity.get(&pane.0).copied();
-                panes.push(PaneInfo {
-                    id: pane.0,
-                    project: *project,
-                    kind: if agent.is_some() { "agent" } else { "shell" }.into(),
-                    agent,
-                    title: snapshot.label(),
-                    cwd: snapshot.cwd.clone(),
-                    status,
-                    unread,
-                    last_line: last_nonempty_line(&snapshot),
-                    last_activity: activity
-                        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |elapsed| elapsed.as_secs()),
-                    cols: snapshot
-                        .cells
-                        .first()
-                        .map(|row| row.len().clamp(1, u16::MAX as usize) as u16)
-                        .unwrap_or(80),
-                    rows: snapshot.rows.max(1),
-                });
-            }
-        }
-        panes.sort_by_key(|pane| pane.id);
-        state.panes = panes;
-        state.selected_project = self.selected;
-        state.focused_pane = Some(self.focused.0);
-        state.recent_pane = Some(self.focused.0);
-        state.bump();
-        if let Ok(mut slot) = self.remote_state.write() {
-            *slot = state;
-        }
-        // The sidebar shows the current pairing code, which rotates after a
-        // phone pairs.
-        cx.notify();
-    }
-
-    /// What the phone sees for one pane: a fresh frame means the program is
-    /// working, an unread notification means it wants attention.
-    fn remote_pane_status(
-        &self,
-        workspace: &Workspace,
-        pane: u64,
-        snapshot: &crate::term::Snapshot,
-    ) -> (PaneStatus, bool) {
-        let unread = workspace
-            .term_id_for_pane(pane)
-            .is_some_and(|terminal| self.unread_notifications.contains_key(&terminal));
-        let status = if snapshot.exited {
-            PaneStatus::Exited
-        } else if unread {
-            PaneStatus::Waiting
-        } else if self.pane_is_working(pane) {
-            PaneStatus::Working
-        } else {
-            PaneStatus::Idle
-        };
-        (status, unread)
-    }
-
-    fn pane_is_working(&self, pane: u64) -> bool {
-        self.pane_activity
-            .get(&pane)
-            .is_some_and(|at| at.elapsed().is_ok_and(|elapsed| elapsed < WORKING_WINDOW))
     }
 
     /// Serve the local control socket a program inside a pane uses to read its
@@ -988,9 +627,6 @@ impl KumuApp {
             };
         self.pending_focus = Some(pane);
         self.focus_pane(pane, cx);
-        if self.remote.is_some() {
-            self.publish_remote_state(cx);
-        }
     }
 
     /// Whether a freshly started pane has drawn its own input line, or why it
@@ -1211,217 +847,6 @@ impl KumuApp {
                 .layouts
                 .values()
                 .any(|layout| layout.panes().contains(&pane))
-    }
-
-    fn handle_remote_command(&mut self, command: RemoteCommand, cx: &mut Context<Self>) {
-        match command {
-            RemoteCommand::Attach {
-                pane,
-                cols,
-                rows,
-                reply,
-            } => {
-                // The server already clamps; keep the bound at the point the
-                // phone's request enters the app as well.
-                let cols = cols.clamp(1, MAX_GRID);
-                let rows = rows.clamp(1, MAX_GRID);
-                let result = self
-                    .workspace
-                    .update(cx, |workspace, _| workspace.begin_remote_attach(pane));
-                let (term, attach) = match result {
-                    Ok(reserved) => reserved,
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return;
-                    }
-                };
-                let snapshot = term.snapshot();
-                let title = snapshot.label();
-                let status = {
-                    let workspace = self.workspace.read(cx);
-                    self.remote_pane_status(workspace, pane, &snapshot).0
-                };
-                let detach_term = term.clone();
-                cx.spawn(async move |this, cx| {
-                    let attached = cx
-                        .background_spawn(async move { term.attach_remote(attach, cols, rows) })
-                        .await;
-                    let _ = this.update(cx, |app, cx| {
-                        let Some(attached) = attached else {
-                            // The reservation is gone (a newer attach took the
-                            // pane, or the pane closed) or the session thread
-                            // never answered.
-                            let cancelled = app.workspace.update(cx, |workspace, _| {
-                                workspace.cancel_remote_attach(pane, attach)
-                            });
-                            let error = if cancelled {
-                                RemoteError::new("timeout", "the terminal did not answer")
-                            } else if app.workspace.read(cx).terminal_for_pane(pane).is_some() {
-                                RemoteError::new(
-                                    "invalid_state",
-                                    "another device took the pane over",
-                                )
-                            } else {
-                                RemoteError::new("pane_gone", "the terminal is not available")
-                            };
-                            let _ = reply.send(Err(error));
-                            return;
-                        };
-                        let tap = attached.tap;
-                        let confirmed = app.workspace.update(cx, |workspace, _| {
-                            workspace.confirm_remote_attach(pane, attach, tap)
-                        });
-                        if !confirmed {
-                            // Another attach took the pane over while this one
-                            // ran. Its stream has no owner, so stop it rather
-                            // than leave the phone typing into nothing.
-                            detach_term.detach_remote(tap);
-                            let _ = reply.send(Err(RemoteError::new(
-                                "invalid_state",
-                                "another device took the pane over",
-                            )));
-                            return;
-                        }
-                        app.publish_remote_state(cx);
-                        let handle = AttachHandle {
-                            tap,
-                            cols: attached.cols,
-                            rows: attached.rows,
-                            title,
-                            status,
-                            replay: attached.replay,
-                            output: attached.output,
-                        };
-                        if reply.send(Ok(handle)).is_err() {
-                            // The server gave up waiting, so no channel owns
-                            // this tap. Hand the pane back to the desktop
-                            // instead of leaving it at the phone's size.
-                            app.workspace.update(cx, |workspace, _| {
-                                workspace.release_remote_attach(pane, tap)
-                            });
-                            app.publish_remote_state(cx);
-                        }
-                    });
-                })
-                .detach();
-            }
-            RemoteCommand::Detach { pane, tap, reply } => {
-                self.workspace.update(cx, |workspace, _| {
-                    workspace.release_remote_attach(pane, tap)
-                });
-                if let Some(reply) = reply {
-                    let _ = reply.send(());
-                }
-                self.publish_remote_state(cx);
-            }
-            RemoteCommand::Input { pane, tap, bytes } => {
-                self.workspace.update(cx, |workspace, _| {
-                    workspace.remote_write(pane, tap, bytes);
-                });
-            }
-            RemoteCommand::Resize {
-                pane,
-                tap,
-                cols,
-                rows,
-            } => {
-                self.workspace.update(cx, |workspace, _| {
-                    workspace.resize_remote(pane, tap, cols, rows);
-                });
-            }
-            RemoteCommand::Action { action, reply } => {
-                let result = self.remote_action(action, cx);
-                let _ = reply.send(result);
-            }
-        }
-    }
-
-    /// Run one of the phone's actions against a project id that still exists.
-    /// A cached id from the phone must not create a pane for a project the
-    /// Mac has already deleted.
-    fn remote_action(&mut self, action: Action, cx: &mut Context<Self>) -> Result<(), RemoteError> {
-        match action {
-            Action::NewTerminal { project } => {
-                let project = self.remote_project(project, cx)?;
-                // `add_terminal` focuses the pane it opened; no change means
-                // there was nothing to open it in.
-                let focused = self.focused;
-                self.add_terminal(project, cx);
-                if self.focused == focused {
-                    return Err(RemoteError::new(
-                        "invalid_state",
-                        "the terminal could not start",
-                    ));
-                }
-                Ok(())
-            }
-            Action::NewAgent { project, agent } => {
-                if !crate::agent::installed(&agent) {
-                    return Err(RemoteError::new("invalid_params", "agent is not installed"));
-                }
-                let project = match self.remote_project(project, cx)? {
-                    Some(project) => Some(project),
-                    None => self.selected.or_else(|| {
-                        self.workspace
-                            .update(cx, |workspace, cx| workspace.ensure_project(cx))
-                    }),
-                };
-                let Some(project) = project else {
-                    return Err(RemoteError::new("invalid_state", "no project"));
-                };
-                // A project that has never been shown has no pane tree yet;
-                // splitting the fallback pane id would take a pane from
-                // another project.
-                self.ensure_project_layout(project, cx);
-                self.select_project(project, cx);
-                let focused = self.focused;
-                self.split_pane_with(
-                    focused,
-                    Axis::Horizontal,
-                    PaneLaunch::Agent {
-                        agent,
-                        session: None,
-                    },
-                    cx,
-                );
-                if self.focused == focused {
-                    return Err(RemoteError::new(
-                        "invalid_state",
-                        "the pane could not split",
-                    ));
-                }
-                Ok(())
-            }
-            Action::ClosePane { pane } => {
-                if self.pane_project(PaneId(pane), cx).is_none() {
-                    return Err(RemoteError::new("pane_gone", "the pane is not open"));
-                }
-                self.close_pane(PaneId(pane), cx);
-                Ok(())
-            }
-            Action::ShowOnDesktop { pane } => {
-                let Some(project) = self.pane_project(PaneId(pane), cx) else {
-                    return Err(RemoteError::new("pane_gone", "the pane is not open"));
-                };
-                self.select_project(project, cx);
-                self.focus_pane(PaneId(pane), cx);
-                self.publish_remote_state(cx);
-                Ok(())
-            }
-        }
-    }
-
-    /// Check a project id the phone sent, if it sent one.
-    fn remote_project(
-        &mut self,
-        project: Option<i64>,
-        cx: &mut Context<Self>,
-    ) -> Result<Option<i64>, RemoteError> {
-        match project {
-            Some(id) if self.workspace.read(cx).project(id).is_some() => Ok(Some(id)),
-            Some(_) => Err(RemoteError::new("invalid_params", "unknown project")),
-            None => Ok(None),
-        }
     }
 
     /// Show the first project in a single pane — the first run, and the
@@ -1844,7 +1269,6 @@ impl KumuApp {
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
-        self.publish_remote_state(cx);
         cx.notify();
     }
 
@@ -2179,7 +1603,6 @@ impl KumuApp {
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
-        self.publish_remote_state(cx);
         cx.notify();
     }
 
@@ -2217,10 +1640,8 @@ impl KumuApp {
             .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
         self.panes.remove(&pane);
         self.launches.remove(&pane);
-        self.pane_activity.remove(&pane.0);
         self.sync_pane_chrome(cx);
         self.persist_workspace(cx);
-        self.publish_remote_state(cx);
         cx.notify();
     }
 
@@ -2675,7 +2096,6 @@ impl KumuApp {
             if let Some(layout) = self.layouts.remove(&id) {
                 for pane in layout.panes() {
                     self.panes.remove(&pane);
-                    self.pane_activity.remove(&pane.0);
                 }
             }
             self.focused_by_project.remove(&id);
@@ -2716,9 +2136,8 @@ impl KumuApp {
         options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
-        let home = cx.entity().downgrade();
         if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| SettingsWindow::new(updater, home, window, cx))
+            cx.new(|cx| SettingsWindow::new(updater, window, cx))
         }) {
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
@@ -2915,22 +2334,6 @@ impl KumuApp {
                 }),
             )
     }
-}
-
-fn last_nonempty_line(snapshot: &crate::term::Snapshot) -> String {
-    snapshot
-        .cells
-        .iter()
-        .rev()
-        .map(|row| {
-            row.iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
-        })
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
 }
 
 impl Render for KumuApp {

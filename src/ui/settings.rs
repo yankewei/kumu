@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use super::home::{KumuApp, pairing_expiry_label};
 use super::widgets::{PillTone, agent_logo, pill};
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
@@ -24,7 +23,6 @@ use gpui_updater::{ErrorKind, UpdateStatus, Updater};
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsPage {
     Providers,
-    Remote,
     General,
 }
 
@@ -83,19 +81,10 @@ pub struct SettingsWindow {
     integration_busy: Option<&'static str>,
     /// Whether panes resume their agent conversations on the next launch.
     auto_resume: bool,
-    /// The home window, so the remote switch can start or stop the service.
-    home: WeakEntity<KumuApp>,
-    /// Whether the remote-control service is on.
-    remote: bool,
 }
 
 impl SettingsWindow {
-    pub fn new(
-        updater: Entity<Updater>,
-        home: WeakEntity<KumuApp>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(updater: Entity<Updater>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe(&updater, |_, updater, cx| {
             if let UpdateStatus::Errored(error) = updater.read(cx).status() {
                 eprintln!("[updates] {error}");
@@ -160,8 +149,6 @@ impl SettingsWindow {
                 .collect(),
             integration_busy: None,
             auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
-            home,
-            remote: db::get_setting(db::SETTING_REMOTE).as_deref() == Some("1"),
         }
     }
 
@@ -295,9 +282,8 @@ impl SettingsWindow {
             .child(Icon::new(IconName::ArrowLeft).small().text_color(muted_fg))
             .child("返回");
 
-        let nav_defs: [(IconName, &'static str, SettingsPage); 3] = [
+        let nav_defs: [(IconName, &'static str, SettingsPage); 2] = [
             (IconName::Bot, "服务商", SettingsPage::Providers),
-            (IconName::Globe, "远程", SettingsPage::Remote),
             (IconName::Settings, "通用", SettingsPage::General),
         ];
         let nav = nav_defs
@@ -362,13 +348,11 @@ impl SettingsWindow {
         // ---- Right: centered column with the page title + grouped cards. ----
         let title = match self.settings_page {
             SettingsPage::Providers => "服务商",
-            SettingsPage::Remote => "远程",
             SettingsPage::General => "通用",
         };
 
         let cards: Vec<AnyElement> = match self.settings_page {
             SettingsPage::Providers => vec![self.render_providers_card(dark, theme, cx)],
-            SettingsPage::Remote => vec![self.render_remote_card(dark, theme, cx)],
             SettingsPage::General => vec![
                 self.render_general_card(dark, theme, cx),
                 self.render_updates_card(dark, theme, cx),
@@ -559,239 +543,6 @@ impl SettingsWindow {
                     )),
             )
             .child(v_flex().mt_1().children(rows))
-            .into_any_element()
-    }
-
-    /// The remote page: the on/off switch, the live pairing code, and the
-    /// paired phones the Mac remembers.
-    fn render_remote_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let (muted, muted_fg, border) = (theme.muted, theme.muted_foreground, theme.border);
-        let status = self
-            .home
-            .read_with(cx, |app, _| app.remote_status())
-            .unwrap_or_default();
-        let home = self.home.clone();
-        let this = cx.entity().downgrade();
-
-        let switch = {
-            let home = home.clone();
-            let this = this.clone();
-            Switch::new("remote-control")
-                .checked(self.remote)
-                .on_click(move |checked, window, cx| {
-                    if let Err(error) =
-                        db::set_setting(db::SETTING_REMOTE, if *checked { "1" } else { "0" })
-                    {
-                        window.push_notification(
-                            Notification::error(format!("保存远程控制设置失败：{error}")),
-                            cx,
-                        );
-                        return;
-                    }
-                    let _ = this.update(cx, |this, cx| {
-                        this.remote = *checked;
-                        cx.notify();
-                    });
-                    home.update(cx, |app, cx| app.set_remote(*checked, cx)).ok();
-                })
-                .into_any_element()
-        };
-
-        let label = |text: &'static str| {
-            div()
-                .w(rems(3.5))
-                .flex_none()
-                .text_xs()
-                .text_color(muted_fg)
-                .child(text)
-        };
-        let copy = |id: &'static str, value: String, done: &'static str| {
-            Button::new(id)
-                .compact()
-                .ghost()
-                .icon(IconName::Copy)
-                .tooltip("复制")
-                .on_click(move |_, window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
-                    window.push_notification(Notification::success(done), cx);
-                })
-                .into_any_element()
-        };
-
-        let mut body: Vec<AnyElement> = Vec::new();
-        if status.running {
-            let bridge: String = status.bridge_id.chars().take(8).collect();
-            body.push(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(label("状态"))
-                    .child(div().text_xs().child(format!("运行中 · iroh {bridge}…")))
-                    .into_any_element(),
-            );
-            if let Some(code) = &status.code {
-                let rotate = {
-                    let home = home.clone();
-                    let this = this.clone();
-                    Button::new("rotate-pairing-code")
-                        .compact()
-                        .ghost()
-                        .icon(IconName::RefreshCw)
-                        .tooltip("重新生成配对码")
-                        .on_click(move |_, window, cx| {
-                            if let Ok(Err(error)) =
-                                home.update(cx, |app, cx| app.remote_rotate_code(cx))
-                            {
-                                window.push_notification(
-                                    Notification::error(format!("更新配对码失败：{error}")),
-                                    cx,
-                                );
-                            }
-                            let _ = this.update(cx, |_, cx| cx.notify());
-                        })
-                        .into_any_element()
-                };
-                body.push(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(label("配对码"))
-                        .child(div().text_xs().font_medium().child(code.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(pairing_expiry_label(status.expires_ms)),
-                        )
-                        .child(div().flex_1())
-                        .child(copy("copy-pairing-code", code.clone(), "已复制配对码"))
-                        .child(rotate)
-                        .into_any_element(),
-                );
-            }
-            if let Some(link) = &status.pairing_link {
-                body.push(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(label("配对链接"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .child(link.clone()),
-                        )
-                        .child(copy("copy-pairing-link", link.clone(), "已复制配对链接"))
-                        .into_any_element(),
-                );
-            }
-            body.push(
-                div()
-                    .mt_2()
-                    .text_xs()
-                    .font_medium()
-                    .child("已配对设备")
-                    .into_any_element(),
-            );
-            if status.devices.is_empty() {
-                body.push(
-                    div()
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child("还没有配对设备。")
-                        .into_any_element(),
-                );
-            }
-            body.extend(status.devices.iter().map(|device| {
-                let home = home.clone();
-                let this = this.clone();
-                let id = device.id.clone();
-                h_flex()
-                    .items_center()
-                    .gap_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(div().text_xs().font_medium().child(device.name.clone()))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child(last_seen_label(device.last_seen_ms)),
-                    )
-                    .child(
-                        Button::new(format!("revoke-{id}"))
-                            .small()
-                            .ghost()
-                            .label("撤销")
-                            .on_click(move |_, window, cx| {
-                                match home.update(cx, |app, cx| app.remote_revoke(&id, cx)) {
-                                    Ok(Err(error)) => window.push_notification(
-                                        Notification::error(format!("撤销设备失败：{error}")),
-                                        cx,
-                                    ),
-                                    Ok(Ok(())) => window.push_notification(
-                                        Notification::success("已撤销该设备"),
-                                        cx,
-                                    ),
-                                    Err(_) => {}
-                                }
-                                let _ = this.update(cx, |_, cx| cx.notify());
-                            }),
-                    )
-                    .into_any_element()
-            }));
-        } else if status.starting {
-            body.push(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(label("状态"))
-                    .child(div().text_xs().child("正在启动…"))
-                    .into_any_element(),
-            );
-        } else if self.remote {
-            body.push(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(label("状态"))
-                    .child(div().text_xs().child("未运行，请关闭后重新开启。"))
-                    .into_any_element(),
-            );
-        } else {
-            body.push(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child("开启后会创建连接并在这里显示配对码和已配对设备。")
-                    .into_any_element(),
-            );
-        }
-
-        self.card(if dark { muted } else { gpui_kit::gpui::white() })
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_6()
-                    .pb_3()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_xs().font_medium().child("允许 iPhone 连接"))
-                            .child(div().mt_0p5().text_xs().text_color(muted_fg).child(
-                                "开启后创建连接并生成配对码；关闭时断开所有设备，已配对记录保留。",
-                            )),
-                    )
-                    .child(switch),
-            )
-            .child(v_flex().pt_3().gap_2().children(body))
             .into_any_element()
     }
 
@@ -1086,20 +837,6 @@ impl SettingsWindow {
                 true,
             ))
             .into_any_element()
-    }
-}
-
-/// When a paired phone last authenticated, in the same hint style as the
-/// pairing expiry: rounded and relative to now.
-fn last_seen_label(ms: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    match now.saturating_sub(ms) {
-        0..=59_999 => "刚刚在线".to_string(),
-        ago if ago < 3_600_000 => format!("{} 分钟前", ago / 60_000),
-        ago if ago < 86_400_000 => format!("{} 小时前", ago / 3_600_000),
-        ago => format!("{} 天前", ago / 86_400_000),
     }
 }
 

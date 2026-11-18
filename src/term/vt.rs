@@ -187,61 +187,6 @@ pub struct SearchView {
     pub hits: Vec<SearchHit>,
 }
 
-/// The SGR state an ANSI replay has written so far. A run of cells that share
-/// it costs one byte each instead of a full escape sequence per cell.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ReplayStyle {
-    bold: bool,
-    faint: bool,
-    italic: bool,
-    underline: bool,
-    strike: bool,
-    fg: Rgb,
-    bg: Option<Rgb>,
-}
-
-impl ReplayStyle {
-    fn of(cell: &Cell) -> Self {
-        Self {
-            bold: cell.bold,
-            faint: cell.faint,
-            italic: cell.italic,
-            underline: cell.underline,
-            strike: cell.strike,
-            fg: cell.fg,
-            bg: cell.bg,
-        }
-    }
-
-    fn write(self, out: &mut String) {
-        use std::fmt::Write as _;
-
-        out.push_str("\x1b[0m");
-        if self.bold {
-            out.push_str("\x1b[1m");
-        }
-        if self.faint {
-            out.push_str("\x1b[2m");
-        }
-        if self.italic {
-            out.push_str("\x1b[3m");
-        }
-        if self.underline {
-            out.push_str("\x1b[4m");
-        }
-        if self.strike {
-            out.push_str("\x1b[9m");
-        }
-        let _ = write!(out, "\x1b[38;2;{};{};{}m", self.fg.0, self.fg.1, self.fg.2);
-        match self.bg {
-            Some(bg) => {
-                let _ = write!(out, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
-            }
-            None => out.push_str("\x1b[49m"),
-        }
-    }
-}
-
 impl Snapshot {
     /// What the program calls itself: its OSC title (an agent TUI names itself
     /// there), else the command it was launched as, else an empty string.
@@ -280,91 +225,6 @@ impl Snapshot {
         }
     }
 
-    /// A self-contained ANSI screen for a terminal that joined mid-stream.
-    ///
-    /// This is the viewport only: scrollback stays on the Mac. The caller
-    /// supplies the modes that are not part of a cell grid (alternate screen,
-    /// bracketed paste), so the phone's encoder starts in the same state.
-    ///
-    /// Style is written only where it changes and trailing blank cells are
-    /// left to the clear above, which keeps a full screen inside one protocol
-    /// frame. The second column of a wide character is not written: the glyph
-    /// already advanced the phone's cursor past it.
-    pub fn ansi_replay(&self, alt_screen: bool, bracketed_paste: bool) -> Vec<u8> {
-        self.ansi_replay_with_history(&[], alt_screen, bracketed_paste)
-    }
-
-    /// An ANSI replay with `history`, the rows scrolled above the viewport
-    /// (oldest first), so the phone can scroll back through them too.
-    ///
-    /// The history rows are printed as ordinary lines first, which puts them
-    /// in the phone's scrollback; the viewport rows follow as the screen. The
-    /// alternate screen has no scrollback, so it always replays the viewport
-    /// alone.
-    pub fn ansi_replay_with_history(
-        &self,
-        history: &[Arc<Vec<Cell>>],
-        alt_screen: bool,
-        bracketed_paste: bool,
-    ) -> Vec<u8> {
-        use std::fmt::Write as _;
-
-        let mut out = String::new();
-        if alt_screen {
-            out.push_str("\x1b[?1049h");
-        } else {
-            out.push_str("\x1b[?1049l");
-        }
-        if bracketed_paste {
-            out.push_str("\x1b[?2004h");
-        } else {
-            out.push_str("\x1b[?2004l");
-        }
-        if self.mouse_tracking {
-            out.push_str("\x1b[?1000h\x1b[?1006h");
-        } else {
-            out.push_str("\x1b[?1000l\x1b[?1006l");
-        }
-        // Clear the screen and the old scrollback: this terminal may have
-        // shown another pane, or the same pane before a reattach.
-        out.push_str("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
-        let mut current: Option<ReplayStyle> = None;
-        if !alt_screen && !history.is_empty() {
-            // Lines printed one after another leave the earlier ones in the
-            // scrollback; the viewport rows then land on the screen.
-            for cells in history {
-                write_replay_row(&mut out, cells, &mut current);
-                out.push_str("\x1b[0m\r\n");
-                current = None;
-            }
-            for (row, cells) in self.cells.iter().enumerate() {
-                write_replay_row(&mut out, cells, &mut current);
-                if row + 1 < self.cells.len() {
-                    out.push_str("\x1b[0m\r\n");
-                    current = None;
-                }
-            }
-        } else {
-            for (row, cells) in self.cells.iter().enumerate() {
-                // Everything past the last painted cell is already blank.
-                let width = replay_width(cells);
-                if width == 0 {
-                    continue;
-                }
-                let _ = write!(out, "\x1b[{};1H", row + 1);
-                write_replay_cells(&mut out, cells, width, &mut current);
-            }
-        }
-        out.push_str("\x1b[0m");
-        match self.cursor {
-            Some(cursor) => {
-                let _ = write!(out, "\x1b[?25h\x1b[{};{}H", cursor.y + 1, cursor.x + 1);
-            }
-            None => out.push_str("\x1b[?25l"),
-        }
-        out.into_bytes()
-    }
-
     /// The visible screen as plain text, one line per row.
     #[cfg(test)]
     pub fn plain_text(&self) -> String {
@@ -383,58 +243,6 @@ fn row_text(row: &[Cell]) -> String {
         text.push_str(&cell.text);
     }
     text.trim_end().to_string()
-}
-
-/// The cells of a row up to its last painted cell: everything past it is
-/// already blank.
-fn replay_width(cells: &[Cell]) -> usize {
-    cells
-        .iter()
-        .rposition(|cell| {
-            !cell.text.is_empty() || cell.bg.is_some() || cell.underline || cell.strike
-        })
-        .map_or(0, |last| last + 1)
-}
-
-/// Writes one whole row as a line (no cursor positioning, no line break).
-fn write_replay_row(out: &mut String, cells: &[Cell], current: &mut Option<ReplayStyle>) {
-    let width = replay_width(cells);
-    if width == 0 {
-        return;
-    }
-    write_replay_cells(out, cells, width, current);
-}
-
-/// Writes the first `width` cells of a row, styling only where it changes.
-fn write_replay_cells(
-    out: &mut String,
-    cells: &[Cell],
-    width: usize,
-    current: &mut Option<ReplayStyle>,
-) {
-    let mut spacer = false;
-    for cell in cells.iter().take(width) {
-        if spacer {
-            spacer = false;
-            continue;
-        }
-        spacer = cell.wide;
-        let style = ReplayStyle::of(cell);
-        if *current != Some(style) {
-            style.write(out);
-            *current = Some(style);
-        }
-        if cell.text.is_empty() {
-            out.push(' ');
-            // A wide cell whose glyph is hidden still holds two columns; the
-            // spacer is skipped like any other.
-            if cell.wide {
-                out.push(' ');
-            }
-        } else {
-            out.push_str(&cell.text);
-        }
-    }
 }
 
 fn blank_cell(fg: Rgb) -> Cell {
@@ -1223,8 +1031,7 @@ impl Vt {
         unsafe { ghostty_terminal_scroll_viewport(self.term, scroll) };
     }
 
-    /// The last `limit` rows above the viewport, oldest first: what a remote
-    /// viewer needs to scroll back without its own copy of the session.
+    /// The last `limit` rows above the viewport, oldest first.
     ///
     /// The rows are read by paging the viewport up, so the caller's scroll
     /// position is put back before this returns. The alternate screen has no
@@ -2358,88 +2165,6 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_keeps_a_wide_character_on_its_own_columns() {
-        let fg = Rgb(0xdd, 0xdd, 0xdd);
-        let mut cells = vec![blank_cell(fg); 4];
-        cells[0].text = "中".into();
-        cells[0].wide = true;
-        // cells[1] is the wide character's spacer: still blank.
-        cells[2].text = "a".into();
-        let replay = Snapshot {
-            rows: 1,
-            bg: fg,
-            fg,
-            cells: vec![Arc::new(cells)],
-            all: true,
-            cursor: None,
-            cursor_cell: None,
-            command: "sh".into(),
-            cwd: "/".into(),
-            title: String::new(),
-            exited: false,
-            spawn_error: None,
-            mouse_tracking: false,
-            search: None,
-        }
-        .ansi_replay(false, false);
-        let text = String::from_utf8(replay).expect("utf-8 replay");
-        assert!(
-            text.contains("中a"),
-            "the spacer after a wide character must not write a column: {text:?}"
-        );
-    }
-
-    #[test]
-    fn a_replay_styles_only_where_the_cell_changes() {
-        let fg = Rgb(0xdd, 0xdd, 0xdd);
-        let mut cells = vec![blank_cell(fg); 3];
-        cells[0].text = "a".into();
-        cells[1].text = "b".into();
-        cells[2].text = "c".into();
-        let replay = Snapshot {
-            rows: 1,
-            bg: fg,
-            fg,
-            cells: vec![Arc::new(cells)],
-            all: true,
-            cursor: None,
-            cursor_cell: None,
-            command: "sh".into(),
-            cwd: "/".into(),
-            title: String::new(),
-            exited: false,
-            spawn_error: None,
-            mouse_tracking: false,
-            search: None,
-        }
-        .ansi_replay(false, false);
-        let text = String::from_utf8(replay).expect("utf-8 replay");
-        assert_eq!(
-            text.matches("\x1b[38;2;").count(),
-            1,
-            "a run of identical cells shares one escape sequence: {text:?}"
-        );
-    }
-
-    #[test]
-    fn a_replay_rebuilds_the_same_screen() {
-        let mut vt = Vt::new(20, 4);
-        vt.write("echo 中文 ok\r\n".as_bytes());
-        vt.write("\x1b[31mred\x1b[0m plain\r\n".as_bytes());
-        let original = vt.snapshot("sh", "/", false);
-
-        let mut phone = Vt::new(20, 4);
-        phone.write(&original.ansi_replay(false, false));
-        let restored = phone.snapshot("sh", "/", false);
-
-        assert_eq!(restored.plain_text(), original.plain_text());
-        assert_eq!(
-            restored.cells, original.cells,
-            "the phone's grid must match the Mac's cell for cell"
-        );
-    }
-
-    #[test]
     fn content_text_puts_the_newest_output_after_the_scrollback() {
         let mut vt = Vt::new(20, 4);
         for line in 0..10 {
@@ -2480,52 +2205,6 @@ mod tests {
             before,
             "the user's scroll position is put back"
         );
-    }
-
-    #[test]
-    fn a_replay_carries_the_scrollback() {
-        let mut vt = Vt::new(20, 4);
-        for line in 0..20 {
-            vt.write(format!("line {line}\r\n").as_bytes());
-        }
-        let snapshot = vt.snapshot("sh", "/", false);
-        let history = vt.history_cells(10);
-        assert_eq!(history.len(), 10, "ten rows above the viewport");
-
-        let mut phone = Vt::new(20, 4);
-        phone.write(&snapshot.ansi_replay_with_history(&history, false, false));
-        let restored = phone.snapshot("sh", "/", false);
-        assert_eq!(restored.plain_text(), snapshot.plain_text());
-        let bar = phone.scrollbar().expect("the phone has a scrollback");
-        assert!(
-            bar.total > bar.len,
-            "the phone keeps the replayed history above the screen"
-        );
-
-        phone.scroll_to_row(0);
-        let top = phone.snapshot("sh", "/", false);
-        assert!(
-            top.plain_text().contains("line 9"),
-            "the oldest replayed row is in the phone's scrollback: {:?}",
-            top.plain_text()
-        );
-    }
-
-    #[test]
-    fn an_alternate_screen_replay_has_no_scrollback() {
-        let mut vt = Vt::new(20, 4);
-        vt.write(b"\x1b[?1049h");
-        for line in 0..20 {
-            vt.write(format!("alt {line}\r\n").as_bytes());
-        }
-        let snapshot = vt.snapshot("sh", "/", false);
-        let history = vt.history_cells(10);
-        assert!(history.is_empty(), "the alternate screen keeps none");
-
-        let mut phone = Vt::new(20, 4);
-        phone.write(&snapshot.ansi_replay_with_history(&history, true, false));
-        let bar = phone.scrollbar().expect("a scrollbar");
-        assert_eq!(bar.total, bar.len, "nothing above the alternate screen");
     }
 
     /// A find bar restarts the search on every keystroke, so one search over a

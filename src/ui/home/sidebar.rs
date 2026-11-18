@@ -1,15 +1,13 @@
 //! Left column: projects and the settings entry.
 
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::UpdateStatus;
 
-use super::{KumuApp, pairing_expiry_label};
+use super::KumuApp;
 use crate::ui::tooltip::HoverLabel as _;
 
 impl KumuApp {
@@ -131,139 +129,21 @@ impl KumuApp {
                         )
                     })
                     .child(
-                        h_flex()
-                            .w_full()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .id("open-settings")
-                                    .rounded(radius)
-                                    .p_1()
-                                    .cursor_pointer()
-                                    .text_color(muted_fg)
-                                    .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.open_settings(false, cx)),
-                                    )
-                                    .child(Icon::new(IconName::Settings).small()),
-                            )
-                            .when_some(
-                                self.remote.as_ref().and_then(|remote| {
-                                    remote.pairing_link().map(|link| {
-                                        (link, remote.auth.code(), remote.auth.pairing_expires_ms())
-                                    })
-                                }),
-                                |row, (link, code, expires)| {
-                                    row.child(self.render_pairing_entry(link, code, expires, cx))
-                                },
-                            ),
+                        h_flex().w_full().justify_between().child(
+                            div()
+                                .id("open-settings")
+                                .rounded(radius)
+                                .p_1()
+                                .cursor_pointer()
+                                .text_color(muted_fg)
+                                .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_settings(false, cx)),
+                                )
+                                .child(Icon::new(IconName::Settings).small()),
+                        ),
                     ),
             )
-    }
-
-    /// The footer's phone entry: a button that opens the pairing card, so the
-    /// link and the current code are both on screen instead of going silently
-    /// to the clipboard. `expires` is when the one-use code stops working.
-    fn render_pairing_entry(
-        &self,
-        link: String,
-        code: String,
-        expires: u64,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let (muted_fg, sidebar_accent) = (theme.muted_foreground, theme.sidebar_accent);
-        Popover::new("remote-pairing-popover")
-            .anchor(Anchor::BottomRight)
-            .trigger(
-                Button::new("remote-pairing")
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(theme.transparent)
-                            .foreground(muted_fg)
-                            .hover(sidebar_accent.opacity(0.5)),
-                    )
-                    .compact()
-                    .icon(Icon::empty().path("icons/smartphone.svg"))
-                    .text_color(muted_fg)
-                    .tooltip("远程控制"),
-            )
-            .content(move |_, _, cx| {
-                let theme = cx.theme();
-                let (muted_fg, muted) = (theme.muted_foreground, theme.muted);
-                // One labelled value with its own copy button. The value is
-                // shown truncated; the button copies all of it.
-                let field = |id: &'static str,
-                             label: &'static str,
-                             value: String,
-                             copied: &'static str| {
-                    let copy = value.clone();
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(rems(3.5))
-                                .flex_none()
-                                .text_xs()
-                                .text_color(muted_fg)
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .font_medium()
-                                .child(value),
-                        )
-                        .child(
-                            Button::new(id)
-                                .compact()
-                                .ghost()
-                                .icon(IconName::Copy)
-                                .tooltip("复制")
-                                .on_click(move |_, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                                    window.push_notification(Notification::success(copied), cx);
-                                }),
-                        )
-                };
-                v_flex()
-                    .w(rems(16.))
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_xs().font_medium().child("远程控制"))
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted_fg)
-                                    .child(pairing_expiry_label(expires)),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .rounded(theme.radius)
-                            .bg(muted)
-                            .px_2()
-                            .py_1p5()
-                            .child(field("copy-pairing-code", "配对码", code.clone(), "已复制配对码"))
-                            .child(field("copy-pairing-link", "配对链接", link.clone(), "已复制配对链接")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_fg)
-                            .child("在 iPhone 上打开 Kumu，粘贴链接并输入配对码。配对码一次有效，配对后自动更新。"),
-                    )
-            })
-            .into_any_element()
     }
 
     /// One project or worktree row. A worktree is indented under its
