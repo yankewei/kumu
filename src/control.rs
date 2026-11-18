@@ -288,16 +288,22 @@ fn accept_loop(listener: UnixListener, commands: UnboundedSender<Command>, stop:
 /// One connection, one request, one reply.
 fn serve(stream: UnixStream, commands: &UnboundedSender<Command>) {
     let mut stream = stream;
+    // The listener accepts in nonblocking mode, and macOS hands that flag to
+    // the connection: left as is, a request that lands a moment after the
+    // connection reads as WouldBlock and looks like an empty one. The
+    // timeouts below only apply to a blocking socket.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let read = stream.set_read_timeout(Some(REPLY_TIMEOUT));
     let write = stream.set_write_timeout(Some(REPLY_TIMEOUT));
     if read.is_err() || write.is_err() {
         return;
     }
     let mut line = String::new();
-    let read = stream
-        .try_clone()
-        .ok()
-        .is_some_and(|socket| BufReader::new(socket).read_line(&mut line).is_ok());
+    // Read through a borrow: cloning the socket can fail when the process is
+    // out of descriptors, which would read as an empty request too.
+    let read = BufReader::new(&stream).read_line(&mut line).is_ok();
     let reply = if read {
         match serde_json::from_str::<RequestLine>(line.trim()) {
             Ok(line) => match line.pid {
@@ -1045,6 +1051,51 @@ mod tests {
         let foreign = call_at_instance(&path, &Request::Panes, Some(std::process::id() + 1))
             .expect_err("another instance is refused");
         assert!(foreign.contains("another Kumu"), "{foreign}");
+
+        drop(handle);
+        answering
+            .join()
+            .expect("the answering side ends with the socket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// accept() inherits the listener's nonblocking flag on macOS, so a client
+    /// whose request lands a moment after the connection must still be read as
+    /// one request instead of an empty line.
+    #[test]
+    fn a_late_request_is_not_read_as_an_empty_one() {
+        use futures::StreamExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kumu-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("socket dir");
+        let path = dir.join("control.sock");
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let handle = start_at(path.clone(), tx).expect("bind the socket");
+        let answering = std::thread::spawn(move || {
+            while let Some(command) = futures::executor::block_on(rx.next()) {
+                if let Command::Panes { reply } = command {
+                    let _ = reply.send(Ok(vec![summary(3)]));
+                }
+            }
+        });
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+        std::thread::sleep(Duration::from_millis(300));
+        stream
+            .write_all(b"{\"op\":\"panes\"}\n")
+            .expect("write request");
+        let mut reply = String::new();
+        BufReader::new(stream)
+            .read_line(&mut reply)
+            .expect("read reply");
+        assert!(reply.contains("\"ok\":true"), "{reply}");
 
         drop(handle);
         answering
