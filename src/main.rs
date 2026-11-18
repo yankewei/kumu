@@ -29,7 +29,6 @@ mod dock_icon;
 mod fonts;
 mod git;
 mod plugins;
-mod remote;
 mod term;
 mod theme;
 mod ui;

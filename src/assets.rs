@@ -62,12 +62,6 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            KumuAssetSource
-                .load("icons/smartphone.svg")
-                .unwrap()
-                .is_some()
-        );
         // gpui-kit's bundled icons resolve through the fallback.
         assert!(
             KumuAssetSource
