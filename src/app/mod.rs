@@ -506,7 +506,7 @@ impl Workspace {
     pub fn terminal_label(&self, terminal: u64) -> String {
         self.terms
             .get(&terminal)
-            .map(|live| live.term.snapshot().label())
+            .map(|live| live.term.label())
             .unwrap_or_default()
     }
 

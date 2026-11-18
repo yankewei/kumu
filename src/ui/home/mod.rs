@@ -17,7 +17,7 @@ use super::SettingsWindow;
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::git::WorktreeEntry;
-use crate::plugins::{PluginHost, PluginProject, PluginSpec, SendOutcome};
+use crate::plugins::{PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome};
 use crate::remote::{
     self, Action, AgentInfo, AttachHandle, Command as RemoteCommand, ComputerInfo, MAX_GRID,
     PaneInfo, PaneStatus, ProjectInfo, RemoteConfig, RemoteError, RemoteHandle, RemoteState,
@@ -59,6 +59,15 @@ fn submits_after_paste(pane_is_shell: Option<bool>) -> bool {
 /// its copy of the message arrives as one line of space-separated words.
 fn shell_prompt(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The name a pane's agent shows in the UI, for a pane whose program has not
+/// set a title yet.
+fn agent_display_name(id: &str) -> Option<String> {
+    crate::agent::AGENTS
+        .iter()
+        .find(|agent| agent.id == id)
+        .map(|agent| agent.name.to_string())
 }
 
 /// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
@@ -1367,44 +1376,104 @@ impl KumuApp {
             .map(PluginProject::from)
     }
 
-    /// How plugins hand text to the user's terminal. The target is resolved
-    /// when the panel sends, so a comment reaches whichever pane has focus at
-    /// that moment rather than the one focused when the panel opened.
+    /// How plugins hand text to the user's terminal. A panel names the pane it
+    /// writes to, and the window resolves it only when the send happens, so a
+    /// closed pane is an error rather than text aimed at a stale id.
     fn plugin_host(&self, cx: &Context<Self>) -> PluginHost {
         let home = cx.entity().downgrade();
-        PluginHost::new(move |project, text, cx| {
-            let Some(home) = home.upgrade() else {
-                return Err("窗口已关闭".to_string());
-            };
-            home.update(cx, |app, cx| {
-                app.send_text_to_focused_pane(project, text, cx)
-            })
-        })
+        let listing = home.clone();
+        PluginHost::with_panes(
+            move |project, pane, text, cx| {
+                let Some(home) = home.upgrade() else {
+                    return Err("窗口已关闭".to_string());
+                };
+                home.update(cx, |app, cx| app.send_text_to_pane(project, pane, text, cx))
+            },
+            move |project, cx| {
+                listing
+                    .upgrade()
+                    .map(|home| home.read(cx).plugin_panes(project, cx))
+                    .unwrap_or_default()
+            },
+        )
     }
 
-    /// Paste `text` into the focused pane of `project`. An agent pane also
-    /// receives Enter, because the user is handing the agent an instruction;
-    /// a shell keeps the text on its command line, where Enter would run it.
-    /// Without bracketed paste a shell would run each pasted line, so a shell
-    /// gets the message folded onto one line.
-    fn send_text_to_focused_pane(
+    /// The panes a plugin may hand text to, in layout order. The header's label
+    /// gives way to the agent's name only when no program has set one yet.
+    fn plugin_panes(&self, project: i64, cx: &App) -> Vec<PaneTarget> {
+        let Some(layout) = self.layouts.get(&project) else {
+            return Vec::new();
+        };
+        let focused = self
+            .focused_by_project
+            .get(&project)
+            .copied()
+            .unwrap_or(self.focused);
+        let workspace = self.workspace.read(cx);
+        layout
+            .panes()
+            .into_iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                let agent = match self.launches.get(&pane) {
+                    Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
+                    _ => None,
+                };
+                let title = workspace
+                    .terminal_handle(pane.0)
+                    .map(|term| term.label())
+                    .filter(|label| !label.is_empty())
+                    .or_else(|| agent.as_deref().and_then(agent_display_name))
+                    .unwrap_or_else(|| "终端".to_string());
+                PaneTarget {
+                    pane: pane.0,
+                    ordinal: index + 1,
+                    title,
+                    agent,
+                    focused: pane == focused,
+                }
+            })
+            .collect()
+    }
+
+    /// Paste `text` into one pane of `project`, or into its focused pane when
+    /// `pane` is `None`. An agent pane also receives Enter, because the user is
+    /// handing the agent an instruction; a shell keeps the text on its command
+    /// line, where Enter would run it. Without bracketed paste a shell would run
+    /// each pasted line, so a shell gets the message folded onto one line.
+    fn send_text_to_pane(
         &self,
         project: i64,
+        pane: Option<u64>,
         text: &str,
         cx: &mut Context<Self>,
     ) -> Result<SendOutcome, String> {
         if self.selected != Some(project) {
             return Err("请先切回该项目再发送".to_string());
         }
-        let pane = self
-            .focused_by_project
-            .get(&project)
-            .copied()
-            .unwrap_or(self.focused);
-        let Some(term) = self.workspace.read(cx).terminal_handle(pane.0) else {
+        let pane = match pane {
+            Some(pane) => {
+                let known = self
+                    .layouts
+                    .get(&project)
+                    .is_some_and(|layout| layout.panes().iter().any(|id| id.0 == pane));
+                if !known {
+                    return Err("目标窗格已关闭，请重新选择".to_string());
+                }
+                pane
+            }
+            None => {
+                self.focused_by_project
+                    .get(&project)
+                    .copied()
+                    .unwrap_or(self.focused)
+                    .0
+            }
+        };
+        let Some(term) = self.workspace.read(cx).terminal_handle(pane) else {
             return Err("当前窗格没有运行中的终端".to_string());
         };
-        let shell = self.workspace.read(cx).pane_is_shell(pane.0);
+        let shell = self.workspace.read(cx).pane_is_shell(pane);
         if shell == Some(true) {
             term.paste(shell_prompt(text));
         } else {

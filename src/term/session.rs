@@ -198,6 +198,19 @@ impl Term {
         self.live.screen.lock().unwrap().clone()
     }
 
+    /// The title the program set with OSC 0/2, without copying the screen. It
+    /// reads the way [`Snapshot::label`] does: control characters removed, and
+    /// the command when no title was set.
+    pub fn label(&self) -> String {
+        let screen = self.live.screen.lock().unwrap();
+        let title: String = screen.title.chars().filter(|ch| !ch.is_control()).collect();
+        let title = title.trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+        screen.command.clone()
+    }
+
     /// Consume attention separately from the screen so redraws cannot replay it.
     pub fn take_notification(&self) -> Option<TermNotification> {
         self.live
