@@ -118,7 +118,7 @@ grep -q 'flags=.*runtime' <<<"$signature" \
 echo "签名：$authority"
 
 notarize() {
-    local file="$1" kind="$2" output="$3" id
+    local file="$1" kind="$2" output="$3" id attempt
     if ! xcrun notarytool submit "$file" \
         --keychain-profile "$profile" --wait \
         | tee "$work/$kind-submission.txt"; then
@@ -140,7 +140,19 @@ if result.get("status") != "Accepted" or result.get("issues"):
     raise SystemExit(f"公证未通过：{sys.argv[1]}")
 PY
     xcrun stapler staple "$output"
-    xcrun stapler validate "$output"
+    # The notary service reports Accepted before the ticket reaches the CDN,
+    # so an immediate validate can still miss it. Retry the same artifact
+    # instead of re-notarizing it.
+    for attempt in 1 2 3 4 5; do
+        if xcrun stapler validate "$output"; then
+            return 0
+        fi
+        if ((attempt < 5)); then
+            echo "release: 票据尚未同步，20 秒后重试 stapler validate（$kind）" >&2
+            sleep 20
+        fi
+    done
+    die "stapler validate 失败：$output"
 }
 
 step "4/7 公证应用并附加票据"
