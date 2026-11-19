@@ -131,7 +131,7 @@ if [[ -n "$signing_identity" ]]; then
     [[ "$signing_identity" == "Developer ID Application: "* ]] \
         || die "KUMU_SIGNING_IDENTITY 不是 Developer ID Application：$signing_identity"
     export CODESIGN_IDENTITY="$signing_identity"
-    echo "签名身份：$signing_identity（本地）"
+    echo "签名身份：${signing_identity}（本地）"
 else
     echo "没有 Developer ID 身份，改用 Xcode 云端签名；设置 KUMU_SIGNING_P12 可走本地签名"
 fi
@@ -217,7 +217,7 @@ PY
             return 0
         fi
         if ((attempt < 5)); then
-            echo "release: 票据尚未同步，20 秒后重试 stapler validate（$kind）" >&2
+            echo "release: 票据尚未同步，20 秒后重试 stapler validate（${kind}）" >&2
             sleep 20
         fi
     done
