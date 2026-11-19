@@ -47,6 +47,10 @@ fn main() {
     // build's files, so an app update has to refresh it before any agent pane
     // starts. Hook-based agents run this binary and need nothing here.
     agent::integration::refresh_native();
+    // Capture the login shell's environment before any pane starts: an agent
+    // pane runs its binary directly and would otherwise miss what `~/.zshrc`
+    // exports (PATH, API keys) when Kumu was opened from Finder.
+    term::shell_env::prewarm();
     let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
 
     // Closing the last window on macOS leaves the app running. A Dock click

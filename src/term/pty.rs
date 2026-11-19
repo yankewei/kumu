@@ -24,6 +24,15 @@ pub fn open(
         .map_err(std::io::Error::other)?;
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // A Finder-launched app has launchd's environment, so an agent started
+    // directly would miss what the user's shell exports (PATH, API keys).
+    // Lay the captured login-shell environment under the pane's own values.
+    // A pane that runs the login shell needs no capture: it reads the same
+    // startup files itself, and applying it here would only duplicate what
+    // the profile prepends to PATH.
+    if !is_login_shell(program, args) {
+        super::shell_env::apply(&mut cmd);
+    }
     cmd.env("KUMU_TERMINAL", "1");
     // Which pane this process runs in. An agent inside it uses the id to ask
     // the app about its neighbours ("read the pane on my right").
@@ -65,4 +74,12 @@ pub fn open(
         reader,
         writer,
     })
+}
+
+/// Whether this launch is the login shell a shell pane runs. That shell reads
+/// the same startup files the environment capture read, so it does not need
+/// the captured environment laid over it.
+fn is_login_shell(program: &str, args: &[String]) -> bool {
+    let (shell, shell_args) = super::default_shell();
+    program == shell.as_str() && args == shell_args.as_slice()
 }

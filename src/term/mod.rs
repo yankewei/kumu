@@ -7,6 +7,7 @@
 
 mod pty;
 mod session;
+pub mod shell_env;
 mod vt;
 
 pub use session::Term;
