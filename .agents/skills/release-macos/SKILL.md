@@ -86,6 +86,7 @@ source ~/.kumu-signing/env.sh
 2. `source ~/.kumu-signing/env.sh`
 3. `packaging/release.sh` 先本地验证一遍（不发布），确认产物和校验。
 4. `packaging/release.sh --publish` 打标签、推送并上传 Release。
+5. 发布后补 Release notes（见下文），`--generate-notes` 的提交列表不算完成。
 
 6 个阶段：预检 → 编译/组包/本地签名 →（本地已签名，跳过云端导出）→ 制作/签名/公证 DMG → 挂载复验 → 发布。**约 2 分钟**（公证等待占大头）。
 
@@ -152,6 +153,32 @@ packaging/release.sh --publish
 
 脚本会复核工作区干净、本地和远端都没有该标签，然后打 `v<version>`、推送、`gh release create` 上传三个附件（DMG、`.dmg.sha256`、`SHA256SUMS`）。
 
+发布完还没结束：必须补 Release notes（见下节）。
+
+## 发布说明（Release notes）
+
+每次发布都要补。`release.sh` 用 `--generate-notes` 创建 Release，正文往往只有提交列表或一行 Full Changelog；发布后立刻用 `gh release edit` 重写，保留对比链接：
+
+```bash
+gh release edit "v$version" -R yankewei/kumu --notes-file - <<'MD'
+## 变更
+
+- **一句话说清用户能感知的变化**：之前怎样、现在怎样。
+- **修复**：修了什么，什么条件下会触发。
+
+## 安装
+
+下载 `Kumu-<version>-<arch>.dmg` 拖到 `/Applications`（或走应用内更新）。校验值见同页 `SHA256SUMS`。
+
+**Full Changelog**: https://github.com/yankewei/kumu/compare/v<上一个版本>...v<version>
+MD
+```
+
+- 写给用户看：重点是他们会遇到的现象和怎么用，不是提交清单。
+- 内部重构、测试、版本号改动合并成一条或不写。
+- 多架构时写清产物名和各自架构。
+- 改完 `gh release view v<version> --json body --jq .body` 复核一次。
+
 ## 硬约束
 
 - 不要用 `make-app.sh` / `make-dmg.sh` 覆盖签名后的发布产物；它们只做本地测试包（`release.sh` 会在有 Developer ID 时调用 `make-app.sh`）。
@@ -162,6 +189,7 @@ packaging/release.sh --publish
 
 ## 常见失败
 
+- **`unbound variable`（消息里是 `signing_identity…` / `kind…` 之类）**：bash 会把变量后紧跟的全角字符（`（`、`）`、`：` 等）当成变量名的一部分。给变量加花括号，例如 `${signing_identity}（本地）`；不要靠切 locale 规避，`C.UTF-8` 和 `zh_CN.UTF-8` 都会这样。
 - **`stapler validate` 在刚 `staple` 后失败（CloudKit / base64 ticket）**：票据到 CDN 有延迟，脚本会对同一产物重试 5 次（每次间隔 20 秒）。不要重新编译或重新公证。
 - **公证上传超时 / 只拿到 submission id**：网络问题常见。脚本会打印“对同一文件重新 submit”的命令；不要重新编译或重新配置已验证有效的凭据。
 - **`No Account for Team`（仅云端回退路径）**：Team ID 是 `3BUD4GCZCQ`，不是证书名里的 `GK4M5T86KV`；再查 Xcode 登录状态。
