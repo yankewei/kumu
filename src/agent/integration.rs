@@ -1332,7 +1332,10 @@ mod tests {
         let registered = edit_hooks(original, "agy", false).expect("register");
         assert!(registered.contains("// keep my comment"), "{registered}");
         assert!(registered.contains("\"lint-checker\""), "{registered}");
-        assert!(registered.contains("\"kumu-notifications\""), "{registered}");
+        assert!(
+            registered.contains("\"kumu-notifications\""),
+            "{registered}"
+        );
         assert!(registered.contains("\"SessionStart\""), "{registered}");
         assert!(registered.contains("\"Stop\""), "{registered}");
         assert!(registered.contains("printf '{}'"), "{registered}");
