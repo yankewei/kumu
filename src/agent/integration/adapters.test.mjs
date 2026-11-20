@@ -118,7 +118,7 @@ test("OpenCode 2 scopes events to root sessions and cleans up subscriptions", ()
   let disposed = 0;
   const cleanup = openCode.setup({ data: {
     on: (name, callback) => { handlers[name] = callback; return () => disposed++; },
-    session: { get: (id) => id === "root" ? {} : { parentID: "root" } },
+    session: { get: (id) => id === "root" ? { directory: process.cwd() } : { parentID: "root" } },
   } });
   handlers["permission.asked"]({ data: { sessionID: "root" } });
   handlers["form.created"]({ data: { form: { sessionID: "root" } } });
@@ -189,29 +189,49 @@ test("OpenCode 2 matches the directory when project IDs are unavailable", () => 
   cleanup();
 });
 
-test("OpenCode 2 reads the TUI directory when the event fires", () => {
+test("OpenCode 2 reads the pane's own directory when the TUI location is missing", () => {
   messages = [];
   const handlers = {};
   const location = {};
+  const here = process.cwd();
   const cleanup = openCode.setup({
     get location() { return location; },
     data: {
       on: (name, callback) => { handlers[name] = callback; return () => {}; },
-      location: { default: () => ({ directory: "/work/here" }) },
-      session: { get: (id) => ({ location: { directory: id } }) },
+      // The server's default location is shared by every attached TUI, so it
+      // must not decide which pane an event belongs to.
+      location: { default: () => ({ directory: here }) },
+      session: { get: (id) => ({ directory: id }) },
     },
   });
   handlers["session.execution.started"]({ data: { sessionID: "/work/elsewhere" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/elsewhere" } });
-  handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
-  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
-  assert.equal(visible().length, 1, "startup directory applies before location info loads");
+  assert.equal(messages.length, 0, "another project's session stays silent");
+  handlers["session.execution.started"]({ data: { sessionID: here } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: here } });
+  assert.equal(visible().length, 1, "the pane's own session notifies before location loads");
   location.directory = "/work/next";
-  handlers["session.execution.started"]({ data: { sessionID: "/work/here" } });
-  handlers["session.execution.succeeded"]({ data: { sessionID: "/work/here" } });
+  handlers["session.execution.started"]({ data: { sessionID: here } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: here } });
   handlers["session.execution.started"]({ data: { sessionID: "/work/next" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/next" } });
   assert.equal(visible().length, 2, "a later directory change is not ignored");
+  cleanup();
+});
+
+test("OpenCode 2 stays silent for a session it cannot place in a directory", () => {
+  messages = [];
+  const handlers = {};
+  const cleanup = openCode.setup({ data: {
+    on: (name, callback) => { handlers[name] = callback; return () => {}; },
+    location: { default: () => ({ directory: process.cwd() }) },
+    session: { get: () => ({}) },
+  } });
+  handlers["session.execution.started"]({ data: { sessionID: "nowhere" } });
+  handlers["session.execution.succeeded"]({ data: { sessionID: "nowhere" } });
+  handlers["permission.asked"]({ data: { sessionID: "nowhere" } });
+  handlers["form.created"]({ data: { form: { sessionID: "nowhere" } } });
+  assert.equal(messages.length, 0, "no directory means no proof this pane owns the session");
   cleanup();
 });
 

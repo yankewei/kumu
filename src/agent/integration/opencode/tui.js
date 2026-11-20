@@ -1,4 +1,15 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { notify, notifySession } from "../notify.js";
+
+// The same directory reaches us with and without resolved symlinks.
+const canonical = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+};
 
 // OpenCode 2's TUI owns the PTY even when its server is shared or remote.
 export default {
@@ -7,17 +18,23 @@ export default {
     if (process.env.KUMU_TERMINAL !== "1") return;
     const ended = new Set();
     // Every attached TUI receives every location's events. Notify only for
-    // this TUI's project, otherwise each open pane raises its own copy.
+    // this TUI's own project, otherwise each open pane raises its own copy.
+    // `ctx.location` is optional in OpenCode's TUI context, and
+    // `data.location.default()` is the server's — one location shared by
+    // every attached TUI — so it can never say which pane this is. The pane
+    // started this process in its project directory: that is `process.cwd()`.
     // Read the location per event; it can arrive after setup.
+    const here = () => ctx.location?.directory || process.cwd();
     const relevant = (id) => {
       const session = ctx.data.session.get(id);
       if (!session || session.parentID) return false;
       const hereProject = ctx.location?.project?.id;
       if (hereProject && session.projectID) return hereProject === session.projectID;
-      const here = ctx.location?.directory || ctx.data.location?.default?.()?.directory;
-      const there = session.location?.directory || session.directory;
-      if (here && there) return here === there;
-      return !here;
+      const there = session.directory || session.location?.directory;
+      // Without the session's directory nothing proves this pane owns it;
+      // silence beats echoing another pane's conversation.
+      if (!there) return false;
+      return canonical(here()) === canonical(there);
     };
     const end = (event, message) => {
       const id = event.data.sessionID;
