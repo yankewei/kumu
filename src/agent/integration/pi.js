@@ -15,15 +15,21 @@ export default function (pi) {
   const wrapped = new WeakSet();
 
   const installDialogs = (ctx) => {
-    if (!interactiveOmp(ctx) || wrapped.has(ctx.ui)) return;
+    if (!interactiveOmp(ctx) || !ctx.ui || typeof ctx.ui !== "object" || wrapped.has(ctx.ui)) {
+      return;
+    }
     wrapped.add(ctx.ui);
     for (const method of ["select", "confirm", "input", "editor", "ask", "custom"]) {
       const original = ctx.ui[method];
       if (typeof original !== "function") continue;
-      ctx.ui[method] = function (...args) {
-        if (ompBusy) notify("Oh My Pi", "需要你输入、确认或选择");
-        return original.apply(this, args);
-      };
+      try {
+        ctx.ui[method] = function (...args) {
+          if (ompBusy) notify("Oh My Pi", "需要你输入、确认或选择");
+          return original.apply(this, args);
+        };
+      } catch {
+        // Ignore frozen or non-writable UI objects so we never break the host.
+      }
     }
   };
 
@@ -39,10 +45,10 @@ export default function (pi) {
     }
   });
   pi.on("message_end", (event, ctx) => {
-    if (interactivePi(ctx) && event.message?.role === "assistant") {
+    if (interactivePi(ctx) && event?.message?.role === "assistant") {
       piStopReason = event.message.stopReason;
     }
-    if (interactiveOmp(ctx) && event.message?.stopReason === "aborted") {
+    if (interactiveOmp(ctx) && event?.message?.stopReason === "aborted") {
       ompInterrupted = true;
     }
   });
@@ -56,7 +62,7 @@ export default function (pi) {
   pi.on("agent_settled", (event, ctx) => {
     if (!interactivePi(ctx) || !piBusy) return;
     piBusy = false;
-    if (event.aborted || ctx.hasPendingMessages()) return;
+    if (event?.aborted || ctx?.hasPendingMessages?.()) return;
     notify("Pi", piStopReason === "error" ? "任务执行失败，请查看终端" : "本轮任务已完成");
   });
 
@@ -66,7 +72,7 @@ export default function (pi) {
   });
   pi.on("tool_call", (event, ctx) => {
     if (!interactiveOmp(ctx)) return;
-    if (["ask", "ask_user", "ask_user_question", "question"].includes(event.toolName)) {
+    if (["ask", "ask_user", "ask_user_question", "question"].includes(event?.toolName)) {
       notify("Oh My Pi", "需要你输入、确认或选择");
     }
   });
@@ -74,10 +80,10 @@ export default function (pi) {
   // it continues its own work must not claim completion.
   pi.on("agent_end", (event, ctx) => {
     if (!interactiveOmp(ctx) || !ompBusy) return;
-    if (event.yielded === false || (event.isTerminal === false && event.yielded !== true)) return;
+    if (event?.yielded === false || (event?.isTerminal === false && event?.yielded !== true)) return;
     ompBusy = false;
-    if (ompInterrupted || ctx.hasPendingMessages()) return;
-    const last = event.messages?.filter((message) => message.role === "assistant").at(-1);
+    if (ompInterrupted || ctx?.hasPendingMessages?.()) return;
+    const last = event?.messages?.filter((message) => message?.role === "assistant").at(-1);
     notify("Oh My Pi", last?.stopReason === "error" ? "任务执行失败，请查看终端" : "本轮任务已完成");
   });
 }

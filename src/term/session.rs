@@ -4,9 +4,9 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedReceiver;
 use portable_pty::PtySize;
@@ -18,39 +18,235 @@ use super::vt::{
     TermNotification, Vt,
 };
 
-/// How long a content read waits for the terminal thread. Reading scrollback
-/// pages the viewport, so a terminal in the middle of a flood can take a
-/// moment; a pane that never answers is better reported than hung on.
+/// How long a content read waits for the terminal thread.
 const CONTENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A hover probe answers a click or a highlight; a terminal buried in output
 /// may answer late, but the pointer has moved on by then.
 const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Maximum wait for selection text on mouse release.
+const SELECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Backpressure limit for unread PTY output chunks before `kumu-pty` pauses.
+const MAX_PTY_BUFFER_BYTES: usize = 512 * 1024;
+
+/// Maximum PTY bytes drained in one batch before publishing a frame.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// Maximum time spent coalescing queued PTY chunks in one batch.
+const MAX_BATCH_TIME: Duration = Duration::from_millis(4);
+
+/// Bounded capacity of the asynchronous PTY writer queue.
+const PTY_WRITE_QUEUE: usize = 64;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    const SIGHUP: i32 = 1;
+    const SIGKILL: i32 = 9;
+    if let Some(pid) = child.process_id()
+        && let Ok(pgid) = i32::try_from(pid)
+        && pgid > 0
+    {
+        unsafe {
+            kill(-pgid, SIGHUP);
+        }
+        // Give the process group a brief window to react to SIGHUP before SIGKILL.
+        let deadline = Instant::now() + Duration::from_millis(40);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe {
+            kill(-pgid, SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 struct Live {
     screen: Mutex<Snapshot>,
     notifications: Mutex<VecDeque<TermNotification>>,
-    generation: AtomicU64,
     queued: AtomicBool,
-    /// The PTY child (the shell), or 0 before it is spawned. Lets the app
-    /// inspect what the user started inside it, e.g. an agent that should not
-    /// outlive the choice to resume it.
+    /// The PTY child (the shell), or 0 before it is spawned.
     pid: AtomicU64,
+    /// Per-pane random token authenticating `kumu-session:` OSC reports.
+    session_token: String,
     wake: futures::channel::mpsc::UnboundedSender<()>,
 }
 
 impl Live {
-    fn publish(&self, snapshot: Snapshot) {
-        *self.screen.lock().unwrap() = snapshot;
-        self.generation.fetch_add(1, Ordering::Release);
-        if !self.queued.swap(true, Ordering::AcqRel) {
+    fn publish(&self, snapshot: Snapshot, force_wake: bool) {
+        *self.screen.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        let was_queued = self.queued.swap(true, Ordering::SeqCst);
+        if !was_queued || force_wake {
             let _ = self.wake.unbounded_send(());
+        }
+    }
+
+    fn wake_for_notification(&self) {
+        self.queued.store(true, Ordering::SeqCst);
+        let _ = self.wake.unbounded_send(());
+    }
+}
+
+struct InboxState {
+    control: VecDeque<Msg>,
+    pty_bytes: VecDeque<Vec<u8>>,
+    pty_queued_bytes: usize,
+    eof: bool,
+    shutdown: bool,
+    closed: bool,
+}
+
+/// Priority mailbox for `kumu-term`: control/UI commands always preempt PTY
+/// output floods, while PTY reads apply bounded backpressure so a flooding
+/// child cannot OOM Kumu.
+struct Inbox {
+    state: Mutex<InboxState>,
+    item_cv: Condvar,
+    space_cv: Condvar,
+}
+
+enum NextWork {
+    Shutdown,
+    Control(Msg),
+    PtyBatch(Vec<Vec<u8>>),
+    Eof,
+    Timeout,
+}
+
+impl Inbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(InboxState {
+                control: VecDeque::new(),
+                pty_bytes: VecDeque::new(),
+                pty_queued_bytes: 0,
+                eof: false,
+                shutdown: false,
+                closed: false,
+            }),
+            item_cv: Condvar::new(),
+            space_cv: Condvar::new(),
+        })
+    }
+
+    fn send_control(&self, msg: Msg) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return;
+        }
+        state.control.push_back(msg);
+        self.item_cv.notify_one();
+    }
+
+    fn send_shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.shutdown = true;
+        state.closed = true;
+        self.item_cv.notify_one();
+        self.space_cv.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        self.space_cv.notify_all();
+    }
+
+    fn push_pty(&self, chunk: Vec<u8>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.pty_queued_bytes >= MAX_PTY_BUFFER_BYTES && !state.closed {
+            state = self.space_cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if state.closed {
+            return false;
+        }
+        state.pty_queued_bytes += chunk.len();
+        state.pty_bytes.push_back(chunk);
+        self.item_cv.notify_one();
+        true
+    }
+
+    fn push_eof(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.eof = true;
+        self.item_cv.notify_one();
+    }
+
+    fn next(&self, timeout: Option<Duration>) -> NextWork {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            if state.shutdown {
+                return NextWork::Shutdown;
+            }
+            if let Some(msg) = state.control.pop_front() {
+                return NextWork::Control(msg);
+            }
+            if !state.pty_bytes.is_empty() {
+                let mut batch = Vec::new();
+                let mut total = 0usize;
+                while let Some(chunk) = state.pty_bytes.pop_front() {
+                    let len = chunk.len();
+                    state.pty_queued_bytes = state.pty_queued_bytes.saturating_sub(len);
+                    total += len;
+                    batch.push(chunk);
+                    if total >= MAX_BATCH_BYTES {
+                        break;
+                    }
+                }
+                self.space_cv.notify_all();
+                return NextWork::PtyBatch(batch);
+            }
+            if state.eof {
+                state.eof = false;
+                return NextWork::Eof;
+            }
+            match deadline {
+                Some(until) => {
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return NextWork::Timeout;
+                    }
+                    let (guard, res) = self
+                        .item_cv
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = guard;
+                    if res.timed_out()
+                        && !state.shutdown
+                        && state.control.is_empty()
+                        && state.pty_bytes.is_empty()
+                        && !state.eof
+                    {
+                        return NextWork::Timeout;
+                    }
+                }
+                None => {
+                    state = self.item_cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            }
         }
     }
 }
 
 enum Msg {
-    Bytes(Vec<u8>),
     /// Bytes to write to the PTY (IME commit).
     Write(Vec<u8>),
     /// Clipboard text, encoded for the program's paste mode.
@@ -83,8 +279,7 @@ enum Msg {
         older: bool,
     },
     SearchClear,
-    /// The screen and up to `history` rows above it, as plain text. Reading
-    /// scrollback pages the viewport, so only this thread may do it.
+    /// The screen and up to `history` rows above it, as plain text.
     Content {
         history: usize,
         reply: Sender<Option<String>>,
@@ -106,25 +301,23 @@ enum Msg {
         cell_h: u32,
     },
     Colors(TermColors),
-    Eof,
-    Shutdown,
 }
 
 /// Sends shutdown when the last [`Term`] handle is dropped.
 struct Close {
-    tx: Sender<Msg>,
+    inbox: Arc<Inbox>,
 }
 
 impl Drop for Close {
     fn drop(&mut self) {
-        let _ = self.tx.send(Msg::Shutdown);
+        self.inbox.send_shutdown();
     }
 }
 
 /// Handle to a running terminal. Dropping the last handle stops the process.
 #[derive(Clone)]
 pub struct Term {
-    tx: Sender<Msg>,
+    inbox: Arc<Inbox>,
     live: Arc<Live>,
     /// Keeps the process alive until the last handle is dropped.
     _close: Arc<Close>,
@@ -152,24 +345,25 @@ impl Term {
         cwd: PathBuf,
         colors: TermColors,
     ) -> (Self, UnboundedReceiver<()>) {
-        let (tx, rx) = mpsc::channel();
+        let inbox = Inbox::new();
         let (wake, wake_rx) = futures::channel::mpsc::unbounded();
         let command = std::path::Path::new(&program)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or(program.clone());
         let cwd_text = cwd.display().to_string();
+        let session_token = pty::generate_session_token();
         let live = Arc::new(Live {
             screen: Mutex::new(Snapshot::blank_with(
                 &command, &cwd_text, colors.fg, colors.bg,
             )),
             notifications: Mutex::new(VecDeque::new()),
-            generation: AtomicU64::new(0),
             queued: AtomicBool::new(false),
             pid: AtomicU64::new(0),
+            session_token: session_token.clone(),
             wake,
         });
-        let thread_tx = tx.clone();
+        let thread_inbox = Arc::clone(&inbox);
         let thread_live = Arc::clone(&live);
         let launch = Launch {
             pane,
@@ -179,24 +373,44 @@ impl Term {
             command,
             cwd_text,
             colors,
+            session_token,
         };
         std::thread::Builder::new()
             .name("kumu-term".into())
-            .spawn(move || run(launch, thread_tx, rx, thread_live))
+            .spawn(move || run(launch, thread_inbox, thread_live))
             .expect("spawn terminal thread");
-        let _close = Arc::new(Close { tx: tx.clone() });
-        (Self { tx, live, _close }, wake_rx)
+        let _close = Arc::new(Close {
+            inbox: Arc::clone(&inbox),
+        });
+        (
+            Self {
+                inbox,
+                live,
+                _close,
+            },
+            wake_rx,
+        )
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.live.screen.lock().unwrap().clone()
+        self.live
+            .screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The per-pane token that authenticates `kumu-session:` reports from this
+    /// terminal's hooks and extensions.
+    pub fn session_token(&self) -> &str {
+        &self.live.session_token
     }
 
     /// The title the program set with OSC 0/2, without copying the screen. It
     /// reads the way [`Snapshot::label`] does: control characters removed, and
     /// the command when no title was set.
     pub fn label(&self) -> String {
-        let screen = self.live.screen.lock().unwrap();
+        let screen = self.live.screen.lock().unwrap_or_else(|e| e.into_inner());
         let title: String = screen.title.chars().filter(|ch| !ch.is_control()).collect();
         let title = title.trim();
         if !title.is_empty() {
@@ -210,12 +424,8 @@ impl Term {
         self.live
             .notifications
             .lock()
-            .expect("terminal notification lock")
+            .unwrap_or_else(|e| e.into_inner())
             .pop_front()
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.live.generation.load(Ordering::Acquire)
     }
 
     /// The pid of the PTY child, once it has spawned.
@@ -227,18 +437,18 @@ impl Term {
     /// The UI has started handling a wake. A publish that arrives after this
     /// sends another one.
     pub fn wake_handled(&self) {
-        self.live.queued.store(false, Ordering::Release);
+        self.live.queued.store(false, Ordering::SeqCst);
     }
 
     pub fn key(&self, input: KeyInput) {
-        let _ = self.tx.send(Msg::Key(input));
+        self.inbox.send_control(Msg::Key(input));
     }
 
     /// Write raw bytes to the PTY (finished IME text).
     pub fn write(&self, bytes: impl Into<Vec<u8>>) {
         let bytes = bytes.into();
         if !bytes.is_empty() {
-            let _ = self.tx.send(Msg::Write(bytes));
+            self.inbox.send_control(Msg::Write(bytes));
         }
     }
 
@@ -246,12 +456,12 @@ impl Term {
     pub fn paste(&self, text: impl Into<Vec<u8>>) {
         let text = text.into();
         if !text.is_empty() {
-            let _ = self.tx.send(Msg::Paste(text));
+            self.inbox.send_control(Msg::Paste(text));
         }
     }
 
     pub fn mouse(&self, input: MouseInput) {
-        let _ = self.tx.send(Msg::Mouse(input));
+        self.inbox.send_control(Msg::Mouse(input));
     }
 
     /// Drive a selection gesture. On [`SelectStep::Release`], returns the
@@ -276,7 +486,7 @@ impl Term {
         } else {
             (None, None)
         };
-        let _ = self.tx.send(Msg::Select {
+        self.inbox.send_control(Msg::Select {
             step,
             col,
             row,
@@ -286,11 +496,12 @@ impl Term {
             height,
             reply,
         });
-        wait.and_then(|rx| rx.recv().ok()).flatten()
+        wait.and_then(|rx| rx.recv_timeout(SELECT_TIMEOUT).ok())
+            .flatten()
     }
 
     pub fn clear_selection(&self) {
-        let _ = self.tx.send(Msg::ClearSelection);
+        self.inbox.send_control(Msg::ClearSelection);
     }
 
     /// The OSC 8 hyperlink on a viewport cell, with the cells it covers.
@@ -300,7 +511,7 @@ impl Term {
     /// pointer.
     pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<Hyperlink> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(Msg::HyperlinkAt {
+        self.inbox.send_control(Msg::HyperlinkAt {
             col,
             row,
             reply: tx,
@@ -311,39 +522,29 @@ impl Term {
     /// Search the terminal for `needle` and select the newest match. An empty
     /// needle closes the find bar's highlights.
     pub fn search_set(&self, needle: impl Into<String>) {
-        let _ = self.tx.send(Msg::SearchSet(needle.into()));
+        self.inbox.send_control(Msg::SearchSet(needle.into()));
     }
 
     /// Move the selected match toward older (`older`) or newer content.
     pub fn search_step(&self, older: bool) {
-        let _ = self.tx.send(Msg::SearchStep { older });
+        self.inbox.send_control(Msg::SearchStep { older });
     }
 
     pub fn search_clear(&self) {
-        let _ = self.tx.send(Msg::SearchClear);
+        self.inbox.send_control(Msg::SearchClear);
     }
 
     /// Currently selected plain text, if any.
-    ///
-    /// Blocks until the session thread answers. Callers run on the background
-    /// executor, and a busy session thread (a paste, a flood of output) must not
-    /// turn ⌘C into a silent no-op: a short timeout here just drops the copy.
-    /// The channel disconnecting is the one thing that ends the wait early,
-    /// which is the session thread being gone.
     pub fn selection_text(&self) -> Option<String> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(Msg::SelectionText(tx));
-        rx.recv().ok().flatten()
+        self.inbox.send_control(Msg::SelectionText(tx));
+        rx.recv_timeout(CONTENT_TIMEOUT).ok().flatten()
     }
 
     /// The screen and up to `history` rows of scrollback, as plain text.
-    ///
-    /// The terminal thread answers, so this blocks and must run off the UI
-    /// thread. A terminal already buried in output times out instead of
-    /// holding the caller forever.
     pub fn content(&self, history: usize) -> Option<String> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(Msg::Content { history, reply: tx });
+        self.inbox.send_control(Msg::Content { history, reply: tx });
         rx.recv_timeout(CONTENT_TIMEOUT).ok().flatten()
     }
 
@@ -351,7 +552,7 @@ impl Term {
         if lines == 0 {
             return;
         }
-        let _ = self.tx.send(Msg::Scroll {
+        self.inbox.send_control(Msg::Scroll {
             lines,
             x,
             y,
@@ -362,7 +563,7 @@ impl Term {
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
-        let _ = self.tx.send(Msg::Resize {
+        self.inbox.send_control(Msg::Resize {
             cols,
             rows,
             cell_w,
@@ -371,7 +572,7 @@ impl Term {
     }
 
     pub fn set_colors(&self, colors: TermColors) {
-        let _ = self.tx.send(Msg::Colors(colors));
+        self.inbox.send_control(Msg::Colors(colors));
     }
 }
 
@@ -386,9 +587,10 @@ struct Launch {
     command: String,
     cwd_text: String,
     colors: TermColors,
+    session_token: String,
 }
 
-fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
+fn run(launch: Launch, inbox: Arc<Inbox>, live: Arc<Live>) {
     let Launch {
         pane,
         program,
@@ -397,6 +599,7 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
         command,
         cwd_text,
         colors,
+        session_token,
     } = launch;
     let size = PtySize {
         rows: 24,
@@ -404,21 +607,41 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
         pixel_width: 80 * 8,
         pixel_height: 24 * 16,
     };
-    let pty = match pty::open(&program, &args, &cwd, size, pane) {
+    let mut pty = match pty::open(&program, &args, &cwd, size, pane, &session_token) {
         Ok(pty) => pty,
         Err(error) => {
             let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.fg, colors.bg);
             snapshot.exited = true;
             snapshot.spawn_error = Some(error.to_string());
-            live.publish(snapshot);
+            live.publish(snapshot, true);
+            inbox.close();
             return;
         }
     };
     if let Some(pid) = pty.child.process_id() {
         live.pid.store(pid as u64, Ordering::Release);
     }
+    let mut reader = std::mem::replace(&mut pty.reader, Box::new(std::io::empty()));
+    let mut writer = std::mem::replace(&mut pty.writer, Box::new(std::io::sink()));
+    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(PTY_WRITE_QUEUE);
+    let _ = std::thread::Builder::new()
+        .name("kumu-pty-write".into())
+        .spawn(move || {
+            while let Ok(bytes) = write_rx.recv() {
+                if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+    let reader_inbox = Arc::clone(&inbox);
+    let _ = std::thread::Builder::new()
+        .name("kumu-pty".into())
+        .spawn(move || read_pty(&mut reader, &reader_inbox));
+
     let mut session = Running {
         pty,
+        write_tx,
         vt: Vt::with_colors(80, 24, colors),
         command,
         cwd: cwd_text,
@@ -426,37 +649,30 @@ fn run(launch: Launch, tx: Sender<Msg>, rx: Receiver<Msg>, live: Arc<Live>) {
         live,
     };
     session.vt.resize(80, 24, 8, 16);
-    session.publish();
+    session.publish(false);
 
-    let reader_tx = tx;
-    // The reader is moved into the read thread, so take it out of the pty first.
-    let mut reader = std::mem::replace(&mut session.pty.reader, Box::new(std::io::empty()));
-    std::thread::Builder::new()
-        .name("kumu-pty".into())
-        .spawn(move || read_pty(&mut reader, &reader_tx))
-        .expect("spawn pty reader");
-
-    session.pump(rx);
-    let _ = session.pty.child.kill();
-    let _ = session.pty.child.wait();
+    session.pump(&inbox);
+    inbox.close();
+    drop(session.write_tx);
+    terminate_process_group(&mut session.pty.child);
 }
 
-fn read_pty(reader: &mut dyn Read, tx: &Sender<Msg>) {
+fn read_pty(reader: &mut dyn Read, inbox: &Inbox) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
-                let _ = tx.send(Msg::Eof);
+                inbox.push_eof();
                 break;
             }
             Ok(n) => {
-                if tx.send(Msg::Bytes(buf[..n].to_vec())).is_err() {
+                if !inbox.push_pty(buf[..n].to_vec()) {
                     break;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                let _ = tx.send(Msg::Eof);
+                inbox.push_eof();
                 break;
             }
         }
@@ -465,6 +681,7 @@ fn read_pty(reader: &mut dyn Read, tx: &Sender<Msg>) {
 
 struct Running {
     pty: Pty,
+    write_tx: SyncSender<Vec<u8>>,
     vt: Vt,
     command: String,
     cwd: String,
@@ -473,61 +690,62 @@ struct Running {
 }
 
 impl Running {
-    fn pump(&mut self, rx: Receiver<Msg>) {
+    fn write_pty(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            // Never block `kumu-term` on a wedged child's stdin.
+            let _ = self.write_tx.try_send(bytes);
+        }
+    }
+
+    fn pump(&mut self, inbox: &Inbox) {
         loop {
-            let msg = match self.vt.hold_wait() {
-                Some(wait) => match rx.recv_timeout(wait) {
-                    Ok(msg) => Some(msg),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                },
-                None => match rx.recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => break,
-                },
-            };
-            match msg {
-                None => self.publish(),
-                Some(Msg::Bytes(bytes)) => {
-                    self.vt.write(&bytes);
-                    self.flush_replies();
-                    self.publish();
+            let work = inbox.next(self.vt.hold_wait());
+            match work {
+                NextWork::Timeout => self.publish(false),
+                NextWork::PtyBatch(chunks) => {
+                    let started = Instant::now();
+                    for chunk in chunks {
+                        self.vt.write(&chunk);
+                        self.flush_replies();
+                        if started.elapsed() >= MAX_BATCH_TIME {
+                            break;
+                        }
+                    }
+                    if self.vt.is_held() {
+                        // A synchronized-output hold freezes the frame; still
+                        // deliver notifications without taking a redundant snapshot.
+                        if self.drain_notifications() {
+                            self.live.wake_for_notification();
+                        }
+                    } else {
+                        self.publish(false);
+                    }
                 }
-                Some(Msg::Key(input)) => {
+                NextWork::Control(Msg::Key(input)) => {
                     if self.vt.clear_selection() {
-                        self.publish();
+                        self.publish(false);
                     }
                     let bytes = self.vt.encode_input(&input);
-                    if !bytes.is_empty() {
-                        let _ = self.pty.writer.write_all(&bytes);
-                        let _ = self.pty.writer.flush();
-                    }
+                    self.write_pty(bytes);
                 }
-                Some(Msg::Write(bytes)) => {
+                NextWork::Control(Msg::Write(bytes)) => {
                     if self.vt.clear_selection() {
-                        self.publish();
+                        self.publish(false);
                     }
-                    let _ = self.pty.writer.write_all(&bytes);
-                    let _ = self.pty.writer.flush();
+                    self.write_pty(bytes);
                 }
-                Some(Msg::Paste(text)) => {
+                NextWork::Control(Msg::Paste(text)) => {
                     if self.vt.clear_selection() {
-                        self.publish();
+                        self.publish(false);
                     }
                     let bytes = self.vt.encode_paste(&text);
-                    if !bytes.is_empty() {
-                        let _ = self.pty.writer.write_all(&bytes);
-                        let _ = self.pty.writer.flush();
-                    }
+                    self.write_pty(bytes);
                 }
-                Some(Msg::Mouse(input)) => {
+                NextWork::Control(Msg::Mouse(input)) => {
                     let bytes = self.vt.encode_mouse(input);
-                    if !bytes.is_empty() {
-                        let _ = self.pty.writer.write_all(&bytes);
-                        let _ = self.pty.writer.flush();
-                    }
+                    self.write_pty(bytes);
                 }
-                Some(Msg::Select {
+                NextWork::Control(Msg::Select {
                     step,
                     col,
                     row,
@@ -538,39 +756,39 @@ impl Running {
                     reply,
                 }) => {
                     self.vt.select(step, col, row, x, y, cell_w, height);
-                    self.publish();
+                    self.publish(false);
                     if let Some(reply) = reply {
                         let _ = reply.send(self.vt.selection_text());
                     }
                 }
-                Some(Msg::ClearSelection) => {
+                NextWork::Control(Msg::ClearSelection) => {
                     if self.vt.clear_selection() {
-                        self.publish();
+                        self.publish(false);
                     }
                 }
-                Some(Msg::SelectionText(reply)) => {
+                NextWork::Control(Msg::SelectionText(reply)) => {
                     let _ = reply.send(self.vt.selection_text());
                 }
-                Some(Msg::HyperlinkAt { col, row, reply }) => {
+                NextWork::Control(Msg::HyperlinkAt { col, row, reply }) => {
                     let _ = reply.send(self.vt.hyperlink_at(col, row));
                 }
-                Some(Msg::SearchSet(needle)) => {
+                NextWork::Control(Msg::SearchSet(needle)) => {
                     self.vt.search_set(&needle);
-                    self.publish();
+                    self.publish(false);
                 }
-                Some(Msg::SearchStep { older }) => {
+                NextWork::Control(Msg::SearchStep { older }) => {
                     self.vt.search_step(older);
-                    self.publish();
+                    self.publish(false);
                 }
-                Some(Msg::SearchClear) => {
+                NextWork::Control(Msg::SearchClear) => {
                     if self.vt.search_clear() {
-                        self.publish();
+                        self.publish(false);
                     }
                 }
-                Some(Msg::Content { history, reply }) => {
+                NextWork::Control(Msg::Content { history, reply }) => {
                     let _ = reply.send(Some(self.vt.content_text(history)));
                 }
-                Some(Msg::Scroll {
+                NextWork::Control(Msg::Scroll {
                     lines,
                     x,
                     y,
@@ -597,22 +815,16 @@ impl Running {
                                 mods,
                             }));
                         }
-                        if !out.is_empty() {
-                            let _ = self.pty.writer.write_all(&out);
-                            let _ = self.pty.writer.flush();
-                        }
+                        self.write_pty(out);
                     } else if self.vt.alt_screen() {
                         let bytes = self.vt.encode_scroll_keys(lines < 0, lines.unsigned_abs());
-                        if !bytes.is_empty() {
-                            let _ = self.pty.writer.write_all(&bytes);
-                            let _ = self.pty.writer.flush();
-                        }
+                        self.write_pty(bytes);
                     } else {
                         self.vt.scroll_viewport(lines);
-                        self.publish();
+                        self.publish(false);
                     }
                 }
-                Some(Msg::Resize {
+                NextWork::Control(Msg::Resize {
                     cols,
                     rows,
                     cell_w,
@@ -630,49 +842,53 @@ impl Running {
                     });
                     self.vt.resize(cols, rows, cell_w, cell_h);
                     self.flush_replies();
-                    self.publish();
+                    self.publish(false);
                 }
-                Some(Msg::Colors(colors)) => {
+                NextWork::Control(Msg::Colors(colors)) => {
                     self.vt.set_colors(colors);
-                    self.publish();
+                    self.publish(false);
                 }
-                Some(Msg::Eof) => {
+                NextWork::Eof => {
                     self.exited = true;
-                    self.publish();
+                    self.publish(true);
                     break;
                 }
-                Some(Msg::Shutdown) => break,
+                NextWork::Shutdown => break,
             }
         }
     }
 
     fn flush_replies(&mut self) {
         let replies = self.vt.take_replies();
-        if replies.is_empty() {
-            return;
-        }
-        let _ = self.pty.writer.write_all(&replies);
-        let _ = self.pty.writer.flush();
+        self.write_pty(replies);
     }
 
-    fn publish(&mut self) {
+    fn drain_notifications(&mut self) -> bool {
+        let mut any = false;
         let mut pending = self
             .live
             .notifications
             .lock()
-            .expect("terminal notification lock");
+            .unwrap_or_else(|e| e.into_inner());
         while let Some(notification) = self.vt.take_notification() {
             if pending.len() == MAX_NOTIFICATIONS {
                 pending.pop_front();
             }
             pending.push_back(notification);
+            any = true;
         }
-        drop(pending);
+        any
+    }
+
+    fn publish(&mut self, force_wake: bool) {
+        let got_notification = self.drain_notifications();
         // A running find bar has to see new output and viewport scrolls; with
         // no needle this is a no-op.
         self.vt.search_feed();
-        self.live
-            .publish(self.vt.snapshot(&self.command, &self.cwd, self.exited));
+        self.live.publish(
+            self.vt.snapshot(&self.command, &self.cwd, self.exited),
+            force_wake || got_notification,
+        );
     }
 }
 

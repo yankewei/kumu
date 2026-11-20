@@ -69,10 +69,17 @@ fn main() {
     });
 }
 
+struct MainWindow(Option<AnyWindowHandle>);
+impl Global for MainWindow {}
+
 fn open_main_window(cx: &mut App) {
     // Keep the check and creation synchronous so repeated reopen events
-    // cannot queue multiple main windows.
-    if !cx.windows().is_empty() {
+    // cannot queue multiple main windows. Checking the tracked main window
+    // handle lets the Dock reopen Kumu even while Settings is still open.
+    if let Some(handle) = cx.try_global::<MainWindow>().and_then(|m| m.0)
+        && cx.windows().contains(&handle)
+    {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
         return;
     }
 
@@ -89,7 +96,10 @@ fn open_main_window(cx: &mut App) {
     match gpui_kit::open_window(window_options, cx, |window, cx| {
         cx.new(|cx| KumuApp::new(window, cx))
     }) {
-        Ok(_) => eprintln!("[ui] window opened"),
+        Ok((handle, _)) => {
+            cx.set_global(MainWindow(Some(handle)));
+            eprintln!("[ui] window opened");
+        }
         Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),
     }
 }

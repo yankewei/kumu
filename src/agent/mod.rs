@@ -17,5 +17,5 @@ pub mod integration;
 pub mod launch;
 mod registry;
 
-pub use config::{executable, installed};
+pub use config::{executable, installed, installed_with_shell_env};
 pub use registry::{AGENTS, id_for};

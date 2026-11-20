@@ -8,10 +8,15 @@
 //! queries that no longer match it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, TransactionBehavior, params};
 use serde_json::{Value, json};
+
+/// Set when [`Store::open`] refuses a newer-schema database so standalone
+/// `set_setting` calls never write into a newer build's database.
+static SETTINGS_READONLY: AtomicBool = AtomicBool::new(false);
 
 /// A project: a directory with its own terminal panes. A worktree is a
 /// project whose `parent_id` points at the repository it was created from.
@@ -70,25 +75,40 @@ const SCHEMA_VERSION: i64 = 5;
 
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
+        if path.as_os_str().is_empty() {
+            return Err(OpenError::Db(rusqlite::Error::InvalidPath(
+                path.to_path_buf(),
+            )));
+        }
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir);
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(dir).ok();
+            }
         }
         let conn = Connection::open(path)?;
-        prepare(&conn)?;
-        let store = Self { conn };
-        // A newer build has already migrated this file. Its tables no longer
-        // match this build's queries, so reopening it here must fail loudly
-        // instead of panicking halfway through the first read.
-        let version: i64 = store
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(OpenError::SchemaTooNew {
-                found: version,
-                supported: SCHEMA_VERSION,
-            });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        store.init()?;
+        prepare(&conn)?;
+        let mut store = Self { conn };
+        if let Err(err) = store.init() {
+            if matches!(err, OpenError::SchemaTooNew { .. }) {
+                SETTINGS_READONLY.store(true, Ordering::Release);
+            }
+            return Err(err);
+        }
         Ok(store)
     }
 
@@ -98,48 +118,52 @@ impl Store {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         prepare(&conn)?;
-        let store = Self { conn };
-        store.init()?;
+        let mut store = Self { conn };
+        store.init().map_err(|err| match err {
+            OpenError::Db(e) => e,
+            OpenError::SchemaTooNew { .. } => rusqlite::Error::InvalidQuery,
+        })?;
         Ok(store)
     }
 
-    fn init(&self) -> Result<()> {
-        // Keep the old layout and its session ownership together until the
-        // rewritten layout, table removal, and schema version all commit.
-        let transaction = self.conn.unchecked_transaction()?;
-        let version: i64 = self
+    fn init(&mut self) -> Result<(), OpenError> {
+        // Check `user_version` and migrate inside a single IMMEDIATE transaction
+        // so concurrent launches serialize cleanly via `busy_timeout` instead
+        // of hitting SQLITE_BUSY on a deferred write-lock upgrade.
+        let transaction = self
             .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(OpenError::SchemaTooNew {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         if version < 1 {
-            self.migrate_v1()?;
+            Self::migrate_v1_conn(&transaction)?;
         }
         if version < 2 {
-            self.migrate_v2()?;
+            Self::migrate_v2_conn(&transaction)?;
         }
         if version < 3 {
-            self.migrate_v3()?;
+            Self::migrate_v3_conn(&transaction)?;
         }
         if version < 4 {
-            self.migrate_v4()?;
+            Self::migrate_v4_conn(&transaction)?;
         }
         if version < 5 {
-            self.migrate_v5()?;
+            Self::migrate_v5_conn(&transaction)?;
         }
         if version < SCHEMA_VERSION {
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        transaction.commit()
+        transaction.commit()?;
+        Ok(())
     }
 
-    /// The project/session/settings schema, plus the cleanup of the removed
-    /// in-app chat path. Existing databases have `user_version = 0` and already
-    /// contain most of this, so every step here is idempotent.
-    ///
-    /// `sessions` is created even on a fresh database because the v3 step below
-    /// inspects its columns; `migrate_v4` then drops it in the same transaction.
-    fn migrate_v1(&self) -> Result<()> {
-        self.conn.execute_batch(
+    fn migrate_v1_conn(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -167,34 +191,31 @@ impl Store {
         // Columns from that chat path. `DROP COLUMN` errors when the column is
         // already missing, which is the expected case on fresh and current dbs.
         for column in ["model", "mode", "sandbox", "reasoning", "usage"] {
-            self.conn
-                .execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), [])
+            conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), [])
                 .ok();
         }
         // Databases created before `title_manual` and `resume_id` joined the
         // schema gain them here.
-        self.conn
-            .execute(
-                "ALTER TABLE sessions ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .ok();
-        let has_resume_id: bool = self.conn.query_row(
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN title_manual INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .ok();
+        let has_resume_id: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
             [],
             |row| row.get(0),
         )?;
         if !has_resume_id {
-            self.conn
-                .execute("ALTER TABLE sessions ADD COLUMN resume_id TEXT", [])?;
+            conn.execute("ALTER TABLE sessions ADD COLUMN resume_id TEXT", [])?;
         }
         Ok(())
     }
 
     /// The home window's last layout: pane tree, pane → session mapping,
     /// focused pane, and collapsed projects, as one JSON document.
-    fn migrate_v2(&self) -> Result<()> {
-        self.conn.execute_batch(
+    fn migrate_v2_conn(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workspace_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 layout_json TEXT NOT NULL,
@@ -205,40 +226,34 @@ impl Store {
     }
 
     /// Session recency, used to order the sidebar, plus the rename of the old
-    /// `resume_id` column to `agent_session_id`. Existing rows start their
-    /// recency clock at their creation time, so the first upgrade does not
-    /// shuffle them into an arbitrary order.
-    fn migrate_v3(&self) -> Result<()> {
-        // The field only ever held the agent-side session id used for title
-        // lookup; `agent_session_id` says that instead of promising a resume.
-        let has_old: bool = self.conn.query_row(
+    /// `resume_id` column to `agent_session_id`.
+    fn migrate_v3_conn(conn: &Connection) -> Result<()> {
+        let has_old: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'resume_id')",
             [],
             |row| row.get(0),
         )?;
-        let has_new: bool = self.conn.query_row(
+        let has_new: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'agent_session_id')",
             [],
             |row| row.get(0),
         )?;
         if has_old && !has_new {
-            self.conn.execute(
+            conn.execute(
                 "ALTER TABLE sessions RENAME COLUMN resume_id TO agent_session_id",
                 [],
             )?;
         } else if !has_new {
-            self.conn
-                .execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT", [])?;
+            conn.execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT", [])?;
         }
-        self.conn
-            .execute("ALTER TABLE sessions ADD COLUMN last_used_at TEXT", [])
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_used_at TEXT", [])
             .ok();
-        self.conn.execute(
+        conn.execute(
             "UPDATE sessions
              SET last_used_at = COALESCE(last_used_at, created_at, datetime('now'))",
             [],
         )?;
-        self.conn.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS sessions_last_used
              ON sessions(project_id, last_used_at DESC)",
             [],
@@ -248,10 +263,9 @@ impl Store {
 
     /// Projects own panes directly. Older databases stored a session row per
     /// terminal; their layout is rewritten onto the owning project and the
-    /// table is dropped. A project can later gain a worktree without growing
-    /// another list in the sidebar.
-    fn migrate_v4(&self) -> Result<()> {
-        let has_sessions: bool = self.conn.query_row(
+    /// table is dropped.
+    fn migrate_v4_conn(conn: &Connection) -> Result<()> {
+        let has_sessions: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions')",
             [],
             |row| row.get(0),
@@ -259,7 +273,7 @@ impl Store {
         if has_sessions {
             let mut session_project = HashMap::new();
             {
-                let mut stmt = self.conn.prepare("SELECT id, project_id FROM sessions")?;
+                let mut stmt = conn.prepare("SELECT id, project_id FROM sessions")?;
                 let rows =
                     stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
                 for row in rows {
@@ -267,12 +281,26 @@ impl Store {
                     session_project.insert(session, project);
                 }
             }
-            if let Some(json) = self.workspace_state()?
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT layout_json FROM workspace_state WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(json) = existing
                 && let Some(next) = rekey_workspace_json(&json, &session_project)
             {
-                self.save_workspace_state(&next)?;
+                conn.execute(
+                    "INSERT INTO workspace_state (id, layout_json, updated_at)
+                     VALUES (1, ?1, datetime('now'))
+                     ON CONFLICT(id) DO UPDATE SET
+                        layout_json = excluded.layout_json,
+                        updated_at = datetime('now')",
+                    params![next],
+                )?;
             }
-            self.conn.execute_batch(
+            conn.execute_batch(
                 "DROP INDEX IF EXISTS sessions_last_used;
                  DROP TABLE IF EXISTS sessions;",
             )?;
@@ -281,16 +309,14 @@ impl Store {
     }
 
     /// A worktree is a project that points at the repository it came from.
-    /// Deleting the repository removes its worktree rows with it; the
-    /// directories on disk are left alone.
-    fn migrate_v5(&self) -> Result<()> {
-        let has_parent: bool = self.conn.query_row(
+    fn migrate_v5_conn(conn: &Connection) -> Result<()> {
+        let has_parent: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'parent_id')",
             [],
             |row| row.get(0),
         )?;
         if !has_parent {
-            self.conn.execute_batch(
+            conn.execute_batch(
                 "ALTER TABLE projects
                      ADD COLUMN parent_id INTEGER
                      REFERENCES projects(id) ON DELETE CASCADE;
@@ -301,22 +327,36 @@ impl Store {
         Ok(())
     }
 
-    pub fn projects(&self) -> Vec<Project> {
+    pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, parent_id FROM projects ORDER BY id")
-            .unwrap();
-        stmt.query_map([], |row| {
+            .prepare("SELECT id, name, path, parent_id FROM projects ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
                 parent_id: row.get(3)?,
             })
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+        })?;
+        rows.collect()
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     pub fn insert_project(&self, name: &str, path: &str) -> Result<i64> {
@@ -351,7 +391,7 @@ impl Store {
         self.conn.execute(
             "WITH RECURSIVE tree(id) AS (
                  SELECT id FROM projects WHERE id = ?1
-                 UNION ALL
+                 UNION
                  SELECT projects.id FROM projects JOIN tree ON projects.parent_id = tree.id
              )
              DELETE FROM projects WHERE id IN (SELECT id FROM tree)",
@@ -677,20 +717,48 @@ pub const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
 /// writes.
 const SETTING_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Read one app setting; None when unset.
+/// Read one app setting; None when unset or when the on-disk database has not
+/// been initialized yet. Opens read-only so startup reads before [`Store::open`]
+/// never create an unmigrated 0-byte database file.
 pub fn get_setting(key: &str) -> Option<String> {
-    let conn = Connection::open(db_path()).ok()?;
+    if SETTINGS_READONLY.load(Ordering::Acquire) {
+        return None;
+    }
+    let path = db_path();
+    if !path.is_absolute() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     conn.busy_timeout(SETTING_BUSY_TIMEOUT).ok()?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok()?;
+    if version > SCHEMA_VERSION {
+        return None;
+    }
     conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
         row.get(0)
     })
     .ok()
 }
 
-/// Persist one app setting.
+/// Persist one app setting. No-op when this process refused a newer-schema
+/// database on startup so an older build never mutates a newer database.
 pub fn set_setting(key: &str, value: &str) -> Result<()> {
-    let conn = Connection::open(db_path())?;
+    if SETTINGS_READONLY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let path = db_path();
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(SETTING_BUSY_TIMEOUT)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        SETTINGS_READONLY.store(true, Ordering::Release);
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -699,10 +767,18 @@ pub fn set_setting(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Default database location: ~/.kumu/kumu.db.
+/// Default database location: ~/.kumu/kumu.db. Returns an empty path if `HOME`
+/// is unset or relative so callers never silently write into the current
+/// working directory.
 pub fn db_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join(".kumu").join("kumu.db")
+    let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) else {
+        return std::path::PathBuf::new();
+    };
+    let home = std::path::PathBuf::from(home);
+    if !home.is_absolute() {
+        return std::path::PathBuf::new();
+    }
+    home.join(".kumu").join("kumu.db")
 }
 
 #[cfg(test)]
@@ -787,12 +863,13 @@ mod tests {
         assert!(
             store
                 .projects()
+                .unwrap()
                 .iter()
                 .any(|p| p.id == doomed && p.name == "renamed")
         );
 
         store.delete_project(doomed).unwrap();
-        let projects = store.projects();
+        let projects = store.projects().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, kept);
     }
@@ -807,7 +884,7 @@ mod tests {
             .insert_worktree(repo, "feat/login", "/repo-feat-login")
             .unwrap();
 
-        let projects = store.projects();
+        let projects = store.projects().unwrap();
         assert_eq!(
             projects
                 .iter()
@@ -821,6 +898,7 @@ mod tests {
         assert!(
             store
                 .projects()
+                .unwrap()
                 .iter()
                 .all(|project| project.id != worktree)
         );
@@ -896,11 +974,11 @@ mod tests {
             INSERT INTO messages (session_id, role, content) VALUES (1, 'user', 'hi');",
         )
         .unwrap();
-        let store = Store { conn };
+        let mut store = Store { conn };
         store.init().unwrap();
 
-        assert_eq!(store.projects().len(), 1, "the project survives");
-        assert_eq!(store.projects()[0].name, "kumu");
+        assert_eq!(store.projects().unwrap().len(), 1, "the project survives");
+        assert_eq!(store.projects().unwrap()[0].name, "kumu");
         let sessions_table: i64 = store
             .conn
             .query_row(
@@ -988,7 +1066,7 @@ mod tests {
             [layout],
         )
         .unwrap();
-        let store = Store { conn };
+        let mut store = Store { conn };
         store.init().unwrap();
 
         let saved: serde_json::Value =
@@ -1075,7 +1153,7 @@ mod tests {
              PRAGMA foreign_keys = ON;",
         )
         .unwrap();
-        let store = Store { conn };
+        let mut store = Store { conn };
         assert!(store.init().is_err());
         assert_eq!(store.workspace_state().unwrap(), Some(layout));
         assert_eq!(

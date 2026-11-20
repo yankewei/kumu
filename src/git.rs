@@ -99,10 +99,13 @@ pub struct Patch {
 /// A commit that rewrites a generated file can produce a patch far bigger than
 /// anyone reads, so the panel stops at this many bytes of patch text.
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on commits loaded into the Git Log panel at once.
+const MAX_HISTORY_COMMITS: &str = "5000";
+/// Upper bound on captured stderr from a git subprocess.
+const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
-/// Read the full history of `dir`'s checked-out branch. The panel virtualizes
-/// the rows, so there is no limit here: "all commits" means every commit git
-/// reaches from `HEAD`.
+/// Read recent commit history of `dir`'s checked-out branch, bounded by
+/// [`MAX_HISTORY_COMMITS`] so huge repositories do not exhaust memory.
 pub fn history(dir: &Path) -> Result<History, String> {
     let root = repo_root(dir)?;
     let branch = current_branch(&root);
@@ -113,6 +116,8 @@ pub fn history(dir: &Path) -> Result<History, String> {
         &[
             "--no-optional-locks",
             "log",
+            "-n",
+            MAX_HISTORY_COMMITS,
             "-z",
             "--date=short",
             "--pretty=format:%H%x00%h%x00%D%x00%an%x00%ae%x00%cd%x00%s%x00%P%x00%b",
@@ -174,21 +179,28 @@ pub fn history(dir: &Path) -> Result<History, String> {
 /// prints nothing for; `--no-color` keeps a `color.ui=always` configuration
 /// from putting escape codes in the patch.
 pub fn commit_diff(dir: &Path, hash: &str) -> Result<Patch, String> {
+    if hash.is_empty() || hash.starts_with('-') {
+        return Err("无效的提交哈希".to_string());
+    }
     let root = repo_root(dir)?;
-    read_patch(
-        &root,
-        &[
-            "--no-optional-locks",
-            "show",
-            "--format=",
-            "--patch",
-            "--no-color",
-            "-m",
-            "--first-parent",
-            hash,
-        ],
-        false,
-    )
+    let args: Vec<std::ffi::OsString> = [
+        "--no-optional-locks",
+        "show",
+        "--format=",
+        "--patch",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "-m",
+        "--first-parent",
+        "--end-of-options",
+        hash,
+        "--",
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    read_patch(&root, &args, false)
 }
 
 /// Read what the index and the working tree changed.
@@ -212,50 +224,72 @@ pub fn changes(dir: &Path) -> Result<Changes, String> {
 }
 
 /// The patch one uncommitted change introduced, cut at [`MAX_PATCH_BYTES`].
-///
-/// A staged change is read from the index and an unstaged one from the working
-/// tree. An untracked file has nothing to diff against, so git compares it with
-/// an empty file; that run exits 1 because the files differ, which is the patch
-/// rather than a failure. A rename is filtered by both of its paths so git can
-/// pair the two sides.
 pub fn change_diff(dir: &Path, change: &Change) -> Result<Patch, String> {
     let root = repo_root(dir)?;
     let untracked = change.status == '?';
-    let mut args = vec!["--no-optional-locks", "diff", "--no-color"];
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--no-optional-locks".into(),
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+    ];
     if untracked {
-        args.push("--no-index");
+        args.push("--no-index".into());
     } else if change.staged {
-        args.push("--cached");
+        args.push("--cached".into());
     }
-    args.push("--");
+    args.push("--".into());
     if untracked {
-        args.push("/dev/null");
+        args.push("/dev/null".into());
+        // Pass an absolute path so an untracked file literally named `-` is
+        // never treated as stdin by `git diff --no-index`.
+        args.push(root.join(&change.path).into_os_string());
+    } else {
+        if let Some(original) = &change.original {
+            args.push(original.into());
+        }
+        args.push((&change.path).into());
     }
-    if let Some(original) = &change.original {
-        args.push(original);
-    }
-    args.push(&change.path);
     read_patch(&root, &args, untracked)
+}
+
+struct ChildGuard(Option<std::process::Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Read the patch `args` print, stopped at [`MAX_PATCH_BYTES`]. `diff --no-index`
 /// exits 1 when it found differences, which `differences_are_ok` accepts as a
 /// patch instead of an error.
-fn read_patch(dir: &Path, args: &[&str], differences_are_ok: bool) -> Result<Patch, String> {
-    let mut child = Command::new("git")
+fn read_patch(
+    dir: &Path,
+    args: &[std::ffi::OsString],
+    differences_are_ok: bool,
+) -> Result<Patch, String> {
+    let child = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("无法运行 git：{error}"))?;
+    let mut guard = ChildGuard(Some(child));
 
     // stderr is drained on its own thread: a chatty git must not fill the pipe
     // and block while the patch is read.
-    let stderr = child.stderr.take().map(drain);
+    let stderr = guard.0.as_mut().and_then(|c| c.stderr.take()).map(drain);
     let mut output = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = guard.0.as_mut().and_then(|c| c.stdout.take()) {
         stdout
             .take(MAX_PATCH_BYTES as u64 + 1)
             .read_to_end(&mut output)
@@ -264,6 +298,7 @@ fn read_patch(dir: &Path, args: &[&str], differences_are_ok: bool) -> Result<Pat
     // Everything past the cap would be thrown away, so stop git instead of
     // waiting for output nobody reads.
     let truncated = output.len() > MAX_PATCH_BYTES;
+    let mut child = guard.0.take().expect("git child");
     if truncated {
         let _ = child.kill();
     }
@@ -277,8 +312,10 @@ fn read_patch(dir: &Path, args: &[&str], differences_are_ok: bool) -> Result<Pat
     if !truncated && !status.success() && !changed {
         let command = args
             .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .copied()
+            .find_map(|arg| {
+                let s = arg.to_str()?;
+                (!s.starts_with('-')).then_some(s)
+            })
             .unwrap_or("git");
         return Err(git_failure(command, status, &stderr));
     }
@@ -370,12 +407,12 @@ fn push_xy(changes: &mut Changes, xy: &str, path: &str, original: Option<&str>) 
     }
 }
 
-/// Read a child's stderr to the end on its own thread.
-fn drain(mut pipe: ChildStderr) -> JoinHandle<String> {
+/// Read a child's stderr up to [`MAX_STDERR_BYTES`] on its own thread.
+fn drain(pipe: ChildStderr) -> JoinHandle<String> {
     thread::spawn(move || {
-        let mut message = String::new();
-        let _ = pipe.read_to_string(&mut message);
-        message
+        let mut bytes = Vec::new();
+        let _ = pipe.take(MAX_STDERR_BYTES).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
     })
 }
 
@@ -447,12 +484,15 @@ fn current_branch(root: &Path) -> String {
 /// recreated.
 pub fn create_worktree(dir: &Path, branch: &str) -> Result<Worktree, String> {
     let branch = branch.trim();
-    if branch.is_empty() {
-        return Err("分支名不能为空".to_string());
+    if branch.is_empty() || branch.starts_with('-') || branch.contains("@{") {
+        return Err(format!("「{branch}」不是有效的分支名"));
     }
     let root = repo_root(dir)?;
-    git(&root, &["check-ref-format", "--branch", branch])
+    let branch = git(&root, &["check-ref-format", "--branch", branch])
         .map_err(|_| format!("「{branch}」不是有效的分支名"))?;
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err(format!("「{branch}」不是有效的分支名"));
+    }
 
     let repo_name = root
         .file_name()
@@ -469,16 +509,31 @@ pub fn create_worktree(dir: &Path, branch: &str) -> Result<Worktree, String> {
 
     let branch_ref = format!("refs/heads/{branch}");
     if git(&root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok() {
-        git(&root, &["worktree", "add", &path_arg(&path), branch])?;
+        git_raw_os(
+            &root,
+            &[
+                std::ffi::OsStr::new("worktree"),
+                std::ffi::OsStr::new("add"),
+                std::ffi::OsStr::new("--"),
+                path.as_os_str(),
+                std::ffi::OsStr::new(&branch),
+            ],
+        )?;
     } else {
-        let path = path_arg(&path);
-        git(&root, &["worktree", "add", "-b", branch, &path])?;
+        git_raw_os(
+            &root,
+            &[
+                std::ffi::OsStr::new("worktree"),
+                std::ffi::OsStr::new("add"),
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new(&branch),
+                std::ffi::OsStr::new("--"),
+                path.as_os_str(),
+            ],
+        )?;
     }
 
-    Ok(Worktree {
-        name: branch.to_string(),
-        path,
-    })
+    Ok(Worktree { name: branch, path })
 }
 
 /// Every worktree attached to the repository that contains `dir`, including
@@ -486,53 +541,81 @@ pub fn create_worktree(dir: &Path, branch: &str) -> Result<Worktree, String> {
 /// is pruned) are left out: Kumu cannot open them.
 pub fn list_worktrees(dir: &Path) -> Result<Vec<WorktreeEntry>, String> {
     let root = repo_root(dir)?;
-    let output = git(&root, &["worktree", "list", "--porcelain"])?;
+    let output = git_raw(&root, &["worktree", "list", "--porcelain", "-z"])?;
     let mut entries = Vec::new();
     let normalize = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    // Porcelain output is one block per worktree, separated by a blank line.
-    // Git lists the main worktree first, but the path comparison below is
-    // what decides which entry it is.
-    for block in output.split("\n\n") {
-        let mut path = None;
-        let mut branch = None;
-        let mut unusable = false;
-        for line in block.lines() {
-            if let Some(value) = line.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(value));
-            } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
-                branch = Some(value.to_string());
+    // `-z` terminates each field with NUL and separates worktree stanzas with
+    // an empty NUL-terminated record, so paths containing newlines parse intact.
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    let mut unusable = false;
+    let mut flush =
+        |path: &mut Option<PathBuf>, branch: &mut Option<String>, unusable: &mut bool| {
+            let Some(p) = path.take() else {
+                *branch = None;
+                *unusable = false;
+                return;
+            };
+            let b = branch.take();
+            let skip = std::mem::take(unusable);
+            if skip || !p.exists() {
+                return;
             }
-            // A bare repository has no checkout, and a prunable entry has no
-            // directory left to open.
-            unusable |= line == "bare" || line.starts_with("prunable");
-        }
-        let Some(path) = path else {
-            continue;
+            let main = normalize(&p) == normalize(&root);
+            let name = b.filter(|name| !name.is_empty()).unwrap_or_else(|| {
+                p.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned())
+            });
+            entries.push(WorktreeEntry {
+                name,
+                path: p,
+                main,
+            });
         };
-        if unusable || !path.exists() {
+    for field in output.split(|&b| b == 0) {
+        if field.is_empty() {
+            flush(&mut path, &mut branch, &mut unusable);
             continue;
         }
-        let main = normalize(&path) == normalize(&root);
-        let name = branch.filter(|name| !name.is_empty()).unwrap_or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned())
-        });
-        entries.push(WorktreeEntry { name, path, main });
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                path = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+            }
+            #[cfg(not(unix))]
+            {
+                path = Some(PathBuf::from(String::from_utf8_lossy(value).into_owned()));
+            }
+        } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
+            branch = Some(String::from_utf8_lossy(value).into_owned());
+        } else if field == b"bare" || field.starts_with(b"prunable") {
+            unusable = true;
+        }
     }
+    flush(&mut path, &mut branch, &mut unusable);
     Ok(entries)
 }
 
 /// The repository working tree that contains `dir`, which may be a
 /// subdirectory of it.
 fn repo_root(dir: &Path) -> Result<PathBuf, String> {
-    let output = git(dir, &["rev-parse", "--show-toplevel"])
+    let raw = git_raw(dir, &["rev-parse", "--show-toplevel"])
         .map_err(|error| format!("不是 git 仓库：{error}"))?;
-    Ok(PathBuf::from(output))
-}
-
-fn path_arg(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    let trimmed = raw
+        .strip_suffix(b"\r\n")
+        .or_else(|| raw.strip_suffix(b"\n"))
+        .unwrap_or(&raw);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(String::from_utf8_lossy(trimmed).into_owned()))
+    }
 }
 
 /// Run git in `dir` and return trimmed stdout, or its stderr on failure.
@@ -545,17 +628,26 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// Run git in `dir` and return stdout exactly as git wrote it, NUL separators
 /// included.
 fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+    git_raw_os(dir, &os_args)
+}
+
+fn git_raw_os(dir: &Path, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("无法运行 git：{error}"))?;
     if !output.status.success() {
         let command = args
             .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .copied()
+            .find_map(|arg| {
+                let s = arg.to_str()?;
+                (!s.starts_with('-')).then_some(s)
+            })
             .unwrap_or("git");
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(git_failure(command, output.status, &stderr));
@@ -601,6 +693,8 @@ mod tests {
         git(&repo, &["init", "-q"]).unwrap();
         git(&repo, &["config", "user.email", "test@example.com"]).unwrap();
         git(&repo, &["config", "user.name", "test"]).unwrap();
+        git(&repo, &["config", "commit.gpgsign", "false"]).unwrap();
+        git(&repo, &["config", "tag.gpgsign", "false"]).unwrap();
         std::fs::write(repo.join("a"), "a").unwrap();
         git(&repo, &["add", "a"]).unwrap();
         git(&repo, &["commit", "-qm", "init"]).unwrap();
@@ -640,7 +734,7 @@ mod tests {
                 "worktree",
                 "add",
                 "--detach",
-                &path_arg(&detached_path),
+                &detached_path.to_string_lossy(),
                 "HEAD",
             ],
         )

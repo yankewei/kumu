@@ -1,16 +1,40 @@
 //! Persistent agent registration, independent of how the user launches a CLI.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
 use serde_json::{Value, json};
 
 use super::launch::{SESSION_PREFIX, clean_session};
+use crate::term::SESSION_TOKEN_ENV;
 
 const MARKER: &str = " # kumu-notifications";
+const MAX_HOOK_PAYLOAD_BYTES: u64 = 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+const O_NOCTTY: i32 = 0x20000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(target_os = "linux")]
+const O_NOCTTY: i32 = 0x0100;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0x0800;
+
+fn non_empty_env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn is_under_managed(path: &Path, managed: &Path) -> bool {
+    !path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+        && path.starts_with(managed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -29,7 +53,8 @@ fn paths(agent: &str) -> io::Result<Paths> {
     let home = crate::db::db_path()
         .parent()
         .and_then(Path::parent)
-        .expect("home directory")
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| io::Error::other("无法确定用户主目录（HOME 未设置）"))?
         .to_path_buf();
     // Pi and Oh My Pi load the same extension API. They share one installed
     // module so a common `PI_CODING_AGENT_DIR` cannot make the two
@@ -41,30 +66,24 @@ fn paths(agent: &str) -> io::Result<Paths> {
         agent
     });
     let registration = match agent {
-        "codex" => std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
+        "codex" => non_empty_env_path("CODEX_HOME")
             .unwrap_or_else(|| home.join(".codex"))
             .join("hooks.json"),
-        "claude" => std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
+        "claude" => non_empty_env_path("CLAUDE_CONFIG_DIR")
             .unwrap_or_else(|| home.join(".claude"))
             .join("settings.json"),
-        "pi" => std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
+        "pi" => non_empty_env_path("PI_CODING_AGENT_DIR")
             .unwrap_or_else(|| home.join(".pi/agent"))
             .join("extensions/kumu-notifications"),
-        "omp" => std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
+        "omp" => non_empty_env_path("PI_CODING_AGENT_DIR")
             .unwrap_or_else(|| {
-                std::env::var_os("PI_CONFIG_DIR")
-                    .map(PathBuf::from)
+                non_empty_env_path("PI_CONFIG_DIR")
                     .unwrap_or_else(|| home.join(".omp"))
                     .join("agent")
             })
             .join("extensions/kumu-notifications"),
         "opencode" => {
-            let config = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
+            let config = non_empty_env_path("XDG_CONFIG_HOME")
                 .unwrap_or_else(|| home.join(".config"))
                 .join("opencode/plugins");
             config.join("kumu-notifications")
@@ -72,11 +91,8 @@ fn paths(agent: &str) -> io::Result<Paths> {
         // Cursor's own config directory: CURSOR_CONFIG_DIR, else
         // $XDG_CONFIG_HOME/cursor, else ~/.cursor. Its user hooks live in one
         // flat `hooks.json` at the top of that directory.
-        "cursor" => std::env::var_os("CURSOR_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("cursor"))
-            })
+        "cursor" => non_empty_env_path("CURSOR_CONFIG_DIR")
+            .or_else(|| non_empty_env_path("XDG_CONFIG_HOME").map(|path| path.join("cursor")))
             .unwrap_or_else(|| home.join(".cursor"))
             .join("hooks.json"),
         // Grok Build reads personal hooks from ~/.grok/hooks/*.json. Kumu keeps
@@ -201,7 +217,7 @@ fn remove_managed_hooks(hooks: &CstObject) -> bool {
         };
         let event_removed = remove_managed_from_groups(&groups);
         removed |= event_removed;
-        if groups.elements().is_empty() {
+        if event_removed && groups.elements().is_empty() {
             property.remove();
         }
     }
@@ -298,8 +314,9 @@ fn remove_cursor_handlers(hooks: &CstObject) -> bool {
         let Some(handlers) = property.value().and_then(|value| value.as_array()) else {
             continue;
         };
-        removed |= remove_managed_from_event(&handlers);
-        if handlers.elements().is_empty() {
+        let event_removed = remove_managed_from_event(&handlers);
+        removed |= event_removed;
+        if event_removed && handlers.elements().is_empty() {
             property.remove();
         }
     }
@@ -442,12 +459,32 @@ fn hooks_status(value: &Value, install: &[(&'static str, Value)], nested: bool) 
             .get("hooks")
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array);
-        // Compare the entry itself, so a user-added handler inside the same
-        // nested group does not pass as Kumu's registration.
-        complete &= groups.is_some_and(|groups| groups.iter().any(|entry| entry == expected));
-        found |= event_handlers(value, event, nested)
-            .iter()
-            .any(is_managed_hook);
+        let correct = groups
+            .map(|entries| entries.iter().filter(|entry| *entry == expected).count())
+            .unwrap_or(0);
+        let managed = groups
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        if nested {
+                            entry
+                                .get("hooks")
+                                .and_then(Value::as_array)
+                                .is_some_and(|handlers| handlers.iter().any(is_managed_hook))
+                        } else {
+                            is_managed_hook(entry)
+                        }
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        complete &= correct == 1 && managed == 1;
+        found |= managed > 0;
+    }
+    // Cursor rejects hooks files that lack a schema version.
+    if !nested && value.get("version").is_none() {
+        complete = false;
     }
     // A managed handler under an event this version no longer registers still
     // fires in the Agent; ask for a repair so install can prune it.
@@ -518,6 +555,17 @@ pub fn status(agent: &str) -> io::Result<Status> {
         });
     }
     let target = paths.assets.join("extension");
+    match std::fs::symlink_metadata(&paths.registration) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            return Err(io::Error::other(format!(
+                "接入路径已有其他文件，未覆盖：{}",
+                paths.registration.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Status::Missing),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
     match std::fs::read_link(&paths.registration) {
         Ok(current) if current == target => {
             let current = paths.registration.exists()
@@ -534,7 +582,7 @@ pub fn status(agent: &str) -> io::Result<Status> {
             })
         }
         // A link from an older Kumu layout can be repaired in place.
-        Ok(current) if current.starts_with(&paths.managed) => Ok(Status::NeedsRepair),
+        Ok(current) if is_under_managed(&current, &paths.managed) => Ok(Status::NeedsRepair),
         Ok(_) => Err(io::Error::other(format!(
             "接入路径已被其他链接占用：{}",
             paths.registration.display()
@@ -558,29 +606,43 @@ pub fn install(agent: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Copy this build's extension files into Kumu's managed directory.
+/// Copy this build's extension files atomically into Kumu's managed directory.
 fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
     for (relative, contents) in asset_files(agent) {
         let file = paths.assets.join(relative);
-        std::fs::create_dir_all(file.parent().expect("asset directory"))?;
-        if std::fs::read_to_string(&file).ok().as_deref() != Some(contents.as_str()) {
-            std::fs::write(file, contents)?;
+        let parent = file.parent().expect("asset directory");
+        std::fs::create_dir_all(parent)?;
+        if std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(io::Error::other(format!(
+                "托管扩展文件不应为符号链接：{}",
+                file.display()
+            )));
         }
+        if std::fs::read_to_string(&file).ok().as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        let temporary = temporary_path(&file);
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)?;
+        let result = (|| {
+            out.write_all(contents.as_bytes())?;
+            out.sync_all()?;
+            drop(out);
+            std::fs::rename(&temporary, &file)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
     }
     Ok(())
 }
 
 /// Bring Kumu's own extension files up to date at startup, for an agent whose
 /// registration already points at them.
-///
-/// Hook-based agents need nothing here: their handler runs this binary, so a
-/// new app build is used immediately. Native extensions are copied files, and
-/// only the settings toggle rewrites them — without this, an app update would
-/// leave a registered agent running last version's plugin, and an older
-/// OpenCode plugin never reports session ids, silently turning auto resume
-/// into a no-op. This only touches Kumu's managed directory, never a foreign
-/// registration; a link left by an older Kumu layout is re-pointed, exactly as
-/// an explicit install would.
 pub fn refresh_native() {
     for agent in ["opencode", "pi", "omp"] {
         let Ok(paths) = paths(agent) else {
@@ -601,7 +663,7 @@ pub fn refresh_native() {
 /// all — must be left alone by a background refresh.
 fn registration_is_ours(paths: &Paths) -> bool {
     std::fs::read_link(&paths.registration).is_ok_and(|current| {
-        current == paths.assets.join("extension") || current.starts_with(&paths.managed)
+        current == paths.assets.join("extension") || is_under_managed(&current, &paths.managed)
     })
 }
 
@@ -618,7 +680,19 @@ fn refresh_registered(paths: &Paths, agent: &str) -> io::Result<()> {
 pub fn uninstall(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
     if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
-        return update_hook_file(&paths.registration, agent, true);
+        update_hook_file(&paths.registration, agent, true)?;
+        // Grok's file is Kumu-owned (`~/.grok/hooks/kumu-notifications.json`):
+        // remove it once empty instead of leaving `{}` behind.
+        if agent == "grok"
+            && let Ok(text) = std::fs::read_to_string(&paths.registration)
+            && serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.as_object().map(|obj| obj.is_empty()))
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&paths.registration);
+        }
+        return Ok(());
     }
     remove_link(
         &paths.registration,
@@ -634,27 +708,31 @@ fn register_link(entry: &Path, target: &Path, managed: &Path) -> io::Result<()> 
             let previous = std::fs::read_link(entry).ok();
             if !previous
                 .as_deref()
-                .is_some_and(|path| path.starts_with(managed))
+                .is_some_and(|path| is_under_managed(path, managed))
             {
                 return Err(io::Error::other(format!(
                     "接入路径已有其他文件，未覆盖：{}",
                     entry.display()
                 )));
             }
-            // Replace Kumu's own older layout instead of reporting a conflict.
-            std::fs::remove_file(entry)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     std::fs::create_dir_all(entry.parent().expect("registration directory"))?;
-    symlink(target, entry)
+    let temporary = temporary_path(entry);
+    symlink(target, &temporary)?;
+    if let Err(error) = std::fs::rename(&temporary, entry) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn remove_link(entry: &Path, target: &Path, managed: &Path) -> io::Result<()> {
     match std::fs::read_link(entry) {
         Ok(current) if current == target => std::fs::remove_file(entry),
-        Ok(current) if current.starts_with(managed) => std::fs::remove_file(entry),
+        Ok(current) if is_under_managed(&current, managed) => std::fs::remove_file(entry),
         Ok(_) => Err(io::Error::other(format!(
             "接入路径属于其他链接，未删除：{}",
             entry.display()
@@ -701,7 +779,8 @@ fn update_hook_file(path: &Path, agent: &str, remove: bool) -> io::Result<()> {
     if original.as_deref() == Some(updated.as_str()) {
         return Ok(());
     }
-    std::fs::create_dir_all(path.parent().expect("hook directory"))?;
+    let parent = path.parent().expect("hook directory");
+    std::fs::create_dir_all(parent)?;
     let temporary = temporary_path(&path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -714,11 +793,20 @@ fn update_hook_file(path: &Path, agent: &str, remove: bool) -> io::Result<()> {
         }
         file.write_all(updated.as_bytes())?;
         file.sync_all()?;
-        // Best effort against a concurrent editor; rename itself is atomic.
-        if std::fs::read_to_string(&path).ok() != original {
+        // Best effort against a concurrent editor; distinguish NotFound from IO errors.
+        let current = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if current != original {
             return Err(io::Error::other("Agent 配置已被其他程序修改，请重试"));
         }
-        std::fs::rename(&temporary, &path)
+        std::fs::rename(&temporary, &path)?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -727,11 +815,21 @@ fn update_hook_file(path: &Path, agent: &str, remove: bool) -> io::Result<()> {
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    path.with_extension(format!("kumu-{}-{nonce}.tmp", std::process::id()))
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let hidden = format!(".{name}.kumu-{}-{nonce}-{seq}.tmp", std::process::id());
+    match path.parent() {
+        Some(parent) => parent.join(hidden),
+        None => PathBuf::from(hidden),
+    }
 }
 
 /// Called by persistent hooks; the CLI returns before GPUI is initialized.
@@ -741,6 +839,9 @@ pub fn run_cli() -> Option<i32> {
         return None;
     }
     let agent = args.next().unwrap_or_default();
+    if !matches!(agent.as_str(), "claude" | "codex" | "grok" | "cursor") {
+        return Some(0);
+    }
     let message = match args.next().as_deref() {
         Some("complete") => "本轮任务已结束",
         Some("permission") => "需要你确认操作权限",
@@ -749,12 +850,15 @@ pub fn run_cli() -> Option<i32> {
     if std::env::var("KUMU_TERMINAL").as_deref() != Ok("1") {
         return Some(0);
     }
+    let token = std::env::var(SESSION_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty());
     // Hooks run with the event's JSON on stdin, which is where Claude, Codex
     // and Cursor put the session id. The session update is another OSC on the
     // same channel, framed as a notification so the pane can tell it apart.
     let mut sequence = String::new();
     if let Some(session) = hook_payload().as_ref().and_then(session_id)
-        && let Some(update) = session_sequence(&agent, &session)
+        && let Some(update) = session_sequence(&agent, &session, token.as_deref())
     {
         sequence.push_str(&update);
     }
@@ -781,12 +885,7 @@ pub fn run_cli() -> Option<i32> {
 }
 
 /// The hook event as JSON, or `None` when stdin is a terminal or stays silent.
-///
-/// Hooks close stdin after writing, but a shell this binary is run from by hand
-/// has no payload at all: the wait is bounded so an interactive run cannot
-/// hang the hook's timeout.
 fn hook_payload() -> Option<Value> {
-    use std::io::IsTerminal;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -796,20 +895,29 @@ fn hook_payload() -> Option<Value> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut payload = String::new();
-        let _ = io::stdin().read_to_string(&mut payload);
+        let _ = io::stdin()
+            .take(MAX_HOOK_PAYLOAD_BYTES)
+            .read_to_string(&mut payload);
         let _ = tx.send(payload);
     });
-    let payload = rx.recv_timeout(Duration::from_millis(300)).ok()?;
+    let payload = rx.recv_timeout(Duration::from_millis(500)).ok()?;
     serde_json::from_str(&payload).ok()
 }
 
 /// The OSC that reports a conversation id, framed as a notification so it
 /// travels the channel every hook already writes to.
-fn session_sequence(agent: &str, session: &str) -> Option<String> {
+fn session_sequence(agent: &str, session: &str, token: Option<&str>) -> Option<String> {
     let session = clean_session(session)?;
-    Some(format!(
-        "\x1b]777;notify;{agent};{SESSION_PREFIX}{session}\x07"
-    ))
+    let body = match token.filter(|t| {
+        !t.is_empty()
+            && t.len() <= 128
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    }) {
+        Some(token) => format!("{SESSION_PREFIX}{token}:{session}"),
+        None => format!("{SESSION_PREFIX}{session}"),
+    };
+    Some(format!("\x1b]777;notify;{agent};{body}\x07"))
 }
 
 /// The conversation id in a hook payload. Every shape Kumu registers uses
@@ -829,10 +937,19 @@ fn session_id(payload: &Value) -> Option<String> {
 }
 
 fn open_notification_tty() -> Option<std::fs::File> {
-    let path = std::env::var_os("KUMU_TTY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/tty"));
-    std::fs::OpenOptions::new().write(true).open(path).ok()
+    let path = non_empty_env_path("KUMU_TTY").unwrap_or_else(|| PathBuf::from("/dev/tty"));
+    let text = path.to_str()?;
+    let valid_dev =
+        text == "/dev/tty" || text.starts_with("/dev/ttys") || text.starts_with("/dev/pts/");
+    if !valid_dev {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NOCTTY | O_NONBLOCK)
+        .open(&path)
+        .ok()?;
+    file.is_terminal().then_some(file)
 }
 
 #[cfg(test)]
@@ -843,11 +960,35 @@ mod tests {
     #[test]
     fn a_conversation_id_travels_as_a_silent_osc() {
         assert_eq!(
-            session_sequence("codex", "abc-1").as_deref(),
+            session_sequence("codex", "abc-1", None).as_deref(),
             Some("\x1b]777;notify;codex;kumu-session:abc-1\x07")
         );
-        assert!(session_sequence("codex", "a;b").is_none());
-        assert!(session_sequence("codex", "a\x07b").is_none());
+        assert_eq!(
+            session_sequence("codex", "abc-1", Some("tok99")).as_deref(),
+            Some("\x1b]777;notify;codex;kumu-session:tok99:abc-1\x07")
+        );
+        assert!(session_sequence("codex", "a;b", None).is_none());
+        assert!(session_sequence("codex", "a\x07b", None).is_none());
+        assert!(session_sequence("codex", "--yolo", Some("tok99")).is_none());
+    }
+
+    #[test]
+    fn removal_keeps_unrelated_user_empty_hook_arrays_and_rejects_parent_traversal() {
+        let with_empty =
+            edit_hooks(r#"{"hooks":{"BeforeTool":[]}}"#, "claude", false).expect("install");
+        let after = edit_hooks(&with_empty, "claude", true).expect("remove");
+        let parsed: Value = serde_json::from_str(&after).expect("json");
+        assert_eq!(parsed["hooks"]["BeforeTool"], json!([]));
+
+        let managed = Path::new("/Users/me/.kumu/agent-integration");
+        assert!(is_under_managed(
+            Path::new("/Users/me/.kumu/agent-integration/pi/extension"),
+            managed
+        ));
+        assert!(!is_under_managed(
+            Path::new("/Users/me/.kumu/agent-integration/../../other"),
+            managed
+        ));
     }
 
     #[test]

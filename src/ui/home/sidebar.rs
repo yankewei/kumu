@@ -28,7 +28,10 @@ impl KumuApp {
             UpdateStatus::Downloading { downloaded, total } => {
                 let label = match total {
                     Some(total) if *total > 0 => {
-                        format!("正在下载 {}%", downloaded.saturating_mul(100) / total)
+                        format!(
+                            "正在下载 {}%",
+                            (downloaded.saturating_mul(100) / total).min(100)
+                        )
                     }
                     _ => "正在下载更新…".to_string(),
                 };
@@ -47,18 +50,30 @@ impl KumuApp {
         // Worktrees hang under the project they were created from. A row
         // whose parent is gone (a database trimmed outside Kumu) still shows
         // at the top level instead of disappearing.
+        let mut rendered = std::collections::HashSet::with_capacity(projects.len());
         let roots = projects.iter().filter(|project| {
-            project
-                .parent_id
-                .is_none_or(|parent| !projects.iter().any(|project| project.id == parent))
+            project.parent_id.is_none_or(|parent| {
+                parent == project.id || !projects.iter().any(|candidate| candidate.id == parent)
+            })
         });
         for project in roots {
-            tree.push(self.render_project_row(project, false, cx));
+            if rendered.insert(project.id) {
+                tree.push(self.render_project_row(project, false, cx));
+            }
             for worktree in projects
                 .iter()
                 .filter(|worktree| worktree.parent_id == Some(project.id))
             {
-                tree.push(self.render_project_row(worktree, true, cx));
+                if rendered.insert(worktree.id) {
+                    tree.push(self.render_project_row(worktree, true, cx));
+                }
+            }
+        }
+        // Any remaining rows (e.g. a corrupted parent_id cycle) still appear
+        // at top level instead of vanishing from the sidebar.
+        for project in projects {
+            if rendered.insert(project.id) {
+                tree.push(self.render_project_row(project, false, cx));
             }
         }
 
@@ -364,7 +379,10 @@ impl KumuApp {
 fn reveal_in_finder(path: String, cx: &mut App) {
     cx.background_spawn(async move {
         // Reap the child instead of leaving `open` as a zombie until quit.
-        let _ = std::process::Command::new("open").arg(path).status();
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg("--")
+            .arg(path)
+            .status();
     })
     .detach();
 }

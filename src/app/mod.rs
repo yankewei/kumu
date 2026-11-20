@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter, Global};
 
-use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX};
+use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX, authenticated_session};
 use crate::db::{Project, Store, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
@@ -199,22 +199,33 @@ impl Workspace {
     /// never opens onto nothing. The seeded flag keeps an intentionally
     /// emptied workspace empty on later launches.
     fn bootstrap(&mut self) {
-        let seeded = self.persistent && crate::db::get_setting(crate::db::SETTING_SEEDED).is_some();
+        let seeded = self.persistent
+            && match self.store.setting(crate::db::SETTING_SEEDED) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                // Do not re-seed on a transient DB error.
+                Err(_) => true,
+            };
         if !seeded {
-            let seeded_ok = if self.store.projects().is_empty() {
-                insert_bootstrap_project(&self.store).is_some()
-            } else {
-                true
+            let seeded_ok = match self.store.projects() {
+                Ok(projects) if projects.is_empty() => {
+                    insert_bootstrap_project(&self.store).is_some()
+                }
+                Ok(_) => true,
+                Err(_) => false,
             };
             if seeded_ok && self.persistent {
-                let _ = crate::db::set_setting(crate::db::SETTING_SEEDED, "1");
+                let _ = self.store.set_setting(crate::db::SETTING_SEEDED, "1");
             }
         }
         self.refresh();
     }
 
     fn refresh(&mut self) {
-        self.projects = self.store.projects();
+        match self.store.projects() {
+            Ok(projects) => self.projects = projects,
+            Err(error) => eprintln!("[app] 读取项目列表失败：{error}"),
+        }
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -313,7 +324,12 @@ impl Workspace {
         {
             return true;
         }
-        if self.terms.len() >= MAX_LIVE_TERMINALS {
+        let alive = self
+            .terms
+            .values()
+            .filter(|live| !live.term.snapshot().exited)
+            .count();
+        if alive >= MAX_LIVE_TERMINALS {
             return false;
         }
         let Some(path) = self.project(project_id).map(|project| project.path.clone()) else {
@@ -328,6 +344,7 @@ impl Workspace {
         if let Some(live) = self.terms.get_mut(&term_id) {
             live.pane = None;
             live.parked_for = Some(pane);
+            live.term.wake_handled();
         }
         self.touch_terminal(term_id);
         true
@@ -339,16 +356,27 @@ impl Workspace {
         self.live_for_pane(pane).map(|live| live.launch.is_shell())
     }
 
+    /// Snapshot the current process table once so callers checking several
+    /// panes do not spawn `/bin/ps` repeatedly on the UI thread.
+    pub fn process_tree_snapshot() -> Option<String> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// Whether `program` (an executable file name) still runs below the shell
-    /// shown in `pane`. `None` when there is nothing to inspect — a pane
-    /// started as an agent reports its own exit, and a pane with no process
-    /// has no evidence either way.
-    pub fn pane_runs_program(&self, pane: u64, program: &str) -> Option<bool> {
+    /// shown in `pane`, evaluated against a previously captured `ps` snapshot.
+    pub fn pane_runs_program_in(&self, pane: u64, program: &str, ps: &str) -> Option<bool> {
         let live = self.live_for_pane(pane)?;
         if !live.launch.is_shell() {
             return None;
         }
-        descendant_runs(live.term.child_pid()?, program)
+        Some(tree_runs(ps, live.term.child_pid()?, program))
     }
 
     /// The live terminal a pane shows, or the one parked for it.
@@ -428,6 +456,7 @@ impl Workspace {
             let live = self.terms.get_mut(&terminal)?;
             live.pane = Some(pane);
             live.parked_for = None;
+            live.term.wake_handled();
             self.pane_term.insert(pane, terminal);
         }
         self.touch_terminal(terminal);
@@ -464,10 +493,6 @@ impl Workspace {
             .get(&terminal)
             .map(|live| live.term.label())
             .unwrap_or_default()
-    }
-
-    pub fn terminal_generation(&self, pane: u64) -> Option<u64> {
-        self.shown_term(pane).map(|live| live.term.generation())
     }
 
     pub fn terminal_wake_handled(&self, pane: u64) {
@@ -585,6 +610,7 @@ impl Workspace {
         };
         live.pane = None;
         live.parked_for = Some(pane);
+        live.term.wake_handled();
         if live.term.snapshot().spawn_error.is_some() {
             self.drop_term(term_id);
         }
@@ -672,85 +698,101 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            while wake.next().await.is_some() {
-                let watching = this
-                    .update(cx, |workspace, cx| {
-                        let Some(live) = workspace.terms.get_mut(&term_id) else {
-                            return false;
-                        };
-                        let snapshot = live.term.snapshot();
-                        let pane = live.pane;
-                        let owning_pane = pane.or(live.parked_for);
-                        let agent_pane = !live.launch.is_shell();
-                        let resume_failed = resume_failed(&live.launch, live.started);
-                        let term = live.term.clone();
-                        while let Some(notification) = term.take_notification() {
-                            // A session update travels as a notification but
-                            // is not one: record it with the pane and stay
-                            // silent.
-                            if let Some(session) = notification.body.strip_prefix(SESSION_PREFIX)
-                                && let Some(pane) = owning_pane
+            let drain = |this: &gpui::WeakEntity<Workspace>, cx: &mut gpui::AsyncApp| -> bool {
+                this.update(cx, |workspace, cx| {
+                    let Some(live) = workspace.terms.get_mut(&term_id) else {
+                        return false;
+                    };
+                    let term = live.term.clone();
+                    // Clear the wake gate *before* reading the snapshot and
+                    // draining notifications so any event published
+                    // concurrently schedules a fresh wake — even for hidden
+                    // tabs or parked terminals that have no TerminalView.
+                    term.wake_handled();
+                    let snapshot = term.snapshot();
+                    let pane = live.pane;
+                    let owning_pane = pane.or(live.parked_for);
+                    let agent_pane = !live.launch.is_shell();
+                    let resume_failed = resume_failed(&live.launch, live.started);
+                    while let Some(notification) = term.take_notification() {
+                        // A session update travels as a notification but is
+                        // not one: authenticate it against the pane's random
+                        // token so untrusted terminal output cannot spoof it.
+                        if let Some(rest) = notification.body.strip_prefix(SESSION_PREFIX) {
+                            if let Some(pane) = owning_pane
+                                && let Some(session) =
+                                    authenticated_session(rest, term.session_token())
                             {
                                 cx.emit(WorkspaceEvent::Session {
                                     pane,
                                     agent: notification.title.clone(),
                                     session: session.to_string(),
                                 });
-                                continue;
                             }
-                            let now = Instant::now();
-                            if !live
-                                .last_notification
-                                .as_ref()
-                                .is_some_and(|(last, previous)| {
-                                    now.duration_since(*last) < Duration::from_secs(2)
-                                        && previous == &notification
-                                })
-                            {
-                                live.last_notification = Some((now, notification.clone()));
-                                cx.emit(WorkspaceEvent::Attention {
-                                    terminal: term_id,
+                            continue;
+                        }
+                        let now = Instant::now();
+                        if !live
+                            .last_notification
+                            .as_ref()
+                            .is_some_and(|(last, previous)| {
+                                now.duration_since(*last) < Duration::from_secs(2)
+                                    && previous == &notification
+                            })
+                        {
+                            live.last_notification = Some((now, notification.clone()));
+                            cx.emit(WorkspaceEvent::Attention {
+                                terminal: term_id,
+                                project: project_id,
+                                notification,
+                            });
+                        }
+                    }
+                    // A parked terminal that failed to spawn has no header to
+                    // display the error; drop it so it does not leak a slot.
+                    if pane.is_none() && snapshot.spawn_error.is_some() {
+                        workspace.drop_term(term_id);
+                        return false;
+                    }
+                    // A clean shell death closes this pane; an agent death
+                    // turns it back into a shell. The project stays.
+                    // Spawn failures keep the visible pane so the header can
+                    // show why.
+                    let shell_done = snapshot.exited && snapshot.spawn_error.is_none();
+                    if shell_done {
+                        workspace.drop_term(term_id);
+                        if let Some(pane) = owning_pane {
+                            if agent_pane {
+                                cx.emit(WorkspaceEvent::AgentExited {
+                                    pane,
                                     project: project_id,
-                                    notification,
+                                    resume_failed,
+                                });
+                            } else {
+                                cx.emit(WorkspaceEvent::PaneExited {
+                                    pane,
+                                    project: project_id,
                                 });
                             }
                         }
-                        // A clean shell death closes this pane; an agent death
-                        // turns it back into a shell. The project stays.
-                        // Spawn failures keep the pane so the header can show
-                        // why.
-                        let shell_done = snapshot.exited && snapshot.spawn_error.is_none();
-                        if shell_done {
-                            workspace.drop_term(term_id);
-                            if let Some(pane) = owning_pane {
-                                if agent_pane {
-                                    cx.emit(WorkspaceEvent::AgentExited {
-                                        pane,
-                                        project: project_id,
-                                        resume_failed,
-                                    });
-                                } else {
-                                    cx.emit(WorkspaceEvent::PaneExited {
-                                        pane,
-                                        project: project_id,
-                                    });
-                                }
-                            }
-                            return false;
-                        }
-                        match pane {
-                            Some(pane) => cx.emit(WorkspaceEvent::Frame(pane)),
-                            // Parked: keep reading so it does not block on a
-                            // full pty, but no pane draws it.
-                            None => term.wake_handled(),
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !watching {
-                    break;
+                        return false;
+                    }
+                    if let Some(pane) = pane {
+                        cx.emit(WorkspaceEvent::Frame(pane));
+                    }
+                    true
+                })
+                .unwrap_or(false)
+            };
+
+            while wake.next().await.is_some() {
+                if !drain(&this, cx) {
+                    return;
                 }
             }
+            // Final drain when the sender closes so an exit or final
+            // notification can never be lost on channel shutdown.
+            let _ = drain(&this, cx);
         })
         .detach();
     }
@@ -877,8 +919,8 @@ enum ProjectPick {
 
 /// Resolve a picked folder against the known projects — see [`ProjectPick`].
 fn resolve_project_pick(projects: &[Project], path: &str) -> ProjectPick {
-    if let Some(existing) = projects.iter().find(|p| p.path == path) {
-        return ProjectPick::Existing(existing.id);
+    if let Some(id) = project_for_path(projects, Path::new(path)) {
+        return ProjectPick::Existing(id);
     }
     let name = std::path::Path::new(path)
         .file_name()
@@ -951,6 +993,45 @@ fn terminal_evictions(order: &[u64], alive: usize, cap: usize) -> Vec<u64> {
 /// Nothing reports that agent leaving, so at quit this is the evidence that
 /// the conversation is still there to resume. Matching is by executable name
 /// because agents are launched by path, alias, or through a runtime.
+/// Whether `command` (from `ps -o command=`) executes `program` directly or
+/// through a scripting runtime (`node`, `bun`, `deno`, `python`, `sh`, `env`).
+/// Matching only the command's executable / script entrypoint avoids false
+/// positives like `vim codex` or `grep claude notes.txt`.
+fn command_runs_program(command: &str, program: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let matches_token = |token: &str| {
+        let path = Path::new(token);
+        path.file_name().and_then(|n| n.to_str()) == Some(program)
+            || path.file_stem().and_then(|n| n.to_str()) == Some(program)
+    };
+    if Path::new(first).file_name().and_then(|n| n.to_str()) == Some(program) {
+        return true;
+    }
+    let runtime = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let is_runtime = matches!(
+        runtime,
+        "node" | "bun" | "deno" | "python" | "python3" | "sh" | "bash" | "zsh" | "env"
+    );
+    if !is_runtime {
+        return false;
+    }
+    // Skip runtime flags (`--experimental-...`, `-e`, `FOO=bar` for `env`) to
+    // inspect the script/program token.
+    for token in tokens {
+        if token.starts_with('-') || (runtime == "env" && token.contains('=')) {
+            continue;
+        }
+        return matches_token(token);
+    }
+    false
+}
+
 fn tree_runs(ps: &str, root: u32, program: &str) -> bool {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut commands: HashMap<u32, &str> = HashMap::new();
@@ -978,32 +1059,15 @@ fn tree_runs(ps: &str, root: u32, program: &str) -> bool {
         if !seen.insert(pid) {
             continue;
         }
-        if commands.get(&pid).is_some_and(|command| {
-            command.split_whitespace().any(|token| {
-                Path::new(token)
-                    .file_name()
-                    .is_some_and(|name| name.to_str() == Some(program))
-            })
-        }) {
+        if commands
+            .get(&pid)
+            .is_some_and(|command| command_runs_program(command, program))
+        {
             return true;
         }
         stack.extend(children.get(&pid).into_iter().flatten().copied());
     }
     false
-}
-
-/// Ask `ps` whether `program` is still a descendant of `root`. `None` when the
-/// question cannot be answered; callers keep the saved choice in that case.
-fn descendant_runs(root: u32, program: &str) -> Option<bool> {
-    // Absolute path: a Finder-launched app has a minimal PATH.
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| tree_runs(&String::from_utf8_lossy(&output.stdout), root, program))
 }
 
 #[cfg(test)]

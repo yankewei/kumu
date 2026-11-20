@@ -14,36 +14,84 @@
 //! directly. A login-shell pane reads those files itself and is left alone.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-/// How long the login shell gets to print its environment. A startup file
-/// that waits on a network mount or a prompt must not hold up the panes of
-/// every project, so a late answer is dropped and the app environment is used
-/// alone — the same result as before the capture existed.
+/// How long the login shell gets to print its environment.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait before retrying after a failed or timed-out capture, so a
+/// broken rc file does not stall every subsequent agent pane for 5 seconds.
+const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Markers bracket the `env` output so a chatty rc file (banners, version
 /// managers, fetch tools) cannot be mistaken for a variable.
 const BEGIN: &str = "__kumu_env_begin__";
 const END: &str = "__kumu_env_end__";
 
-/// A successful capture, kept for the session. A failed or timed-out capture
-/// stays `None` so the next pane tries again instead of leaving every later
-/// pane with the app environment alone.
-static SHELL_ENV: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+struct Cache {
+    env: Option<HashMap<String, String>>,
+    last_failure: Option<Instant>,
+}
+
+static SHELL_ENV: Mutex<Cache> = Mutex::new(Cache {
+    env: None,
+    last_failure: None,
+});
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    const SIGKILL: i32 = 9;
+    if let Some(pid) = child.process_id()
+        && let Ok(pgid) = i32::try_from(pid)
+        && pgid > 0
+    {
+        unsafe {
+            kill(-pgid, SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    let _ = child.kill();
+}
 
 /// Start the capture early so the first pane finds it ready. Panes themselves
 /// wait for the result in [`apply`], off the UI thread.
 pub fn prewarm() {
-    std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("kumu-env".into())
-        .spawn(captured)
-        .expect("spawn environment thread");
+        .spawn(captured);
+}
+
+/// The captured login-shell `PATH`, if already available (or once captured).
+/// Safe to call from background threads; never blocks the UI thread if called
+/// via [`cached_path`].
+pub fn captured_path() -> Option<OsString> {
+    captured().get("PATH").map(OsString::from)
+}
+
+/// Non-blocking read of the already-captured `PATH`, for callers that must not
+/// wait on shell capture.
+pub fn cached_path() -> Option<OsString> {
+    SHELL_ENV.try_lock().ok().and_then(|slot| {
+        slot.env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsString::from)
+    })
 }
 
 /// Lay the captured shell environment under `cmd`. Variables that describe
@@ -60,13 +108,22 @@ pub fn apply(cmd: &mut CommandBuilder) {
 fn captured() -> HashMap<String, String> {
     // Holding the lock across the capture keeps two first panes from running
     // the login shell twice; the timeout bounds how long a pane waits.
-    let mut slot = SHELL_ENV.lock().expect("shell env lock");
-    if let Some(env) = slot.as_ref() {
+    let mut slot = SHELL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = slot.env.as_ref() {
         return env.clone();
     }
+    if slot
+        .last_failure
+        .is_some_and(|at| at.elapsed() < RETRY_BACKOFF)
+    {
+        return HashMap::new();
+    }
     let env = capture();
-    if !env.is_empty() {
-        *slot = Some(env.clone());
+    if env.is_empty() {
+        slot.last_failure = Some(Instant::now());
+    } else {
+        slot.last_failure = None;
+        slot.env = Some(env.clone());
     }
     env
 }
@@ -92,15 +149,12 @@ fn capture_from(
     base_args: &[String],
     extra_env: &[(&str, String)],
 ) -> HashMap<String, String> {
-    let Some(pty) = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 80 * 8,
-            pixel_height: 24 * 16,
-        })
-        .ok()
-    else {
+    let Ok(pty) = native_pty_system().openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 80 * 8,
+        pixel_height: 24 * 16,
+    }) else {
         return HashMap::new();
     };
 
@@ -127,23 +181,38 @@ fn capture_from(
     // once the shell exits.
     drop(pty.slave);
     let Ok(mut reader) = pty.master.try_clone_reader() else {
-        let _ = child.kill();
+        kill_process_group(&mut child);
         let _ = child.wait();
         return HashMap::new();
     };
 
     let (tx, rx) = mpsc::channel();
-    let reader = std::thread::Builder::new()
+    let reader_handle = std::thread::Builder::new()
         .name("kumu-env-read".into())
         .spawn(move || {
             let mut bytes = Vec::new();
-            // EOF or EIO ends the read; either way the bytes already received
-            // are the answer.
-            let _ = reader.read_to_end(&mut bytes);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        // Stop as soon as the closing marker arrives instead of
+                        // waiting for EOF, so background helpers launched by
+                        // `~/.zshrc` that inherit the PTY slave cannot trigger a
+                        // timeout.
+                        if has_end_marker(&bytes) || bytes.len() >= 2 * 1024 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
             let _ = tx.send(bytes);
         });
-    if reader.is_err() {
-        let _ = child.kill();
+    if reader_handle.is_err() {
+        kill_process_group(&mut child);
         let _ = child.wait();
         return HashMap::new();
     }
@@ -159,14 +228,26 @@ fn capture_from(
                     eprintln!("[term] shell environment capture reader stopped");
                 }
             }
-            let _ = child.kill();
+            kill_process_group(&mut child);
             drop(pty.master);
             let _ = child.wait();
             return HashMap::new();
         }
     };
+    // Ensure the shell and any background helpers it spawned are cleaned up so
+    // `wait()` cannot hang.
     drop(pty.master);
-    let _ = child.wait();
+    let wait_deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < wait_deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        kill_process_group(&mut child);
+        let _ = child.wait();
+    }
 
     let env = parse(&bytes);
     if env.is_empty() {
@@ -175,26 +256,57 @@ fn capture_from(
     env
 }
 
+fn has_end_marker(bytes: &[u8]) -> bool {
+    let needle = END.as_bytes();
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
 fn script() -> String {
-    format!("printf '%s\\n' {BEGIN}; env; printf '%s\\n' {END}")
+    format!(
+        "command printf '%s\\n' {BEGIN}; /usr/bin/env -0 2>/dev/null || /usr/bin/env; command printf '\\n%s\\n' {END}"
+    )
 }
 
 fn parse(bytes: &[u8]) -> HashMap<String, String> {
-    let text = String::from_utf8_lossy(bytes);
+    let begin = BEGIN.as_bytes();
+    let end = END.as_bytes();
+    let Some(begin_pos) = bytes.windows(begin.len()).position(|w| w == begin) else {
+        return HashMap::new();
+    };
+    let after_begin = &bytes[begin_pos + begin.len()..];
+    let Some(end_rel) = after_begin.windows(end.len()).position(|w| w == end) else {
+        return HashMap::new();
+    };
+    let body = &after_begin[..end_rel];
+    // Strip the newline (CR/LF) right after BEGIN.
+    let body = body
+        .strip_prefix(b"\r\n")
+        .or_else(|| body.strip_prefix(b"\n"))
+        .unwrap_or(body);
+
+    if body.contains(&0) {
+        let mut env = HashMap::new();
+        for entry in body.split(|&b| b == 0) {
+            if entry.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(entry);
+            // PTY line discipline translates LF inside values into CRLF.
+            let cleaned = text.replace("\r\n", "\n");
+            if let Some((key, value)) = cleaned.split_once('=')
+                && is_env_name(key)
+            {
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+        return env;
+    }
+
+    let text = String::from_utf8_lossy(body);
     let mut env = HashMap::new();
-    let mut started = false;
-    let mut finished = false;
     let mut last: Option<String> = None;
     // `lines` strips the CR a PTY puts before every LF.
     for line in text.lines() {
-        if !started {
-            started = line.trim() == BEGIN;
-            continue;
-        }
-        if line.trim() == END {
-            finished = true;
-            break;
-        }
         match line.split_once('=') {
             Some((key, value)) if is_env_name(key) => {
                 env.insert(key.to_string(), value.to_string());
@@ -212,10 +324,7 @@ fn parse(bytes: &[u8]) -> HashMap<String, String> {
             }
         }
     }
-    // Without the closing marker the output ended mid-stream (the shell died
-    // or was killed). Applying the values received so far risks a truncated
-    // PATH or key, which is worse than using the app environment alone.
-    if finished { env } else { HashMap::new() }
+    env
 }
 
 /// Whether `key` can be a shell-exported variable name. `env` prints one

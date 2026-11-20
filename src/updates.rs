@@ -1,10 +1,13 @@
 //! The release contract shared by the app's updater and macOS packaging.
 
-use gpui_kit::{App, AppContext, Entity};
+use gpui_kit::{App, AppContext, Entity, Global};
 use gpui_updater::{
     CodeSigning, EngineConfig, Error, GitHubSource, Release, UpdateSource, Updater, Verification,
     Version,
 };
+
+struct GlobalUpdater(Entity<Updater>);
+impl Global for GlobalUpdater {}
 
 pub struct KumuReleases;
 
@@ -32,11 +35,15 @@ pub fn release_config(current_version: Version) -> EngineConfig {
 }
 
 pub fn init(cx: &mut App) -> Entity<Updater> {
+    if let Some(existing) = cx.try_global::<GlobalUpdater>() {
+        return existing.0.clone();
+    }
     let config = release_config(
         Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version is valid semver"),
     );
     let updater = cx.new(|cx| Updater::new(KumuReleases, config, cx));
     updater.update(cx, |updater, cx| updater.check(cx));
+    cx.set_global(GlobalUpdater(updater.clone()));
     updater
 }
 

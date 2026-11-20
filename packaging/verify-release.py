@@ -57,15 +57,19 @@ try:
     verdict = gatekeeper.stdout + gatekeeper.stderr
     if "source=Notarized Developer ID" not in verdict:
         raise SystemExit(f"DMG 内的应用未通过 Gatekeeper 的公证检查：{verdict.strip()}")
-    info = plistlib.load((bundled / "Contents/Info.plist").open("rb"))
+    with (bundled / "Contents/Info.plist").open("rb") as fh:
+        info = plistlib.load(fh)
     if info.get("CFBundleShortVersionString") != version:
         raise SystemExit(
             f"DMG 内应用版本为 {info.get('CFBundleShortVersionString')}，应为 {version}"
         )
-    assert (mount / "Applications").is_symlink()
-    assert os.readlink(mount / "Applications") == "/Applications"
+    apps_link = mount / "Applications"
+    if not apps_link.is_symlink() or os.readlink(apps_link) != "/Applications":
+        raise SystemExit("DMG 内缺少指向 /Applications 的 Applications 符号链接")
 finally:
-    subprocess.run(["hdiutil", "detach", str(mount)], check=True)
+    detach = subprocess.run(["hdiutil", "detach", str(mount)], check=False)
+    if detach.returncode != 0:
+        subprocess.run(["hdiutil", "detach", "-force", str(mount)], check=False)
 
 out = Path("target/release")
 # A local sign puts the app in target/release already: it is both the source

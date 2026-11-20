@@ -109,9 +109,14 @@ pub fn session_launch(
     adopt_shell: bool,
     shell_pane: bool,
 ) -> Option<PaneLaunch> {
+    let session = clean_session(session)?;
     match current {
         Some(PaneLaunch::Agent { agent: running, .. }) if running == agent => {}
-        Some(PaneLaunch::Agent { .. }) if shell_pane => {}
+        Some(PaneLaunch::Agent { .. }) if shell_pane => {
+            if resume_args(agent, Some(session)).is_empty() {
+                return None;
+            }
+        }
         Some(PaneLaunch::Agent { .. }) => return None,
         Some(PaneLaunch::Shell) | None => {
             if !adopt_shell || resume_args(agent, Some(session)).is_empty() {
@@ -125,15 +130,40 @@ pub fn session_launch(
     })
 }
 
-/// Session ids are agent-generated, but they end up inside a terminal escape
-/// sequence, so only characters that cannot terminate or split it are kept.
+/// Session ids are agent-generated, but they travel in a terminal escape
+/// sequence and become CLI arguments on restart. Require an alphanumeric start
+/// (preventing `--flag` option injection), reject path traversal (`..`), and
+/// allow only safe identifier characters.
 pub fn clean_session(id: &str) -> Option<&str> {
-    (!id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    let bytes = id.as_bytes();
+    (!bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && !id.contains("..")
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
     .then_some(id)
+}
+
+/// Extract and authenticate a `kumu-session:<token>:<id>` body against the
+/// pane's per-process random token.
+pub fn authenticated_session<'a>(rest: &'a str, expected_token: &str) -> Option<&'a str> {
+    if expected_token.is_empty() {
+        return None;
+    }
+    let (token, session) = rest.split_once(':')?;
+    if token.len() != expected_token.len() {
+        return None;
+    }
+    let mut diff = 0u8;
+    for (a, b) in token.bytes().zip(expected_token.bytes()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return None;
+    }
+    clean_session(session)
 }
 
 fn well_formed(id: &str) -> bool {
@@ -170,8 +200,31 @@ mod tests {
         assert!(args("codex", Some("a;b")).is_empty());
         assert!(args("codex", Some("a\x07b")).is_empty());
         assert!(args("codex", Some("")).is_empty());
+        assert!(args("codex", Some("--dangerously-skip-permissions")).is_empty());
+        assert!(args("claude", Some("-r")).is_empty());
+        assert!(args("codex", Some("../escape")).is_empty());
         assert!(args("codex", Some(&"a".repeat(129))).is_empty());
         assert_eq!(args("codex", Some("a-b_c.d")), ["resume", "a-b_c.d"]);
+        assert_eq!(
+            session_launch(
+                Some(&agent("codex", Some("ok"))),
+                "codex",
+                "--yolo",
+                true,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            session_launch(Some(&agent("codex", Some("ok"))), "grok", "abc", true, true),
+            None
+        );
+        assert_eq!(
+            authenticated_session("tok123:abc-1", "tok123"),
+            Some("abc-1")
+        );
+        assert_eq!(authenticated_session("wrong:abc-1", "tok123"), None);
+        assert_eq!(authenticated_session("abc-1", "tok123"), None);
     }
 
     #[test]

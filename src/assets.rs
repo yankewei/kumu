@@ -31,12 +31,14 @@ impl AssetSource for KumuAssetSource {
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut all = gpui_kit::assets::Assets.list(path)?;
+        let mut all = gpui_kit::assets::Assets.list(path).unwrap_or_default();
         all.extend(
             KumuAssets::iter()
                 .filter(|p| p.starts_with(path))
                 .map(SharedString::from),
         );
+        all.sort();
+        all.dedup();
         Ok(all)
     }
 }

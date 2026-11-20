@@ -26,19 +26,21 @@ source packaging/lib.sh
 
 profile=release
 open_after=false
+skip_build=false
 for arg in "$@"; do
     case "$arg" in
         release|debug) profile="$arg" ;;
         --open) open_after=true ;;
-        *) echo "usage: $0 [release|debug] [--open]" >&2; exit 2 ;;
+        --no-build) skip_build=true ;;
+        *) echo "usage: $0 [release|debug] [--open] [--no-build]" >&2; exit 2 ;;
     esac
 done
 
 if [[ "$profile" == release ]]; then
-    cargo build --release
+    [[ "$skip_build" == true ]] || cargo build --release
     target_dir=target/release
 else
-    cargo build
+    [[ "$skip_build" == true ]] || cargo build
     target_dir=target/debug
 fi
 
@@ -53,7 +55,7 @@ cp assets/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"
 cp packaging/Info.plist "$bundle/Contents/Info.plist"
 
 # Keep the bundle's version in step with Cargo.toml.
-version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+version="$(sed -n '/^version =/{s/^version = "\([^"]*\)".*/\1/p; q;}' Cargo.toml)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist" >/dev/null

@@ -85,26 +85,28 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 
-    let zig_env = Command::new(&zig).arg("env").output().expect("zig env");
-    let zig_env = String::from_utf8_lossy(&zig_env.stdout);
-    let zig_lib = zig_env
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(".lib_dir = \""))
-        .and_then(|line| line.strip_suffix("\","))
-        .expect("zig env has no lib_dir");
-
     let include = src.join("include");
     let mut builder = bindgen::Builder::default()
         .header(include.join("ghostty/vt.h").to_string_lossy())
         .clang_arg(format!("-I{}", include.display()));
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        if let Ok(sdk) = Command::new("xcrun").args(["--show-sdk-path"]).output() {
-            builder = builder.clang_arg(format!(
-                "-isysroot{}",
-                String::from_utf8_lossy(&sdk.stdout).trim()
-            ));
+        if let Ok(sdk) = Command::new("xcrun").args(["--show-sdk-path"]).output()
+            && sdk.status.success()
+        {
+            let path = String::from_utf8_lossy(&sdk.stdout);
+            let path = path.trim();
+            if !path.is_empty() {
+                builder = builder.clang_arg(format!("-isysroot{path}"));
+            }
         }
     } else if Command::new("clang").arg("--version").output().is_err() {
+        let zig_env = Command::new(&zig).arg("env").output().expect("zig env");
+        let zig_env = String::from_utf8_lossy(&zig_env.stdout);
+        let zig_lib = zig_env
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(".lib_dir = \""))
+            .and_then(|line| line.strip_suffix("\","))
+            .expect("zig env has no lib_dir");
         builder = builder.clang_arg(format!("-isystem{zig_lib}/include"));
     }
     builder

@@ -34,14 +34,51 @@ pub fn executable(agent: &str) -> Option<String> {
     })
 }
 
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+fn non_empty_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Whether `command` names something launchable: a file at a path, or a bare
-/// name that resolves on this process's PATH.
+/// name that resolves on this process's PATH or the captured login-shell PATH.
 fn is_executable(command: &str) -> bool {
+    if command.is_empty() {
+        return false;
+    }
     if command.contains(std::path::MAIN_SEPARATOR) {
         return is_executable_file(Path::new(command));
     }
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(command)))
+    let on_path = |path: &std::ffi::OsStr| {
+        std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(command)))
+    };
+    if std::env::var_os("PATH").is_some_and(|p| on_path(&p)) {
+        return true;
+    }
+    // Finder-launched apps have launchd's minimal PATH; consult the captured
+    // login-shell PATH so version-manager installs (nvm/fnm/mise/bun/cargo)
+    // are recognized.
+    crate::term::shell_env::cached_path().is_some_and(|p| on_path(&p))
+}
+
+/// Like [`installed`], but awaits login-shell PATH capture when needed. Call
+/// from background threads (e.g. Settings open probe), never the UI thread.
+pub fn installed_with_shell_env(id: &str) -> bool {
+    let Some(command) = executable(id) else {
+        return false;
+    };
+    if is_executable(&command) {
+        return true;
+    }
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return false;
+    }
+    crate::term::shell_env::captured_path().is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join(&command)))
     })
 }
 
@@ -66,153 +103,122 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+fn first_executable(candidates: &[PathBuf]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| is_executable_file(candidate))
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
 fn omp_bin() -> String {
-    std::env::var("OMP_BIN").unwrap_or_else(|_| {
+    non_empty_env("OMP_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/bin/omp"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".local/bin/omp"));
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin/omp"));
         candidates.push(PathBuf::from("/usr/local/bin/omp"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "omp".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "omp".to_string())
     })
 }
 
 fn opencode_bin() -> String {
-    std::env::var("OPENCODE_BIN").unwrap_or_else(|_| {
-        if let Some(home) = std::env::var_os("HOME") {
-            let candidate = PathBuf::from(&home).join(".opencode/bin/opencode");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
+    non_empty_env("OPENCODE_BIN").unwrap_or_else(|| {
+        let mut candidates = Vec::new();
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".opencode/bin/opencode"));
+            candidates.push(home.join(".local/bin/opencode"));
         }
-        "opencode".to_string()
+        candidates.push(PathBuf::from("/opt/homebrew/bin/opencode"));
+        candidates.push(PathBuf::from("/usr/local/bin/opencode"));
+        first_executable(&candidates).unwrap_or_else(|| "opencode".to_string())
     })
 }
 
 /// Resolve the codex executable: env override, then the usual install
 /// locations, then PATH.
-///
-/// The absolute candidates matter: a GUI-launched process does not inherit the
-/// shell's PATH, so a `brew install`ed or per-user codex would otherwise be
-/// invisible.
 fn codex_bin() -> String {
-    std::env::var("CODEX_BIN").unwrap_or_else(|_| {
+    non_empty_env("CODEX_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            // The official installer and per-user installs.
-            candidates.push(PathBuf::from(&home).join(".local/bin/codex"));
-            candidates.push(PathBuf::from(&home).join(".codex/bin/codex"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".local/bin/codex"));
+            candidates.push(home.join(".codex/bin/codex"));
         }
-        // Homebrew, Intel and Apple Silicon.
         candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
         candidates.push(PathBuf::from("/usr/local/bin/codex"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "codex".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "codex".to_string())
     })
 }
 
 /// Resolve the `claude` executable: env override, then the usual install
 /// locations, then PATH.
-///
-/// The native installer links `~/.local/bin/claude` into
-/// `~/.local/share/claude/versions/`, and both Homebrew casks land in a `bin`
-/// directory above.
 fn claude_bin() -> String {
-    std::env::var("CLAUDE_BIN").unwrap_or_else(|_| {
+    non_empty_env("CLAUDE_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/bin/claude"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".local/bin/claude"));
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
         candidates.push(PathBuf::from("/usr/local/bin/claude"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "claude".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "claude".to_string())
     })
 }
 
 /// Resolve the `pi` executable: env override, then the usual install
 /// locations, then PATH.
-///
-/// Pi installs through npm into a per-user prefix — the npm global `bin` is
-/// where a default `npm install -g` puts it — so neither would be found
-/// otherwise from a GUI launch.
 fn pi_bin() -> String {
-    std::env::var("PI_BIN").unwrap_or_else(|_| {
+    non_empty_env("PI_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/bin/pi"));
-            candidates.push(PathBuf::from(&home).join(".npm-global/bin/pi"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".local/bin/pi"));
+            candidates.push(home.join(".npm-global/bin/pi"));
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin/pi"));
         candidates.push(PathBuf::from("/usr/local/bin/pi"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "pi".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "pi".to_string())
     })
 }
 
 /// Resolve the Cursor CLI executable: env override, then its install
 /// locations, then PATH.
 ///
-/// The installer links `~/.local/bin/agent` and the legacy alias
-/// `~/.local/bin/cursor-agent`. `agent` is a generic name the Grok Build
-/// installer also claims when the two share a machine, so the unambiguous
-/// alias is tried first and the bare fallback is `cursor-agent`, never `agent`.
+/// `~/.local/bin/agent` is shared with Grok Build on some setups, so it is
+/// accepted only when its canonical target path identifies Cursor.
 fn cursor_bin() -> String {
-    std::env::var("CURSOR_AGENT_BIN").unwrap_or_else(|_| {
+    non_empty_env("CURSOR_AGENT_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".local/bin/cursor-agent"));
-            candidates.push(PathBuf::from(&home).join(".local/bin/agent"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".local/bin/cursor-agent"));
+            let agent = home.join(".local/bin/agent");
+            if is_executable_file(&agent)
+                && std::fs::canonicalize(&agent).is_ok_and(|target| {
+                    target
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("cursor")
+                })
+            {
+                candidates.push(agent);
+            }
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
         candidates.push(PathBuf::from("/usr/local/bin/cursor-agent"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "cursor-agent".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "cursor-agent".to_string())
     })
 }
 
 /// Resolve the Grok Build executable: env override, then its install
 /// locations, then PATH.
-///
-/// The installer puts `grok` in `~/.grok/bin` and links it into
-/// `~/.local/bin` when that is already on PATH.
 fn grok_bin() -> String {
-    std::env::var("GROK_BIN").unwrap_or_else(|_| {
+    non_empty_env("GROK_BIN").unwrap_or_else(|| {
         let mut candidates = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(&home).join(".grok/bin/grok"));
-            candidates.push(PathBuf::from(&home).join(".local/bin/grok"));
+        if let Some(home) = non_empty_home() {
+            candidates.push(home.join(".grok/bin/grok"));
+            candidates.push(home.join(".local/bin/grok"));
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin/grok"));
         candidates.push(PathBuf::from("/usr/local/bin/grok"));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-        "grok".to_string()
+        first_executable(&candidates).unwrap_or_else(|| "grok".to_string())
     })
 }
 

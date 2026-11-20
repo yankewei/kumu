@@ -37,6 +37,9 @@ struct SavedWindow {
     mode: WindowMode,
 }
 
+/// Title bar band height that must stay reachable on a display.
+const TITLE_BAR_BAND: f32 = 40.;
+
 impl SavedWindow {
     fn from_bounds(bounds: WindowBounds) -> Self {
         let (rect, mode) = match bounds {
@@ -53,8 +56,9 @@ impl SavedWindow {
         }
     }
 
-    /// The saved rectangle, clamped to the app's minimum size and accepted only
-    /// when a meaningful part of it lands on one of `displays`.
+    /// The saved rectangle, clamped to the app's minimum size (and matched
+    /// display's visible size) and accepted only when both a meaningful part
+    /// and the title-bar band land on one of `displays`.
     fn valid_bounds(&self, displays: &[Bounds<Pixels>]) -> Option<Bounds<Pixels>> {
         if !self.x.is_finite()
             || !self.y.is_finite()
@@ -63,23 +67,27 @@ impl SavedWindow {
         {
             return None;
         }
-        let bounds = Bounds::new(
-            point(px(self.x), px(self.y)),
-            size(
-                px(self.width.clamp(MIN_WIDTH, MAX_SIDE)),
-                px(self.height.clamp(MIN_HEIGHT, MAX_SIDE)),
-            ),
-        );
-        let visible = displays.iter().any(|display| {
+        let raw_w = self.width.clamp(MIN_WIDTH, MAX_SIDE);
+        let raw_h = self.height.clamp(MIN_HEIGHT, MAX_SIDE);
+        let bounds = Bounds::new(point(px(self.x), px(self.y)), size(px(raw_w), px(raw_h)));
+        let matched = displays.iter().find(|display| {
             let overlap_width = (f32::from(bounds.right()).min(f32::from(display.right()))
                 - f32::from(bounds.origin.x).max(f32::from(display.origin.x)))
             .max(0.);
             let overlap_height = (f32::from(bounds.bottom()).min(f32::from(display.bottom()))
                 - f32::from(bounds.origin.y).max(f32::from(display.origin.y)))
             .max(0.);
-            overlap_width >= MIN_VISIBLE && overlap_height >= MIN_VISIBLE
-        });
-        visible.then_some(bounds)
+            let title_y = f32::from(bounds.origin.y);
+            let title_visible = title_y >= f32::from(display.origin.y)
+                && title_y + TITLE_BAR_BAND <= f32::from(display.bottom());
+            overlap_width >= MIN_VISIBLE && overlap_height >= MIN_VISIBLE && title_visible
+        })?;
+        let max_w = f32::from(matched.size.width).max(MIN_WIDTH);
+        let max_h = f32::from(matched.size.height).max(MIN_HEIGHT);
+        Some(Bounds::new(
+            bounds.origin,
+            size(px(raw_w.min(max_w)), px(raw_h.min(max_h))),
+        ))
     }
 }
 

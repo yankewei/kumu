@@ -7,22 +7,8 @@
 
 use super::vt::Snapshot;
 
-/// Schemes that mark the start of a URL in plain output.
-const SCHEMES: [&str; 13] = [
-    "https://",
-    "http://",
-    "ftp://",
-    "file://",
-    "git://",
-    "ssh://",
-    "ipfs://",
-    "ipns://",
-    "gemini://",
-    "gopher://",
-    "news:",
-    "mailto:",
-    "magnet:",
-];
+/// Schemes that mark the start of an openable URL in plain output.
+const SCHEMES: [&str; 3] = ["https://", "http://", "mailto:"];
 
 /// One row's part of a link: cell columns `from..to` on `row`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,27 +160,24 @@ fn url_char(ch: char) -> bool {
 }
 
 /// Whether the platform should open this URI. Terminal output is untrusted, so
-/// the schemes that run script are refused; everything else — `http`/`file` and
-/// the app schemes programs use for themselves — opens the way Ghostty opens an
-/// OSC 8 link.
+/// only safe web and mail schemes are opened automatically; `file://`, script
+/// schemes, and arbitrary local app handlers (which can launch binaries or
+/// trigger actions via spoofed OSC 8 links) are refused.
 pub fn openable(uri: &str) -> bool {
-    const REFUSED: [&str; 4] = ["javascript:", "data:", "vbscript:", "blob:"];
-    let uri = uri.trim_start();
-    if REFUSED.iter().any(|scheme| {
-        uri.get(..scheme.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
-    }) {
+    const ALLOWED: [&str; 3] = ["http", "https", "mailto"];
+    let uri = uri.trim();
+    if uri.is_empty() || uri.chars().any(char::is_control) {
         return false;
     }
-    // There has to be a scheme at all: a bare path is not something the
-    // platform's URL opener can act on.
-    uri.split(':').next().is_some_and(|scheme| {
-        !scheme.is_empty()
-            && scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-    })
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    ALLOWED
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
 }
 
 /// The cell runs the URL byte range `start..end` covers.
@@ -323,14 +306,27 @@ mod tests {
     }
 
     #[test]
-    fn scripts_are_not_opened_but_app_schemes_are() {
-        for refused in ["javascript:alert(1)", " DATA:text/html,x", "vbscript:x"] {
+    fn only_safe_schemes_with_a_colon_are_opened() {
+        for refused in [
+            "javascript:alert(1)",
+            " DATA:text/html,x",
+            "vbscript:x",
+            "file:///tmp/evil.command",
+            "shortcuts://run-shortcut?name=x",
+            "vscode://file/x",
+            "evil.app",
+            "https:",
+            "/tmp/notes.md",
+        ] {
             assert!(!openable(refused), "{refused}");
         }
-        for allowed in ["https://example.com", "file:///tmp/x", "vscode://file/x"] {
+        for allowed in [
+            "https://example.com",
+            "HTTP://example.com/a",
+            "mailto:dev@example.com",
+        ] {
             assert!(openable(allowed), "{allowed}");
         }
-        assert!(!openable("/tmp/notes.md"), "a bare path is not a URI");
     }
 
     #[test]

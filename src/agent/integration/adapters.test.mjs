@@ -1,24 +1,37 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import tty from "node:tty";
 import { syncBuiltinESMExports } from "node:module";
+import { notify, notifySession } from "./notify.js";
 import piExtension from "./pi.js";
 import openCode from "./opencode/tui.js";
 import { KumuNotifications } from "./opencode-v1.js";
 
 // Capture only the external PTY side effect; run the real event adapters.
-const originals = { openSync: fs.openSync, writeSync: fs.writeSync, closeSync: fs.closeSync };
+const originals = {
+  openSync: fs.openSync,
+  writeSync: fs.writeSync,
+  closeSync: fs.closeSync,
+  isatty: tty.isatty,
+};
 let messages = [];
 fs.openSync = () => 42;
 fs.writeSync = (_fd, message) => messages.push(message);
 fs.closeSync = () => {};
+tty.isatty = () => true;
 syncBuiltinESMExports();
 process.env.KUMU_TERMINAL = "1";
 // Session updates travel on the same channel but are not shown to the user.
 const visible = () => messages.filter((message) => !message.includes(";kumu-session:"));
 process.env.KUMU_TTY = "/dev/fake-kumu-tty";
 after(() => {
-  Object.assign(fs, originals);
+  Object.assign(fs, {
+    openSync: originals.openSync,
+    writeSync: originals.writeSync,
+    closeSync: originals.closeSync,
+  });
+  tty.isatty = originals.isatty;
   syncBuiltinESMExports();
 });
 
@@ -268,7 +281,25 @@ test("globally installed integrations leave other terminals untouched", async ()
     assert.deepEqual(await KumuNotifications({}), {});
   } finally {
     process.env.KUMU_TERMINAL = "1";
-// Session updates travel on the same channel but are not shown to the user.
-const visible = () => messages.filter((message) => !message.includes(";kumu-session:"));
+  }
+});
+
+test("notify sanitizes control chars and notifySession rejects option injection", () => {
+  messages = [];
+  notify("Open;Code\x07", "done\x1b]52;c;evil\x07");
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0], "\x1b]777;notify;OpenCode;done]52cevil\x07");
+
+  messages = [];
+  notifySession("OpenCode", "--dangerously-skip-permissions");
+  notifySession("OpenCode", "../escape");
+  assert.equal(messages.length, 0);
+
+  process.env.KUMU_SESSION_TOKEN = "tok_abc";
+  try {
+    notifySession("OpenCode", "ses-1");
+    assert.equal(messages[0], "\x1b]777;notify;OpenCode;kumu-session:tok_abc:ses-1\x07");
+  } finally {
+    delete process.env.KUMU_SESSION_TOKEN;
   }
 });

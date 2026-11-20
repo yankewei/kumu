@@ -10,15 +10,16 @@
 //! The same file holds both ends: the CLI a pane's agent runs and the server
 //! the home window starts.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,13 @@ use serde_json::{Value, json};
 /// waits for the agent to draw its prompt is the slow one.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often the accept loop looks at its stop flag.
-const POLL: Duration = Duration::from_millis(100);
+const POLL: Duration = Duration::from_millis(25);
+/// Upper bound on one JSON request line accepted by the control socket.
+const MAX_REQUEST_BYTES: u64 = 256 * 1024;
+/// Upper bound on one JSON reply line read by the CLI client.
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum concurrent control-socket worker threads.
+const MAX_CONCURRENT_CLIENTS: usize = 32;
 /// The most scrollback rows one read may ask for. Reading history pages the
 /// viewport, so the bound is work, not storage.
 pub const MAX_HISTORY: usize = 2_000;
@@ -37,13 +44,27 @@ pub const MAX_HISTORY: usize = 2_000;
 /// happens to serve the socket.
 pub const PID_ENV: &str = "KUMU_APP_PID";
 
+unsafe extern "C" {
+    fn geteuid() -> u32;
+    fn flock(fd: i32, operation: i32) -> i32;
+    #[cfg(target_os = "macos")]
+    fn getpeereid(fd: i32, euid: *mut u32, egid: *mut u32) -> i32;
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+
 /// Where the socket lives. `KUMU_CONTROL_SOCKET` lets a test or a second
 /// instance pick its own; the default sits beside the database.
 pub fn socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("KUMU_CONTROL_SOCKET") {
+    if let Some(path) = std::env::var_os("KUMU_CONTROL_SOCKET").filter(|v| !v.is_empty()) {
         return PathBuf::from(path);
     }
-    crate::db::db_path().with_file_name("control.sock")
+    let db = crate::db::db_path();
+    if db.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
+    db.with_file_name("control.sock")
 }
 
 // ---------------------------------------------------------------- protocol
@@ -195,6 +216,7 @@ pub enum Command {
         agent: String,
         from: Option<u64>,
         prompt: Option<String>,
+        cancelled: Arc<AtomicBool>,
         reply: Sender<Result<SplitResult, ControlError>>,
     },
     Send {
@@ -213,6 +235,8 @@ pub enum Command {
 /// connect to.
 pub struct ControlHandle {
     path: PathBuf,
+    inode: Option<(u64, u64)>,
+    _lock: std::fs::File,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -223,7 +247,14 @@ impl Drop for ControlHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove the socket file if it is still the exact inode we bound.
+        if let Some((dev, ino)) = self.inode
+            && let Ok(meta) = std::fs::symlink_metadata(&self.path)
+            && meta.file_type().is_socket()
+            && (meta.dev(), meta.ino()) == (dev, ino)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -235,16 +266,58 @@ pub fn start(commands: UnboundedSender<Command>) -> Option<ControlHandle> {
 }
 
 fn start_at(path: PathBuf, commands: UnboundedSender<Command>) -> Option<ControlHandle> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
     let dir = path.parent()?;
-    std::fs::create_dir_all(dir).ok()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .ok()?;
+    let dir_meta = std::fs::symlink_metadata(dir).ok()?;
+    let my_uid = unsafe { geteuid() };
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() || dir_meta.uid() != my_uid {
+        eprintln!(
+            "[control] refusing unsafe socket directory {}",
+            dir.display()
+        );
+        return None;
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-    // A socket file left by a crashed run is dead; one that still answers
-    // belongs to another Kumu, which keeps the channel.
-    if UnixStream::connect(&path).is_ok() {
+
+    // Serialize socket ownership across concurrent Kumu launches with an
+    // exclusive non-blocking flock on a sibling lockfile.
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .ok()?;
+    if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
         eprintln!("[control] {} is served by another Kumu", path.display());
         return None;
     }
-    let _ = std::fs::remove_file(&path);
+
+    // A socket file left by a crashed run is dead; never unlink a non-socket.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() {
+            eprintln!(
+                "[control] refusing to replace non-socket {}",
+                path.display()
+            );
+            return None;
+        }
+        if UnixStream::connect(&path).is_ok() {
+            eprintln!("[control] {} is served by another Kumu", path.display());
+            return None;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(error) => {
@@ -252,32 +325,79 @@ fn start_at(path: PathBuf, commands: UnboundedSender<Command>) -> Option<Control
             return None;
         }
     };
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("[control] cannot chmod {}: {error}", path.display());
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let inode = std::fs::symlink_metadata(&path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()));
     if let Err(error) = listener.set_nonblocking(true) {
         eprintln!("[control] cannot watch {}: {error}", path.display());
+        let _ = std::fs::remove_file(&path);
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let accepting = Arc::clone(&stop);
-    let thread = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name("kumu-control".into())
         .spawn(move || accept_loop(listener, commands, accepting))
-        .ok()?;
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            eprintln!("[control] cannot spawn control thread: {error}");
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
     Some(ControlHandle {
         path,
+        inode,
+        _lock: lock_file,
         stop,
         thread: Some(thread),
     })
 }
 
+struct ActiveClientGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn accept_loop(listener: UnixListener, commands: UnboundedSender<Command>, stop: Arc<AtomicBool>) {
+    let active = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((mut stream, _)) => {
+                if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_CLIENTS {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let body = failure(&ControlError::new(
+                        "busy",
+                        "too many concurrent control requests",
+                    ));
+                    let _ = stream.write_all(format!("{body}\n").as_bytes());
+                    continue;
+                }
+                let guard = ActiveClientGuard(Arc::clone(&active));
                 let commands = commands.clone();
-                // A client that connects and stalls must not keep another
-                // client from being answered.
-                std::thread::spawn(move || serve(stream, &commands));
+                // Use Builder::spawn so thread-creation failure never panics
+                // the accept loop.
+                if std::thread::Builder::new()
+                    .name("kumu-control-client".into())
+                    .spawn(move || {
+                        let _guard = guard;
+                        serve(stream, &commands);
+                    })
+                    .is_err()
+                {
+                    let _ = active.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => std::thread::sleep(POLL),
             Err(_) => std::thread::sleep(POLL),
@@ -285,27 +405,75 @@ fn accept_loop(listener: UnixListener, commands: UnboundedSender<Command>, stop:
     }
 }
 
+fn peer_is_same_user(stream: &UnixStream) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut euid: u32 = u32::MAX;
+        let mut egid: u32 = u32::MAX;
+        let ok = unsafe { getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) == 0 };
+        ok && euid == unsafe { geteuid() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stream;
+        true
+    }
+}
+
+fn read_bounded_line(
+    stream: &UnixStream,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<String, &'static str> {
+    let mut reader = BufReader::new(stream.take(max_bytes + 1));
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("request read timed out");
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        let mut chunk = Vec::new();
+        match reader.read_until(b'\n', &mut chunk) {
+            Ok(0) => break,
+            Ok(_) => {
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() as u64 > max_bytes {
+                    return Err("request exceeds maximum size");
+                }
+                if bytes.ends_with(b"\n") {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err("expected one JSON request line"),
+        }
+    }
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err("expected one newline-terminated JSON request line");
+    }
+    String::from_utf8(bytes).map_err(|_| "request must be valid UTF-8")
+}
+
 /// One connection, one request, one reply.
 fn serve(stream: UnixStream, commands: &UnboundedSender<Command>) {
     let mut stream = stream;
     // The listener accepts in nonblocking mode, and macOS hands that flag to
     // the connection: left as is, a request that lands a moment after the
-    // connection reads as WouldBlock and looks like an empty one. The
-    // timeouts below only apply to a blocking socket.
+    // connection reads as WouldBlock and looks like an empty one.
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let read = stream.set_read_timeout(Some(REPLY_TIMEOUT));
-    let write = stream.set_write_timeout(Some(REPLY_TIMEOUT));
-    if read.is_err() || write.is_err() {
+    if !peer_is_same_user(&stream) {
         return;
     }
-    let mut line = String::new();
-    // Read through a borrow: cloning the socket can fail when the process is
-    // out of descriptors, which would read as an empty request too.
-    let read = BufReader::new(&stream).read_line(&mut line).is_ok();
-    let reply = if read {
-        match serde_json::from_str::<RequestLine>(line.trim()) {
+    let write = stream.set_write_timeout(Some(REPLY_TIMEOUT));
+    if write.is_err() {
+        return;
+    }
+    let deadline = Instant::now() + REPLY_TIMEOUT;
+    let reply = match read_bounded_line(&stream, MAX_REQUEST_BYTES, deadline) {
+        Ok(line) => match serde_json::from_str::<RequestLine>(line.trim()) {
             Ok(line) => match line.pid {
                 Some(pid) if pid != std::process::id() => Err(ControlError::new(
                     "wrongInstance",
@@ -317,12 +485,8 @@ fn serve(stream: UnixStream, commands: &UnboundedSender<Command>) {
                 _ => ask(commands, line.request),
             },
             Err(error) => Err(ControlError::new("badRequest", error.to_string())),
-        }
-    } else {
-        Err(ControlError::new(
-            "badRequest",
-            "expected one JSON request line",
-        ))
+        },
+        Err(msg) => Err(ControlError::new("badRequest", msg)),
     };
     let body = match reply {
         Ok(value) => json!({ "ok": true, "pid": std::process::id(), "result": value }),
@@ -369,13 +533,22 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
             agent,
             from,
             prompt,
-        } => exchange(commands, |reply| Command::Split {
-            direction,
-            agent,
-            from,
-            prompt,
-            reply,
-        }),
+        } => {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancel_flag = Arc::clone(&cancelled);
+            let result = exchange(commands, |reply| Command::Split {
+                direction,
+                agent,
+                from,
+                prompt,
+                cancelled: cancel_flag,
+                reply,
+            });
+            if result.is_err() {
+                cancelled.store(true, Ordering::Release);
+            }
+            result
+        }
         Request::Send {
             pane,
             from,
@@ -467,7 +640,11 @@ fn panes_cli(args: &[String]) -> i32 {
         }
     };
     if json {
-        println!("{}", value["panes"]);
+        let Some(panes) = value.get("panes").filter(|v| v.is_array()) else {
+            eprintln!("kumu: unexpected reply: missing panes array");
+            return 1;
+        };
+        println!("{panes}");
         return 0;
     }
     let panes: Vec<PaneSummary> = match serde_json::from_value(value["panes"].clone()) {
@@ -642,10 +819,10 @@ fn pane_send(args: &[String]) -> i32 {
             continue;
         }
         match arg.as_str() {
-            "--" => text_only = true,
+            "--" if target.is_some() => text_only = true,
             "--json" => json = true,
             "--no-enter" => enter = false,
-            "-h" | "--help" => {
+            "-h" | "--help" if words.is_empty() => {
                 println!("{USAGE}");
                 return 0;
             }
@@ -768,6 +945,7 @@ fn call_at_instance(
         request: request.clone(),
     })
     .map_err(|error| error.to_string())?;
+    let _ = stream.set_write_timeout(Some(REPLY_TIMEOUT));
     stream
         .write_all(format!("{body}\n").as_bytes())
         .and_then(|()| stream.flush())
@@ -776,9 +954,12 @@ fn call_at_instance(
     // that so its error reaches the user instead of a silent hang.
     let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + Duration::from_secs(2)));
     let mut line = String::new();
-    BufReader::new(stream)
+    let n = BufReader::new(stream.take(MAX_RESPONSE_BYTES))
         .read_line(&mut line)
         .map_err(|error| format!("kumu did not answer: {error}"))?;
+    if n == 0 {
+        return Err("kumu closed the connection before replying".to_string());
+    }
     let reply: Value =
         serde_json::from_str(line.trim()).map_err(|error| format!("bad reply: {error}"))?;
     if let Some(expected) = instance
@@ -974,6 +1155,7 @@ mod tests {
                         agent,
                         from,
                         prompt,
+                        cancelled: _,
                         reply,
                     } => {
                         assert_eq!(direction, "right");

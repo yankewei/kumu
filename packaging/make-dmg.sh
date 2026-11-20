@@ -32,7 +32,7 @@ else
     target_dir=target/debug
 fi
 
-version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+version="$(sed -n '/^version =/{s/^version = "\([^"]*\)".*/\1/p; q;}' Cargo.toml)"
 arch="$(uname -m)"
 case "$arch" in
     arm64|aarch64) arch=aarch64 ;;
@@ -46,7 +46,7 @@ cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT
 
 mkdir -p "$stage"
-cp -R "$app" "$stage/Kumu.app"
+ditto "$app" "$stage/Kumu.app"
 ln -s /Applications "$stage/Applications"
 
 rm -f "$dmg"

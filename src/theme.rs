@@ -53,7 +53,7 @@ pub fn load_kumu_themes(cx: &mut App) {
     }
     let mode =
         theme_mode_from_setting(crate::db::get_setting(crate::db::SETTING_THEME_MODE).as_deref());
-    change_mode(mode, None, cx);
+    apply_mode(mode, None, cx);
 }
 
 /// The light/dark choice saved by Settings, defaulting to light.
@@ -69,17 +69,18 @@ fn theme_mode_from_setting(value: Option<&str>) -> ThemeMode {
 /// would drop the family.
 pub fn change_mode(mode: impl Into<ThemeMode>, window: Option<&mut Window>, cx: &mut App) {
     let mode = mode.into();
-    // The startup call writes the value it just read; that is harmless and
-    // keeps this the one place a mode change becomes persistent.
     crate::db::set_setting(
         crate::db::SETTING_THEME_MODE,
         if mode.is_dark() { "dark" } else { "light" },
     )
     .ok();
+    apply_mode(mode, window, cx);
+}
+
+fn apply_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     Theme::change(mode, window, cx);
     cx.default_global::<ThemeRevision>().0 += 1;
     apply_saved_font(cx);
-    install_text_view_style(cx);
 }
 
 /// Terminal typeface: theme mono family (JetBrains Mono by default), sized
@@ -158,22 +159,39 @@ pub fn set_font_family(cx: &mut App, family: &str) {
 /// `Window::set_rem_size` on each frame. The app's layout and type scale are
 /// all in rems, so this one value scales the whole UI — text, icons, spacing —
 /// in proportion, the way Zed's `ui_font_size` scales its UI.
+fn clamp_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(10., 32.)
+    } else {
+        DEFAULT_FONT_SIZE
+    }
+}
+
 pub fn set_font_size(cx: &mut App, size: f32) {
-    Theme::global_mut(cx).font_size = px(size);
+    Theme::global_mut(cx).font_size = px(clamp_font_size(size));
     Theme::sync_base(cx);
     install_text_view_style(cx);
     cx.refresh_windows();
 }
 
-/// Re-apply the persisted font choices on top of the current theme.
+/// Re-apply the persisted font choices on top of the current theme in one
+/// sync/refresh pass.
 pub fn apply_saved_font(cx: &mut App) {
-    if let Some(family) = crate::db::get_setting(crate::db::SETTING_FONT) {
-        set_font_family(cx, &family);
-    }
+    let family = crate::db::get_setting(crate::db::SETTING_FONT);
     let size = crate::db::get_setting(crate::db::SETTING_FONT_SIZE)
-        .and_then(|size| size.parse().ok())
+        .and_then(|size| size.parse::<f32>().ok())
+        .map(clamp_font_size)
         .unwrap_or(DEFAULT_FONT_SIZE);
-    set_font_size(cx, size);
+    {
+        let theme = Theme::global_mut(cx);
+        if let Some(family) = family {
+            theme.font_family = family.into();
+        }
+        theme.font_size = px(size);
+    }
+    Theme::sync_base(cx);
+    install_text_view_style(cx);
+    cx.refresh_windows();
 }
 
 /// Shared text view defaults: the component theme's colors plus a wider

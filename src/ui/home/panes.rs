@@ -5,7 +5,8 @@
 //! layout while every terminal keeps running. Switching projects restores the
 //! project's selected tab and its tree.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui_kit::Axis;
 
@@ -14,6 +15,18 @@ use crate::agent::launch::PaneLaunch;
 /// Stable id for one terminal pane in the home window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u64);
+
+/// Stable id for one tab in the home window, immune to index shifts when
+/// earlier tabs close asynchronously.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TabId(pub u64);
+
+impl TabId {
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// Direction of a keyboard focus move between panes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +53,7 @@ const READABLE_WORKSPACE_VERSIONS: std::ops::RangeInclusive<u32> = 3..=WORKSPACE
 /// bound, not a working limit: a real layout above the old 12-pane cap used to
 /// be dropped on the floor, taking the whole project tree with it.
 const MAX_RESTORED_PANES: usize = 64;
+const MAX_RESTORED_TOTAL_PANES: usize = 256;
 
 /// Saved pane ids are kept below this bound so `next_pane` cannot overflow on
 /// the next split after a corrupt document.
@@ -52,10 +66,22 @@ const MIN_RATIO: f32 = 0.02;
 /// One tab of a project: a named pane layout and the pane that had focus.
 #[derive(Clone, Debug)]
 pub struct ProjectTab {
+    pub id: TabId,
     /// Empty until the user renames it; the UI shows a numbered fallback.
     pub name: String,
     pub layout: PaneNode,
     pub focused: PaneId,
+}
+
+impl ProjectTab {
+    pub fn new(name: String, layout: PaneNode, focused: PaneId) -> Self {
+        Self {
+            id: TabId::next(),
+            name,
+            layout,
+            focused,
+        }
+    }
 }
 
 /// A project's tabs and the one currently shown.
@@ -117,15 +143,15 @@ pub enum SavedNode {
         /// Pane id → what it runs, for panes that are not plain shells.
         /// Omitted when empty, so a shell-only layout looks exactly like one
         /// written before agent panes existed.
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        launches: HashMap<u64, PaneLaunch>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        launches: BTreeMap<u64, PaneLaunch>,
     },
     /// Version 5 payload: one or more named layouts per project.
     ProjectTabs {
         selected: Option<i64>,
         projects: Vec<SavedProjectTabs>,
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        launches: HashMap<u64, PaneLaunch>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        launches: BTreeMap<u64, PaneLaunch>,
     },
 }
 
@@ -224,11 +250,10 @@ impl SavedWorkspace {
 fn restore_project_tabs(
     saved_projects: &[SavedProjectTabs],
     selected: Option<i64>,
-    saved_launches: &HashMap<u64, PaneLaunch>,
+    saved_launches: &BTreeMap<u64, PaneLaunch>,
     project_exists: impl Fn(i64) -> bool,
 ) -> Option<RestoredWorkspace> {
     let mut next_group = 1;
-    let mut next_pane = 2;
     let mut group_sizes = HashMap::new();
     let mut tabs_by_project = HashMap::new();
     let mut seen = HashSet::new();
@@ -237,6 +262,7 @@ fn restore_project_tabs(
             continue;
         }
         let mut tabs = Vec::new();
+        let mut project_pane_count = 0usize;
         for saved_tab in &saved.tabs {
             let mut tab_groups = HashMap::new();
             let mut tab_next_group = next_group;
@@ -248,7 +274,10 @@ fn restore_project_tabs(
                 continue;
             };
             let leaves = layout.panes();
-            if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
+            if leaves.is_empty()
+                || project_pane_count + leaves.len() > MAX_RESTORED_PANES
+                || seen.len() + leaves.len() > MAX_RESTORED_TOTAL_PANES
+            {
                 continue;
             }
             let unique: HashSet<u64> = leaves.iter().map(|pane| pane.0).collect();
@@ -259,26 +288,16 @@ fn restore_project_tabs(
             {
                 continue;
             }
+            project_pane_count += leaves.len();
             seen.extend(unique);
             next_group = tab_next_group;
             group_sizes.extend(tab_groups);
-            next_pane = next_pane.max(
-                leaves
-                    .iter()
-                    .map(|pane| pane.0.saturating_add(1))
-                    .max()
-                    .unwrap_or(2),
-            );
             let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
                 PaneId(saved_tab.focused)
             } else {
                 leaves[0]
             };
-            tabs.push(ProjectTab {
-                name: saved_tab.name.clone(),
-                layout,
-                focused,
-            });
+            tabs.push(ProjectTab::new(saved_tab.name.clone(), layout, focused));
         }
         if tabs.is_empty() {
             continue;
@@ -311,11 +330,10 @@ fn restore_project_tabs(
 fn restore_project_layouts(
     saved_projects: &[SavedProjectLayout],
     selected: Option<i64>,
-    saved_launches: &HashMap<u64, PaneLaunch>,
+    saved_launches: &BTreeMap<u64, PaneLaunch>,
     project_exists: impl Fn(i64) -> bool,
 ) -> Option<RestoredWorkspace> {
     let mut next_group = 1;
-    let mut next_pane = 2;
     let mut group_sizes = HashMap::new();
     let mut tabs_by_project = HashMap::new();
     let mut seen = HashSet::new();
@@ -333,7 +351,10 @@ fn restore_project_layouts(
             continue;
         };
         let leaves = layout.panes();
-        if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
+        if leaves.is_empty()
+            || leaves.len() > MAX_RESTORED_PANES
+            || seen.len() + leaves.len() > MAX_RESTORED_TOTAL_PANES
+        {
             continue;
         }
         let unique: HashSet<u64> = leaves.iter().map(|pane| pane.0).collect();
@@ -347,13 +368,6 @@ fn restore_project_layouts(
         seen.extend(unique);
         next_group = local_next_group;
         group_sizes.extend(local_groups);
-        next_pane = next_pane.max(
-            leaves
-                .iter()
-                .map(|pane| pane.0.saturating_add(1))
-                .max()
-                .unwrap_or(2),
-        );
         let focused = if leaves.contains(&PaneId(saved.focused)) {
             PaneId(saved.focused)
         } else {
@@ -362,11 +376,7 @@ fn restore_project_layouts(
         tabs_by_project.insert(
             saved.project,
             ProjectTabs {
-                tabs: vec![ProjectTab {
-                    name: String::new(),
-                    layout,
-                    focused,
-                }],
+                tabs: vec![ProjectTab::new(String::new(), layout, focused)],
                 selected: 0,
             },
         );
@@ -390,7 +400,7 @@ fn finish_restore(
     tabs_by_project: HashMap<i64, ProjectTabs>,
     selected: Option<i64>,
     saved: Vec<i64>,
-    saved_launches: &HashMap<u64, PaneLaunch>,
+    saved_launches: &BTreeMap<u64, PaneLaunch>,
     group_sizes: HashMap<u64, Vec<f32>>,
     next_group: u64,
     project_exists: &impl Fn(i64) -> bool,
@@ -620,10 +630,12 @@ impl PaneNode {
                     (region.center_x() - target.center_x()).abs(),
                 ),
             };
-            // Panes share exact edges; float error must not hide those.
+            // Panes share exact edges; clamp tiny float error to 0.0 so a
+            // diagonal pane with -1e-5 never outranks a directly adjacent pane.
             if gap < -0.0001 {
                 continue;
             }
+            let gap = if gap < 0.0001 { 0.0 } else { gap };
             if best.is_none_or(|(_, best_gap, best_side)| (gap, side) < (best_gap, best_side)) {
                 best = Some((pane, gap, side));
             }
@@ -988,7 +1000,7 @@ mod tests {
                         focused: 1,
                     }],
                 }],
-                launches: HashMap::new(),
+                launches: BTreeMap::new(),
             },
             focused: 1,
         };
@@ -1130,7 +1142,7 @@ mod tests {
                         ],
                     },
                 ],
-                launches: HashMap::new(),
+                launches: BTreeMap::new(),
             },
             focused: 4,
         }
@@ -1255,7 +1267,7 @@ mod tests {
                 selected_tab: 0,
                 tabs: vec![tab("one", leaf(1), 1), tab("two", leaf(1), 1)],
             }],
-            launches: HashMap::new(),
+            launches: BTreeMap::new(),
         };
         let json = serde_json::to_string(&duplicate).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).expect("one tab survives");
@@ -1285,7 +1297,7 @@ mod tests {
                     selected_tab: 0,
                     tabs: vec![tab("", leaf(7), 7)],
                 }],
-                launches: HashMap::new(),
+                launches: BTreeMap::new(),
             },
             focused: 7,
         };
@@ -1309,7 +1321,7 @@ mod tests {
                     selected_tab: 0,
                     tabs: vec![tab("", leaf(7), 7)],
                 }],
-                launches: HashMap::from([(7, launch.clone())]),
+                launches: BTreeMap::from([(7, launch.clone())]),
             },
             focused: 7,
         };
@@ -1331,7 +1343,7 @@ mod tests {
                     selected_tab: 0,
                     tabs: vec![tab("", leaf(7), 7)],
                 }],
-                launches: HashMap::from([
+                launches: BTreeMap::from([
                     (
                         7,
                         PaneLaunch::Agent {

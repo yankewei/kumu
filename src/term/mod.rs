@@ -11,6 +11,7 @@ mod session;
 pub mod shell_env;
 mod vt;
 
+pub use pty::SESSION_TOKEN_ENV;
 pub use session::Term;
 pub use vt::{
     Cell, CursorShape, Hyperlink, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb,
@@ -20,7 +21,10 @@ pub use vt::{
 /// The user's login shell: `$SHELL`, falling back to `/bin/sh`.
 /// Load login profiles so Finder-launched terminals get the user's tool paths.
 pub fn default_shell() -> (String, Vec<String>) {
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let program = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
     (program, vec!["-l".into()])
 }
 

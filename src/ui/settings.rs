@@ -10,7 +10,7 @@ use crate::db;
 use crate::theme;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -77,6 +77,7 @@ pub struct SettingsWindow {
     /// UI font-size picker over the app's type scale.
     font_size_select: Entity<SelectState<SearchableVec<FontSizeItem>>>,
     updater: Entity<Updater>,
+    installed_agents: HashMap<&'static str, bool>,
     integrations: HashMap<&'static str, Result<integration::Status, String>>,
     integration_busy: Option<&'static str>,
     /// Whether panes resume their agent conversations on the next launch.
@@ -131,22 +132,50 @@ impl SettingsWindow {
         })
         .detach();
 
+        let search_state = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…"));
+        cx.subscribe(&search_state, |_, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        // Probe agent executables and hook/extension registrations off the UI
+        // thread so opening Settings or hovering never blocks on $PATH stats.
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    AGENTS
+                        .iter()
+                        .map(|agent| {
+                            let is_installed = crate::agent::installed_with_shell_env(agent.id);
+                            let status =
+                                integration::status(agent.id).map_err(|error| error.to_string());
+                            (agent.id, is_installed, status)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for (id, is_installed, status) in results {
+                    this.installed_agents.insert(id, is_installed);
+                    this.integrations.insert(id, status);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+
         Self {
             settings_page: SettingsPage::Providers,
-            search_state: cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…")),
+            search_state,
             content_scroll: ScrollHandle::new(),
             font_select,
             font_size_select,
             updater,
-            integrations: AGENTS
-                .iter()
-                .map(|agent| {
-                    (
-                        agent.id,
-                        integration::status(agent.id).map_err(|error| error.to_string()),
-                    )
-                })
-                .collect(),
+            installed_agents: HashMap::new(),
+            integrations: HashMap::new(),
             integration_busy: None,
             auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
         }
@@ -352,7 +381,7 @@ impl SettingsWindow {
         };
 
         let cards: Vec<AnyElement> = match self.settings_page {
-            SettingsPage::Providers => vec![self.render_providers_card(dark, theme, cx)],
+            SettingsPage::Providers => vec![self.render_providers_card(dark, &query, theme, cx)],
             SettingsPage::General => vec![
                 self.render_general_card(dark, theme, cx),
                 self.render_updates_card(dark, theme, cx),
@@ -363,11 +392,7 @@ impl SettingsWindow {
             .flex_1()
             .h_full()
             .min_w_0()
-            .bg(if dark {
-                theme.background
-            } else {
-                gpui_kit::gpui::white()
-            })
+            .bg(theme.background)
             .child(
                 div()
                     .flex_1()
@@ -410,7 +435,13 @@ impl SettingsWindow {
         div().w_full().px_5().py_4().rounded_lg().bg(bg)
     }
 
-    fn render_providers_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+    fn render_providers_card(
+        &self,
+        dark: bool,
+        query: &str,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let (base_bg, radius, muted, muted_fg, border) = (
             theme.background,
             theme.radius,
@@ -418,18 +449,18 @@ impl SettingsWindow {
             theme.muted_foreground,
             theme.border,
         );
-        // White card on the light panel; keep the muted surface in dark mode.
-        let card_bg = if dark { muted } else { gpui_kit::gpui::white() };
-        // Icon tiles flip to muted so they still contrast against the white card.
+        let card_bg = if dark { muted } else { theme.popover };
         let tile_bg = if dark { base_bg } else { muted };
         let rows = AGENTS
             .iter()
+            .filter(|a| {
+                query.is_empty()
+                    || a.name.to_lowercase().contains(query)
+                    || a.id.to_lowercase().contains(query)
+            })
             .enumerate()
             .map(|(i, a)| {
-                // The registry is what kumu supports; this is the one fact the
-                // list takes from the machine. An agent that is not installed
-                // is still shown, so its absence is visible.
-                let installed = crate::agent::installed(a.id);
+                let installed = self.installed_agents.get(a.id).copied().unwrap_or(false);
                 let agent = a.id;
                 let status = self.integrations.get(agent);
                 let registered = matches!(status, Some(Ok(integration::Status::Registered)));
@@ -537,7 +568,7 @@ impl SettingsWindow {
                 v_flex()
                     .min_w_0()
                     .gap_1()
-                    .child(div().text_xs().font_medium().child("编码 Agent"))
+                    .child(div().text_sm().font_medium().child("编码 Agent"))
                     .child(div().text_xs().text_color(muted_fg).child(
                         "开启通知会注册到 Agent 的配置或扩展目录，之后可按原来的方式启动。",
                     )),
@@ -594,7 +625,10 @@ impl SettingsWindow {
             UpdateStatus::Downloading { downloaded, total } => {
                 let message = match total {
                     Some(total) if *total > 0 => {
-                        format!("正在下载：{}%", downloaded.saturating_mul(100) / total)
+                        format!(
+                            "正在下载：{}%",
+                            (downloaded.saturating_mul(100) / total).min(100)
+                        )
                     }
                     _ => format!("正在下载：{:.1} MB", *downloaded as f64 / 1_048_576.),
                 };
@@ -618,56 +652,52 @@ impl SettingsWindow {
             _ => ("暂时无法检查更新。".to_string(), "检查更新"),
         };
         let busy = matches!(status, UpdateStatus::Checking | UpdateStatus::Installing);
-        self.card(if dark {
-            theme.muted
-        } else {
-            gpui_kit::gpui::white()
-        })
-        .child(
-            h_flex()
-                .items_center()
-                .gap_4()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().text_sm().font_medium().child("软件更新"))
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("当前版本 {}", env!("CARGO_PKG_VERSION"))),
-                        ),
-                )
-                .child(
-                    Button::new("app-update")
-                        .small()
-                        .label(label)
-                        .loading(busy)
-                        .disabled(busy)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.update_action(window, cx)),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .mt_2()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(message),
-        )
-        .child(
-            Button::new("release-page")
-                .small()
-                .ghost()
-                .label("发布页面")
-                .on_click(|_, _, cx| {
-                    cx.open_url("https://github.com/yankewei/kumu/releases/latest")
-                }),
-        )
-        .into_any_element()
+        self.card(if dark { theme.muted } else { theme.popover })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().font_medium().child("软件更新"))
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("当前版本 {}", env!("CARGO_PKG_VERSION"))),
+                            ),
+                    )
+                    .child(
+                        Button::new("app-update")
+                            .small()
+                            .label(label)
+                            .loading(busy)
+                            .disabled(busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.update_action(window, cx)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(message),
+            )
+            .child(
+                Button::new("release-page")
+                    .small()
+                    .ghost()
+                    .label("发布页面")
+                    .on_click(|_, _, cx| {
+                        cx.open_url("https://github.com/yankewei/kumu/releases/latest")
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_general_card(&self, dark: bool, theme: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -786,7 +816,7 @@ impl SettingsWindow {
             )
             .into_any_element();
 
-        self.card(if dark { muted } else { gpui_kit::gpui::white() })
+        self.card(if dark { muted } else { theme.popover })
             .child(row(
                 "深色外观",
                 "在亮色与暗色主题之间切换。",

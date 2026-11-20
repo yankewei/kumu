@@ -55,10 +55,11 @@ jobs:
 
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - run: node --test src/agent/integration/adapters.test.mjs
 
       # The release binary is what packaging/make-app.sh bundles and signs.
       - run: cargo build --release --locked
-      - run: packaging/make-app.sh release
+      - run: packaging/make-app.sh release --no-build
       - run: ditto -c -k --keepParent target/release/Kumu.app target/release/Kumu.app.zip
 
       - uses: actions/upload-artifact@v7

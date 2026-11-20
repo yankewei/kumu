@@ -6,10 +6,12 @@
 //! that, so we set kumu's own `.icns` on the shared `NSApplication` at launch,
 //! which updates the Dock even for an unbundled process.
 //!
-//! A shipped `.app` bundle still wins: AppKit only uses this while the process
-//! has no bundle icon of its own.
+//! Only runs for unbundled launches (e.g. `cargo run`): a shipped `.app`
+//! bundle already supplies its Dock icon via `CFBundleIconFile` and must not
+//! be overridden with `setApplicationIconImage:`.
 
-/// Sets the Dock icon from the embedded `assets/AppIcon.icns`.
+/// Sets the Dock icon from the embedded `assets/AppIcon.icns` when running as
+/// a bare executable outside a `.app` bundle.
 ///
 /// Must be called on the main thread (AppKit requirement).
 #[cfg(target_os = "macos")]
@@ -18,6 +20,11 @@ pub fn install() {
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
 
+    if std::env::current_exe()
+        .is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+    {
+        return;
+    }
     let Some(bytes) = crate::assets::app_icon() else {
         eprintln!("[ui] dock icon asset AppIcon.icns missing");
         return;
@@ -31,8 +38,8 @@ pub fn install() {
         eprintln!("[ui] dock icon failed to decode");
         return;
     };
-    // A non-nil image argument is required; `setApplicationIconImage:` is the
-    // only reason this block is unsafe.
+    // `mtm` proves we are on the AppKit main thread and `image` is a valid
+    // decoded `NSImage`.
     unsafe {
         NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
     }
