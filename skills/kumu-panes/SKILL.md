@@ -42,7 +42,7 @@ Kumu 的每个窗格是一个独立终端。你只能看到自己这一格，但
 ```
 
 - 方向只有 `right`（横向，右边）和 `down`（纵向，下面）：Kumu 只会在目标之后追加窗格。
-- `--agent` 用注册 id（`codex`、`claude`、`opencode`、`pi`、`omp`、`cursor`、`grok`）或显示名；没安装会报 `agentNotInstalled`。
+- `--agent` 用注册 id（`codex`、`claude`、`opencode`、`pi`、`omp`、`cursor`、`grok`、`agy`）或显示名；没安装会报 `agentNotInstalled`。
 - `--prompt` 会等新 Agent 画出自己的输入框（最多约 12 秒）再粘贴文字并回车，所以新窗格会直接开工；也可以省略 `--prompt`，只用它占位。
 - 省略 `--prompt` 时方向后面剩下的词也会当作 prompt，例如 `pane split right --agent codex review the diff`。
 - 新窗格开在你旁边，但你自己的键盘焦点不变。

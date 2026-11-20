@@ -17,10 +17,13 @@ Kumu 不改写用户的 Agent 启动命令，不添加 `-c`、`--settings` 或 `
 | Oh My Pi | `~/.omp/agent/extensions/kumu-notifications/` | `agent_end`、`tool_approval_requested`、提问工具事件、输入／确认／选择对话框 |
 | Cursor CLI | `~/.cursor/hooks.json` | `stop`（只覆盖任务结束） |
 | Grok Build | `~/.grok/hooks/kumu-notifications.json` | `Stop`、`Notification` |
+| Antigravity CLI | `~/.gemini/config/hooks.json` 的 `kumu-notifications` | `SessionStart`（静默上报会话 id）、`Stop`（任务结束或失败，取消不提醒） |
 
 Cursor 的钩子文件是扁平结构：事件直接对应处理器数组，处理器自身就是命令（不像 Claude／Codex／Grok 那样再嵌一层 `hooks`），因此 Kumu 用单独的读改写逻辑处理它，并保留 `version` 字段与其他事件。Cursor 没有“等待权限”事件：`beforeShellExecution` 是权限闸门，返回格式错误会阻断命令，因此不用它发送通知，Cursor 只提供任务结束提醒。
 
 Grok 的钩子格式与 Claude 相同，可以复用同一套 CST 逻辑；Kumu 写自己的 `~/.grok/hooks/kumu-notifications.json`，不修改用户已有的 hook 文件。
+
+Antigravity 的全局 `hooks.json` 以顶层命名键组织钩子，没有外层 `hooks` 字段，且 `SessionStart`／`Stop` 为扁平处理器数组。Kumu 只管理自己的 `kumu-notifications` 键，保留同文件内的其他命名钩子与注释；由于同一全局文件会被 Antigravity IDE 与桌面端读取，命令在结束时固定向标准输出打印 `{}`，保证在非 Kumu 环境中也是合法的空响应。Antigravity 的 `PreToolUse` 是要求返回 `decision` 的权限闸门，因此不用于通知，只覆盖会话上报与任务结束。
 
 Pi 与 Oh My Pi 共用 `~/.kumu/agent-integration/pi/` 下的一份扩展；安装时只创建各自的自动发现链接。扩展通过 OMP 独有的 `ctx.agent` 区分宿主（Pi 没有这个字段），因此两者即使通过 `PI_CODING_AGENT_DIR` 指向同一个 agent 目录，也不需要重复安装，更不会互相占用链接。共用同一目录时，移除其中一个链接也会让另一个失效，重新为任一 Agent 接入即可恢复。
 
@@ -47,7 +50,7 @@ Claude Code 和 Codex 都会把 command hook 放到没有控制终端的新 sess
 传输方式按 Agent 的官方能力区分：
 
 - **Claude Code**：命令向标准输出返回 `{"terminalSequence":"..."}`，由 Claude 自己发到终端（OSC 777）。这是 Claude 文档推荐的无控制终端方案，也适用于 tmux/screen；不支持该字段的旧版本会静默忽略，请更新 Claude Code。
-- **Codex／Grok Build／Cursor**：hook 打开 `KUMU_TTY` 写入 OSC 777；不向标准输出写内容，避免被各自的 hook 输出协议误读。Cursor 的 `hooks.json` 与 IDE 共用，`KUMU_TERMINAL` 守卫让它在 IDE 中立即返回。
+- **Codex／Grok Build／Cursor／Antigravity CLI**：hook 打开 `KUMU_TTY` 写入 OSC 777；不向标准输出写通知内容，避免被各自的 hook 输出协议误读（Antigravity 的 shell 包装命令末尾单独打印 `{}` 满足其 JSON 响应约定）。Cursor 的 `hooks.json` 与 Antigravity 的 `~/.gemini/config/hooks.json` 均与 IDE 共用，`KUMU_TERMINAL` 守卫让它们在 IDE 中保持静默。
 - **Pi／Oh My Pi／OpenCode**：扩展通过同一 `KUMU_TTY` 写入；拿不到时回退 `/dev/tty`。
 
 后代进程会继承这些环境变量。不向 hook 的标准输出写入协议内容，也不替用户回答、选择或批准操作。
@@ -60,7 +63,7 @@ Agent 窗格需要记住“这是哪个对话”，重启后才知道带哪条 `
 - OpenCode 插件在根会话开始时发同样的序列；
 - Kumu 看到 body 以 `kumu-session:` 开头就把它记到窗格上，**不弹提醒**。
 
-Agent 不一定从「新建 Agent 窗格」启动：手动在普通 shell 窗格输入的支持恢复的 Agent（OpenCode／Codex／Claude／Cursor）只要发出会话更新，Kumu 就把这个窗格记为对应 Agent，下次启动直接带恢复参数启动（关闭“恢复 Agent 会话”时保持 shell 窗格不变）。会话 id 来自该窗格自己的 PTY，因此不同分栏里的 Agent 不会记错。没有恢复语法的 Agent（Pi、OMP、Grok）不会接管 shell 窗格，否则只会把用户的 shell 换成一个全新的 Agent。
+Agent 不一定从「新建 Agent 窗格」启动：手动在普通 shell 窗格输入的支持恢复的 Agent（OpenCode／Codex／Claude／Cursor／Antigravity CLI）只要发出会话更新，Kumu 就把这个窗格记为对应 Agent，下次启动直接带恢复参数启动（关闭“恢复 Agent 会话”时保持 shell 窗格不变）。会话 id 来自该窗格自己的 PTY，因此不同分栏里的 Agent 不会记错。没有恢复语法的 Agent（Pi、OMP、Grok）不会接管 shell 窗格，否则只会把用户的 shell 换成一个全新的 Agent。
 
 这个接管有一个已知边界：Kumu 收不到“Agent 主动退出、shell 还在”的事件，只在退出 App 或关闭窗口时用进程树判断被接管的 Agent 是否仍在运行。已经退出的 Agent 会被释放，窗格恢复为 shell；仍在运行的会话会被恢复。但 App 运行期间窗格会一直带着这个 launch：如果随后在同一个窗格里启动另一个可恢复的 Agent，会替换掉原来的记录；如果启动的是 Pi／OMP／Grok，原记录会保留。需要撤销时，关闭该窗格再新开，或重启后退出被恢复的 Agent。
 
@@ -88,6 +91,6 @@ node --test src/agent/integration/adapters.test.mjs
 cargo clippy --all-targets -- -D warnings
 ```
 
-Rust 检查配置合并、注释与用户 hooks 保留、重复安装、移除（包括旧版本事件）、文件权限与符号链接保护，以及自定义启动命令的参数和终端身份。Python 在没有控制终端的 session 中检查 Claude 的 `terminalSequence`、Codex 的 `KUMU_TTY` 传输和标准输出隔离。Node 检查 Pi／OMP 的完成边界、同一扩展的宿主识别、OpenCode 事件适配与非 Kumu 环境中的停用。这些测试不等同于七种 Agent 的真实模型任务和 macOS 横幅验收。
+Rust 检查配置合并、注释与用户 hooks 保留、重复安装、移除（包括旧版本事件）、文件权限与符号链接保护，以及自定义启动命令的参数和终端身份。Python 在没有控制终端的 session 中检查 Claude 的 `terminalSequence`、Codex／Grok／Cursor／Antigravity CLI 的 `KUMU_TTY` 传输和标准输出隔离。Node 检查 Pi／OMP 的完成边界、同一扩展的宿主识别、OpenCode 事件适配与非 Kumu 环境中的停用。这些测试不等同于八种 Agent 的真实模型任务和 macOS 横幅验收。
 
-接口依据：[OpenAI hooks](https://learn.chatgpt.com/docs/hooks)、[Claude Code hooks](https://code.claude.com/docs/en/hooks)、[OpenCode 插件自动发现](https://opencode.ai/docs/plugins/)、[OpenCode V1 插件兼容接口](https://opencode.ai/docs/build/plugins/server/#support-v1)、[Pi 发布包](https://www.npmjs.com/package/@mariozechner/pi-coding-agent)、[OMP 扩展加载](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)、[Cursor hooks](https://cursor.com/docs/agent/hooks)、[Grok Build hooks](https://docs.x.ai/build/features/hooks)。
+接口依据：[OpenAI hooks](https://learn.chatgpt.com/docs/hooks)、[Claude Code hooks](https://code.claude.com/docs/en/hooks)、[OpenCode 插件自动发现](https://opencode.ai/docs/plugins/)、[OpenCode V1 插件兼容接口](https://opencode.ai/docs/build/plugins/server/#support-v1)、[Pi 发布包](https://www.npmjs.com/package/@mariozechner/pi-coding-agent)、[OMP 扩展加载](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)、[Cursor hooks](https://cursor.com/docs/agent/hooks)、[Grok Build hooks](https://docs.x.ai/build/features/hooks)、[Antigravity hooks](https://antigravity.google/docs/hooks)。

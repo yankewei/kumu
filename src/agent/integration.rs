@@ -36,6 +36,12 @@ fn is_under_managed(path: &Path, managed: &Path) -> bool {
         && path.starts_with(managed)
 }
 
+const AGY_HOOK_NAME: &str = "kumu-notifications";
+
+fn is_hook_agent(agent: &str) -> bool {
+    matches!(agent, "codex" | "claude" | "grok" | "cursor" | "agy")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Missing,
@@ -98,6 +104,10 @@ fn paths(agent: &str) -> io::Result<Paths> {
         // Grok Build reads personal hooks from ~/.grok/hooks/*.json. Kumu keeps
         // its own file so installing never has to rewrite a user's hook file.
         "grok" => home.join(".grok/hooks/kumu-notifications.json"),
+        // Antigravity reads global hooks from ~/.gemini/config/hooks.json,
+        // where each top-level key is a named hook group rather than a shared
+        // `hooks` object.
+        "agy" => home.join(".gemini/config/hooks.json"),
         _ => return Err(io::Error::other("不支持的 Agent")),
     };
     Ok(Paths {
@@ -154,6 +164,9 @@ fn notify_command(agent: &str, kind: &str) -> String {
 fn edit_hooks(text: &str, agent: &str, remove: bool) -> io::Result<String> {
     if agent == "cursor" {
         return edit_cursor_hooks(text, remove);
+    }
+    if agent == "agy" {
+        return edit_agy_hooks(text, remove);
     }
     let root = CstRootNode::parse(text, &ParseOptions::default()).map_err(io::Error::other)?;
     let object = root
@@ -308,6 +321,115 @@ fn cursor_hook(kind: &str) -> Value {
     json!({ "command": notify_command("cursor", kind), "timeout": 3 })
 }
 
+/// Antigravity's global `hooks.json` maps top-level hook names directly to
+/// event objects (no outer `hooks` wrapper). Kumu owns only its own named
+/// entry so user hooks in the same file stay untouched.
+fn edit_agy_hooks(text: &str, remove: bool) -> io::Result<String> {
+    let root = CstRootNode::parse(text, &ParseOptions::default()).map_err(io::Error::other)?;
+    let object = root
+        .object_value()
+        .ok_or_else(|| io::Error::other("配置必须是 JSON 对象，未覆盖原文件"))?;
+    if remove {
+        let Some(hooks) = object.object_value(AGY_HOOK_NAME) else {
+            return Ok(text.into());
+        };
+        if !remove_agy_handlers(&hooks) {
+            return Ok(text.into());
+        }
+        if hooks.properties().is_empty()
+            && let Some(property) = object.get(AGY_HOOK_NAME)
+        {
+            property.remove();
+        }
+        return Ok(root.to_string());
+    }
+    let hooks = object
+        .object_value_or_create(AGY_HOOK_NAME)
+        .ok_or_else(|| io::Error::other(format!("{AGY_HOOK_NAME} 必须是对象，未覆盖原文件")))?;
+    if let Some(enabled) = hooks.get("enabled")
+        && enabled.value().and_then(|value| value.to_serde_value()) == Some(Value::Bool(false))
+    {
+        enabled.remove();
+    }
+    let events = agy_events();
+    let known: Vec<&str> = events.iter().map(|(event, _)| *event).collect();
+    for (event, kind) in events {
+        let expected = agy_hook(kind);
+        let handlers = hooks.array_value_or_create(event).ok_or_else(|| {
+            io::Error::other(format!("{AGY_HOOK_NAME}.{event} 必须是数组，未覆盖原文件"))
+        })?;
+        let existing = handlers.elements();
+        let correct = existing
+            .iter()
+            .filter(|node| node.to_serde_value().as_ref() == Some(&expected))
+            .count();
+        let managed = existing
+            .iter()
+            .filter(|node| node.to_serde_value().as_ref().is_some_and(is_managed_hook))
+            .count();
+        if correct == 1 && managed == 1 {
+            continue;
+        }
+        remove_managed_from_event(&handlers);
+        handlers.append(cst_input(expected));
+    }
+    prune_unknown_agy(&hooks, &known);
+    Ok(root.to_string())
+}
+
+/// Antigravity's `PreToolUse` is a permission gate whose stdout requires a
+/// `decision`, so Kumu does not attach notifications to it. `SessionStart`
+/// reports the conversation id silently when a session opens; `Stop` reports
+/// both the conversation id and turn completion.
+fn agy_events() -> Vec<(&'static str, &'static str)> {
+    vec![("SessionStart", "session"), ("Stop", "complete")]
+}
+
+fn agy_hook(kind: &str) -> Value {
+    // Antigravity parses every command hook's stdout as JSON, including when
+    // the same global file runs in Antigravity IDE/App outside Kumu. Always
+    // emit `{}` so the hook stays a valid no-op everywhere.
+    let command = format!(
+        "if [ \"${{KUMU_TERMINAL:-}}\" = 1 ] && [ -n \"${{KUMU_APP_BINARY:-}}\" ]; then \"$KUMU_APP_BINARY\" --kumu-notify agy {kind}; fi; printf '{{}}'{MARKER}"
+    );
+    json!({ "type": "command", "command": command, "timeout": 3 })
+}
+
+fn remove_agy_handlers(hooks: &CstObject) -> bool {
+    let mut removed = false;
+    for property in hooks.properties() {
+        let Some(entries) = property.value().and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let event_removed =
+            remove_managed_from_event(&entries) | remove_managed_from_groups(&entries);
+        removed |= event_removed;
+        if entries.elements().is_empty() {
+            property.remove();
+        }
+    }
+    removed
+}
+
+fn prune_unknown_agy(hooks: &CstObject, known: &[&str]) {
+    for property in hooks.properties() {
+        let Some(name) = property.decoded_name() else {
+            continue;
+        };
+        if known.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(entries) = property.value().and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if (remove_managed_from_event(&entries) | remove_managed_from_groups(&entries))
+            && entries.elements().is_empty()
+        {
+            property.remove();
+        }
+    }
+}
+
 fn remove_cursor_handlers(hooks: &CstObject) -> bool {
     let mut removed = false;
     for property in hooks.properties() {
@@ -451,12 +573,42 @@ fn asset_files(agent: &str) -> Vec<(&'static str, String)> {
 /// says whether handlers sit inside a group's `hooks` array (Claude/Codex/Grok)
 /// or are the event's entries themselves (Cursor).
 fn hooks_status(value: &Value, install: &[(&'static str, Value)], nested: bool) -> Status {
+    let status = hooks_object_status(value.get("hooks"), install, nested);
+    // Cursor rejects hooks files that lack a schema version.
+    if !nested && value.get("version").is_none() && status != Status::Missing {
+        return Status::NeedsRepair;
+    }
+    status
+}
+
+fn agy_hooks_status(value: &Value) -> Status {
+    let install: Vec<(&'static str, Value)> = agy_events()
+        .into_iter()
+        .map(|(event, kind)| (event, agy_hook(kind)))
+        .collect();
+    let entry = value.get(AGY_HOOK_NAME);
+    let status = hooks_object_status(entry, &install, false);
+    if status == Status::Registered
+        && entry
+            .and_then(|hook| hook.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        return Status::NeedsRepair;
+    }
+    status
+}
+
+fn hooks_object_status(
+    hooks: Option<&Value>,
+    install: &[(&'static str, Value)],
+    nested: bool,
+) -> Status {
     let known: Vec<&str> = install.iter().map(|(event, _)| *event).collect();
     let mut found = false;
     let mut complete = true;
     for (event, expected) in install {
-        let groups = value
-            .get("hooks")
+        let groups = hooks
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array);
         let correct = groups
@@ -480,25 +632,20 @@ fn hooks_status(value: &Value, install: &[(&'static str, Value)], nested: bool) 
             })
             .unwrap_or(0);
         complete &= correct == 1 && managed == 1;
-        found |= managed > 0;
-    }
-    // Cursor rejects hooks files that lack a schema version.
-    if !nested && value.get("version").is_none() {
-        complete = false;
+        found |= event_handlers_in(hooks, event, nested)
+            .iter()
+            .any(is_managed_hook);
     }
     // A managed handler under an event this version no longer registers still
     // fires in the Agent; ask for a repair so install can prune it.
-    let stale = value
-        .get("hooks")
-        .and_then(Value::as_object)
-        .is_some_and(|hooks| {
-            hooks.keys().any(|event| {
-                !known.contains(&event.as_str())
-                    && event_handlers(value, event, nested)
-                        .iter()
-                        .any(is_managed_hook)
-            })
-        });
+    let stale = hooks.and_then(Value::as_object).is_some_and(|map| {
+        map.keys().any(|event| {
+            !known.contains(&event.as_str())
+                && event_handlers_in(hooks, event, nested)
+                    .iter()
+                    .any(is_managed_hook)
+        })
+    });
     if complete && !stale {
         Status::Registered
     } else if found || stale {
@@ -508,9 +655,8 @@ fn hooks_status(value: &Value, install: &[(&'static str, Value)], nested: bool) 
     }
 }
 
-fn event_handlers(value: &Value, event: &str, nested: bool) -> Vec<Value> {
-    let Some(groups) = value
-        .get("hooks")
+fn event_handlers_in(hooks: Option<&Value>, event: &str, nested: bool) -> Vec<Value> {
+    let Some(groups) = hooks
         .and_then(|hooks| hooks.get(event))
         .and_then(Value::as_array)
     else {
@@ -534,7 +680,7 @@ fn event_handlers(value: &Value, event: &str, nested: bool) -> Vec<Value> {
 
 pub fn status(agent: &str) -> io::Result<Status> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
+    if is_hook_agent(agent) {
         let text = match std::fs::read_to_string(&paths.registration) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Status::Missing),
@@ -550,6 +696,8 @@ pub fn status(agent: &str) -> io::Result<Status> {
                 .map(|(event, kind)| (event, cursor_hook(kind)))
                 .collect();
             hooks_status(&value, &install, false)
+        } else if agent == "agy" {
+            agy_hooks_status(&value)
         } else {
             hooks_status(&value, &hook_groups(agent), true)
         });
@@ -594,7 +742,7 @@ pub fn status(agent: &str) -> io::Result<Status> {
 
 pub fn install(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
+    if is_hook_agent(agent) {
         return update_hook_file(&paths.registration, agent, false);
     }
     write_assets(&paths, agent)?;
@@ -679,7 +827,7 @@ fn refresh_registered(paths: &Paths, agent: &str) -> io::Result<()> {
 
 pub fn uninstall(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
-    if matches!(agent, "codex" | "claude" | "grok" | "cursor") {
+    if is_hook_agent(agent) {
         update_hook_file(&paths.registration, agent, true)?;
         // Grok's file is Kumu-owned (`~/.grok/hooks/kumu-notifications.json`):
         // remove it once empty instead of leaving `{}` behind.
@@ -839,30 +987,30 @@ pub fn run_cli() -> Option<i32> {
         return None;
     }
     let agent = args.next().unwrap_or_default();
-    if !matches!(agent.as_str(), "claude" | "codex" | "grok" | "cursor") {
-        return Some(0);
-    }
-    let message = match args.next().as_deref() {
-        Some("complete") => "本轮任务已结束",
-        Some("permission") => "需要你确认操作权限",
-        _ => "需要你输入、确认或选择",
-    };
+    let kind = args.next().unwrap_or_default();
     if std::env::var("KUMU_TERMINAL").as_deref() != Ok("1") {
         return Some(0);
     }
     let token = std::env::var(SESSION_TOKEN_ENV)
         .ok()
         .filter(|t| !t.is_empty());
-    // Hooks run with the event's JSON on stdin, which is where Claude, Codex
-    // and Cursor put the session id. The session update is another OSC on the
-    // same channel, framed as a notification so the pane can tell it apart.
+    // Hooks run with the event's JSON on stdin, which is where Claude, Codex,
+    // Cursor and Antigravity put the conversation/session id. The session
+    // update is another OSC on the same channel, framed as a notification so
+    // the pane can tell it apart.
+    let payload = hook_payload();
     let mut sequence = String::new();
-    if let Some(session) = hook_payload().as_ref().and_then(session_id)
+    if let Some(session) = payload.as_ref().and_then(session_id)
         && let Some(update) = session_sequence(&agent, &session, token.as_deref())
     {
         sequence.push_str(&update);
     }
-    sequence.push_str(&format!("\x1b]777;notify;{agent};{message}\x07"));
+    if let Some(message) = notification_message(&agent, &kind, payload.as_ref()) {
+        sequence.push_str(&format!("\x1b]777;notify;{agent};{message}\x07"));
+    }
+    if sequence.is_empty() {
+        return Some(0);
+    }
     match agent.as_str() {
         // Claude runs command hooks in their own session without a controlling
         // terminal. Its documented channel is `terminalSequence` on stdout.
@@ -872,9 +1020,9 @@ pub fn run_cli() -> Option<i32> {
             let _ = stdout.write_all(output.to_string().as_bytes());
             let _ = stdout.write_all(b"\n");
         }
-        // Codex, Grok and Cursor detach hooks, so write to the explicit PTY
-        // path Kumu inherited into the process rather than `/dev/tty`.
-        "codex" | "grok" | "cursor" => {
+        // Codex, Grok, Cursor and Antigravity detach hooks, so write to the
+        // explicit PTY path Kumu inherited into the process rather than `/dev/tty`.
+        "codex" | "grok" | "cursor" | "agy" => {
             if let Some(mut tty) = open_notification_tty() {
                 let _ = tty.write_all(sequence.as_bytes());
             }
@@ -882,6 +1030,27 @@ pub fn run_cli() -> Option<i32> {
         _ => {}
     }
     Some(0)
+}
+
+fn notification_message(agent: &str, kind: &str, payload: Option<&Value>) -> Option<&'static str> {
+    if kind == "session" {
+        return None;
+    }
+    if agent == "agy" && kind == "complete" {
+        match payload
+            .and_then(|value| value.get("terminationReason"))
+            .and_then(Value::as_str)
+        {
+            Some("USER_CANCELED") => return None,
+            Some("ERROR") => return Some("任务执行失败"),
+            _ => {}
+        }
+    }
+    Some(match kind {
+        "complete" => "本轮任务已结束",
+        "permission" => "需要你确认操作权限",
+        _ => "需要你输入、确认或选择",
+    })
 }
 
 /// The hook event as JSON, or `None` when stdin is a terminal or stays silent.
@@ -1144,6 +1313,106 @@ mod tests {
         assert!(registered.contains("\"version\": 1"), "{registered}");
         let removed = edit_cursor_hooks(&registered, true).expect("remove");
         assert!(!removed.contains(MARKER), "{removed}");
+    }
+
+    #[test]
+    fn agy_hooks_live_under_their_own_named_entry_and_preserve_user_hooks() {
+        let original = r#"{
+  // keep my comment
+  "lint-checker": {
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [{"type": "command", "command": "./lint.sh"}]
+      }
+    ]
+  }
+}
+"#;
+        let registered = edit_hooks(original, "agy", false).expect("register");
+        assert!(registered.contains("// keep my comment"), "{registered}");
+        assert!(registered.contains("\"lint-checker\""), "{registered}");
+        assert!(
+            registered.contains("\"kumu-notifications\""),
+            "{registered}"
+        );
+        assert!(registered.contains("\"SessionStart\""), "{registered}");
+        assert!(registered.contains("\"Stop\""), "{registered}");
+        assert!(registered.contains("printf '{}'"), "{registered}");
+        assert_eq!(
+            registered,
+            edit_hooks(&registered, "agy", false).expect("repair"),
+            "repair must be idempotent"
+        );
+        let parsed = CstRootNode::parse(&registered, &ParseOptions::default())
+            .expect("valid jsonc")
+            .to_serde_value()
+            .expect("value");
+        assert_eq!(agy_hooks_status(&parsed), Status::Registered);
+
+        let removed = edit_hooks(&registered, "agy", true).expect("remove");
+        assert!(!removed.contains(MARKER), "{removed}");
+        assert!(!removed.contains("\"kumu-notifications\""), "{removed}");
+        assert!(removed.contains("\"lint-checker\""), "{removed}");
+        assert!(removed.contains("// keep my comment"), "{removed}");
+        let parsed_removed = CstRootNode::parse(&removed, &ParseOptions::default())
+            .expect("valid jsonc")
+            .to_serde_value()
+            .expect("value");
+        assert_eq!(agy_hooks_status(&parsed_removed), Status::Missing);
+    }
+
+    #[test]
+    fn agy_status_and_repair_handle_disabled_and_stale_hooks() {
+        let disabled = json!({
+            "kumu-notifications": {
+                "enabled": false,
+                "SessionStart": [agy_hook("session")],
+                "Stop": [agy_hook("complete")],
+            }
+        });
+        assert_eq!(agy_hooks_status(&disabled), Status::NeedsRepair);
+
+        let repaired = edit_hooks(&disabled.to_string(), "agy", false).expect("repair");
+        let parsed = CstRootNode::parse(&repaired, &ParseOptions::default())
+            .expect("valid json")
+            .to_serde_value()
+            .expect("value");
+        assert_eq!(agy_hooks_status(&parsed), Status::Registered);
+        assert!(parsed["kumu-notifications"].get("enabled").is_none());
+    }
+
+    #[test]
+    fn agy_notification_messages_respect_session_cancel_and_error() {
+        assert_eq!(notification_message("agy", "session", None), None);
+        assert_eq!(
+            notification_message("agy", "complete", None),
+            Some("本轮任务已结束")
+        );
+        assert_eq!(
+            notification_message(
+                "agy",
+                "complete",
+                Some(&json!({"terminationReason": "NO_TOOL_CALL"}))
+            ),
+            Some("本轮任务已结束")
+        );
+        assert_eq!(
+            notification_message(
+                "agy",
+                "complete",
+                Some(&json!({"terminationReason": "USER_CANCELED"}))
+            ),
+            None
+        );
+        assert_eq!(
+            notification_message(
+                "agy",
+                "complete",
+                Some(&json!({"terminationReason": "ERROR"}))
+            ),
+            Some("任务执行失败")
+        );
     }
 
     /// Both hook file shapes are recognised, so the settings row can tell an

@@ -23,7 +23,7 @@
 
 Kumu 是一个 macOS 终端工作区，用来同时跑多个本地编码 Agent。左侧是项目列表，右侧是当前项目的页签和可按任意方向拆分的终端网格；每个页签是一整套分屏布局，每个窗格直接运行 Agent 自己的 TUI，而不是另做一层聊天界面。切换项目或页签不会打断后台的终端；重新打开应用时，窗格会接回原来的对话。
 
-支持 Codex、Claude Code、OpenCode、Pi、Oh My Pi、Cursor CLI 和 Grok Build。
+支持 Codex、Claude Code、OpenCode、Pi、Oh My Pi、Cursor CLI、Grok Build 和 Antigravity CLI。
 
 ## 安装
 
@@ -55,7 +55,7 @@ Kumu 把每个项目当作独立工作区：它有各自的分屏布局和终端
 ## 让 Agent 各占一格
 
 - 点击窗格标题栏的 Agent 按钮，可以直接新建一个运行指定 Agent 的窗格。
-- 也可以在普通 shell 里照常输入 `codex`、`claude`、`opencode`、`pi`、`omp` 等命令，Kumu 一样能识别它属于哪个 Agent。
+- 也可以在普通 shell 里照常输入 `codex`、`claude`、`opencode`、`pi`、`omp`、`agy` 等命令，Kumu 一样能识别它属于哪个 Agent。
 - 窗格记住 Agent 侧的会话 id，重启后按该 CLI 的 resume 语法接回同一个对话：
 
 | Agent | 恢复方式 |
@@ -64,6 +64,7 @@ Kumu 把每个项目当作独立工作区：它有各自的分屏布局和终端
 | Claude Code | `claude --resume <id>` |
 | OpenCode | `opencode --session <id>` |
 | Cursor CLI | `cursor --resume <id>` |
+| Antigravity CLI | `agy --conversation <id>` |
 | Pi、Oh My Pi、Grok Build | 暂不恢复，以新对话开始 |
 
 恢复功能可在 **设置 → 通用 → 恢复 Agent 会话** 关闭。Agent 退出后窗格会变回普通 shell；在 shell 里手动启动的 Agent 也会被接管，同样支持下次恢复。
