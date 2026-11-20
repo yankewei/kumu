@@ -1,3 +1,6 @@
 /target
 __pycache__/
 *.pyc
+
+# pen.dev screenshot/export scratch
+design/todo-exports/

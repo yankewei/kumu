@@ -1,7 +1,9 @@
-//! Pane layout tree: leaves hold a pane id; groups split along an axis.
+//! Pane layout tree: leaves hold one pane id; groups split along an axis.
 //!
-//! Each project owns a pane tree. Splitting adds another pane to that project;
-//! switching projects restores its own tree.
+//! Each project owns tabs, and each tab owns a pane tree. A tab is one whole
+//! arrangement of panes, like a Herdr/tmux window; switching tabs switches the
+//! layout while every terminal keeps running. Switching projects restores the
+//! project's selected tab and its tree.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +26,14 @@ pub enum PaneDirection {
 
 /// Structure version of [`SavedWorkspace`]. Bump it when the JSON shape
 /// changes; an unknown version is ignored rather than guessed at.
-pub const WORKSPACE_STATE_VERSION: u32 = 3;
+///
+/// Version 4 added cell-level tabs (`SavedNode::Tabs`). Version 5 replaced
+/// them with project-level tabs; the older wrappers stay readable so a saved
+/// layout is never silently thrown away.
+pub const WORKSPACE_STATE_VERSION: u32 = 5;
+
+/// Structure versions this build can read.
+const READABLE_WORKSPACE_VERSIONS: std::ops::RangeInclusive<u32> = 3..=WORKSPACE_STATE_VERSION;
 
 /// A saved layout is restored only up to this many panes per project, so a
 /// corrupt document cannot ask for hundreds of processes. This is a sanity
@@ -40,12 +49,57 @@ const MAX_SAVED_PANE_ID: u64 = u32::MAX as u64;
 /// would make them wrong anyway, so an even split is the honest fallback.
 const MIN_RATIO: f32 = 0.02;
 
+/// One tab of a project: a named pane layout and the pane that had focus.
+#[derive(Clone, Debug)]
+pub struct ProjectTab {
+    /// Empty until the user renames it; the UI shows a numbered fallback.
+    pub name: String,
+    pub layout: PaneNode,
+    pub focused: PaneId,
+}
+
+/// A project's tabs and the one currently shown.
+#[derive(Clone, Debug)]
+pub struct ProjectTabs {
+    pub tabs: Vec<ProjectTab>,
+    pub selected: usize,
+}
+
+impl ProjectTabs {
+    /// The visible tab, falling back to the first when `selected` is stale.
+    pub fn active(&self) -> Option<&ProjectTab> {
+        self.tabs.get(self.selected).or_else(|| self.tabs.first())
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut ProjectTab> {
+        let index = if self.selected < self.tabs.len() {
+            self.selected
+        } else {
+            return self.tabs.first_mut();
+        };
+        self.tabs.get_mut(index)
+    }
+
+    /// Every pane of every tab, in tab order.
+    pub fn panes(&self) -> Vec<PaneId> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.layout.panes())
+            .collect()
+    }
+}
+
 /// The pane tree as persisted. Group ids are a rendering detail — they key the
 /// resizable element — so they are assigned fresh on restore instead of saved.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum SavedNode {
     Leaf {
         pane: u64,
+    },
+    /// Version 4 cell tabs. Read only: one cell could hold several terminals.
+    Tabs {
+        active: u64,
+        panes: Vec<u64>,
     },
     Group {
         horizontal: bool,
@@ -56,7 +110,7 @@ pub enum SavedNode {
         sizes: Vec<f32>,
         children: Vec<SavedNode>,
     },
-    /// Version 3 payload: one pane tree per project.
+    /// Version 3/4 payload: one pane tree per project.
     ProjectLayouts {
         selected: Option<i64>,
         projects: Vec<SavedProjectLayout>,
@@ -66,12 +120,37 @@ pub enum SavedNode {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         launches: HashMap<u64, PaneLaunch>,
     },
+    /// Version 5 payload: one or more named layouts per project.
+    ProjectTabs {
+        selected: Option<i64>,
+        projects: Vec<SavedProjectTabs>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        launches: HashMap<u64, PaneLaunch>,
+    },
 }
 
-/// One project's saved pane tree and last focused pane.
+/// One project's saved pane tree and last focused pane, before tabs existed.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SavedProjectLayout {
     pub project: i64,
+    pub layout: SavedNode,
+    pub focused: u64,
+}
+
+/// One project's saved tab list.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SavedProjectTabs {
+    pub project: i64,
+    #[serde(default)]
+    pub selected_tab: usize,
+    pub tabs: Vec<SavedProjectTab>,
+}
+
+/// One saved tab.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SavedProjectTab {
+    #[serde(default)]
+    pub name: String,
     pub layout: SavedNode,
     pub focused: u64,
 }
@@ -86,8 +165,9 @@ pub struct SavedWorkspace {
 
 /// Persisted layouts that passed validation.
 pub struct RestoredWorkspace {
-    pub layouts: HashMap<i64, PaneNode>,
-    pub focused_by_project: HashMap<i64, PaneId>,
+    /// Project id → its tabs. Projects whose tabs all failed validation are
+    /// absent, while `selected` may still name one (an empty project).
+    pub tabs: HashMap<i64, ProjectTabs>,
     pub selected: Option<i64>,
     /// Group id → normalized child sizes. Every restored group has an entry;
     /// an empty vector means "no usable sizes, divide evenly".
@@ -122,21 +202,112 @@ impl SavedWorkspace {
     /// ignored so the app can open a fresh default pane without a startup error.
     pub fn restore(saved: &str, project_exists: impl Fn(i64) -> bool) -> Option<RestoredWorkspace> {
         let state: Self = serde_json::from_str(saved).ok()?;
-        if state.version != WORKSPACE_STATE_VERSION {
+        if !READABLE_WORKSPACE_VERSIONS.contains(&state.version) {
             return None;
         }
-        let SavedNode::ProjectLayouts {
-            selected,
-            projects,
-            launches,
-        } = &state.layout
-        else {
-            return None;
-        };
-        restore_project_layouts(projects, *selected, launches, project_exists)
+        match &state.layout {
+            SavedNode::ProjectTabs {
+                selected,
+                projects,
+                launches,
+            } => restore_project_tabs(projects, *selected, launches, project_exists),
+            SavedNode::ProjectLayouts {
+                selected,
+                projects,
+                launches,
+            } => restore_project_layouts(projects, *selected, launches, project_exists),
+            _ => None,
+        }
     }
 }
 
+fn restore_project_tabs(
+    saved_projects: &[SavedProjectTabs],
+    selected: Option<i64>,
+    saved_launches: &HashMap<u64, PaneLaunch>,
+    project_exists: impl Fn(i64) -> bool,
+) -> Option<RestoredWorkspace> {
+    let mut next_group = 1;
+    let mut next_pane = 2;
+    let mut group_sizes = HashMap::new();
+    let mut tabs_by_project = HashMap::new();
+    let mut seen = HashSet::new();
+    for saved in saved_projects {
+        if !project_exists(saved.project) || tabs_by_project.contains_key(&saved.project) {
+            continue;
+        }
+        let mut tabs = Vec::new();
+        for saved_tab in &saved.tabs {
+            let mut tab_groups = HashMap::new();
+            let mut tab_next_group = next_group;
+            let Some(layout) = saved_tab.layout.restore(
+                &saved_tab.layout.pane_ids(),
+                &mut tab_next_group,
+                &mut tab_groups,
+            ) else {
+                continue;
+            };
+            let leaves = layout.panes();
+            if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
+                continue;
+            }
+            let unique: HashSet<u64> = leaves.iter().map(|pane| pane.0).collect();
+            if unique.len() != leaves.len()
+                || leaves
+                    .iter()
+                    .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || seen.contains(&pane.0))
+            {
+                continue;
+            }
+            seen.extend(unique);
+            next_group = tab_next_group;
+            group_sizes.extend(tab_groups);
+            next_pane = next_pane.max(
+                leaves
+                    .iter()
+                    .map(|pane| pane.0.saturating_add(1))
+                    .max()
+                    .unwrap_or(2),
+            );
+            let focused = if leaves.contains(&PaneId(saved_tab.focused)) {
+                PaneId(saved_tab.focused)
+            } else {
+                leaves[0]
+            };
+            tabs.push(ProjectTab {
+                name: saved_tab.name.clone(),
+                layout,
+                focused,
+            });
+        }
+        if tabs.is_empty() {
+            continue;
+        }
+        let selected_tab = saved.selected_tab.min(tabs.len() - 1);
+        tabs_by_project.insert(
+            saved.project,
+            ProjectTabs {
+                tabs,
+                selected: selected_tab,
+            },
+        );
+    }
+    finish_restore(
+        tabs_by_project,
+        selected,
+        saved_projects
+            .iter()
+            .map(|project| project.project)
+            .collect(),
+        saved_launches,
+        group_sizes,
+        next_group,
+        &project_exists,
+    )
+}
+
+/// Version 3/4 documents had one tree per project: that tree becomes the
+/// project's first tab. Version 4 cell tabs collapse to their visible pane.
 fn restore_project_layouts(
     saved_projects: &[SavedProjectLayout],
     selected: Option<i64>,
@@ -146,34 +317,34 @@ fn restore_project_layouts(
     let mut next_group = 1;
     let mut next_pane = 2;
     let mut group_sizes = HashMap::new();
-    let mut layouts = HashMap::new();
-    let mut focused_by_project = HashMap::new();
+    let mut tabs_by_project = HashMap::new();
     let mut seen = HashSet::new();
     for saved in saved_projects {
-        if !project_exists(saved.project) || layouts.contains_key(&saved.project) {
+        if !project_exists(saved.project) || tabs_by_project.contains_key(&saved.project) {
             continue;
         }
-        let ids = saved.layout.pane_ids();
         let mut local_groups = HashMap::new();
         let mut local_next_group = next_group;
-        let Some(layout) = saved
-            .layout
-            .restore(&ids, &mut local_next_group, &mut local_groups)
-        else {
+        let Some(layout) = saved.layout.restore(
+            &saved.layout.pane_ids(),
+            &mut local_next_group,
+            &mut local_groups,
+        ) else {
             continue;
         };
         let leaves = layout.panes();
         if leaves.is_empty() || leaves.len() > MAX_RESTORED_PANES {
             continue;
         }
-        if ids.len() != leaves.len()
+        let unique: HashSet<u64> = leaves.iter().map(|pane| pane.0).collect();
+        if unique.len() != leaves.len()
             || leaves
                 .iter()
                 .any(|pane| pane.0 == 0 || pane.0 > MAX_SAVED_PANE_ID || seen.contains(&pane.0))
         {
             continue;
         }
-        seen.extend(ids);
+        seen.extend(unique);
         next_group = local_next_group;
         group_sizes.extend(local_groups);
         next_pane = next_pane.max(
@@ -183,46 +354,79 @@ fn restore_project_layouts(
                 .max()
                 .unwrap_or(2),
         );
-        focused_by_project.insert(
+        let focused = if leaves.contains(&PaneId(saved.focused)) {
+            PaneId(saved.focused)
+        } else {
+            leaves[0]
+        };
+        tabs_by_project.insert(
             saved.project,
-            if leaves.contains(&PaneId(saved.focused)) {
-                PaneId(saved.focused)
-            } else {
-                leaves[0]
+            ProjectTabs {
+                tabs: vec![ProjectTab {
+                    name: String::new(),
+                    layout,
+                    focused,
+                }],
+                selected: 0,
             },
         );
-        layouts.insert(saved.project, layout);
     }
+    finish_restore(
+        tabs_by_project,
+        selected,
+        saved_projects
+            .iter()
+            .map(|project| project.project)
+            .collect(),
+        saved_launches,
+        group_sizes,
+        next_group,
+        &project_exists,
+    )
+}
+
+/// Validate the selection and keep only launches owned by a surviving pane.
+fn finish_restore(
+    tabs_by_project: HashMap<i64, ProjectTabs>,
+    selected: Option<i64>,
+    saved: Vec<i64>,
+    saved_launches: &HashMap<u64, PaneLaunch>,
+    group_sizes: HashMap<u64, Vec<f32>>,
+    next_group: u64,
+    project_exists: &impl Fn(i64) -> bool,
+) -> Option<RestoredWorkspace> {
     let selected = selected
         .filter(|project| {
             project_exists(*project)
-                && (layouts.contains_key(project)
-                    || !saved_projects.iter().any(|saved| saved.project == *project))
+                && (tabs_by_project.contains_key(project) || !saved.contains(project))
         })
         .or_else(|| {
-            saved_projects
+            saved
                 .iter()
-                .find(|saved| layouts.contains_key(&saved.project))
-                .map(|saved| saved.project)
+                .find(|project| tabs_by_project.contains_key(project))
+                .copied()
         });
-    if selected.is_none() && !saved_projects.is_empty() {
+    if selected.is_none() && !saved.is_empty() {
         return None;
     }
-    // A launch belongs to the pane tree that survived validation: a stale or
-    // duplicate entry would otherwise start a process no pane owns.
     let launches: HashMap<PaneId, PaneLaunch> = saved_launches
         .iter()
         .filter(|(pane, launch)| {
             !launch.is_shell()
-                && layouts
+                && tabs_by_project
                     .values()
-                    .any(|layout| layout.panes().contains(&PaneId(**pane)))
+                    .any(|project| project.panes().contains(&PaneId(**pane)))
         })
         .map(|(pane, launch)| (PaneId(*pane), launch.clone()))
         .collect();
+    let next_pane = tabs_by_project
+        .values()
+        .flat_map(|project| project.panes())
+        .map(|pane| pane.0.saturating_add(1))
+        .max()
+        .unwrap_or(2);
     Some(RestoredWorkspace {
-        layouts,
-        focused_by_project,
+        tabs: tabs_by_project,
         selected,
         group_sizes,
         launches,
@@ -235,16 +439,90 @@ impl SavedNode {
     fn pane_ids(&self) -> HashSet<u64> {
         match self {
             Self::Leaf { pane } => HashSet::from([*pane]),
+            Self::Tabs { panes, .. } => panes.iter().copied().collect(),
             Self::Group { children, .. } => children.iter().flat_map(Self::pane_ids).collect(),
             Self::ProjectLayouts { projects, .. } => projects
                 .iter()
                 .flat_map(|project| project.layout.pane_ids())
                 .collect(),
+            Self::ProjectTabs { projects, .. } => projects
+                .iter()
+                .flat_map(|project| project.tabs.iter().flat_map(|tab| tab.layout.pane_ids()))
+                .collect(),
+        }
+    }
+
+    /// Rebuild the layout, keeping only panes in `valid` (their project still
+    /// exists) and collapsing groups left with a single child. Group ids are
+    /// assigned from `next_group` so a restored tree never collides with one
+    /// created later.
+    pub fn restore(
+        &self,
+        valid: &HashSet<u64>,
+        next_group: &mut u64,
+        group_sizes: &mut HashMap<u64, Vec<f32>>,
+    ) -> Option<PaneNode> {
+        match self {
+            Self::Leaf { pane } => valid
+                .contains(pane)
+                .then_some(PaneNode::leaf(PaneId(*pane))),
+            // Version 4 only: a cell's tabs collapse to the pane it showed.
+            Self::Tabs { active, panes } => {
+                let kept: Vec<u64> = panes
+                    .iter()
+                    .copied()
+                    .filter(|pane| valid.contains(pane))
+                    .collect();
+                let pane = if kept.contains(active) {
+                    *active
+                } else {
+                    *kept.first()?
+                };
+                Some(PaneNode::leaf(PaneId(pane)))
+            }
+            Self::ProjectLayouts { .. } | Self::ProjectTabs { .. } => None,
+            Self::Group {
+                horizontal,
+                sizes,
+                children,
+            } => {
+                let mut restored: Vec<PaneNode> = children
+                    .iter()
+                    .filter_map(|child| child.restore(valid, next_group, group_sizes))
+                    .collect();
+                match restored.len() {
+                    0 => None,
+                    1 => restored.pop(),
+                    _ => {
+                        let id = *next_group;
+                        *next_group += 1;
+                        // Dropping a child invalidates the old fractions; keep
+                        // them only when every original child survived.
+                        group_sizes.insert(
+                            id,
+                            if restored.len() == children.len() {
+                                normalized_sizes(sizes, restored.len()).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            },
+                        );
+                        Some(PaneNode::Group {
+                            id,
+                            axis: if *horizontal {
+                                Axis::Horizontal
+                            } else {
+                                Axis::Vertical
+                            },
+                            children: restored,
+                        })
+                    }
+                }
+            }
         }
     }
 }
 
-/// Recursive layout of panes in the content area.
+/// Recursive layout of panes in one tab.
 #[derive(Clone, Debug)]
 pub enum PaneNode {
     Leaf(PaneId),
@@ -282,11 +560,18 @@ impl PaneNode {
         Self::Leaf(id)
     }
 
-    /// Every leaf id, depth-first.
+    /// Every pane id, depth-first.
     pub fn panes(&self) -> Vec<PaneId> {
         match self {
             Self::Leaf(id) => vec![*id],
             Self::Group { children, .. } => children.iter().flat_map(Self::panes).collect(),
+        }
+    }
+
+    pub fn contains(&self, id: PaneId) -> bool {
+        match self {
+            Self::Leaf(leaf) => *leaf == id,
+            Self::Group { children, .. } => children.iter().any(|child| child.contains(id)),
         }
     }
 
@@ -373,8 +658,8 @@ impl PaneNode {
         }
     }
 
-    /// Neighbor to focus after `id` is removed: the previous sibling leaf, else
-    /// the next, else any remaining leaf.
+    /// Neighbor to focus after `id` is removed: the previous pane, else the
+    /// next, else any remaining pane.
     pub fn neighbor(&self, id: PaneId) -> Option<PaneId> {
         let panes = self.panes();
         let i = panes.iter().position(|p| *p == id)?;
@@ -396,7 +681,7 @@ impl PaneNode {
             }) = self.find_group_mut(parent_id)
             && *group_axis == axis
         {
-            let Some(i) = children.iter().position(|c| c.is_leaf(target)) else {
+            let Some(i) = children.iter().position(|c| c.contains(target)) else {
                 return false;
             };
             children.insert(i + 1, Self::Leaf(new));
@@ -460,10 +745,6 @@ impl PaneNode {
         self.group_ids().contains(&group_id)
     }
 
-    fn is_leaf(&self, id: PaneId) -> bool {
-        matches!(self, Self::Leaf(leaf) if *leaf == id)
-    }
-
     fn parent_group_id(&self, id: PaneId) -> Option<u64> {
         match self {
             Self::Leaf(_) => None,
@@ -472,13 +753,20 @@ impl PaneNode {
                 children,
                 ..
             } => {
-                if children.iter().any(|c| c.is_leaf(id)) {
+                // Only a direct leaf child means this is the target's parent;
+                // `contains` would return the outermost group of a nested tree
+                // and make a second same-axis split nest instead of reuse.
+                if children.iter().any(|child| child.is_leaf(id)) {
                     Some(*group_id)
                 } else {
-                    children.iter().find_map(|c| c.parent_group_id(id))
+                    children.iter().find_map(|child| child.parent_group_id(id))
                 }
             }
         }
+    }
+
+    fn is_leaf(&self, id: PaneId) -> bool {
+        matches!(self, Self::Leaf(leaf) if *leaf == id)
     }
 
     fn find_group_mut(&mut self, group_id: u64) -> Option<&mut Self> {
@@ -504,11 +792,16 @@ fn remove_inner(node: &mut PaneNode, id: PaneId) -> bool {
     let PaneNode::Group { children, .. } = node else {
         return false;
     };
-    if let Some(i) = children.iter().position(|c| c.is_leaf(id)) {
-        children.remove(i);
-        return true;
+    if let Some(i) = children.iter().position(|c| c.contains(id)) {
+        if let PaneNode::Leaf(leaf) = &children[i]
+            && *leaf == id
+        {
+            children.remove(i);
+            return true;
+        }
+        return remove_inner(&mut children[i], id);
     }
-    children.iter_mut().any(|c| remove_inner(c, id))
+    false
 }
 
 fn collapse(node: &mut PaneNode) {
@@ -523,69 +816,20 @@ fn collapse(node: &mut PaneNode) {
     }
 }
 
-impl SavedNode {
-    /// Rebuild the layout, keeping only panes in `valid` (their project still
-    /// exists) and collapsing groups left with a single child. Group ids are
-    /// assigned from `next_group` so a restored tree never collides with one
-    /// created later.
-    pub fn restore(
-        &self,
-        valid: &HashSet<u64>,
-        next_group: &mut u64,
-        group_sizes: &mut HashMap<u64, Vec<f32>>,
-    ) -> Option<PaneNode> {
-        match self {
-            Self::Leaf { pane } => valid
-                .contains(pane)
-                .then_some(PaneNode::Leaf(PaneId(*pane))),
-            Self::ProjectLayouts { .. } => None,
-            Self::Group {
-                horizontal,
-                sizes,
-                children,
-            } => {
-                let mut restored: Vec<PaneNode> = children
-                    .iter()
-                    .filter_map(|child| child.restore(valid, next_group, group_sizes))
-                    .collect();
-                match restored.len() {
-                    0 => None,
-                    1 => restored.pop(),
-                    _ => {
-                        let id = *next_group;
-                        *next_group += 1;
-                        // Dropping a child invalidates the old fractions; keep
-                        // them only when every original child survived.
-                        group_sizes.insert(
-                            id,
-                            if restored.len() == children.len() {
-                                normalized_sizes(sizes, restored.len()).unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            },
-                        );
-                        Some(PaneNode::Group {
-                            id,
-                            axis: if *horizontal {
-                                Axis::Horizontal
-                            } else {
-                                Axis::Vertical
-                            },
-                            children: restored,
-                        })
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn leaf(n: u64) -> PaneNode {
         PaneNode::leaf(PaneId(n))
+    }
+
+    fn tab(name: &str, layout: PaneNode, focused: u64) -> SavedProjectTab {
+        SavedProjectTab {
+            name: name.into(),
+            layout: layout.to_saved(&HashMap::new()),
+            focused,
+        }
     }
 
     #[test]
@@ -618,6 +862,30 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(n.panes(), vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4)]);
+    }
+
+    #[test]
+    fn splitting_reuses_the_direct_same_axis_parent() {
+        let mut n = leaf(1);
+        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
+        assert!(n.split(PaneId(3), Axis::Vertical, PaneId(4), 12));
+        // H[1, V[2, 3, 4]]: the second vertical split joins V, it does not
+        // wrap pane 3 in another vertical group.
+        let PaneNode::Group { children, .. } = &n else {
+            panic!("root group");
+        };
+        assert_eq!(children.len(), 2);
+        let PaneNode::Group {
+            axis: Axis::Vertical,
+            children: inner,
+            ..
+        } = &children[1]
+        else {
+            panic!("right column is vertical");
+        };
+        assert_eq!(inner.len(), 3);
         assert_eq!(n.panes(), vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4)]);
     }
 
@@ -705,16 +973,20 @@ mod tests {
         let leaves = (1..=13).map(|pane| SavedNode::Leaf { pane }).collect();
         let saved = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
+            layout: SavedNode::ProjectTabs {
                 selected: Some(3),
-                projects: vec![SavedProjectLayout {
+                projects: vec![SavedProjectTabs {
                     project: 3,
-                    layout: SavedNode::Group {
-                        horizontal: true,
-                        sizes: Vec::new(),
-                        children: leaves,
-                    },
-                    focused: 1,
+                    selected_tab: 0,
+                    tabs: vec![SavedProjectTab {
+                        name: String::new(),
+                        layout: SavedNode::Group {
+                            horizontal: true,
+                            sizes: Vec::new(),
+                            children: leaves,
+                        },
+                        focused: 1,
+                    }],
                 }],
                 launches: HashMap::new(),
             },
@@ -722,7 +994,7 @@ mod tests {
         };
         let json = serde_json::to_string(&saved).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).expect("layout restores");
-        assert_eq!(restored.layouts[&3].panes().len(), 13);
+        assert_eq!(restored.tabs[&3].panes().len(), 13);
     }
 
     /// A saved tree comes back with the same leaves and split axes, even though
@@ -830,26 +1102,37 @@ mod tests {
         assert!(matches!(one, PaneNode::Leaf(PaneId(3))));
     }
 
-    fn two_project_state() -> SavedWorkspace {
+    fn three_project_state() -> SavedWorkspace {
         SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
+            layout: SavedNode::ProjectTabs {
                 selected: Some(20),
                 projects: vec![
-                    SavedProjectLayout {
+                    SavedProjectTabs {
                         project: 10,
-                        layout: SavedNode::Leaf { pane: 1 },
-                        focused: 1,
+                        selected_tab: 0,
+                        tabs: vec![tab("", leaf(1), 1)],
                     },
-                    SavedProjectLayout {
+                    SavedProjectTabs {
                         project: 20,
-                        layout: SavedNode::Leaf { pane: 2 },
-                        focused: 2,
+                        selected_tab: 1,
+                        tabs: vec![
+                            tab(
+                                "agents",
+                                {
+                                    let mut n = leaf(2);
+                                    n.split(PaneId(2), Axis::Horizontal, PaneId(3), 10);
+                                    n
+                                },
+                                3,
+                            ),
+                            tab("review", leaf(4), 4),
+                        ],
                     },
                 ],
                 launches: HashMap::new(),
             },
-            focused: 2,
+            focused: 4,
         }
     }
 
@@ -857,48 +1140,69 @@ mod tests {
     /// surviving pane.
     #[test]
     fn restoring_keeps_only_live_projects() {
-        let json = serde_json::to_string(&two_project_state()).unwrap();
+        let json = serde_json::to_string(&three_project_state()).unwrap();
         let restored =
             SavedWorkspace::restore(&json, |project| project == 20).expect("one live project");
         assert_eq!(restored.selected, Some(20));
-        assert_eq!(
-            restored.layouts.get(&20).map(PaneNode::panes),
-            Some(vec![PaneId(2)])
-        );
-        assert_eq!(restored.focused_by_project.get(&20), Some(&PaneId(2)));
-        assert_eq!(restored.next_pane, 3);
+        let project = &restored.tabs[&20];
+        assert_eq!(project.tabs.len(), 2);
+        assert_eq!(project.selected, 1);
+        assert_eq!(project.tabs[0].name, "agents");
+        assert_eq!(project.tabs[1].name, "review");
+        assert_eq!(project.panes(), vec![PaneId(2), PaneId(3), PaneId(4)]);
+    }
+
+    /// Version 3 documents had one tree per project; that tree becomes the
+    /// project's first tab.
+    #[test]
+    fn a_version_three_layout_becomes_one_tab() {
+        let json = r#"{"version":3,"focused":7,"layout":{"ProjectLayouts":{"selected":3,"projects":[{"project":3,"layout":{"Leaf":{"pane":7}},"focused":7}]}}}"#;
+        let restored = SavedWorkspace::restore(json, |_| true).unwrap();
+        assert!(restored.launches.is_empty());
+        let project = &restored.tabs[&3];
+        assert_eq!(project.tabs.len(), 1);
+        assert_eq!(project.selected, 0);
+        assert_eq!(project.panes(), vec![PaneId(7)]);
+    }
+
+    /// Version 4 cell tabs collapse to the pane that cell was showing.
+    #[test]
+    fn version_four_cell_tabs_keep_the_visible_pane() {
+        let json = r#"{"version":4,"focused":2,"layout":{"ProjectLayouts":{"selected":3,"projects":[{"project":3,"layout":{"Tabs":{"active":2,"panes":[1,2]}},"focused":2}]}}}"#;
+        let restored = SavedWorkspace::restore(json, |_| true).unwrap();
+        assert_eq!(restored.tabs[&3].panes(), vec![PaneId(2)]);
     }
 
     #[test]
     fn restoring_keeps_an_empty_project_selected() {
-        let mut state = two_project_state();
-        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
+        let mut state = three_project_state();
+        if let SavedNode::ProjectTabs { projects, .. } = &mut state.layout {
             projects.retain(|project| project.project != 20);
         }
         let json = serde_json::to_string(&state).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
         assert_eq!(restored.selected, Some(20));
-        assert!(!restored.layouts.contains_key(&20));
-        assert!(restored.layouts.contains_key(&10));
+        assert!(!restored.tabs.contains_key(&20));
+        assert!(restored.tabs.contains_key(&10));
 
-        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
+        if let SavedNode::ProjectTabs { projects, .. } = &mut state.layout {
             projects.clear();
         }
         let json = serde_json::to_string(&state).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
         assert_eq!(restored.selected, Some(20));
-        assert!(restored.layouts.is_empty());
+        assert!(restored.tabs.is_empty());
     }
 
     #[test]
     fn an_invalid_project_layout_does_not_discard_later_projects() {
-        let mut state = two_project_state();
-        if let SavedNode::ProjectLayouts {
+        let mut state = three_project_state();
+        if let SavedNode::ProjectTabs {
             projects, selected, ..
         } = &mut state.layout
         {
             *selected = Some(10);
-            projects[0].layout = SavedNode::Group {
+            projects[0].tabs[0].layout = SavedNode::Group {
                 horizontal: true,
                 sizes: Vec::new(),
                 children: Vec::new(),
@@ -907,19 +1211,19 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
         assert_eq!(restored.selected, Some(20));
-        assert_eq!(restored.layouts.len(), 1);
+        assert_eq!(restored.tabs.len(), 1);
+    }
 
-        if let SavedNode::ProjectLayouts { projects, .. } = &mut state.layout {
-            projects[0].layout = SavedNode::Group {
-                horizontal: true,
-                sizes: Vec::new(),
-                children: vec![SavedNode::Leaf { pane: 2 }, SavedNode::Leaf { pane: 2 }],
-            };
+    /// A selected tab beyond the surviving tabs falls back to the last one.
+    #[test]
+    fn a_stale_selected_tab_falls_back() {
+        let mut state = three_project_state();
+        if let SavedNode::ProjectTabs { projects, .. } = &mut state.layout {
+            projects[1].selected_tab = 99;
         }
         let json = serde_json::to_string(&state).unwrap();
         let restored = SavedWorkspace::restore(&json, |_| true).unwrap();
-        assert_eq!(restored.selected, Some(20));
-        assert_eq!(restored.layouts[&20].panes(), vec![PaneId(2)]);
+        assert_eq!(restored.tabs[&20].selected, 1);
     }
 
     /// Malformed JSON, an unknown version, a missing project, and duplicate
@@ -928,7 +1232,7 @@ mod tests {
     fn an_untrusted_saved_workspace_is_rejected() {
         assert!(SavedWorkspace::restore("{", |_| true).is_none());
 
-        let state = two_project_state();
+        let state = three_project_state();
         let json = serde_json::to_string(&state).unwrap();
         assert!(
             SavedWorkspace::restore(&json, |_| false).is_none(),
@@ -944,23 +1248,21 @@ mod tests {
         );
 
         let mut duplicate = state;
-        duplicate.layout = SavedNode::ProjectLayouts {
+        duplicate.layout = SavedNode::ProjectTabs {
             selected: Some(10),
-            projects: vec![SavedProjectLayout {
+            projects: vec![SavedProjectTabs {
                 project: 10,
-                layout: SavedNode::Group {
-                    horizontal: true,
-                    sizes: vec![0.5, 0.5],
-                    children: vec![SavedNode::Leaf { pane: 1 }, SavedNode::Leaf { pane: 1 }],
-                },
-                focused: 1,
+                selected_tab: 0,
+                tabs: vec![tab("one", leaf(1), 1), tab("two", leaf(1), 1)],
             }],
             launches: HashMap::new(),
         };
         let json = serde_json::to_string(&duplicate).unwrap();
-        assert!(
-            SavedWorkspace::restore(&json, |_| true).is_none(),
-            "two leaves cannot share a pane"
+        let restored = SavedWorkspace::restore(&json, |_| true).expect("one tab survives");
+        assert_eq!(
+            restored.tabs[&10].tabs.len(),
+            1,
+            "a tab sharing a pane with an earlier tab is dropped"
         );
     }
 
@@ -972,16 +1274,16 @@ mod tests {
         let json = r#"{"version":3,"focused":7,"layout":{"ProjectLayouts":{"selected":3,"projects":[{"project":3,"layout":{"Leaf":{"pane":7}},"focused":7}]}}}"#;
         let restored = SavedWorkspace::restore(json, |_| true).unwrap();
         assert!(restored.launches.is_empty());
-        assert_eq!(restored.layouts[&3].panes(), vec![PaneId(7)]);
+        assert_eq!(restored.tabs[&3].panes(), vec![PaneId(7)]);
 
         let saved = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
+            layout: SavedNode::ProjectTabs {
                 selected: Some(3),
-                projects: vec![SavedProjectLayout {
+                projects: vec![SavedProjectTabs {
                     project: 3,
-                    layout: SavedNode::Leaf { pane: 7 },
-                    focused: 7,
+                    selected_tab: 0,
+                    tabs: vec![tab("", leaf(7), 7)],
                 }],
                 launches: HashMap::new(),
             },
@@ -989,6 +1291,7 @@ mod tests {
         };
         let json = serde_json::to_string(&saved).unwrap();
         assert!(!json.contains("launches"), "shells write no launch data");
+        assert!(json.contains("ProjectTabs"));
     }
 
     #[test]
@@ -999,12 +1302,12 @@ mod tests {
         };
         let saved = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
+            layout: SavedNode::ProjectTabs {
                 selected: Some(3),
-                projects: vec![SavedProjectLayout {
+                projects: vec![SavedProjectTabs {
                     project: 3,
-                    layout: SavedNode::Leaf { pane: 7 },
-                    focused: 7,
+                    selected_tab: 0,
+                    tabs: vec![tab("", leaf(7), 7)],
                 }],
                 launches: HashMap::from([(7, launch.clone())]),
             },
@@ -1015,18 +1318,18 @@ mod tests {
         assert_eq!(restored.launches[&PaneId(7)], launch);
     }
 
-    /// A launch whose pane is no longer in any tree must not start a process
+    /// A launch whose pane is no longer in any tab must not start a process
     /// no pane can show.
     #[test]
     fn a_launch_for_a_missing_pane_is_dropped() {
         let saved = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: SavedNode::ProjectLayouts {
+            layout: SavedNode::ProjectTabs {
                 selected: Some(3),
-                projects: vec![SavedProjectLayout {
+                projects: vec![SavedProjectTabs {
                     project: 3,
-                    layout: SavedNode::Leaf { pane: 7 },
-                    focused: 7,
+                    selected_tab: 0,
+                    tabs: vec![tab("", leaf(7), 7)],
                 }],
                 launches: HashMap::from([
                     (

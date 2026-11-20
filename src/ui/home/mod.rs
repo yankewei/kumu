@@ -1,7 +1,8 @@
 //! Home window: projects on the left, the selected project's splitable pane
 //! tree on the right. Owns the settings window handle.
 //!
-//! A project owns its panes. Splitting adds another shell to that project.
+//! A project owns its panes. Splitting adds another cell to that project; a
+//! cell can hold several terminals as tabs.
 
 mod panes;
 mod sidebar;
@@ -18,17 +19,20 @@ use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::git::WorktreeEntry;
 use crate::plugins::{PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome};
 use crate::term::KeyInput;
+use crate::ui::tooltip::HoverLabel as _;
 use futures::StreamExt;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::Updater;
 use panes::{
-    PaneDirection, PaneId, PaneNode, SavedProjectLayout, SavedWorkspace, WORKSPACE_STATE_VERSION,
+    PaneDirection, PaneId, PaneNode, ProjectTab, ProjectTabs, SavedProjectTab, SavedProjectTabs,
+    SavedWorkspace, WORKSPACE_STATE_VERSION,
 };
 use terminal::{TerminalEvent, TerminalView};
 
@@ -93,16 +97,16 @@ pub struct KumuApp {
     store_error: Option<String>,
     /// Terminal views keyed by pane id.
     panes: HashMap<PaneId, Entity<TerminalView>>,
-    /// Each project owns an independent pane tree.
-    layouts: HashMap<i64, PaneNode>,
-    /// Last focused pane in each project's tree.
-    focused_by_project: HashMap<i64, PaneId>,
+    /// Each project's independent tab list; the selected tab's tree is shown.
+    tabs_by_project: HashMap<i64, ProjectTabs>,
     /// Resizable state per split group, so drag sizes can be saved and restored.
     group_states: HashMap<u64, Entity<ResizableState>>,
-    /// Focused pane in the selected project.
+    /// Focused pane in the selected project's selected tab.
     focused: PaneId,
     /// Focus this pane's terminal on the next paint (after a split / select).
     pending_focus: Option<PaneId>,
+    /// A tab close waiting for confirmation; clearing a tab ends every pane.
+    pending_close_tab: Option<(i64, usize)>,
     next_pane: u64,
     next_group: u64,
     /// What each pane runs. Absent panes are shells, so a workspace restored
@@ -256,10 +260,10 @@ impl KumuApp {
                 } else {
                     this.launches.insert(pane, next.clone());
                 }
-                // Only the selected project's panes are on screen. Restarting
-                // a hidden one would spend a process nobody can see; it starts
-                // when the project is selected.
-                if this.selected == Some(*project)
+                // Only the visible tab's panes are on screen. Restarting a
+                // hidden one would spend a process nobody can see; it starts
+                // when its tab is selected.
+                if this.pane_is_visible(pane)
                     && let Some(terminal) = this.panes.get(&pane).cloned()
                 {
                     terminal.update(cx, |terminal, cx| {
@@ -359,11 +363,11 @@ impl KumuApp {
             unread_notifications: HashMap::new(),
             store_error: startup_error,
             panes: HashMap::new(),
-            layouts: HashMap::new(),
-            focused_by_project: HashMap::new(),
+            tabs_by_project: HashMap::new(),
             group_states: HashMap::new(),
             focused: PaneId(1),
             pending_focus: None,
+            pending_close_tab: None,
             next_pane: 1,
             next_group: 1,
             launches: HashMap::new(),
@@ -735,12 +739,13 @@ impl KumuApp {
             .ok_or_else(|| ControlError::new("paneGone", format!("pane {} is not running", pane.0)))
     }
 
-    /// Every pane of every project, with the facts a reader needs to pick one.
+    /// Every pane of every tab of every project, with the facts a reader needs
+    /// to pick one.
     fn control_panes(&self, cx: &Context<Self>) -> Vec<crate::control::PaneSummary> {
         let mut panes: Vec<_> = self
-            .layouts
+            .tabs_by_project
             .values()
-            .flat_map(|layout| layout.panes())
+            .flat_map(ProjectTabs::panes)
             .filter_map(|pane| self.control_summary(pane, cx))
             .collect();
         panes.sort_by_key(|pane| pane.id);
@@ -789,7 +794,7 @@ impl KumuApp {
         &self,
         target: &crate::control::PaneTarget,
         from: Option<u64>,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> Result<PaneId, crate::control::ControlError> {
         use crate::control::{ControlError, PaneTarget};
 
@@ -813,12 +818,16 @@ impl KumuApp {
                     "up" => PaneDirection::Up,
                     _ => PaneDirection::Down,
                 };
-                let project = self.pane_project(anchor, cx).ok_or_else(|| {
-                    ControlError::new("unknownPane", format!("pane {} is not open", anchor.0))
-                })?;
-                self.layouts
+                let Some((project, tab_index)) = self.pane_tab(anchor) else {
+                    return Err(ControlError::new(
+                        "unknownPane",
+                        format!("pane {} is not open", anchor.0),
+                    ));
+                };
+                self.tabs_by_project
                     .get(&project)
-                    .and_then(|layout| layout.neighbor_in(anchor, direction))
+                    .and_then(|tabs| tabs.tabs.get(tab_index))
+                    .and_then(|tab| tab.layout.neighbor_in(anchor, direction))
                     .ok_or_else(|| {
                         ControlError::new(
                             "noPane",
@@ -844,12 +853,57 @@ impl KumuApp {
     fn control_owns(&self, pane: PaneId) -> bool {
         self.panes.contains_key(&pane)
             || self
-                .layouts
+                .tabs_by_project
                 .values()
-                .any(|layout| layout.panes().contains(&pane))
+                .any(|tabs| tabs.panes().contains(&pane))
     }
 
-    /// Show the first project in a single pane — the first run, and the
+    /// The project and tab that own `pane`.
+    fn pane_tab(&self, pane: PaneId) -> Option<(i64, usize)> {
+        self.tabs_by_project.iter().find_map(|(project, tabs)| {
+            tabs.tabs
+                .iter()
+                .position(|tab| tab.layout.contains(pane))
+                .map(|index| (*project, index))
+        })
+    }
+
+    /// Whether `pane` belongs to the project and tab currently on screen.
+    fn pane_is_visible(&self, pane: PaneId) -> bool {
+        let Some((project, tab_index)) = self.pane_tab(pane) else {
+            return false;
+        };
+        self.selected == Some(project)
+            && self
+                .tabs_by_project
+                .get(&project)
+                .is_some_and(|tabs| tabs.selected == tab_index)
+    }
+
+    /// The visible tab of `project`.
+    fn active_tab(&self, project: i64) -> Option<&ProjectTab> {
+        self.tabs_by_project.get(&project)?.active()
+    }
+
+    fn active_tab_mut(&mut self, project: i64) -> Option<&mut ProjectTab> {
+        self.tabs_by_project.get_mut(&project)?.active_mut()
+    }
+
+    /// The visible tab name, with a numbered fallback until the user renames it.
+    fn tab_name(tabs: &ProjectTabs, index: usize) -> String {
+        let name = tabs
+            .tabs
+            .get(index)
+            .map(|tab| tab.name.trim())
+            .unwrap_or("");
+        if name.is_empty() {
+            format!("工作区 {}", index + 1)
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Show the first project in a single tab — the first run, and the
     /// fallback whenever a saved layout cannot be used.
     fn start_default(&mut self, cx: &mut Context<Self>) {
         let Some(project) = self.workspace.read(cx).projects().first().map(|p| p.id) else {
@@ -858,11 +912,10 @@ impl KumuApp {
         self.ensure_project_layout(project, cx);
         self.selected = Some(project);
         self.focused = self
-            .focused_by_project
-            .get(&project)
-            .copied()
+            .active_tab(project)
+            .map(|tab| tab.focused)
             .unwrap_or(PaneId(1));
-        self.show_project_panes(project, cx);
+        self.show_selected_tab(project, cx);
     }
 
     /// Recreate the saved pane tree and terminals, or return false so the
@@ -886,15 +939,14 @@ impl KumuApp {
         };
 
         let panes::RestoredWorkspace {
-            layouts,
-            focused_by_project,
+            tabs,
             selected,
             group_sizes,
             launches,
             next_pane,
             next_group,
         } = restored;
-        self.layouts = layouts;
+        self.tabs_by_project = tabs;
         self.launches = launches;
         if !self.auto_resume {
             // The panes still come back as agent panes; only the conversations
@@ -903,7 +955,6 @@ impl KumuApp {
                 *launch = launch.clone().fresh();
             }
         }
-        self.focused_by_project = focused_by_project;
         self.selected = selected;
         self.next_pane = next_pane;
         self.next_group = next_group;
@@ -912,25 +963,42 @@ impl KumuApp {
             let state = Self::new_group_state(&ratios, cx);
             self.group_states.insert(group, state);
         }
-        if let Some(project) = self.selected {
-            self.show_project_panes(project, cx);
-        }
         self.focused = self
             .selected
-            .and_then(|project| self.focused_by_project.get(&project).copied())
+            .and_then(|project| self.active_tab(project))
+            .map(|tab| tab.focused)
             .unwrap_or(PaneId(1));
+        if let Some(project) = self.selected {
+            self.show_selected_tab(project, cx);
+        }
         self.queue_pane_restores(cx);
         true
     }
 
-    /// Materialize and attach every pane in the selected project. Other
-    /// projects keep their saved trees and create their views when selected.
-    fn show_project_panes(&mut self, project: i64, cx: &mut Context<Self>) {
-        let Some(layout) = self.layouts.get(&project) else {
+    /// Materialize and attach every pane of one tab. The other tabs of the
+    /// project are hidden but keep their processes.
+    fn show_tab_panes(&mut self, project: i64, index: usize, cx: &mut Context<Self>) {
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
             return;
         };
-        let pane_ids = layout.panes();
-        for pane in pane_ids {
+        let hidden: Vec<PaneId> = tabs
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(_, tab)| tab.layout.panes())
+            .collect();
+        let visible = tabs
+            .tabs
+            .get(index)
+            .map(|tab| tab.layout.panes())
+            .unwrap_or_default();
+        for pane in hidden {
+            if let Some(terminal) = self.panes.get(&pane).cloned() {
+                terminal.update(cx, |terminal, cx| terminal.hide(cx));
+            }
+        }
+        for pane in visible {
             let terminal = if let Some(terminal) = self.panes.get(&pane).cloned() {
                 terminal
             } else {
@@ -939,6 +1007,14 @@ impl KumuApp {
             let launch = self.launches.get(&pane).cloned().unwrap_or_default();
             terminal.update(cx, |terminal, cx| terminal.show(project, &launch, cx));
         }
+    }
+
+    /// Show the tab the project had selected.
+    fn show_selected_tab(&mut self, project: i64, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs_by_project.get(&project).map(|tabs| tabs.selected) else {
+            return;
+        };
+        self.show_tab_panes(project, index, cx);
     }
 
     /// Start every pane in the other projects' trees at startup, one spawn at
@@ -962,18 +1038,20 @@ impl KumuApp {
         let mut agents: Vec<(u64, i64, PaneLaunch)> = Vec::new();
         let mut shells: Vec<(u64, i64, PaneLaunch)> = Vec::new();
         for project in order {
-            if Some(project) == self.selected {
-                continue;
-            }
-            let Some(layout) = self.layouts.get(&project) else {
+            let Some(tabs) = self.tabs_by_project.get(&project) else {
                 continue;
             };
-            for pane in layout.panes() {
-                let launch = self.launches.get(&pane).cloned().unwrap_or_default();
-                if launch.is_shell() {
-                    shells.push((pane.0, project, launch));
-                } else {
-                    agents.push((pane.0, project, launch));
+            for (index, tab) in tabs.tabs.iter().enumerate() {
+                if Some(project) == self.selected && index == tabs.selected {
+                    continue;
+                }
+                for pane in tab.layout.panes() {
+                    let launch = self.launches.get(&pane).cloned().unwrap_or_default();
+                    if launch.is_shell() {
+                        shells.push((pane.0, project, launch));
+                    } else {
+                        agents.push((pane.0, project, launch));
+                    }
                 }
             }
         }
@@ -1081,16 +1159,17 @@ impl KumuApp {
         }
     }
 
-    /// Write each project's pane tree and the focused pane for the next
-    /// launch. Identical state is not rewritten, so selecting or clicking
-    /// around does not turn into a stream of writes.
+    /// Write each project's tabs and the focused panes for the next launch.
+    /// Identical state is not rewritten, so selecting or clicking around does
+    /// not turn into a stream of writes.
     fn persist_workspace(&mut self, cx: &mut Context<Self>) {
-        // Group ids are unique across project layouts and stale groups can be
-        // dropped once their owning pane tree no longer contains them.
+        // Group ids are unique across every tab and stale groups can be
+        // dropped once their owning tree no longer contains them.
         let live_groups: HashSet<u64> = self
-            .layouts
+            .tabs_by_project
             .values()
-            .flat_map(PaneNode::group_ids)
+            .flat_map(|tabs| &tabs.tabs)
+            .flat_map(|tab| PaneNode::group_ids(&tab.layout))
             .collect();
         self.group_states
             .retain(|group, _| live_groups.contains(group));
@@ -1112,31 +1191,44 @@ impl KumuApp {
             })
             .collect();
         self.launches.retain(|pane, _| {
-            self.layouts
+            self.tabs_by_project
                 .values()
-                .any(|layout| layout.panes().contains(pane))
+                .any(|tabs| tabs.panes().contains(pane))
         });
-        let mut projects: Vec<SavedProjectLayout> = self
-            .layouts
+        let mut projects: Vec<SavedProjectTabs> = self
+            .tabs_by_project
             .iter()
-            .filter_map(|(project, layout)| {
-                let focused = self
-                    .focused_by_project
-                    .get(project)
-                    .copied()
-                    .filter(|pane| layout.panes().contains(pane))
-                    .or_else(|| layout.panes().first().copied())?;
-                Some(SavedProjectLayout {
+            .filter_map(|(project, project_tabs)| {
+                let saved_tabs: Vec<SavedProjectTab> = project_tabs
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| {
+                        let panes = tab.layout.panes();
+                        let focused = panes
+                            .contains(&tab.focused)
+                            .then_some(tab.focused)
+                            .or_else(|| panes.first().copied())?;
+                        Some(SavedProjectTab {
+                            name: tab.name.clone(),
+                            layout: tab.layout.to_saved(&ratios),
+                            focused: focused.0,
+                        })
+                    })
+                    .collect();
+                if saved_tabs.is_empty() {
+                    return None;
+                }
+                Some(SavedProjectTabs {
                     project: *project,
-                    layout: layout.to_saved(&ratios),
-                    focused: focused.0,
+                    selected_tab: project_tabs.selected.min(saved_tabs.len() - 1),
+                    tabs: saved_tabs,
                 })
             })
             .collect();
         projects.sort_by_key(|project| project.project);
         let state = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: panes::SavedNode::ProjectLayouts {
+            layout: panes::SavedNode::ProjectTabs {
                 selected: self.selected,
                 projects,
                 launches: self
@@ -1175,57 +1267,65 @@ impl KumuApp {
                 },
                 cx,
             ),
+            TerminalEvent::NewTab => self.new_tab(cx),
+            TerminalEvent::NextTab => self.switch_tab(1, cx),
+            TerminalEvent::PrevTab => self.switch_tab(-1, cx),
+            TerminalEvent::SelectTab(index) => self.select_tab(*index, cx),
+            TerminalEvent::CloseTab => self.close_selected_tab(cx),
             TerminalEvent::Focus(direction) => self.focus_neighbor(pane, *direction, cx),
             TerminalEvent::Close => self.close_pane(pane, cx),
         }
     }
 
-    /// The project that owns `pane`. The desktop installs views only for the
-    /// project it shows, so the layout is authoritative for the others.
+    /// The project that owns `pane`, including panes in hidden tabs.
     fn pane_project(&self, pane: PaneId, cx: &Context<Self>) -> Option<i64> {
-        self.layouts
-            .iter()
-            .find(|(_, layout)| layout.panes().contains(&pane))
-            .map(|(project, _)| *project)
-            .or_else(|| {
-                self.panes
-                    .get(&pane)
-                    .and_then(|view| view.read(cx).project_id())
-            })
+        self.pane_tab(pane).map(|(project, _)| project).or_else(|| {
+            self.panes
+                .get(&pane)
+                .and_then(|view| view.read(cx).project_id())
+        })
     }
 
     /// Move keyboard focus to the pane next to `pane` in `direction`.
     fn focus_neighbor(&mut self, pane: PaneId, direction: PaneDirection, cx: &mut Context<Self>) {
-        let Some(next) = self
-            .layouts
-            .values()
-            .find_map(|layout| layout.neighbor_in(pane, direction))
-        else {
+        let Some(next) = self.pane_tab(pane).and_then(|(project, tab_index)| {
+            self.tabs_by_project
+                .get(&project)
+                .and_then(|tabs| tabs.tabs.get(tab_index))
+                .and_then(|tab| tab.layout.neighbor_in(pane, direction))
+        }) else {
             return;
         };
-        self.pending_focus = Some(next);
         self.focus_pane(next, cx);
     }
 
     fn focus_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        if !self.panes.contains_key(&pane) {
+        let Some((project, tab_index)) = self.pane_tab(pane) else {
             return;
-        }
-        let project = self
-            .panes
-            .get(&pane)
-            .and_then(|terminal| terminal.read(cx).project_id());
-        if let Some(project) = project {
-            if self.selected != Some(project) {
-                if let Some(previous) = self.selected {
-                    self.hide_project_panes(previous, cx);
-                }
-                self.selected = Some(project);
-                self.show_project_panes(project, cx);
+        };
+        let project_changed = self.selected != Some(project);
+        if project_changed {
+            if let Some(previous) = self.selected {
+                self.hide_project_panes(previous, cx);
             }
-            self.focused_by_project.insert(project, pane);
+            self.selected = Some(project);
+        }
+        let previous_tab = self.tabs_by_project.get(&project).map(|tabs| tabs.selected);
+        let needs_view = !self.panes.contains_key(&pane);
+        if previous_tab != Some(tab_index)
+            && let Some(tabs) = self.tabs_by_project.get_mut(&project)
+        {
+            tabs.selected = tab_index;
+        }
+        if let Some(tab) = self.active_tab_mut(project) {
+            tab.focused = pane;
+        }
+        if project_changed || previous_tab != Some(tab_index) || needs_view {
+            self.show_selected_tab(project, cx);
         }
         self.focused = pane;
+        self.pending_focus = Some(pane);
+        self.pending_close_tab = None;
         self.sync_pane_chrome(cx);
         // Focusing a pane can switch the selected project without going
         // through `select_project` (a notification for another project's
@@ -1238,8 +1338,8 @@ impl KumuApp {
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self
             .selected
-            .and_then(|project| self.layouts.get(&project))
-            .is_some_and(|layout| layout.panes().contains(&self.focused))
+            .and_then(|project| self.active_tab(project))
+            .is_some_and(|tab| tab.layout.contains(self.focused))
         {
             return;
         }
@@ -1249,6 +1349,7 @@ impl KumuApp {
     }
 
     fn select_project(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.pending_close_tab = None;
         if self.selected != Some(id)
             && let Some(previous) = self.selected
         {
@@ -1256,16 +1357,11 @@ impl KumuApp {
         }
         self.selected = Some(id);
         self.focused = self
-            .focused_by_project
-            .get(&id)
-            .copied()
-            .or_else(|| self.layouts.get(&id)?.panes().first().copied())
+            .active_tab(id)
+            .map(|tab| tab.focused)
             .unwrap_or(PaneId(1));
-        if self.layouts.contains_key(&id) {
-            self.focused_by_project.insert(id, self.focused);
-        }
-        self.pending_focus = self.layouts.contains_key(&id).then_some(self.focused);
-        self.show_project_panes(id, cx);
+        self.pending_focus = self.active_tab(id).map(|_| self.focused);
+        self.show_selected_tab(id, cx);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
@@ -1304,16 +1400,15 @@ impl KumuApp {
     /// The panes a plugin may hand text to, in layout order. The header's label
     /// gives way to the agent's name only when no program has set one yet.
     fn plugin_panes(&self, project: i64, cx: &App) -> Vec<PaneTarget> {
-        let Some(layout) = self.layouts.get(&project) else {
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
             return Vec::new();
         };
-        let focused = self
-            .focused_by_project
-            .get(&project)
-            .copied()
-            .unwrap_or(self.focused);
+        let Some(tab) = tabs.active() else {
+            return Vec::new();
+        };
+        let focused = tab.focused;
         let workspace = self.workspace.read(cx);
-        layout
+        tab.layout
             .panes()
             .into_iter()
             .enumerate()
@@ -1357,18 +1452,18 @@ impl KumuApp {
         let pane = match pane {
             Some(pane) => {
                 let known = self
-                    .layouts
+                    .tabs_by_project
                     .get(&project)
-                    .is_some_and(|layout| layout.panes().iter().any(|id| id.0 == pane));
+                    .and_then(ProjectTabs::active)
+                    .is_some_and(|tab| tab.layout.panes().iter().any(|id| id.0 == pane));
                 if !known {
                     return Err("目标窗格已关闭，请重新选择".to_string());
                 }
                 pane
             }
             None => {
-                self.focused_by_project
-                    .get(&project)
-                    .copied()
+                self.active_tab(project)
+                    .map(|tab| tab.focused)
                     .unwrap_or(self.focused)
                     .0
             }
@@ -1527,28 +1622,37 @@ impl KumuApp {
     }
 
     fn ensure_project_layout(&mut self, project: i64, cx: &mut Context<Self>) {
-        if self.layouts.contains_key(&project) {
+        if self.tabs_by_project.contains_key(&project) {
             return;
         }
         let pane = PaneId(self.next_pane);
         self.next_pane += 1;
-        self.layouts.insert(project, PaneNode::leaf(pane));
-        self.focused_by_project.insert(project, pane);
+        self.tabs_by_project.insert(
+            project,
+            ProjectTabs {
+                tabs: vec![ProjectTab {
+                    name: String::new(),
+                    layout: PaneNode::leaf(pane),
+                    focused: pane,
+                }],
+                selected: 0,
+            },
+        );
         self.install_pane(pane, cx);
     }
 
     fn hide_project_panes(&mut self, project: i64, cx: &mut Context<Self>) {
-        let Some(layout) = self.layouts.get(&project) else {
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
             return;
         };
-        for pane in layout.panes() {
+        for pane in tabs.panes() {
             if let Some(terminal) = self.panes.get(&pane).cloned() {
                 terminal.update(cx, |terminal, cx| terminal.hide(cx));
             }
         }
     }
 
-    /// Split `pane` along `axis`, open another shell in the same project, and
+    /// Split `pane` along `axis`, open another shell in the same tab, and
     /// focus the new pane.
     fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
         self.split_pane_with(pane, axis, PaneLaunch::Shell, cx);
@@ -1562,33 +1666,41 @@ impl KumuApp {
         launch: PaneLaunch,
         cx: &mut Context<Self>,
     ) {
-        if !self.panes.contains_key(&pane) {
+        let Some((project_id, tab_index)) = self.pane_tab(pane) else {
             return;
+        };
+        // Splitting from a hidden tab (or a pane with no view yet) is
+        // meaningful for the control socket: bring it on screen first.
+        let hidden = self.selected != Some(project_id)
+            || self
+                .tabs_by_project
+                .get(&project_id)
+                .is_some_and(|tabs| tabs.selected != tab_index)
+            || !self.panes.contains_key(&pane);
+        if hidden {
+            self.focus_pane(pane, cx);
         }
-        let Some(project_id) = self
-            .panes
-            .get(&pane)
-            .and_then(|t| t.read(cx).project_id())
-            .filter(|&id| self.workspace.read(cx).project(id).is_some())
+        let new_id = PaneId(self.next_pane);
+        let group_id = self.next_group;
+        let Some(tab) = self
+            .tabs_by_project
+            .get_mut(&project_id)
+            .and_then(|tabs| tabs.tabs.get_mut(tab_index))
         else {
             return;
         };
-
-        let new_id = PaneId(self.next_pane);
-        self.next_pane += 1;
-        let group_id = self.next_group;
-        self.next_group += 1;
-        let Some(layout) = self.layouts.get_mut(&project_id) else {
-            return;
-        };
-        if !layout.split(pane, axis, new_id, group_id) {
+        if !tab.layout.split(pane, axis, new_id, group_id) {
             return;
         }
-        if layout.contains_group(group_id) {
+        let made_group = tab.layout.contains_group(group_id);
+        tab.focused = new_id;
+        self.next_pane += 1;
+        self.next_group += 1;
+
+        if made_group {
             let state = Self::new_group_state(&[], cx);
             self.group_states.insert(group_id, state);
         }
-
         if launch.is_shell() {
             self.launches.remove(&new_id);
         } else {
@@ -1598,7 +1710,6 @@ impl KumuApp {
         terminal.update(cx, |terminal, cx| terminal.show(project_id, &launch, cx));
         self.focused = new_id;
         self.selected = Some(project_id);
-        self.focused_by_project.insert(project_id, new_id);
         self.pending_focus = Some(new_id);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
@@ -1606,41 +1717,287 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// Remove a pane after a close action or shell exit. The last pane leaves
-    /// an empty project; a background exit keeps the selected project intact.
-    fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        let Some(project_id) = self.pane_project(pane, cx) else {
+    /// Open a new tab with one shell, after the visible one, and focus it.
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let project_id = self.selected.or_else(|| {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.ensure_project(cx))
+        });
+        let Some(project_id) = project_id else {
             return;
         };
-        let Some(layout) = self.layouts.get_mut(&project_id) else {
-            return;
-        };
-        if !layout.panes().contains(&pane) {
+        if !self.tabs_by_project.contains_key(&project_id) {
+            self.ensure_project_layout(project_id, cx);
+            self.select_project(project_id, cx);
             return;
         }
-        if let Some(next) = layout.neighbor(pane) {
-            if !layout.remove(pane) {
+        let pane = PaneId(self.next_pane);
+        let Some(tabs) = self.tabs_by_project.get_mut(&project_id) else {
+            return;
+        };
+        let index = (tabs.selected + 1).min(tabs.tabs.len());
+        tabs.tabs.insert(
+            index,
+            ProjectTab {
+                name: String::new(),
+                layout: PaneNode::leaf(pane),
+                focused: pane,
+            },
+        );
+        tabs.selected = index;
+        self.next_pane += 1;
+        self.launches.remove(&pane);
+        if self.selected != Some(project_id) {
+            if let Some(previous) = self.selected {
+                self.hide_project_panes(previous, cx);
+            }
+            self.selected = Some(project_id);
+        }
+        self.focused = pane;
+        self.pending_focus = Some(pane);
+        self.pending_close_tab = None;
+        // Installs the view; show_selected_tab attaches it and hides the
+        // tab that was on screen.
+        self.show_selected_tab(project_id, cx);
+        self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
+        self.persist_workspace(cx);
+        cx.notify();
+    }
+
+    /// Move to the next (+1) or previous (-1) tab, wrapping.
+    fn switch_tab(&mut self, offset: isize, cx: &mut Context<Self>) {
+        let Some(project) = self.selected else {
+            return;
+        };
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
+            return;
+        };
+        let count = tabs.tabs.len();
+        if count <= 1 {
+            return;
+        }
+        let next = (tabs.selected as isize + offset).rem_euclid(count as isize) as usize;
+        self.select_tab(next, cx);
+    }
+
+    /// Show tab `index` (0-based) of the selected project.
+    fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.selected else {
+            return;
+        };
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
+            return;
+        };
+        if index >= tabs.tabs.len() || tabs.selected == index {
+            return;
+        }
+        self.pending_close_tab = None;
+        if let Some(tabs) = self.tabs_by_project.get_mut(&project) {
+            tabs.selected = index;
+        }
+        if let Some(focused) = self.active_tab(project).map(|tab| tab.focused) {
+            self.focused = focused;
+            self.pending_focus = Some(focused);
+        }
+        self.show_selected_tab(project, cx);
+        self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
+        self.persist_workspace(cx);
+        cx.notify();
+    }
+
+    /// Close request from `⌘W` or the tab's `×`. A tab with several panes asks
+    /// first, because closing it ends every terminal in it.
+    fn request_close_tab(&mut self, project: i64, index: usize, cx: &mut Context<Self>) {
+        let Some(panes) = self
+            .tabs_by_project
+            .get(&project)
+            .and_then(|tabs| tabs.tabs.get(index))
+            .map(|tab| tab.layout.panes().len())
+        else {
+            return;
+        };
+        if panes > 1 {
+            self.pending_close_tab = Some((project, index));
+            cx.notify();
+            return;
+        }
+        self.finish_close_tab(project, index, cx);
+    }
+
+    fn close_selected_tab(&mut self, cx: &mut Context<Self>) {
+        // While a close confirmation is on screen, ⌘W answers it instead of
+        // closing whichever tab happens to be selected.
+        if let Some((project, index)) = self.pending_close_tab {
+            self.finish_close_tab(project, index, cx);
+            return;
+        }
+        let Some(project) = self.selected else {
+            return;
+        };
+        let Some(index) = self.tabs_by_project.get(&project).map(|tabs| tabs.selected) else {
+            return;
+        };
+        self.request_close_tab(project, index, cx);
+    }
+
+    /// Rename a tab; the dialog starts on the name the strip shows.
+    fn prompt_rename_tab(
+        &self,
+        project: i64,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self
+            .tabs_by_project
+            .get(&project)
+            .map(|tabs| Self::tab_name(tabs, index))
+        else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        let weak = cx.weak_entity();
+        let dialog_input = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("重命名页签")
+                .child(Input::new(&dialog_input).small())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("保存")
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok({
+                    let weak = weak.clone();
+                    let input = dialog_input.clone();
+                    move |_, _, cx| {
+                        let name = input.read(cx).value().trim().to_string();
+                        if !name.is_empty() {
+                            let _ = weak.update(cx, move |app, cx| {
+                                if let Some(tabs) = app.tabs_by_project.get_mut(&project)
+                                    && let Some(tab) = tabs.tabs.get_mut(index)
+                                {
+                                    tab.name = name;
+                                }
+                                app.persist_workspace(cx);
+                                cx.notify();
+                            });
+                        }
+                        true
+                    }
+                })
+                .centered()
+        });
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+    }
+
+    /// Remove a tab and end every terminal in it.
+    fn finish_close_tab(&mut self, project: i64, index: usize, cx: &mut Context<Self>) {
+        self.pending_close_tab = None;
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
+            return;
+        };
+        let Some(tab) = tabs.tabs.get(index) else {
+            return;
+        };
+        let panes = tab.layout.panes();
+        let was_selected = tabs.selected == index;
+        let leaving_project = tabs.tabs.len() == 1;
+        let new_tab = if leaving_project {
+            None
+        } else if was_selected {
+            Some(index.min(tabs.tabs.len() - 2))
+        } else if index < tabs.selected {
+            Some(tabs.selected - 1)
+        } else {
+            Some(tabs.selected)
+        };
+        if leaving_project {
+            self.tabs_by_project.remove(&project);
+        } else if let Some(tabs) = self.tabs_by_project.get_mut(&project) {
+            tabs.tabs.remove(index);
+            if let Some(new_tab) = new_tab {
+                tabs.selected = new_tab;
+            }
+        }
+        for pane in panes {
+            self.workspace
+                .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
+            self.panes.remove(&pane);
+            self.launches.remove(&pane);
+        }
+        if self.selected == Some(project) {
+            if leaving_project {
+                self.pending_focus = None;
+            } else {
+                if let Some(focused) = self.active_tab(project).map(|tab| tab.focused) {
+                    self.focused = focused;
+                    self.pending_focus = Some(focused);
+                }
+                self.show_selected_tab(project, cx);
+            }
+        }
+        self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
+        self.persist_workspace(cx);
+        cx.notify();
+    }
+
+    /// Remove a pane after a close action or shell exit. Closing the last pane
+    /// of a tab removes the tab; the project keeps its other tabs.
+    fn close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some((project_id, tab_index)) = self.pane_tab(pane) else {
+            return;
+        };
+        let Some(tab) = self
+            .tabs_by_project
+            .get(&project_id)
+            .and_then(|tabs| tabs.tabs.get(tab_index))
+        else {
+            return;
+        };
+        if tab.layout.panes().len() <= 1 {
+            self.finish_close_tab(project_id, tab_index, cx);
+            return;
+        }
+        let next = tab.layout.neighbor(pane);
+        let focused_here = tab.focused == pane;
+        let shown = self.selected == Some(project_id)
+            && self
+                .tabs_by_project
+                .get(&project_id)
+                .is_some_and(|tabs| tabs.selected == tab_index);
+        if let Some(tab) = self
+            .tabs_by_project
+            .get_mut(&project_id)
+            .and_then(|tabs| tabs.tabs.get_mut(tab_index))
+        {
+            if !tab.layout.remove(pane) {
                 return;
             }
-            if self.focused_by_project.get(&project_id) == Some(&pane) {
-                self.focused_by_project.insert(project_id, next);
-                if self.selected == Some(project_id) {
-                    self.focused = next;
-                    self.pending_focus = Some(next);
-                }
+            if focused_here && let Some(next) = next {
+                tab.focused = next;
             }
-        } else {
-            self.layouts.remove(&project_id);
-            self.focused_by_project.remove(&project_id);
-            if self.selected == Some(project_id) {
-                self.pending_focus = None;
-            }
+        }
+        if shown
+            && focused_here
+            && let Some(focused) = self.active_tab(project_id).map(|tab| tab.focused)
+        {
+            self.focused = focused;
+            self.pending_focus = Some(focused);
         }
         self.workspace
             .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
         self.panes.remove(&pane);
         self.launches.remove(&pane);
         self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
         self.persist_workspace(cx);
         cx.notify();
     }
@@ -1648,8 +2005,8 @@ impl KumuApp {
     fn sync_pane_chrome(&mut self, cx: &mut Context<Self>) {
         let visible: HashSet<PaneId> = self
             .selected
-            .and_then(|project_id| self.layouts.get(&project_id))
-            .map(PaneNode::panes)
+            .and_then(|project_id| self.active_tab(project_id))
+            .map(|tab| tab.layout.panes())
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -1674,9 +2031,8 @@ impl KumuApp {
             return;
         };
         let had_panes = self
-            .layouts
-            .get(&project_id)
-            .is_some_and(|layout| !layout.panes().is_empty());
+            .active_tab(project_id)
+            .is_some_and(|tab| !tab.layout.panes().is_empty());
         if had_panes {
             self.select_project(project_id, cx);
             self.split_pane(self.focused, Axis::Horizontal, cx);
@@ -2092,13 +2448,21 @@ impl KumuApp {
             return;
         }
         let selected_removed = self.selected.is_some_and(|id| removed.contains(&id));
-        for id in removed {
-            if let Some(layout) = self.layouts.remove(&id) {
-                for pane in layout.panes() {
+        for id in &removed {
+            if let Some(tabs) = self.tabs_by_project.remove(id) {
+                for pane in tabs.panes() {
+                    self.workspace
+                        .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
                     self.panes.remove(&pane);
+                    self.launches.remove(&pane);
                 }
             }
-            self.focused_by_project.remove(&id);
+        }
+        if self
+            .pending_close_tab
+            .is_some_and(|(project, _)| removed.contains(&project))
+        {
+            self.pending_close_tab = None;
         }
         if selected_removed {
             let next = self.workspace.read(cx).projects().first().map(|p| p.id);
@@ -2108,6 +2472,7 @@ impl KumuApp {
                 return;
             }
             self.focused = PaneId(1);
+            self.pending_focus = None;
         }
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
@@ -2144,10 +2509,201 @@ impl KumuApp {
         }
     }
 
+    /// The project-level tab strip above the panes. Each tab is one whole
+    /// layout; the `+` opens another, `…` renames or closes the visible one.
+    fn render_tab_bar(&self, cx: &Context<Self>) -> AnyElement {
+        let Some(project) = self.selected else {
+            return div().into_any_element();
+        };
+        let Some(tabs) = self.tabs_by_project.get(&project) else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let (muted, fg, hover) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.accent.opacity(0.5),
+        );
+        if let Some((pending_project, index)) = self
+            .pending_close_tab
+            .filter(|(pending_project, _)| *pending_project == project)
+            && let Some(tab) = tabs.tabs.get(index)
+        {
+            let name = Self::tab_name(tabs, index);
+            let count = tab.layout.panes().len();
+            let target = (pending_project, index);
+            return h_flex()
+                .id("project-tab-close-confirm")
+                .flex_none()
+                .h(px(36.))
+                .px_3()
+                .gap_2()
+                .items_center()
+                .bg(theme.warning.opacity(0.12))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(format!("关闭「{name}」会结束 {count} 个终端。")),
+                )
+                .child(
+                    Button::new("tab-close-cancel")
+                        .ghost()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pending_close_tab = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("tab-close-confirm")
+                        .label("关闭页签")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.finish_close_tab(target.0, target.1, cx);
+                        })),
+                )
+                .into_any_element();
+        }
+
+        let mut strip = h_flex()
+            .id("project-tabs-strip")
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .overflow_x_scroll();
+        for index in 0..tabs.tabs.len() {
+            let active = index == tabs.selected;
+            let name = Self::tab_name(tabs, index);
+            let close = index;
+            strip = strip.child(
+                h_flex()
+                    .id(format!("project-tab-{project}-{index}"))
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .h(px(26.))
+                    .px_2()
+                    .rounded(theme.radius)
+                    .cursor_pointer()
+                    .when(active, |this| {
+                        this.bg(theme.background)
+                            .border_1()
+                            .border_color(theme.border)
+                    })
+                    .when(!active, |this| this.hover(move |style| style.bg(hover)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_tab(index, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        Icon::new(IconName::LayoutDashboard)
+                            .with_size(px(14.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(160.))
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(if active { fg } else { muted })
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .id(format!("project-tab-close-{project}-{index}"))
+                            .flex_none()
+                            .rounded(theme.radius)
+                            .p_0p5()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .hover_label("关闭页签 ⌘W")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.request_close_tab(project, close, cx);
+                            }))
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .with_size(px(12.))
+                                    .text_color(muted)
+                                    .opacity(if active { 1. } else { 0.55 }),
+                            ),
+                    ),
+            );
+        }
+
+        let selected = tabs.selected;
+        let view = cx.entity();
+        let menu_view = view.clone();
+        h_flex()
+            .id("project-tabs")
+            .flex_none()
+            .h(px(36.))
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(theme.secondary.opacity(0.45))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(strip)
+            .child(
+                div()
+                    .id("project-tab-add")
+                    .flex_none()
+                    .rounded(theme.radius)
+                    .p_0p5()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .hover_label("新建页签 ⌘T")
+                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .with_size(px(14.))
+                            .text_color(muted),
+                    ),
+            )
+            .child(
+                Button::new("project-tab-menu")
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.transparent)
+                            .foreground(muted)
+                            .hover(hover),
+                    )
+                    .compact()
+                    .icon(IconName::Ellipsis)
+                    .text_color(muted)
+                    .tooltip("页签操作")
+                    .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                        let rename = menu_view.clone();
+                        let close = menu_view.clone();
+                        menu.item(PopupMenuItem::new("重命名页签").on_click(
+                            move |_, window, cx| {
+                                rename.update(cx, |this, cx| {
+                                    this.prompt_rename_tab(project, selected, window, cx)
+                                });
+                            },
+                        ))
+                        .item(PopupMenuItem::new("关闭页签").on_click(move |_, _, cx| {
+                            close.update(cx, |this, cx| {
+                                this.request_close_tab(project, selected, cx)
+                            });
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
         self.selected
-            .and_then(|project_id| self.layouts.get(&project_id))
-            .map(|layout| self.render_node(layout, cx))
+            .and_then(|project_id| self.active_tab(project_id))
+            .map(|tab| self.render_node(&tab.layout, cx))
             .unwrap_or_else(|| div().into_any_element())
     }
 
@@ -2193,8 +2749,8 @@ impl KumuApp {
         let has_projects = !workspace.projects().is_empty();
         let has_panes = self
             .selected
-            .and_then(|project| self.layouts.get(&project))
-            .is_some_and(|layout| !layout.panes().is_empty());
+            .and_then(|project| self.active_tab(project))
+            .is_some_and(|tab| !tab.layout.panes().is_empty());
         let right =
             if has_panes {
                 v_flex()
@@ -2202,7 +2758,14 @@ impl KumuApp {
                     .h_full()
                     .min_w_0()
                     .min_h_0()
-                    .child(self.render_panes(cx))
+                    .child(self.render_tab_bar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .child(self.render_panes(cx)),
+                    )
             } else if has_projects {
                 v_flex()
                     .flex_1()
