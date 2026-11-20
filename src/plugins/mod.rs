@@ -33,8 +33,8 @@ pub enum SendOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneTarget {
     pub pane: u64,
-    /// 1-based position in the project's layout, so two panes running the same
-    /// agent stay distinguishable in a menu.
+    /// 1-based position in the visible tab's layout, so two panes running the
+    /// same agent stay distinguishable in a menu.
     pub ordinal: usize,
     /// What the pane header calls the pane.
     pub title: String,

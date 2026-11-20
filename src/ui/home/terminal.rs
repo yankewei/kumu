@@ -45,6 +45,16 @@ pub enum TerminalEvent {
     Close,
     /// Split this pane to the right and run an agent in the new pane.
     AgentPane(String),
+    /// Open a new tab with one shell.
+    NewTab,
+    /// Close the current tab (and every terminal in it).
+    CloseTab,
+    /// Show the next tab.
+    NextTab,
+    /// Show the previous tab.
+    PrevTab,
+    /// Show tab `n` (0-based).
+    SelectTab(usize),
 }
 
 /// Direction for a ⌘⌥arrow focus move.
@@ -181,6 +191,7 @@ impl TerminalView {
         self.project
     }
 
+    /// Set the chrome state of a visible pane.
     pub fn set_chrome(&mut self, active: bool, can_close: bool, cx: &mut Context<Self>) {
         if self.active == active && self.can_close == can_close {
             return;
@@ -325,7 +336,8 @@ impl TerminalView {
         }
         if mods.platform {
             // ⌘⌥arrows move focus between panes; ⌘D / ⌘⇧D split the focused
-            // pane, matching the split buttons in the pane chrome.
+            // pane, matching the split buttons in the pane chrome. ⌘T / ⌘W
+            // open and close tabs, ⌘⇧[ / ⌘⇧] walk them and ⌘1…9 picks one.
             if mods.alt && !mods.control && !mods.shift {
                 if let Some(direction) = pane_direction(key) {
                     cx.emit(TerminalEvent::Focus(direction));
@@ -334,7 +346,43 @@ impl TerminalView {
                 return;
             }
             if !mods.alt && !mods.control {
+                // Holding a mutating shortcut must not repeat: a held ⌘W
+                // would otherwise turn its own close confirmation into the
+                // confirming click.
+                if event.is_held && matches!(key, "t" | "w" | "d") {
+                    cx.stop_propagation();
+                    return;
+                }
                 match key {
+                    "t" if !mods.shift => {
+                        cx.emit(TerminalEvent::NewTab);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "w" if !mods.shift => {
+                        cx.emit(TerminalEvent::CloseTab);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "{" | "[" => {
+                        cx.emit(TerminalEvent::PrevTab);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "}" | "]" => {
+                        cx.emit(TerminalEvent::NextTab);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                        if !mods.shift =>
+                    {
+                        if let Ok(index) = digit.parse::<usize>() {
+                            cx.emit(TerminalEvent::SelectTab(index - 1));
+                            cx.stop_propagation();
+                        }
+                        return;
+                    }
                     "d" => {
                         cx.emit(if mods.shift {
                             TerminalEvent::SplitDown
@@ -1237,7 +1285,7 @@ fn terminal_header(
         .flex_none()
         .items_center()
         .px_3()
-        .py_1p5()
+        .h(px(34.))
         .gap_2()
         .min_w_0()
         .bg(header_bg)
