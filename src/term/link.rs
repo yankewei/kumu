@@ -174,12 +174,26 @@ fn url_char(ch: char) -> bool {
 }
 
 /// Whether the platform should open this URI. Terminal output is untrusted, so
-/// only the schemes the terminal itself treats as links get through to
-/// `open_url`.
+/// the schemes that run script are refused; everything else — `http`/`file` and
+/// the app schemes programs use for themselves — opens the way Ghostty opens an
+/// OSC 8 link.
 pub fn openable(uri: &str) -> bool {
-    SCHEMES.iter().any(|scheme| {
+    const REFUSED: [&str; 4] = ["javascript:", "data:", "vbscript:", "blob:"];
+    let uri = uri.trim_start();
+    if REFUSED.iter().any(|scheme| {
         uri.get(..scheme.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    }) {
+        return false;
+    }
+    // There has to be a scheme at all: a bare path is not something the
+    // platform's URL opener can act on.
+    uri.split(':').next().is_some_and(|scheme| {
+        !scheme.is_empty()
+            && scheme.starts_with(|ch: char| ch.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
     })
 }
 
@@ -204,7 +218,7 @@ fn runs(spans: &[(u16, u16, usize, usize)], start: usize, end: usize) -> Vec<Spa
 
 #[cfg(test)]
 mod tests {
-    use super::{Span, TextLink, at};
+    use super::{Span, TextLink, at, openable};
     use crate::term::{Cell, Rgb, Snapshot};
 
     /// One cell per char, like a terminal row of narrow text.
@@ -306,6 +320,38 @@ mod tests {
         let snapshot = grid(&["https://a.com next"], &[]);
         assert_eq!(at(&snapshot, 0, 15), None);
         assert_eq!(at(&snapshot, 0, 10), link("https://a.com", 0, 13));
+    }
+
+    #[test]
+    fn scripts_are_not_opened_but_app_schemes_are() {
+        for refused in ["javascript:alert(1)", " DATA:text/html,x", "vbscript:x"] {
+            assert!(!openable(refused), "{refused}");
+        }
+        for allowed in ["https://example.com", "file:///tmp/x", "vscode://file/x"] {
+            assert!(openable(allowed), "{allowed}");
+        }
+        assert!(!openable("/tmp/notes.md"), "a bare path is not a URI");
+    }
+
+    #[test]
+    fn the_filler_at_a_wrapped_row_end_is_not_a_space() {
+        // A wide character that does not fit leaves an empty filler in the last
+        // column; it is not a space in the text, so a URL runs on across it.
+        let mut first = row("https://example.com/");
+        first.push(Cell {
+            text: String::new(),
+            ..row("x")[0].clone()
+        });
+        let mut snapshot = Snapshot::blank("t", "/");
+        snapshot.cells = vec![
+            std::sync::Arc::new(first),
+            std::sync::Arc::new(row("very/long")),
+        ];
+        snapshot.wrap = vec![true];
+        assert_eq!(
+            at(&snapshot, 1, 2).map(|link| link.url),
+            Some("https://example.com/very/long".to_string())
+        );
     }
 
     #[test]

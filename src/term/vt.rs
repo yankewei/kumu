@@ -1037,7 +1037,7 @@ impl Vt {
         while from > 0 && self.hyperlink_uri(from - 1, row).as_deref() == Some(uri.as_str()) {
             from -= 1;
         }
-        let mut to = col + 1;
+        let mut to = col.saturating_add(1);
         while to < self.cols && self.hyperlink_uri(to, row).as_deref() == Some(uri.as_str()) {
             to += 1;
         }

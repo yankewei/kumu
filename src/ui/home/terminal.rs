@@ -124,11 +124,14 @@ pub struct TerminalView {
     selecting: bool,
     /// The link under a ⌘-hovered cell: where it sits and where a click goes.
     link: Option<link::TextLink>,
-    /// The cell the newest probe asked about, and the row as it looked then.
-    /// A new frame that repaints that row re-resolves the link, so a scrolling
-    /// screen never leaves an underline (or a click target) on old text.
+    /// The cell the pointer is over while ⌘ is held.
     hover: Option<(u16, u16)>,
+    /// That cell's row as it looked when the link was resolved. A new frame
+    /// that repaints the row refreshes the link, so a scrolling screen never
+    /// leaves an underline (or a click target) on old text.
     hover_row: Option<Arc<Vec<TermCell>>>,
+    /// The current link came from an OSC 8 read, or one is on its way.
+    hover_osc8: bool,
     /// Id of the newest probe: a late OSC 8 answer for an older cell is
     /// dropped instead of replacing the link under the pointer now.
     hover_probe: u64,
@@ -193,6 +196,7 @@ impl TerminalView {
             link: None,
             hover: None,
             hover_row: None,
+            hover_osc8: false,
             hover_probe: 0,
             reported: Vec::new(),
             scrolled: 0.,
@@ -299,6 +303,7 @@ impl TerminalView {
         self.link = None;
         self.hover = None;
         self.hover_row = None;
+        self.hover_osc8 = false;
         self.hover_probe = self.hover_probe.wrapping_add(1);
     }
 
@@ -341,7 +346,7 @@ impl TerminalView {
                 .as_ref()
                 .is_none_or(|old| !Arc::ptr_eq(old, cells))
         {
-            self.resolve_link(col, row, cx);
+            self.refresh_link(col, row, cx);
         }
         cx.notify();
     }
@@ -768,6 +773,7 @@ impl TerminalView {
             None => {
                 self.hover = None;
                 self.hover_row = None;
+                self.hover_osc8 = false;
                 self.hover_probe = self.hover_probe.wrapping_add(1);
                 self.set_link(None, cx);
             }
@@ -781,16 +787,11 @@ impl TerminalView {
     fn resolve_link(&mut self, col: u16, row: u16, cx: &mut Context<Self>) {
         self.hover = Some((col, row));
         self.hover_row = self.snapshot.cells.get(usize::from(row)).cloned();
+        self.hover_osc8 = false;
         self.hover_probe = self.hover_probe.wrapping_add(1);
         let probe = self.hover_probe;
         self.set_link(link::at(&self.snapshot, row, col), cx);
-        let hyperlinked = self
-            .snapshot
-            .cells
-            .get(usize::from(row))
-            .and_then(|cells| cells.get(usize::from(col)))
-            .is_some_and(|cell| cell.hyperlink);
-        if !hyperlinked {
+        if !self.hyperlinked(row, col) {
             return;
         }
         let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
@@ -808,6 +809,7 @@ impl TerminalView {
                 else {
                     return;
                 };
+                this.hover_osc8 = true;
                 this.set_link(
                     Some(link::TextLink {
                         spans: vec![link::Span {
@@ -824,11 +826,37 @@ impl TerminalView {
         .detach();
     }
 
-    fn set_link(&mut self, link: Option<link::TextLink>, cx: &mut Context<Self>) {
-        if self.link == link {
+    /// The same cell after a frame repainted its row: refresh the text link but
+    /// leave a resolved OSC 8 answer (and its pending probe) alone. Re-probing
+    /// on every frame would invalidate the answer faster than the terminal
+    /// thread can send it, so a link in a streaming pane would never appear.
+    fn refresh_link(&mut self, col: u16, row: u16, cx: &mut Context<Self>) {
+        self.hover_row = self.snapshot.cells.get(usize::from(row)).cloned();
+        let hyperlinked = self.hyperlinked(row, col);
+        if hyperlinked && self.hover_osc8 {
             return;
         }
-        self.link = link;
+        if !hyperlinked {
+            self.hover_osc8 = false;
+            self.hover_probe = self.hover_probe.wrapping_add(1);
+        }
+        self.set_link(link::at(&self.snapshot, row, col), cx);
+    }
+
+    /// Whether this cell is the visible text of an OSC 8 hyperlink.
+    fn hyperlinked(&self, row: u16, col: u16) -> bool {
+        self.snapshot
+            .cells
+            .get(usize::from(row))
+            .and_then(|cells| cells.get(usize::from(col)))
+            .is_some_and(|cell| cell.hyperlink)
+    }
+
+    fn set_link(&mut self, target: Option<link::TextLink>, cx: &mut Context<Self>) {
+        if self.link == target {
+            return;
+        }
+        self.link = target;
         cx.notify();
     }
 
@@ -860,11 +888,17 @@ impl TerminalView {
         let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
             return false;
         };
+        let cells = self.snapshot.cells.get(usize::from(row)).cloned();
         cx.spawn(async move |this, cx| {
             let hyperlink = cx
                 .background_spawn(async move { term.hyperlink_at(col, row) })
                 .await;
-            let _ = this.update(cx, |_, cx| {
+            let _ = this.update(cx, |this, cx| {
+                // The read happens a queue turn later: if output replaced this
+                // row in the meantime, the answer is for text nobody clicked.
+                if !same_row(&cells, this.snapshot.cells.get(usize::from(row))) {
+                    return;
+                }
                 if let Some(hyperlink) =
                     hyperlink.filter(|hyperlink| link::openable(&hyperlink.uri))
                 {
@@ -1062,6 +1096,16 @@ fn local_pos(grid: GridAt, pos: Point<Pixels>) -> (f32, f32) {
         f32::from(pos.x - grid.origin.x).max(0.),
         f32::from(pos.y - grid.origin.y).max(0.),
     )
+}
+
+/// Whether a captured row is still the row at that position (the same [`Arc`],
+/// so libghostty did not repaint it).
+fn same_row(captured: &Option<Arc<Vec<TermCell>>>, now: Option<&Arc<Vec<TermCell>>>) -> bool {
+    match (captured, now) {
+        (Some(captured), Some(now)) => Arc::ptr_eq(captured, now),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn map_mouse_button(button: gpui::MouseButton) -> Option<TermMouseButton> {
@@ -1315,14 +1359,6 @@ impl Render for TerminalView {
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                                 this.on_key(event, window, cx);
                             }))
-                            .on_modifiers_changed(cx.listener(
-                                |this, event: &ModifiersChangedEvent, window, cx| {
-                                    // ⌘ can be pressed or released while the
-                                    // pointer stands still: neither produces a
-                                    // mouse move of its own.
-                                    this.hover_link(window.mouse_position(), &event.modifiers, cx);
-                                },
-                            ))
                             .child(
                                 canvas(
                                     move |bounds, window, cx| {
@@ -1476,6 +1512,23 @@ impl Render for TerminalView {
                                                         this.finish_selection(ev.position, cx);
                                                         cx.stop_propagation();
                                                     }
+                                                });
+                                            },
+                                        );
+                                        // ⌘ can be pressed or released while
+                                        // the pointer stands still: neither
+                                        // produces a mouse move of its own. The
+                                        // window-level listener reaches every
+                                        // pane, not just the focused one.
+                                        let view = mouse_view.clone();
+                                        window.on_modifiers_changed(
+                                            move |ev: &ModifiersChangedEvent, window, cx| {
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.hover_link(
+                                                        window.mouse_position(),
+                                                        &ev.modifiers,
+                                                        cx,
+                                                    );
                                                 });
                                             },
                                         );
