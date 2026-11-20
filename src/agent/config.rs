@@ -30,6 +30,7 @@ pub fn executable(agent: &str) -> Option<String> {
         "pi" => pi_bin(),
         "cursor" => cursor_bin(),
         "grok" => grok_bin(),
+        "agy" => agy_bin(),
         _ => return None,
     })
 }
@@ -219,6 +220,28 @@ fn grok_bin() -> String {
         candidates.push(PathBuf::from("/opt/homebrew/bin/grok"));
         candidates.push(PathBuf::from("/usr/local/bin/grok"));
         first_executable(&candidates).unwrap_or_else(|| "grok".to_string())
+    })
+}
+
+/// Resolve the Antigravity CLI executable: env override, then its install
+/// locations, then PATH.
+///
+/// The official installer puts `agy` in `~/.local/bin/agy`, and Homebrew
+/// casks land in `/opt/homebrew/bin` or `/usr/local/bin`.
+fn agy_bin() -> String {
+    std::env::var("AGY_BIN").unwrap_or_else(|_| {
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(&home).join(".local/bin/agy"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/agy"));
+        candidates.push(PathBuf::from("/usr/local/bin/agy"));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "agy".to_string()
     })
 }
 

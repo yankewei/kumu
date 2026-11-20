@@ -5,7 +5,8 @@ Run after `cargo build`: python3 scripts/test-agent-integration.py
 
 Both Claude and Codex run command hooks in a new session without a
 controlling terminal. Claude therefore receives `terminalSequence` on stdout;
-Codex, Grok Build and Cursor write to the explicit PTY path in `KUMU_TTY`.
+Codex, Grok Build, Cursor and Antigravity CLI write to the explicit PTY path
+in `KUMU_TTY`.
 """
 import json
 import os
@@ -62,7 +63,7 @@ class AgentIntegrationTests(unittest.TestCase):
                 self.assertTrue(sequence.endswith("\x07"))
 
     def test_hook_agents_write_to_the_injected_tty_without_a_controlling_terminal(self):
-        for agent in ("codex", "grok", "cursor"):
+        for agent in ("codex", "grok", "cursor", "agy"):
             for event, message in [
                 ("complete", "本轮任务已结束"),
                 ("permission", "确认操作权限"),
@@ -120,8 +121,54 @@ printf 'ORIGINAL=<%s>\\n' "$@"
             self.assertIn("\x1b]777;notify;codex;需要你确认操作权限\x07", output)
             self.assertEqual((process.returncode, stderr), (0, b""))
 
+    def test_agy_hook_payloads_handle_session_cancel_and_error(self):
+        cases = [
+            (
+                "session",
+                {"conversationId": "conv-123"},
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07",
+            ),
+            (
+                "complete",
+                {"conversationId": "conv-123", "terminationReason": "USER_CANCELED"},
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07",
+            ),
+            (
+                "complete",
+                {"conversationId": "conv-123", "terminationReason": "ERROR"},
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07\x1b]777;notify;agy;任务执行失败\x07",
+            ),
+            (
+                "complete",
+                {"conversationId": "conv-123", "terminationReason": "NO_TOOL_CALL"},
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07\x1b]777;notify;agy;本轮任务已结束\x07",
+            ),
+        ]
+        for event, payload, expected in cases:
+            with self.subTest(event=event, payload=payload):
+                master, slave = pty.openpty()
+                try:
+                    env = detached_env(KUMU_TTY=os.ttyname(slave))
+                    process = subprocess.Popen(
+                        [BINARY, "--kumu-notify", "agy", event],
+                        env=env,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        preexec_fn=os.setsid,
+                    )
+                    process.stdin.write(json.dumps(payload).encode())
+                    process.stdin.close()
+                    output = read_pty(master)
+                    stdout, stderr = process.communicate(timeout=5)
+                finally:
+                    os.close(slave)
+                    os.close(master)
+                self.assertEqual((process.returncode, stdout, stderr), (0, b"", b""))
+                self.assertEqual(output, expected)
+
     def test_callbacks_are_silent_outside_kumu(self):
-        for agent in ("codex", "claude", "grok", "cursor"):
+        for agent in ("codex", "claude", "grok", "cursor", "agy"):
             env = detached_env()
             env.pop("KUMU_TERMINAL")
             result = run_hook([agent, "complete"], env)

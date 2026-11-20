@@ -85,6 +85,7 @@ fn resume_args(agent: &str, session: Option<&str>) -> Vec<String> {
         "opencode" => vec!["--session".into(), id.into()],
         "claude" => vec!["--resume".into(), id.into()],
         "cursor" => vec!["--resume".into(), id.into()],
+        "agy" => vec!["--conversation".into(), id.into()],
         _ => Vec::new(),
     }
 }
@@ -191,6 +192,7 @@ mod tests {
         assert_eq!(args("opencode", Some("abc")), ["--session", "abc"]);
         assert_eq!(args("claude", Some("abc")), ["--resume", "abc"]);
         assert_eq!(args("cursor", Some("abc")), ["--resume", "abc"]);
+        assert_eq!(args("agy", Some("abc")), ["--conversation", "abc"]);
         assert!(args("grok", Some("abc")).is_empty());
         assert!(args("nope", Some("abc")).is_empty());
     }
