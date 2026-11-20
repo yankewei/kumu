@@ -24,6 +24,7 @@ use super::panes::{PaneDirection, PaneId};
 use crate::agent::launch::PaneLaunch;
 use crate::agent::{AGENTS, installed};
 use crate::app::{Workspace, WorkspaceEvent};
+use crate::term::link;
 use crate::term::{
     Cell as TermCell, CursorShape, KeyInput, MouseAction, MouseButton as TermMouseButton,
     MouseInput, MouseMods, Rgb, SelectStep, Snapshot,
@@ -94,6 +95,9 @@ struct GridAt {
     /// Visible grid height in pixels (cell_h * rows), for selection geometry.
     height: f32,
     scale: f32,
+    /// The canvas the grid was painted into: a pointer outside it (over the
+    /// header or the find bar) is not over any cell.
+    bounds: Bounds<Pixels>,
 }
 
 pub struct TerminalView {
@@ -118,6 +122,16 @@ pub struct TerminalView {
     grid_at: Rc<Cell<GridAt>>,
     /// Left-button selection drag in progress.
     selecting: bool,
+    /// The link under a ⌘-hovered cell: where it sits and where a click goes.
+    link: Option<link::TextLink>,
+    /// The cell the newest probe asked about, and the row as it looked then.
+    /// A new frame that repaints that row re-resolves the link, so a scrolling
+    /// screen never leaves an underline (or a click target) on old text.
+    hover: Option<(u16, u16)>,
+    hover_row: Option<Arc<Vec<TermCell>>>,
+    /// Id of the newest probe: a late OSC 8 answer for an older cell is
+    /// dropped instead of replacing the link under the pointer now.
+    hover_probe: u64,
     /// Buttons the mouse-tracking program was told about and has not released.
     /// A gesture is decided when the button goes down, so a modifier or mode
     /// change mid-drag cannot drop its Release.
@@ -173,8 +187,13 @@ impl TerminalView {
                 cell: (px(0.), px(0.)),
                 height: 0.,
                 scale: 1.,
+                bounds: Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
             })),
             selecting: false,
+            link: None,
+            hover: None,
+            hover_row: None,
+            hover_probe: 0,
             reported: Vec::new(),
             scrolled: 0.,
             sent: Rc::new(Cell::new((0, 0, 0, 0))),
@@ -277,6 +296,10 @@ impl TerminalView {
         self.selecting = false;
         self.reported.clear();
         self.scrolled = 0.;
+        self.link = None;
+        self.hover = None;
+        self.hover_row = None;
+        self.hover_probe = self.hover_probe.wrapping_add(1);
     }
 
     fn pull(&mut self, cx: &mut Context<Self>) {
@@ -306,6 +329,19 @@ impl TerminalView {
                 .is_some_and(|search| search.needle != sent)
         {
             self.snapshot.search = None;
+        }
+        // The link under the pointer belongs to the row that was painted when
+        // the pointer last moved. Output, a scroll or a resize can put other
+        // text there; repaint the underline on the new row instead of leaving
+        // it (and a click target) on stale cells.
+        if let Some((col, row)) = self.hover
+            && let Some(cells) = self.snapshot.cells.get(usize::from(row))
+            && self
+                .hover_row
+                .as_ref()
+                .is_none_or(|old| !Arc::ptr_eq(old, cells))
+        {
+            self.resolve_link(col, row, cx);
         }
         cx.notify();
     }
@@ -701,6 +737,145 @@ impl TerminalView {
         })
     }
 
+    /// The viewport cell under a pointer position.
+    fn cell_at(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
+        let grid = self.grid_at.get();
+        let (cw, ch) = (f32::from(grid.cell.0), f32::from(grid.cell.1));
+        if cw <= 0. || ch <= 0. || !grid.bounds.contains(&pos) {
+            return None;
+        }
+        // The padding around the cells is not a cell: clamping it to (0, 0)
+        // would let a click in the margin open the top-left link.
+        let x = f32::from(pos.x - grid.origin.x);
+        let y = f32::from(pos.y - grid.origin.y);
+        if x < 0. || y < 0. {
+            return None;
+        }
+        let (col, row) = ((x / cw) as u16, (y / ch) as u16);
+        let row_cells = self.snapshot.cells.get(usize::from(row))?;
+        (usize::from(col) < row_cells.len()).then_some((col, row))
+    }
+
+    /// Highlight the link under the pointer while ⌘ is held, the macOS gesture
+    /// Ghostty uses. Moving off a link, or releasing ⌘, clears it.
+    fn hover_link(&mut self, pos: Point<Pixels>, mods: &Modifiers, cx: &mut Context<Self>) {
+        let cell = mods.platform.then(|| self.cell_at(pos)).flatten();
+        if cell == self.hover {
+            return;
+        }
+        match cell {
+            Some((col, row)) => self.resolve_link(col, row, cx),
+            None => {
+                self.hover = None;
+                self.hover_row = None;
+                self.hover_probe = self.hover_probe.wrapping_add(1);
+                self.set_link(None, cx);
+            }
+        }
+    }
+
+    /// Resolve the link at one cell: plain URL text from the cells on this
+    /// side, then an OSC 8 hyperlink from the terminal thread when the cell
+    /// carries one. The probe id makes a late answer unable to replace the
+    /// link under a newer cell.
+    fn resolve_link(&mut self, col: u16, row: u16, cx: &mut Context<Self>) {
+        self.hover = Some((col, row));
+        self.hover_row = self.snapshot.cells.get(usize::from(row)).cloned();
+        self.hover_probe = self.hover_probe.wrapping_add(1);
+        let probe = self.hover_probe;
+        self.set_link(link::at(&self.snapshot, row, col), cx);
+        let hyperlinked = self
+            .snapshot
+            .cells
+            .get(usize::from(row))
+            .and_then(|cells| cells.get(usize::from(col)))
+            .is_some_and(|cell| cell.hyperlink);
+        if !hyperlinked {
+            return;
+        }
+        let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let hyperlink = cx
+                .background_spawn(async move { term.hyperlink_at(col, row) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.hover_probe != probe {
+                    return;
+                }
+                let Some(hyperlink) = hyperlink.filter(|hyperlink| link::openable(&hyperlink.uri))
+                else {
+                    return;
+                };
+                this.set_link(
+                    Some(link::TextLink {
+                        spans: vec![link::Span {
+                            row: hyperlink.row,
+                            from: hyperlink.from,
+                            to: hyperlink.to,
+                        }],
+                        url: hyperlink.uri,
+                    }),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn set_link(&mut self, link: Option<link::TextLink>, cx: &mut Context<Self>) {
+        if self.link == link {
+            return;
+        }
+        self.link = link;
+        cx.notify();
+    }
+
+    /// Open the link under the pointer. Called for a ⌘-click; `true` means the
+    /// press was the link gesture and must not become a selection.
+    ///
+    /// The link is resolved fresh rather than read from the hover: output may
+    /// have scrolled the row away since the last mouse move.
+    fn open_link(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if self.project.is_none() {
+            return false;
+        }
+        let Some((col, row)) = self.cell_at(pos) else {
+            return false;
+        };
+        if let Some(link) = link::at(&self.snapshot, row, col) {
+            cx.open_url(&link.url);
+            return true;
+        }
+        let hyperlinked = self
+            .snapshot
+            .cells
+            .get(usize::from(row))
+            .and_then(|cells| cells.get(usize::from(col)))
+            .is_some_and(|cell| cell.hyperlink);
+        if !hyperlinked {
+            return false;
+        }
+        let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
+            return false;
+        };
+        cx.spawn(async move |this, cx| {
+            let hyperlink = cx
+                .background_spawn(async move { term.hyperlink_at(col, row) })
+                .await;
+            let _ = this.update(cx, |_, cx| {
+                if let Some(hyperlink) =
+                    hyperlink.filter(|hyperlink| link::openable(&hyperlink.uri))
+                {
+                    cx.open_url(&hyperlink.uri);
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
     fn on_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         if self.project.is_none() {
             return;
@@ -1043,6 +1218,17 @@ impl Render for TerminalView {
         // paint closure (which must be 'static) captures them.
         let search_hit = theme.selection.opacity(0.55);
         let search_active = theme.warning.opacity(0.55);
+        // The link under a ⌘-hovered cell: its runs are underlined and each is
+        // a hitbox, so the pointer turns into a hand over it.
+        let link_spans: Vec<link::Span> = self
+            .link
+            .as_ref()
+            .map(|link| link.spans.clone())
+            .unwrap_or_default();
+        let snapshot_rows = snapshot.rows;
+        let link_hitboxes: Rc<Cell<Vec<Hitbox>>> = Rc::new(Cell::new(Vec::new()));
+        let link_spans_layout = link_spans.clone();
+        let link_hitboxes_layout = link_hitboxes.clone();
         let header = terminal_header(
             pane, mark, name, cwd, note, header_bg, can_close, muted, fg, warning, radius, hover,
             cx,
@@ -1084,6 +1270,13 @@ impl Render for TerminalView {
                                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                     this.focus.focus(window, cx);
                                     cx.emit(TerminalEvent::Activated);
+                                    // ⌘-click opens the link under the pointer,
+                                    // like Ghostty on macOS; it is never the
+                                    // start of a selection.
+                                    if ev.modifiers.platform && this.open_link(ev.position, cx) {
+                                        cx.stop_propagation();
+                                        return;
+                                    }
                                     if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
                                         if this.project.is_some() {
                                             let pane = this.pane.0;
@@ -1122,6 +1315,14 @@ impl Render for TerminalView {
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                                 this.on_key(event, window, cx);
                             }))
+                            .on_modifiers_changed(cx.listener(
+                                |this, event: &ModifiersChangedEvent, window, cx| {
+                                    // ⌘ can be pressed or released while the
+                                    // pointer stands still: neither produces a
+                                    // mouse move of its own.
+                                    this.hover_link(window.mouse_position(), &event.modifiers, cx);
+                                },
+                            ))
                             .child(
                                 canvas(
                                     move |bounds, window, cx| {
@@ -1152,9 +1353,45 @@ impl Render for TerminalView {
                                                 });
                                             }
                                         }
+                                        let origin = grid_origin(
+                                            bounds,
+                                            cell_h,
+                                            snapshot_rows,
+                                            window.scale_factor(),
+                                        );
+                                        let hitboxes = link_spans_layout
+                                            .iter()
+                                            .filter(|span| {
+                                                span.to > span.from && span.row < snapshot_rows
+                                            })
+                                            .map(|span| {
+                                                let at = origin
+                                                    + point(
+                                                        cell_w * f32::from(span.from),
+                                                        cell_h * f32::from(span.row),
+                                                    );
+                                                window.insert_hitbox(
+                                                    Bounds::new(
+                                                        at,
+                                                        size(
+                                                            cell_w * f32::from(span.to - span.from),
+                                                            cell_h,
+                                                        ),
+                                                    ),
+                                                    HitboxBehavior::Normal,
+                                                )
+                                            })
+                                            .collect();
+                                        link_hitboxes_layout.set(hitboxes);
                                         (cell_w, cell_h)
                                     },
                                     move |bounds, cell, window, cx| {
+                                        for hitbox in link_hitboxes.take() {
+                                            window.set_cursor_style(
+                                                CursorStyle::PointingHand,
+                                                &hitbox,
+                                            );
+                                        }
                                         let origin = paint_grid(
                                             GridPaint {
                                                 bounds,
@@ -1167,6 +1404,7 @@ impl Render for TerminalView {
                                                 cursor_at: &cursor_at,
                                                 search_hit,
                                                 search_active,
+                                                link: &link_spans,
                                             },
                                             window,
                                             cx,
@@ -1176,6 +1414,7 @@ impl Render for TerminalView {
                                             cell,
                                             height: f32::from(cell.1) * snapshot.rows as f32,
                                             scale: window.scale_factor(),
+                                            bounds,
                                         });
                                         let view = mouse_view.clone();
                                         window.on_mouse_event(
@@ -1208,7 +1447,13 @@ impl Render for TerminalView {
                                                             &ev.modifiers,
                                                             cx,
                                                         );
+                                                        return;
                                                     }
+                                                    // Links only highlight while
+                                                    // ⌘ is held; the modifier
+                                                    // release itself arrives
+                                                    // with the next move.
+                                                    this.hover_link(ev.position, &ev.modifiers, cx);
                                                 });
                                             },
                                         );
@@ -1812,6 +2057,20 @@ struct GridPaint<'a> {
     /// Find-bar highlight for a match and for the selected one.
     search_hit: Hsla,
     search_active: Hsla,
+    /// Visible runs of a ⌘-hovered link, underlined so the click target shows.
+    link: &'a [link::Span],
+}
+
+/// Where the cell grid starts inside its canvas: padded, with the leftover
+/// height split evenly above and below, like herdr.
+fn grid_origin(bounds: Bounds<Pixels>, cell_h: Pixels, rows: u16, scale: f32) -> Point<Pixels> {
+    let spare =
+        (f32::from(bounds.size.height) - 2. * PAD_Y - f32::from(cell_h) * f32::from(rows)).max(0.);
+    let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
+    point(
+        snap(bounds.origin.x + px(PAD_X)),
+        snap(bounds.origin.y + px(PAD_Y + (spare / 2.).floor())),
+    )
 }
 
 fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<Pixels> {
@@ -1826,18 +2085,13 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         cursor_at,
         search_hit,
         search_active,
+        link,
     } = grid;
     window.paint_quad(fill(bounds, paint_color(snapshot.bg)));
     let scale = window.scale_factor();
     let snap = |value: Pixels| px((f32::from(value) * scale).round() / scale);
     // Center leftover height between top and bottom padding, like herdr.
-    let spare =
-        (f32::from(bounds.size.height) - 2. * PAD_Y - f32::from(cell_h) * snapshot.rows as f32)
-            .max(0.);
-    let origin = point(
-        snap(bounds.origin.x + px(PAD_X)),
-        snap(bounds.origin.y + px(PAD_Y + (spare / 2.).floor())),
-    );
+    let origin = grid_origin(bounds, cell_h, snapshot.rows, scale);
     let at = |x: usize, y: usize| origin + point(cell_w * x as f32, cell_h * y as f32);
     let snap_box = |b: Bounds<Pixels>| {
         let (x0, x1) = (snap(b.origin.x), snap(b.origin.x + b.size.width));
@@ -1919,6 +2173,19 @@ fn paint_grid(grid: GridPaint<'_>, window: &mut Window, cx: &mut App) -> Point<P
         }
     }
     drop(cache);
+
+    // The hovered link's underline sits on the bottom edge of its cells, over
+    // the text, so it reads as a link without recoloring it.
+    for span in link {
+        if span.to <= span.from || usize::from(span.row) >= snapshot.cells.len() {
+            continue;
+        }
+        let bounds = Bounds::new(
+            at(usize::from(span.from), usize::from(span.row)) + point(px(0.), cell_h - px(1.5)),
+            size(cell_w * f32::from(span.to - span.from), px(1.5)),
+        );
+        window.paint_quad(fill(snap_box(bounds), paint_color(snapshot.fg)));
+    }
 
     let mut cursor_bounds = None;
     if let Some(cur) = snapshot.cursor {

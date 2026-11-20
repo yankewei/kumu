@@ -114,6 +114,8 @@ pub struct Cell {
     pub underline: bool,
     pub strike: bool,
     pub wide: bool,
+    /// The cell carries an OSC 8 hyperlink URI.
+    pub hyperlink: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +143,9 @@ pub struct Snapshot {
     /// preview where a hidden cursor leaves no color behind).
     pub fg: Rgb,
     pub cells: Vec<Arc<Vec<Cell>>>,
+    /// Whether each row continues on the next one (soft wrap), so a URL split
+    /// across rows can be read as one line.
+    pub wrap: Vec<bool>,
     /// Every row changed (scroll, resize, new colors): none of the arcs is kept.
     pub all: bool,
     pub cursor: Option<Cursor>,
@@ -187,6 +192,17 @@ pub struct SearchView {
     pub hits: Vec<SearchHit>,
 }
 
+/// An OSC 8 hyperlink the program wrote, as one row's run of cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hyperlink {
+    pub row: u16,
+    /// First cell of the run (inclusive).
+    pub from: u16,
+    /// Cell after the run (exclusive).
+    pub to: u16,
+    pub uri: String,
+}
+
 impl Snapshot {
     /// What the program calls itself: its OSC title (an agent TUI names itself
     /// there), else the command it was launched as, else an empty string.
@@ -212,6 +228,7 @@ impl Snapshot {
             bg,
             fg,
             cells: Vec::new(),
+            wrap: Vec::new(),
             all: true,
             cursor: None,
             cursor_cell: None,
@@ -236,6 +253,29 @@ impl Snapshot {
     }
 }
 
+/// Whether the render-state row the iterator is on soft-wraps into the row
+/// below, so a URL can be read across the break.
+unsafe fn row_wraps(rows: GhosttyRenderStateRowIterator) -> bool {
+    unsafe {
+        let mut raw: GhosttyRow = 0;
+        if ghostty_render_state_row_get(
+            rows,
+            GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+            &mut raw as *mut _ as *mut c_void,
+        ) != GHOSTTY_SUCCESS
+        {
+            return false;
+        }
+        let mut wrap = false;
+        ghostty_row_get(
+            raw,
+            GHOSTTY_ROW_DATA_WRAP,
+            &mut wrap as *mut _ as *mut c_void,
+        ) == GHOSTTY_SUCCESS
+            && wrap
+    }
+}
+
 /// One row as plain text: cell text concatenated, with the blank tail removed.
 fn row_text(row: &[Cell]) -> String {
     let mut text = String::new();
@@ -256,6 +296,7 @@ fn blank_cell(fg: Rgb) -> Cell {
         underline: false,
         strike: false,
         wide: false,
+        hyperlink: false,
     }
 }
 
@@ -760,6 +801,7 @@ impl Vt {
             let all = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL || with != self.seen_with;
             let mut seen = HashMap::with_capacity(self.rows as usize);
             let mut rows = Vec::with_capacity(self.rows as usize);
+            let mut wraps = Vec::with_capacity(self.rows as usize);
             ghostty_render_state_get(
                 state,
                 GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
@@ -803,6 +845,7 @@ impl Vt {
                     seen.insert(id.bits, (Arc::clone(&row), selection));
                 }
                 rows.push(row);
+                wraps.push(row_wraps(self.rows_it));
             }
             (self.seen, self.seen_with) = (seen, with);
 
@@ -842,6 +885,7 @@ impl Vt {
                 bg,
                 fg: fg_default,
                 cells: rows,
+                wrap: wraps,
                 all,
                 cursor,
                 cursor_cell,
@@ -929,6 +973,12 @@ impl Vt {
                 bg = Some(self.colors.selection);
             }
             let mut text = String::new();
+            let mut hyperlink = false;
+            ghostty_cell_get(
+                raw,
+                GHOSTTY_CELL_DATA_HAS_HYPERLINK,
+                &mut hyperlink as *mut _ as *mut c_void,
+            );
             if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
                 && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD
                 && (style.flags & STYLE_INVISIBLE) == 0
@@ -969,7 +1019,67 @@ impl Vt {
                 underline: (style.flags & STYLE_UNDERLINE_MASK) != 0,
                 strike: (style.flags & STYLE_STRIKE) != 0,
                 wide: wide == GHOSTTY_CELL_WIDE_WIDE,
+                hyperlink,
             }
+        }
+    }
+
+    /// The OSC 8 hyperlink on one viewport cell, with the run of cells it
+    /// covers on that row. Plain printed URLs are not hyperlinks; the UI finds
+    /// those in the snapshot's text. A hyperlink that soft-wrapped is reported
+    /// one row at a time: the URI is the whole link, the run is this row's
+    /// part of it.
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<Hyperlink> {
+        let row = row.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        let uri = self.hyperlink_uri(col, row)?;
+        let mut from = col;
+        while from > 0 && self.hyperlink_uri(from - 1, row).as_deref() == Some(uri.as_str()) {
+            from -= 1;
+        }
+        let mut to = col + 1;
+        while to < self.cols && self.hyperlink_uri(to, row).as_deref() == Some(uri.as_str()) {
+            to += 1;
+        }
+        Some(Hyperlink { row, from, to, uri })
+    }
+
+    /// The OSC 8 URI on one cell of the grid, if the program set one.
+    fn hyperlink_uri(&self, col: u16, row: u16) -> Option<String> {
+        unsafe {
+            let mut grid = GhosttyGridRef::default();
+            let mut point = GhosttyPoint {
+                tag: GHOSTTY_POINT_TAG_VIEWPORT,
+                ..Default::default()
+            };
+            point.value.coordinate = GhosttyPointCoordinate {
+                x: col,
+                y: u32::from(row),
+            };
+            if ghostty_terminal_grid_ref(self.term, point, &mut grid) != GHOSTTY_SUCCESS {
+                return None;
+            }
+            let mut len: usize = 0;
+            // A NULL buffer asks for the size (GHOSTTY_OUT_OF_SPACE) or reports
+            // an empty cell (GHOSTTY_SUCCESS with zero bytes).
+            ghostty_grid_ref_hyperlink_uri(&grid, std::ptr::null_mut(), 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            if ghostty_grid_ref_hyperlink_uri(&grid, buf.as_mut_ptr(), buf.len(), &mut len)
+                != GHOSTTY_SUCCESS
+            {
+                return None;
+            }
+            buf.truncate(len);
+            // The program wrote this URI; control characters have no business
+            // reaching the platform's opener.
+            let uri: String = String::from_utf8_lossy(&buf)
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .collect();
+            (!uri.is_empty()).then_some(uri)
         }
     }
 
@@ -2002,6 +2112,30 @@ mod tests {
         // iTerm2's OSC 1337 carries a bare path.
         vt.write(b"\x1b]1337;CurrentDir=/tmp/demo\x07");
         assert_eq!(vt.snapshot("zsh", "/launch", false).cwd, "/tmp/demo");
+    }
+
+    #[test]
+    fn an_osc8_hyperlink_covers_the_cells_it_was_written_with() {
+        let mut vt = Vt::new(40, 4);
+        // "click here" is the visible text; the URI is the link behind it.
+        vt.write(b"\x1b]8;;https://example.com/docs\x1b\\click here\x1b]8;;\x1b\\");
+        let link = vt.hyperlink_at(3, 0).expect("hyperlink under the text");
+        assert_eq!(link.uri, "https://example.com/docs");
+        assert_eq!((link.row, link.from, link.to), (0, 0, 10));
+        assert_eq!(vt.hyperlink_at(20, 0), None, "the rest of the row is plain");
+        let snapshot = vt.snapshot("t", "/", false);
+        assert!(cell(&snapshot, 0, 0).hyperlink);
+        assert!(!cell(&snapshot, 20, 0).hyperlink);
+    }
+
+    #[test]
+    fn a_soft_wrapped_row_says_it_continues_below() {
+        let mut vt = Vt::new(10, 4);
+        vt.write(b"0123456789abcdef");
+        let snapshot = vt.snapshot("t", "/", false);
+        assert!(snapshot.wrap[0]);
+        assert!(!snapshot.wrap[1]);
+        assert_eq!(cell(&snapshot, 0, 1).text, "a");
     }
 
     #[test]

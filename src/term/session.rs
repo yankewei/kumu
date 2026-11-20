@@ -11,6 +11,7 @@ use std::time::Duration;
 use futures::channel::mpsc::UnboundedReceiver;
 use portable_pty::PtySize;
 
+use super::Hyperlink;
 use super::pty::{self, Pty};
 use super::vt::{
     KeyInput, MAX_NOTIFICATIONS, MouseInput, MouseMods, SelectStep, Snapshot, TermColors,
@@ -21,6 +22,10 @@ use super::vt::{
 /// pages the viewport, so a terminal in the middle of a flood can take a
 /// moment; a pane that never answers is better reported than hung on.
 const CONTENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A hover probe answers a click or a highlight; a terminal buried in output
+/// may answer late, but the pointer has moved on by then.
+const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct Live {
     screen: Mutex<Snapshot>,
@@ -66,6 +71,12 @@ enum Msg {
     },
     ClearSelection,
     SelectionText(Sender<Option<String>>),
+    /// The OSC 8 hyperlink on a viewport cell, with the cells it covers.
+    HyperlinkAt {
+        col: u16,
+        row: u16,
+        reply: Sender<Option<Hyperlink>>,
+    },
     /// Find bar: set the needle (empty clears), or walk matches.
     SearchSet(String),
     SearchStep {
@@ -280,6 +291,21 @@ impl Term {
 
     pub fn clear_selection(&self) {
         let _ = self.tx.send(Msg::ClearSelection);
+    }
+
+    /// The OSC 8 hyperlink on a viewport cell, with the cells it covers.
+    ///
+    /// Blocks until the session thread answers, so callers run on a background
+    /// task; a terminal busy with output drops the probe instead of holding the
+    /// pointer.
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<Hyperlink> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(Msg::HyperlinkAt {
+            col,
+            row,
+            reply: tx,
+        });
+        rx.recv_timeout(LINK_TIMEOUT).ok().flatten()
     }
 
     /// Search the terminal for `needle` and select the newest match. An empty
@@ -524,6 +550,9 @@ impl Running {
                 }
                 Some(Msg::SelectionText(reply)) => {
                     let _ = reply.send(self.vt.selection_text());
+                }
+                Some(Msg::HyperlinkAt { col, row, reply }) => {
+                    let _ = reply.send(self.vt.hyperlink_at(col, row));
                 }
                 Some(Msg::SearchSet(needle)) => {
                     self.vt.search_set(&needle);

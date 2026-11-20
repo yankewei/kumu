@@ -5,6 +5,7 @@
 //! terminal queries. `session` owns both on one thread so a query reply is
 //! written back before the next read.
 
+pub mod link;
 mod pty;
 mod session;
 pub mod shell_env;
@@ -12,8 +13,8 @@ mod vt;
 
 pub use session::Term;
 pub use vt::{
-    Cell, CursorShape, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb, SelectStep,
-    Snapshot, TermColors, TermNotification,
+    Cell, CursorShape, Hyperlink, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb,
+    SelectStep, Snapshot, TermColors, TermNotification,
 };
 
 /// The user's login shell: `$SHELL`, falling back to `/bin/sh`.
