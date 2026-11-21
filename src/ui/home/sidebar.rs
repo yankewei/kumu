@@ -358,7 +358,6 @@ impl KumuApp {
             Some(AgentState::Failed) => theme.danger,
             None => muted_fg,
         };
-        let status_label = row.state.map_or("空闲", AgentState::label);
         let title_color = if row.focused {
             sidebar_accent_fg
         } else if matches!(row.state, None | Some(AgentState::Completed)) {
@@ -433,16 +432,6 @@ impl KumuApp {
                                     .text_xs()
                                     .text_color(muted_fg)
                                     .child(row.project_name),
-                            )
-                            .child(
-                                div()
-                                    .w(px(56.))
-                                    .flex_none()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_right()
-                                    .text_color(color)
-                                    .child(status_label),
                             ),
                     ),
             )
