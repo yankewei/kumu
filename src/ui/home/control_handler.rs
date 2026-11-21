@@ -153,7 +153,10 @@ impl KumuApp {
                 let answer = self.control_todo_board(from, cx).and_then(|board_id| {
                     let trimmed = title.trim();
                     if trimmed.is_empty() {
-                        return Err(ControlError::new("badRequest", "todo title cannot be empty"));
+                        return Err(ControlError::new(
+                            "badRequest",
+                            "todo title cannot be empty",
+                        ));
                     }
                     let (pane_id, agent_id, session_id) = if bind {
                         self.control_todo_binding(from)
@@ -205,11 +208,18 @@ impl KumuApp {
                         ..Default::default()
                     };
                     if patch.title.as_deref().is_some_and(str::is_empty) {
-                        return Err(ControlError::new("badRequest", "todo title cannot be empty"));
+                        return Err(ControlError::new(
+                            "badRequest",
+                            "todo title cannot be empty",
+                        ));
                     }
                     if unbind {
                         patch.pane_id = Some(None);
-                    } else if bind || (awaiting_review == Some(true) && existing.pane_id.is_none() && from.is_some()) {
+                    } else if bind
+                        || (awaiting_review == Some(true)
+                            && existing.pane_id.is_none()
+                            && from.is_some())
+                    {
                         let (pane_id, agent_id, session_id) = self.control_todo_binding(from);
                         if pane_id.is_some() {
                             patch.pane_id = Some(pane_id);
@@ -503,7 +513,10 @@ impl KumuApp {
     }
 
     /// Capture `(pane_id, agent_id, session_id)` for a `kumu todo ... --bind` call.
-    fn control_todo_binding(&self, from: Option<u64>) -> (Option<u64>, Option<String>, Option<String>) {
+    fn control_todo_binding(
+        &self,
+        from: Option<u64>,
+    ) -> (Option<u64>, Option<String>, Option<String>) {
         let pane = self.control_anchor(from);
         if !self.control_owns(pane) {
             return (None, None, None);

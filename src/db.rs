@@ -719,7 +719,8 @@ impl Store {
         let Ok(pane_sql) = i64::try_from(pane_id) else {
             return Ok(Vec::new());
         };
-        let projects = self.projects_with_pane_todos(pane_sql, "status = 'in_progress' AND awaiting_review = 0")?;
+        let projects = self
+            .projects_with_pane_todos(pane_sql, "status = 'in_progress' AND awaiting_review = 0")?;
         if projects.is_empty() {
             return Ok(projects);
         }
@@ -799,9 +800,8 @@ impl Store {
     }
 
     fn projects_with_pane_todos(&self, pane_sql: i64, predicate: &str) -> Result<Vec<i64>> {
-        let sql = format!(
-            "SELECT DISTINCT project_id FROM todos WHERE pane_id = ?1 AND {predicate}"
-        );
+        let sql =
+            format!("SELECT DISTINCT project_id FROM todos WHERE pane_id = ?1 AND {predicate}");
         let mut stmt = self.conn.prepare(&sql)?;
         stmt.query_map(params![pane_sql], |row| row.get(0))?
             .collect()

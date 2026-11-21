@@ -410,20 +410,17 @@ impl TodoPanel {
                     .compact()
                     .icon(IconName::ChevronDown)
                     .tooltip("选择 Agent 或关联已有窗格")
-                    .dropdown_menu_with_anchor(
-                        Anchor::BottomLeft,
-                        move |menu, window, menu_cx| {
-                            Self::populate_dispatch_menu(
-                                menu,
-                                window,
-                                menu_cx,
-                                dropdown_panel.clone(),
-                                dropdown_item.clone(),
-                                dropdown_panes.clone(),
-                                dropdown_default.clone(),
-                            )
-                        },
-                    ),
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, menu_cx| {
+                        Self::populate_dispatch_menu(
+                            menu,
+                            window,
+                            menu_cx,
+                            dropdown_panel.clone(),
+                            dropdown_item.clone(),
+                            dropdown_panes.clone(),
+                            dropdown_default.clone(),
+                        )
+                    }),
             );
 
         let quick_done = div()
@@ -433,7 +430,11 @@ impl TodoPanel {
             .rounded(px(5.))
             .cursor_pointer()
             .text_color(muted)
-            .hover(move |style| style.bg(theme.success.opacity(0.16)).text_color(theme.success))
+            .hover(move |style| {
+                style
+                    .bg(theme.success.opacity(0.16))
+                    .text_color(theme.success)
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_status(id, TodoStatus::Done, cx);
@@ -634,24 +635,31 @@ impl TodoPanel {
         {
             let p = panel.clone();
             let detail_item = item.clone();
-            menu = menu.item(PopupMenuItem::new("查看与编辑").on_click(move |_, window, cx| {
-                let _ = p.update(cx, |this, cx| this.open_detail(&detail_item, window, cx));
-            }));
+            menu = menu.item(
+                PopupMenuItem::new("查看与编辑").on_click(move |_, window, cx| {
+                    let _ = p.update(cx, |this, cx| this.open_detail(&detail_item, window, cx));
+                }),
+            );
         }
         if item.status != TodoStatus::Done {
             let dp = panel.clone();
             let di = item.clone();
-            menu = menu.submenu("派发 / 关联 Agent", window, menu_cx, move |sub, win, scx| {
-                Self::populate_dispatch_menu(
-                    sub,
-                    win,
-                    scx,
-                    dp.clone(),
-                    di.clone(),
-                    live_panes.clone(),
-                    default_agent.clone(),
-                )
-            });
+            menu = menu.submenu(
+                "派发 / 关联 Agent",
+                window,
+                menu_cx,
+                move |sub, win, scx| {
+                    Self::populate_dispatch_menu(
+                        sub,
+                        win,
+                        scx,
+                        dp.clone(),
+                        di.clone(),
+                        live_panes.clone(),
+                        default_agent.clone(),
+                    )
+                },
+            );
         }
         menu = menu.separator();
         for status in [TodoStatus::Todo, TodoStatus::InProgress, TodoStatus::Done] {
@@ -670,9 +678,11 @@ impl TodoPanel {
         }
         if item.pane_id.is_some() {
             let p = panel.clone();
-            menu = menu.item(PopupMenuItem::new("解除 Agent 关联").on_click(move |_, _, cx| {
-                let _ = p.update(cx, |this, cx| this.unbind_agent(id, cx));
-            }));
+            menu = menu.item(
+                PopupMenuItem::new("解除 Agent 关联").on_click(move |_, _, cx| {
+                    let _ = p.update(cx, |this, cx| this.unbind_agent(id, cx));
+                }),
+            );
         }
         let p = panel.clone();
         menu.separator().item(

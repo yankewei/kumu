@@ -39,45 +39,50 @@ impl DetailEditor {
             let text = item.description.clone();
             desc.update(cx, |state, cx| state.set_value(text, window, cx));
         }
-        let followup = cx.new(|cx| InputState::new(window, cx).placeholder("补充修改意见，回车发送…"));
+        let followup =
+            cx.new(|cx| InputState::new(window, cx).placeholder("补充修改意见，回车发送…"));
 
         let mut subscriptions = Vec::new();
-        subscriptions.push(cx.subscribe(&title, move |panel, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let value = input.read(cx).value().trim().to_string();
-                if !value.is_empty()
-                    && let Some(workspace) = panel.host.workspace()
-                {
-                    workspace.update(cx, |ws, cx| {
-                        ws.update_todo(
-                            todo_id,
-                            &TodoPatch {
-                                title: Some(value),
-                                ..Default::default()
-                            },
-                            cx,
-                        );
-                    });
+        subscriptions.push(
+            cx.subscribe(&title, move |panel, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().trim().to_string();
+                    if !value.is_empty()
+                        && let Some(workspace) = panel.host.workspace()
+                    {
+                        workspace.update(cx, |ws, cx| {
+                            ws.update_todo(
+                                todo_id,
+                                &TodoPatch {
+                                    title: Some(value),
+                                    ..Default::default()
+                                },
+                                cx,
+                            );
+                        });
+                    }
                 }
-            }
-        }));
-        subscriptions.push(cx.subscribe(&desc, move |panel, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let value = input.read(cx).value().to_string();
-                if let Some(workspace) = panel.host.workspace() {
-                    workspace.update(cx, |ws, cx| {
-                        ws.update_todo(
-                            todo_id,
-                            &TodoPatch {
-                                description: Some(value),
-                                ..Default::default()
-                            },
-                            cx,
-                        );
-                    });
+            }),
+        );
+        subscriptions.push(
+            cx.subscribe(&desc, move |panel, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().to_string();
+                    if let Some(workspace) = panel.host.workspace() {
+                        workspace.update(cx, |ws, cx| {
+                            ws.update_todo(
+                                todo_id,
+                                &TodoPatch {
+                                    description: Some(value),
+                                    ..Default::default()
+                                },
+                                cx,
+                            );
+                        });
+                    }
                 }
-            }
-        }));
+            }),
+        );
         subscriptions.push(cx.subscribe_in(
             &followup,
             window,
@@ -309,12 +314,7 @@ impl TodoPanel {
                                         .rounded(px(5.))
                                         .bg(pill_bg)
                                         .items_center()
-                                        .child(
-                                            div()
-                                                .size(px(6.))
-                                                .rounded_full()
-                                                .bg(pill_fg),
-                                        )
+                                        .child(div().size(px(6.)).rounded_full().bg(pill_fg))
                                         .child(
                                             div()
                                                 .text_xs()
@@ -419,12 +419,10 @@ impl TodoPanel {
                 .border_1()
                 .border_color(border)
                 .when_some(item.agent_id.as_deref(), |box_el, prev| {
-                    box_el.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("上次关联：{}（窗格已关闭）", short_agent_name(prev))),
-                    )
+                    box_el.child(div().text_xs().text_color(muted).child(format!(
+                        "上次关联：{}（窗格已关闭）",
+                        short_agent_name(prev)
+                    )))
                 })
                 .child(
                     h_flex()
@@ -533,14 +531,26 @@ impl TodoPanel {
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(div().text_xs().font_medium().text_color(muted).child("标题"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(muted)
+                            .child("标题"),
+                    )
                     .child(Input::new(&detail.title).small()),
             )
             .child(
                 v_flex()
                     .w_full()
                     .gap_1()
-                    .child(div().text_xs().font_medium().text_color(muted).child("状态"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(muted)
+                            .child("状态"),
+                    )
                     .child(status_seg),
             )
             .child(

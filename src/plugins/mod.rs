@@ -130,8 +130,7 @@ impl PluginHost {
         mut self,
         workspace: Entity<Workspace>,
         agent_panes: impl Fn(i64, &App) -> Vec<AgentPaneInfo> + 'static,
-        dispatch: impl Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String>
-        + 'static,
+        dispatch: impl Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String> + 'static,
         send_any: impl Fn(u64, &str, &mut App) -> Result<SendOutcome, String> + 'static,
         reveal: impl Fn(u64, &mut Window, &mut App) + 'static,
     ) -> Self {

@@ -892,8 +892,9 @@ impl KumuApp {
         }
         match signal {
             StatusSignal::Active(AgentState::Completed) => {
-                self.workspace
-                    .update(cx, |workspace, cx| workspace.mark_pane_todos_review(pane.0, cx));
+                self.workspace.update(cx, |workspace, cx| {
+                    workspace.mark_pane_todos_review(pane.0, cx)
+                });
             }
             StatusSignal::Active(AgentState::Running) | StatusSignal::Resume => {
                 self.workspace.update(cx, |workspace, cx| {

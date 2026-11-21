@@ -67,7 +67,10 @@ pub(super) fn format_task_prompt(todo: &TodoItem) -> String {
     if desc.is_empty() {
         format!("请完成以下 TODO 任务（#{}）：{}", todo.id, title)
     } else {
-        format!("请完成以下 TODO 任务（#{}）：{}\n\n{}", todo.id, title, desc)
+        format!(
+            "请完成以下 TODO 任务（#{}）：{}\n\n{}",
+            todo.id, title, desc
+        )
     }
 }
 
@@ -503,7 +506,12 @@ impl TodoPanel {
         self.host.reveal_pane(pane, window, cx);
     }
 
-    pub(super) fn open_detail(&mut self, item: &TodoItem, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_detail(
+        &mut self,
+        item: &TodoItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.notice = None;
         self.detail = Some(DetailEditor::new(item, window, cx));
         cx.notify();
@@ -567,22 +575,27 @@ impl TodoPanel {
             }
             let new_tab_panel = panel.clone();
             let new_tab_item = item.clone();
-            menu = menu.submenu("在新页签中启动", window, menu_cx, move |sub, _, _| {
-                let mut sub = sub;
-                for def in AGENTS.iter().filter(|def| crate::agent::installed(def.id)) {
-                    let agent_id = def.id.to_string();
-                    let panel = new_tab_panel.clone();
-                    let item = new_tab_item.clone();
-                    sub = sub.item(PopupMenuItem::new(def.name).icon(IconName::Bot).on_click(
-                        move |_, _, cx| {
-                            let _ = panel.update(cx, |this, cx| {
-                                this.dispatch_new_agent(&item, &agent_id, true, cx);
-                            });
-                        },
-                    ));
-                }
-                sub
-            });
+            menu = menu.submenu(
+                "在新页签中启动",
+                window,
+                menu_cx,
+                move |sub, _, _| {
+                    let mut sub = sub;
+                    for def in AGENTS.iter().filter(|def| crate::agent::installed(def.id)) {
+                        let agent_id = def.id.to_string();
+                        let panel = new_tab_panel.clone();
+                        let item = new_tab_item.clone();
+                        sub = sub.item(PopupMenuItem::new(def.name).icon(IconName::Bot).on_click(
+                            move |_, _, cx| {
+                                let _ = panel.update(cx, |this, cx| {
+                                    this.dispatch_new_agent(&item, &agent_id, true, cx);
+                                });
+                            },
+                        ));
+                    }
+                    sub
+                },
+            );
         }
 
         if !live_panes.is_empty() {
@@ -970,10 +983,7 @@ impl Render for TodoPanel {
                 .p_0p5()
                 .rounded(theme.radius)
                 .drag_over::<DraggedTodo>(move |style, _, _, _| {
-                    style
-                        .bg(drop_bg)
-                        .border_1()
-                        .border_color(drop_border)
+                    style.bg(drop_bg).border_1().border_color(drop_border)
                 })
                 .on_drop(cx.listener(move |this, dragged: &DraggedTodo, _, cx| {
                     this.set_status(dragged.id, target, cx);
@@ -1010,9 +1020,7 @@ impl Render for TodoPanel {
             .collect();
         let todo_cards: Vec<AnyElement> = todo_items
             .iter()
-            .map(|item| {
-                self.render_todo_card(item, &live_panes, default_agent.as_deref(), cx)
-            })
+            .map(|item| self.render_todo_card(item, &live_panes, default_agent.as_deref(), cx))
             .collect();
         let done_rows: Vec<AnyElement> = done_items
             .iter()

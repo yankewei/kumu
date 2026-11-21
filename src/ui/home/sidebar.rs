@@ -451,7 +451,12 @@ impl KumuApp {
 
     /// Switch to the row's project/tab and focus its pane without clearing its
     /// status: a live agent stays in the list for its entire lifetime.
-    pub(super) fn reveal_agent(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn reveal_agent(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus_pane(pane, cx);
         self.focus_terminal(window, cx);
         cx.notify();
