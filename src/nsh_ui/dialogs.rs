@@ -11,11 +11,11 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gpui_kit::component::Theme;
-use gpui_kit::{AppContext, Context, Entity, Task, Window};
+use gpui::{AppContext, Context, Entity, Task, Window};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use super::theme::{appearance, nsh_theme};
+use crate::theme::KumuTheme;
 
 /// One entry in the "open existing worktree" picker dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,7 +369,7 @@ impl Drop for ActiveDialog {
 impl ActiveDialog {
     pub fn open<V: 'static>(
         spec: DialogSpec,
-        theme: &Theme,
+        theme: &KumuTheme,
         window: &mut Window,
         cx: &mut Context<V>,
         on_outcome: impl FnOnce(&mut V, DialogOutcome, &mut Window, &mut Context<V>) + 'static,
@@ -409,7 +409,7 @@ impl ActiveDialog {
         }
     }
 
-    pub fn sync_theme(&self, theme: &Theme, cx: &mut gpui_kit::App) {
+    pub fn sync_theme(&self, theme: &KumuTheme, cx: &mut gpui::App) {
         let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
         self.app_view.update(cx, |view, cx| {
             view.set_theme(Some(mapped), cx);

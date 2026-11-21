@@ -20,6 +20,9 @@ Stay on the two-step rem scale; no custom `text_size(px(...))` or `text_base`+ i
 ## Product reference
 - Use [zed](https://github.com/zed-industries/zed) and [herdr-app](https://github.com/herdrdev/herdr-app) source code on github as a reference when you need to design a UI or build a feature
 
+## Doc reference
+- NSH 框架的文档：https://nsh.dev/docs/
+
 ## macOS releases
 - 生成可分发的 macOS DMG 或发布新版本时，用 `packaging/release.sh`（`--publish` 才打标签上传）；步骤和前置条件见 `.agents/skills/release-macos/SKILL.md`。默认用 Developer ID Application 身份本地签名、只公证 DMG 一次（`KUMU_SIGNING_P12` 或钥匙串里的身份）；没有身份时才回退到 Xcode 云端签名，慢约一分钟。
 - `make-app.sh`/`make-dmg.sh` 只做本地测试包，不要在云端签名后重跑它们覆盖正式产物。

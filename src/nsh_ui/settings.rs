@@ -8,19 +8,19 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme, StyledExt, Theme, ThemeMode, TitleBar, WindowExt};
-use gpui_kit::{
+use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
     Window, div,
 };
+use gpui_kit::component::{StyledExt, TitleBar};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use super::theme::{appearance, nsh_theme};
+use super::toast::ToastItem;
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
-use crate::theme;
+use crate::theme::{self, KumuTheme, ThemeMode};
 use crate::updates::{ErrorKind, UpdateStatus, Updater};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +122,7 @@ enum HostEvent {
     ShowUpdates {
         prompt_restart: bool,
     },
+    Toast(ToastItem),
 }
 
 /// Actions sent from the NSH Settings UI back to the GPUI host.
@@ -238,6 +239,7 @@ mod view {
         let agents_state = signal(HashMap::<&'static str, AgentStatusRow>::new());
         let integration_busy = signal(Option::<&'static str>::None);
         let confirm_restart_open = signal(false);
+        let (toast_tx, toast_rx) = futures::channel::mpsc::unbounded();
 
         let content_scroll = element_ref();
 
@@ -314,6 +316,10 @@ mod view {
                             if prompt_restart {
                                 confirm_restart_open.set(true);
                             }
+                        }
+                        HostEvent::Toast(item) => {
+                            let _ = toast_tx
+                                .unbounded_send(crate::nsh_ui::toast::ToastCommand::Push(item));
                         }
                     }
                 }
@@ -943,6 +949,7 @@ mod view {
         );
 
         view()
+            .relative()
             .flex_row()
             .flex_1()
             .w_full()
@@ -957,6 +964,11 @@ mod view {
             .child(sidebar)
             .child(right_pane)
             .child(restart_dialog)
+            .child(crate::nsh_ui::toast::render_toast_stack(
+                Some(toast_rx),
+                nsh_base::Anchor::TopRight,
+                None,
+            ))
     }
 }
 
@@ -965,6 +977,7 @@ pub struct SettingsWindow {
     updater: Entity<Updater>,
     app_view: Entity<AppView>,
     events_tx: UnboundedSender<HostEvent>,
+    next_toast_id: u64,
     integration_busy: Option<&'static str>,
     _theme_sub: Subscription,
     _updater_sub: Subscription,
@@ -982,9 +995,9 @@ impl SettingsWindow {
         let (events_tx, events_rx) = unbounded::<HostEvent>();
         let (actions_tx, mut actions_rx) = unbounded::<SettingsAction>();
 
-        let gpui_theme = cx.theme();
-        let initial_nsh_theme = nsh_theme(gpui_theme);
-        let initial_appearance = appearance(gpui_theme.mode);
+        let kumu_theme = KumuTheme::global(cx);
+        let initial_nsh_theme = nsh_theme(kumu_theme);
+        let initial_appearance = appearance(kumu_theme.mode);
 
         let system_fonts = theme::system_fonts(cx)
             .into_iter()
@@ -992,9 +1005,9 @@ impl SettingsWindow {
             .collect();
         let notif = cx.global::<NotificationSettings>();
         let initial_state = InitialSettingsState {
-            dark: gpui_theme.mode.is_dark(),
-            font_family: gpui_theme.font_family.to_string(),
-            font_size: f32::from(gpui_theme.font_size).round() as u32,
+            dark: kumu_theme.mode.is_dark(),
+            font_family: kumu_theme.font_family.to_string(),
+            font_size: kumu_theme.font_size.round() as u32,
             system_fonts,
             notifications_enabled: notif.enabled,
             notification_sound: notif.sound,
@@ -1024,13 +1037,13 @@ impl SettingsWindow {
             view
         });
 
-        let theme_sub = cx.observe_global::<Theme>(|this: &mut Self, cx| {
-            let gpui_theme = cx.theme();
-            let mapped = nsh_theme(gpui_theme);
-            let mode = appearance(gpui_theme.mode);
-            let dark = gpui_theme.mode.is_dark();
-            let font_family = gpui_theme.font_family.to_string();
-            let font_size = f32::from(gpui_theme.font_size).round() as u32;
+        let theme_sub = cx.observe_global::<KumuTheme>(|this: &mut Self, cx| {
+            let kumu_theme = KumuTheme::global(cx);
+            let mapped = nsh_theme(kumu_theme);
+            let mode = appearance(kumu_theme.mode);
+            let dark = kumu_theme.mode.is_dark();
+            let font_family = kumu_theme.font_family.to_string();
+            let font_size = kumu_theme.font_size.round() as u32;
             this.app_view.update(cx, |view, cx| {
                 view.set_theme(Some(mapped), cx);
                 view.set_appearance(mode, cx);
@@ -1090,11 +1103,22 @@ impl SettingsWindow {
             updater,
             app_view,
             events_tx,
+            next_toast_id: 1,
             integration_busy: None,
             _theme_sub: theme_sub,
             _updater_sub: updater_sub,
             _actions_task: actions_task,
         }
+    }
+
+    fn push_toast(&mut self, item: ToastItem) {
+        let _ = self.events_tx.unbounded_send(HostEvent::Toast(item));
+    }
+
+    fn next_toast_key(&mut self) -> String {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        format!("settings-toast-{id}")
     }
 
     fn handle_action(
@@ -1117,26 +1141,22 @@ impl SettingsWindow {
                 );
             }
             SettingsAction::SetFontFamily(family) => {
-                if cx.theme().font_family.as_ref() == family.as_str() {
+                if KumuTheme::global(cx).font_family.as_ref() == family.as_str() {
                     return;
                 }
                 if let Err(error) = db::set_setting(db::SETTING_FONT, &family) {
-                    window.push_notification(
-                        Notification::error(format!("保存字体失败：{error}")),
-                        cx,
-                    );
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(key, format!("保存字体失败：{error}")));
                 }
                 theme::set_font_family(cx, &family);
             }
             SettingsAction::SetFontSize(size) => {
-                if gpui_kit::px(size as f32) == cx.theme().font_size {
+                if (size as f32 - KumuTheme::global(cx).font_size).abs() < 0.01 {
                     return;
                 }
                 if let Err(error) = db::set_setting(db::SETTING_FONT_SIZE, &size.to_string()) {
-                    window.push_notification(
-                        Notification::error(format!("保存字号失败：{error}")),
-                        cx,
-                    );
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(key, format!("保存字号失败：{error}")));
                 }
                 theme::set_font_size(cx, size as f32);
             }
@@ -1144,10 +1164,8 @@ impl SettingsWindow {
                 if let Err(error) =
                     db::set_setting(db::SETTING_NOTIFICATIONS, if enabled { "1" } else { "0" })
                 {
-                    window.push_notification(
-                        Notification::error(format!("保存通知设置失败：{error}")),
-                        cx,
-                    );
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(key, format!("保存通知设置失败：{error}")));
                     let cur = cx.global::<NotificationSettings>();
                     let _ = self
                         .events_tx
@@ -1166,10 +1184,11 @@ impl SettingsWindow {
                     db::SETTING_NOTIFICATION_SOUND,
                     if sound { "1" } else { "0" },
                 ) {
-                    window.push_notification(
-                        Notification::error(format!("保存提示音设置失败：{error}")),
-                        cx,
-                    );
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("保存提示音设置失败：{error}"),
+                    ));
                     let cur = cx.global::<NotificationSettings>();
                     let _ = self
                         .events_tx
@@ -1187,10 +1206,11 @@ impl SettingsWindow {
                 if let Err(error) =
                     db::set_setting(db::SETTING_AUTO_RESUME, if enabled { "1" } else { "0" })
                 {
-                    window.push_notification(
-                        Notification::error(format!("保存会话恢复设置失败：{error}")),
-                        cx,
-                    );
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("保存会话恢复设置失败：{error}"),
+                    ));
                     let current = db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0");
                     let _ = self
                         .events_tx
@@ -1226,7 +1246,7 @@ impl SettingsWindow {
         &mut self,
         agent: &'static str,
         remove: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.integration_busy.is_some() {
@@ -1237,7 +1257,6 @@ impl SettingsWindow {
             .events_tx
             .unbounded_send(HostEvent::IntegrationBusy(Some(agent)));
 
-        let window = window.window_handle();
         let work = cx.background_executor().spawn(async move {
             let result = if remove {
                 integration::uninstall(agent)
@@ -1249,22 +1268,26 @@ impl SettingsWindow {
         });
         cx.spawn(async move |this, cx| {
             let (result, status) = work.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update(cx, |this, _cx| {
                 this.integration_busy = None;
                 let _ = this
                     .events_tx
                     .unbounded_send(HostEvent::IntegrationFinished { agent, status });
-                let note = match result {
-                    Ok(()) => Notification::success(if remove {
-                        "已关闭通知；请重新启动 Agent。"
-                    } else if agent == "codex" {
-                        "已开启通知；重新启动 Codex 后，请在 /hooks 中审查并信任。"
-                    } else {
-                        "已开启通知；请重新启动 Agent。"
-                    }),
-                    Err(error) => Notification::error(format!("通知设置失败：{error}")),
+                let key = this.next_toast_key();
+                let toast = match result {
+                    Ok(()) => ToastItem::success(
+                        key,
+                        if remove {
+                            "已关闭通知；请重新启动 Agent。"
+                        } else if agent == "codex" {
+                            "已开启通知；重新启动 Codex 后，请在 /hooks 中审查并信任。"
+                        } else {
+                            "已开启通知；请重新启动 Agent。"
+                        },
+                    ),
+                    Err(error) => ToastItem::error(key, format!("通知设置失败：{error}")),
                 };
-                let _ = window.update(cx, |_, window, cx| window.push_notification(note, cx));
+                this.push_toast(toast);
             });
         })
         .detach();
@@ -1282,15 +1305,15 @@ impl SettingsWindow {
 
 impl Render for SettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = KumuTheme::global(cx);
         let title_bar = TitleBar::new().child(div().text_sm().font_bold().child("kumu"));
         div()
             .flex()
             .flex_col()
             .size_full()
             .font_family(theme.font_family.clone())
-            .bg(theme.background)
-            .text_color(theme.foreground)
+            .bg(theme.colors.background)
+            .text_color(theme.colors.foreground)
             .child(title_bar)
             .child(div().flex_1().min_h_0().child(self.app_view.clone()))
     }

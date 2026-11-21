@@ -9,8 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::{ActiveTheme, Theme, WindowExt};
-use gpui_kit::{
+use gpui::{
     App, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
     Task, Window, div,
 };
@@ -23,9 +22,12 @@ use super::review::{
 };
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::plugins::{PaneTarget, PluginHost, SendOutcome};
+use crate::theme::KumuTheme;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct PatchSnapshot {
+    pub(super) title: String,
+    pub(super) meta: String,
     pub(super) message: String,
     pub(super) patch_text: Option<String>,
     pub(super) index: PatchIndex,
@@ -52,6 +54,7 @@ pub(super) enum PatchAction {
     RemoveComment(u64),
     SetTarget(u64),
     SendComments,
+    Close,
 }
 
 struct PatchMount {
@@ -83,7 +86,7 @@ mod nsh_view {
     use futures::StreamExt;
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::{
-        DiffAnnotation, DiffLayout, DiffLineRange, diff_view, input, theme as active_theme,
+        DiffAnnotation, DiffLayout, DiffLineRange, diff_view, input, sheet, theme as active_theme,
     };
     use nsh_core::element::desktop::{MenuItem, popup_menu};
     use nsh_core::element::{AccessibilityRole, SignalEquals, scroll, signal_with};
@@ -91,7 +94,9 @@ mod nsh_view {
 
     use super::{PatchAction, PatchHostEvent, PatchSnapshot, take_mount};
     use crate::nsh_ui::assets::icon_svg;
-    use crate::nsh_ui::components::{ButtonVariant, kumu_button, meta_text};
+    use crate::nsh_ui::components::{
+        ButtonVariant, kumu_button, kumu_tooltip, meta_text, section_title,
+    };
     use crate::nsh_ui::theme::{TOKEN_LINK, TOKEN_WARNING, kumu_color, text_sm_size, text_xs_size};
     use crate::plugins::git_log::review::{SendNotice, comment_location};
 
@@ -464,21 +469,85 @@ mod nsh_view {
             bar
         });
 
-        view()
+        let tx_close = actions_tx.clone();
+        let tx_sheet = actions_tx.clone();
+        let open = signal(true);
+
+        let header = dynamic(move || {
+            let snap = state.get();
+            let tx_x = tx_close.clone();
+            view()
+                .flex_row()
+                .flex_shrink_0()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_b_color(move || active_theme().border)
+                .child(
+                    view()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(section_title(snap.title))
+                        .child(meta_text(snap.meta)),
+                )
+                .child(
+                    view()
+                        .role(AccessibilityRole::Button)
+                        .label("关闭 Diff 面板")
+                        .tooltip(kumu_tooltip("关闭 (Esc)"))
+                        .flex_shrink_0()
+                        .p_1()
+                        .rounded(move || active_theme().radius)
+                        .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
+                        .on_press(move || {
+                            open.set(false);
+                            send(&tx_x, PatchAction::Close);
+                        })
+                        .child(
+                            icon_svg("icons/x.svg", 14.0)
+                                .text_color(move || active_theme().muted_foreground),
+                        ),
+                )
+        });
+
+        let panel = view()
             .flex_col()
             .flex_1()
             .w_full()
             .h_full()
             .bg(move || active_theme().background)
+            .border_l_1()
+            .border_l_color(move || active_theme().border)
             .font_family(move || {
                 active_theme()
                     .font_sans
                     .clone()
                     .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
             })
+            .child(header)
             .child(banners)
             .child(diff_body)
-            .child(footer)
+            .child(footer);
+
+        sheet()
+            .open(move || Some(open.get()))
+            .side(Placement::Right)
+            .close_on_escape(true)
+            .close_on_backdrop_press(true)
+            .backdrop_class("bg-foreground/25")
+            .popup_class("w-[760px] max-w-[90%] h-full shadow-xl")
+            .on_open_change(move |ev: &nsh_base::SheetEvent| {
+                if matches!(ev, nsh_base::SheetEvent::OpenChange(false, _)) {
+                    open.set(false);
+                    send(&tx_sheet, PatchAction::Close);
+                }
+            })
+            .child(panel)
     }
 }
 
@@ -487,6 +556,8 @@ mod nsh_view {
 pub(super) struct PatchView {
     mount_id: u64,
     project: i64,
+    title: String,
+    meta: String,
     host: PluginHost,
     key: PatchKey,
     reviews: Rc<RefCell<ReviewStore>>,
@@ -524,6 +595,8 @@ impl PatchView {
     pub(super) fn new(sheet: PatchSheet, cx: &mut Context<Self>) -> Self {
         let PatchSheet {
             project,
+            title,
+            meta,
             key,
             source,
             message,
@@ -558,6 +631,8 @@ impl PatchView {
         let (actions_tx, actions_rx) = unbounded::<PatchAction>();
 
         let initial = PatchSnapshot {
+            title: title.clone(),
+            meta: meta.clone(),
             message: message.clone(),
             patch_text: None,
             index: PatchIndex::default(),
@@ -579,6 +654,8 @@ impl PatchView {
         let mut view = Self {
             mount_id,
             project,
+            title,
+            meta,
             host,
             key,
             reviews,
@@ -618,9 +695,9 @@ impl PatchView {
         if self.app_view.is_some() {
             return;
         }
-        let gpui_theme = cx.theme();
-        let initial_theme = nsh_theme(gpui_theme);
-        let initial_appearance = appearance(gpui_theme.mode);
+        let kumu_theme = KumuTheme::global(cx);
+        let initial_theme = nsh_theme(kumu_theme);
+        let initial_appearance = appearance(kumu_theme.mode);
         let mount_id = self.mount_id;
 
         let app_view = cx.new(|cx| {
@@ -639,9 +716,9 @@ impl PatchView {
             view
         });
 
-        self._theme_sub = Some(cx.observe_global::<Theme>(|this: &mut Self, cx| {
-            let gpui_theme = cx.theme();
-            let (mapped, mode) = (nsh_theme(gpui_theme), appearance(gpui_theme.mode));
+        self._theme_sub = Some(cx.observe_global::<KumuTheme>(|this: &mut Self, cx| {
+            let kumu_theme = KumuTheme::global(cx);
+            let (mapped, mode) = (nsh_theme(kumu_theme), appearance(kumu_theme.mode));
             if let Some(app_view) = &this.app_view {
                 app_view.update(cx, |view, cx| {
                     view.set_theme(Some(mapped), cx);
@@ -663,8 +740,11 @@ impl PatchView {
                         PatchAction::SetTarget(pane) => view.set_target(pane, cx),
                         PatchAction::SendComments => {
                             if view.send_comments(cx) {
-                                window.close_sheet(cx);
+                                view.host.close_sheet(window, cx);
                             }
+                        }
+                        PatchAction::Close => {
+                            view.host.close_sheet(window, cx);
                         }
                     });
                     if res.is_err() {
@@ -680,6 +760,8 @@ impl PatchView {
 
     fn snapshot(&self, cx: &App) -> PatchSnapshot {
         PatchSnapshot {
+            title: self.title.clone(),
+            meta: self.meta.clone(),
             message: self.message.clone(),
             patch_text: self.patch_text.clone(),
             index: self.index.clone(),

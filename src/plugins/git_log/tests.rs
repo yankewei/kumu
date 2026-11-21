@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::mpsc::unbounded;
-use gpui_kit::{AppContext, Entity, TestAppContext};
+use gpui::{AppContext, Entity, TestAppContext};
 use nsh_engine::EngineConfig;
 
 use super::patch_view::PatchView;
@@ -44,6 +44,8 @@ fn patch_view(
         PatchView::new(
             PatchSheet {
                 project,
+                title: "test patch".into(),
+                meta: "test meta".into(),
                 key,
                 source,
                 message,

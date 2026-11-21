@@ -5,7 +5,9 @@
 //! - Semantic theme tokens only (`nsh_base::theme()`);
 //! - Primary button reserved for decision commits; internal nav uses Ghost/Default/Outline.
 
-use nsh_base::{ButtonElement, SwitchElement, button, input, switch, theme};
+use nsh_base::{
+    ButtonElement, SwitchElement, TooltipElement, button, input, switch, theme, tooltip,
+};
 use nsh_core::element::{Input, IntoProp, Text};
 use nsh_core::prelude::*;
 
@@ -178,6 +180,23 @@ pub fn section_card() -> View {
         .py_4()
         .rounded(px(8.0))
         .bg(move || theme().card)
+}
+
+/// Styled Kumu hover tooltip built over `nsh_base::tooltip()`.
+pub fn kumu_tooltip(label: impl IntoReactive<SharedString>) -> TooltipElement {
+    tooltip()
+        .px_2()
+        .py_1()
+        .rounded(move || theme().radius)
+        .bg(move || theme().popover)
+        .border_1()
+        .border_color(move || theme().border)
+        .shadow_md()
+        .child(
+            text(label)
+                .text_size(text_xs_size)
+                .text_color(move || theme().popover_foreground),
+        )
 }
 
 #[cfg(test)]

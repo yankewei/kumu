@@ -20,10 +20,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::{ActiveTheme, StyledExt, Theme, WindowExt};
-use gpui_kit::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement, Styled,
-    Subscription, Task, Window, div, px,
+use gpui::{
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
+    Task, Window, div,
 };
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
@@ -32,6 +31,7 @@ use self::review::{PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewSto
 use super::{Plugin, PluginHost, PluginProject};
 use crate::git::{Change, Changes, Commit, History};
 use crate::nsh_ui::theme::{appearance, nsh_theme};
+use crate::theme::KumuTheme;
 
 /// How often an open panel checks whether the repository moved.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -170,9 +170,9 @@ impl Plugin for GitLogPanel {
             actions_tx,
         });
 
-        let gpui_theme = cx.theme();
-        let initial_nsh_theme = nsh_theme(gpui_theme);
-        let initial_appearance = appearance(gpui_theme.mode);
+        let kumu_theme = KumuTheme::global(cx);
+        let initial_nsh_theme = nsh_theme(kumu_theme);
+        let initial_appearance = appearance(kumu_theme.mode);
 
         let app_view = cx.new(|cx| {
             let options = AppOptions {
@@ -190,9 +190,9 @@ impl Plugin for GitLogPanel {
             view
         });
 
-        let theme_sub = cx.observe_global::<Theme>(|panel: &mut Self, cx| {
-            let gpui_theme = cx.theme();
-            let (mapped, mode) = (nsh_theme(gpui_theme), appearance(gpui_theme.mode));
+        let theme_sub = cx.observe_global::<KumuTheme>(|panel: &mut Self, cx| {
+            let kumu_theme = KumuTheme::global(cx);
+            let (mapped, mode) = (nsh_theme(kumu_theme), appearance(kumu_theme.mode));
             panel.app_view.update(cx, |view, cx| {
                 view.set_theme(Some(mapped), cx);
                 view.set_appearance(mode, cx);
@@ -541,6 +541,8 @@ impl GitLogPanel {
             let mut view = PatchView::new(
                 PatchSheet {
                     project,
+                    title,
+                    meta,
                     key,
                     source,
                     message,
@@ -554,32 +556,7 @@ impl GitLogPanel {
             view.ensure_nsh_mounted(window, cx);
             view
         });
-        window.open_sheet(cx, move |sheet, window, cx| {
-            let theme = cx.theme();
-            let width = px(760.).min(window.viewport_size().width - px(96.));
-            sheet
-                .size(width.max(px(320.)))
-                .title(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .min_w_0()
-                        .child(div().text_sm().truncate().child(title.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_normal()
-                                .text_color(theme.muted_foreground)
-                                .truncate()
-                                .child(meta.clone()),
-                        ),
-                )
-                .child(
-                    view.clone()
-                        .cached(StyleRefinement::default().size_full().min_h_0().min_w_0()),
-                )
-        });
+        self.host.open_sheet(view.into(), window, cx);
     }
 
     /// The changes tab's rows: a heading above each non-empty section.

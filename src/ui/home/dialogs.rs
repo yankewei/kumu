@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use gpui_kit::component::{ActiveTheme, Root, TitleBar};
+use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::{
     AnyView, App, AppContext, Context, PathPromptOptions, Window, WindowBounds, px, size,
 };
@@ -9,6 +9,7 @@ use super::KumuApp;
 use crate::app::layout::PaneId;
 use crate::git::WorktreeEntry;
 use crate::nsh_ui::dialogs::{ActiveDialog, DialogOutcome, DialogSpec, WorktreeChoice};
+use crate::theme::KumuTheme;
 use crate::ui::SettingsWindow;
 
 impl KumuApp {
@@ -21,7 +22,7 @@ impl KumuApp {
         cx: &mut Context<Self>,
         on_outcome: impl FnOnce(&mut Self, DialogOutcome, &mut Window, &mut Context<Self>) + 'static,
     ) {
-        let theme = cx.theme().clone();
+        let theme = KumuTheme::global(cx).clone();
         self.active_dialog = Some(ActiveDialog::open(
             spec,
             &theme,

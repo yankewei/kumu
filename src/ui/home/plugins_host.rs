@@ -43,6 +43,8 @@ impl KumuApp {
         let dispatcher = home.clone();
         let any_sender = home.clone();
         let revealer = home.clone();
+        let sheet_opener = home.clone();
+        let sheet_closer = home.clone();
         PluginHost::with_panes(
             move |project, pane, text, cx| {
                 let Some(home) = home.upgrade() else {
@@ -82,6 +84,25 @@ impl KumuApp {
             move |pane, window, cx| {
                 if let Some(home) = revealer.upgrade() {
                     home.update(cx, |app, cx| app.reveal_agent(PaneId(pane), window, cx));
+                }
+            },
+        )
+        .with_sheet_tools(
+            move |view, _window, cx| {
+                if let Some(home) = sheet_opener.upgrade() {
+                    home.update(cx, |app, cx| {
+                        app.active_sheet = Some(view);
+                        cx.notify();
+                    });
+                }
+            },
+            move |window, cx| {
+                if let Some(home) = sheet_closer.upgrade() {
+                    home.update(cx, |app, cx| {
+                        app.active_sheet = None;
+                        app.focus_terminal(window, cx);
+                        cx.notify();
+                    });
                 }
             },
         )

@@ -452,13 +452,15 @@ pub(super) enum SendNotice {
 /// and the panel's review memory it reads and writes.
 pub(super) struct PatchSheet {
     pub(super) project: i64,
+    pub(super) title: String,
+    pub(super) meta: String,
     pub(super) key: PatchKey,
     pub(super) source: PatchSource,
     pub(super) message: String,
     pub(super) context: String,
     pub(super) host: PluginHost,
     pub(super) reviews: Rc<RefCell<ReviewStore>>,
-    pub(super) notify_panel: Rc<dyn Fn(&mut gpui_kit::App)>,
+    pub(super) notify_panel: Rc<dyn Fn(&mut gpui::App)>,
 }
 
 /// A patch's identity for the watcher: the text and whether it was cut.

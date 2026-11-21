@@ -18,8 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::{ActiveTheme, Theme};
-use gpui_kit::{
+use gpui::{
     App, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
     Task, Window, div,
 };
@@ -30,6 +29,7 @@ use crate::agent::{AGENTS, AgentState};
 use crate::app::WorkspaceEvent;
 use crate::db::{SETTING_TODO_DEFAULT_AGENT, TodoItem, TodoPatch, TodoStatus};
 use crate::nsh_ui::theme::{appearance, nsh_theme};
+use crate::theme::KumuTheme;
 
 /// Format the prompt sent to an Agent pane when dispatching a TODO card.
 pub(super) fn format_task_prompt(todo: &TodoItem) -> String {
@@ -213,9 +213,9 @@ impl Plugin for TodoPanel {
             actions_tx,
         });
 
-        let gpui_theme = cx.theme();
-        let initial_nsh_theme = nsh_theme(gpui_theme);
-        let initial_appearance = appearance(gpui_theme.mode);
+        let kumu_theme = KumuTheme::global(cx);
+        let initial_nsh_theme = nsh_theme(kumu_theme);
+        let initial_appearance = appearance(kumu_theme.mode);
 
         let app_view = cx.new(|cx| {
             let options = AppOptions {
@@ -234,9 +234,9 @@ impl Plugin for TodoPanel {
         });
 
         let mut subscriptions = Vec::new();
-        subscriptions.push(cx.observe_global::<Theme>(|panel: &mut Self, cx| {
-            let gpui_theme = cx.theme();
-            let (mapped, mode) = (nsh_theme(gpui_theme), appearance(gpui_theme.mode));
+        subscriptions.push(cx.observe_global::<KumuTheme>(|panel: &mut Self, cx| {
+            let kumu_theme = KumuTheme::global(cx);
+            let (mapped, mode) = (nsh_theme(kumu_theme), appearance(kumu_theme.mode));
             panel.app_view.update(cx, |view, cx| {
                 view.set_theme(Some(mapped), cx);
                 view.set_appearance(mode, cx);

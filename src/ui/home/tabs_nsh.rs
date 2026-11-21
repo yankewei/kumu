@@ -6,12 +6,12 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::Theme;
-use gpui_kit::{AppContext, Context, Entity, Task, Window};
+use gpui::{AppContext, Context, Entity, Task, Window};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use crate::app::layout::TabId;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
+use crate::theme::KumuTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TabAttention {
@@ -359,7 +359,7 @@ impl Drop for NshTabBar {
 impl NshTabBar {
     pub(super) fn new<V: 'static>(
         initial: TabBarSnapshot,
-        theme: &Theme,
+        theme: &KumuTheme,
         window: &mut Window,
         cx: &mut Context<V>,
         mut on_action: impl FnMut(&mut V, TabBarAction, &mut Window, &mut Context<V>) + 'static,
@@ -419,7 +419,7 @@ impl NshTabBar {
         }
     }
 
-    pub(super) fn sync_theme(&self, theme: &Theme, cx: &mut gpui_kit::App) {
+    pub(super) fn sync_theme(&self, theme: &KumuTheme, cx: &mut gpui::App) {
         let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
         self.app_view.update(cx, |view, cx| {
             view.set_theme(Some(mapped), cx);

@@ -25,6 +25,8 @@ use crate::app::layout::{
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::nsh_ui::dialogs::ActiveDialog;
+use crate::nsh_ui::toast::{NshToastHost, ToastItem};
+use crate::theme::KumuTheme;
 use crate::updates::Updater;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
@@ -185,7 +187,11 @@ pub struct KumuApp {
     tabs_nsh: NshTabBar,
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
     active_dialog: Option<ActiveDialog>,
-    /// Syncs GPUI theme/font updates into `sidebar_nsh`, `tabs_nsh`, and `active_dialog`.
+    /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
+    pub(super) active_sheet: Option<AnyView>,
+    /// Pure Rust NSH foreground toast stack overlay (mounted only while non-empty).
+    toast_host: NshToastHost,
+    /// Syncs KumuTheme updates into NSH surfaces (`sidebar_nsh`, `tabs_nsh`, `toast_host`, `active_dialog`).
     _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
@@ -239,38 +245,28 @@ impl KumuApp {
                 };
                 this.unread_notifications.insert(*terminal, *project);
                 let terminal = *terminal;
-                let weak = cx.entity().downgrade();
-                let note = Notification::info(message)
-                    .title(title)
-                    .id1::<NotificationSettings>(terminal.to_string())
-                    .delivery(if window.is_window_active() {
-                        NotificationDelivery::InApp
-                    } else {
-                        NotificationDelivery::System
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            let target = this
-                                .workspace
-                                .update(cx, |workspace, _| workspace.reveal_terminal(terminal));
-                            if let Some((pane, project)) = target {
-                                let pane = PaneId(pane);
-                                let snapshot = this.workspace.read(cx).terminal_snapshot(pane.0);
-                                if let Some(view) = this.panes.get(&pane)
-                                    && let Some(snapshot) = snapshot
-                                {
-                                    view.update(cx, |view, cx| view.attach(project, snapshot, cx));
-                                }
-                                this.focus_pane(pane, cx);
-                                this.focus_terminal(window, cx);
-                            }
+                if window.is_window_active() {
+                    // Foreground window uses Pure Rust NSH toast stack.
+                    this.toast_host.push(
+                        ToastItem::info(terminal.to_string(), Some(title), message).clickable(true),
+                    );
+                } else {
+                    // A background window posts only to Notification Center: one
+                    // event should not surface as both a banner and a toast. The
+                    // sidebar's unread marker is the in-app fallback when macOS
+                    // declines delivery or kumu runs unbundled.
+                    let weak = cx.entity().downgrade();
+                    let note = Notification::info(message)
+                        .title(title)
+                        .id1::<NotificationSettings>(terminal.to_string())
+                        .delivery(NotificationDelivery::System)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.reveal_terminal_by_id(terminal, window, cx);
+                            });
                         });
-                    });
-                // A background window posts only to Notification Center: one
-                // event should not surface as both a banner and a toast. The
-                // sidebar's unread marker is the in-app fallback when macOS
-                // declines delivery or kumu runs unbundled.
-                window.push_notification(note, cx);
+                    window.push_notification(note, cx);
+                }
                 cx.notify();
             }
             WorkspaceEvent::PaneExited { pane, project } => {
@@ -468,7 +464,7 @@ impl KumuApp {
         })
         .detach();
 
-        let initial_theme = cx.theme().clone();
+        let initial_theme = KumuTheme::global(cx).clone();
         let sidebar_nsh = NshSidebar::new(
             SidebarSnapshot::default(),
             &initial_theme,
@@ -483,10 +479,28 @@ impl KumuApp {
             cx,
             |app, action, window, cx| app.handle_tab_bar_action(action, window, cx),
         );
-        let nsh_theme_sub = cx.observe_global::<Theme>(|app: &mut Self, cx| {
-            let theme = cx.theme().clone();
+        let toast_host = NshToastHost::new(
+            &initial_theme,
+            window,
+            cx,
+            |app, id, window, cx| {
+                if let Ok(terminal) = id.parse::<u64>() {
+                    app.reveal_terminal_by_id(terminal, window, cx);
+                }
+            },
+            |app, count, cx| {
+                let was_visible = app.toast_host.is_visible();
+                app.toast_host.set_active_count(count);
+                if was_visible != app.toast_host.is_visible() {
+                    cx.notify();
+                }
+            },
+        );
+        let nsh_theme_sub = cx.observe_global::<KumuTheme>(|app: &mut Self, cx| {
+            let theme = KumuTheme::global(cx).clone();
             app.sidebar_nsh.sync_theme(&theme, cx);
             app.tabs_nsh.sync_theme(&theme, cx);
+            app.toast_host.sync_theme(&theme, cx);
             if let Some(dialog) = &app.active_dialog {
                 dialog.sync_theme(&theme, cx);
             }
@@ -519,6 +533,8 @@ impl KumuApp {
             sidebar_nsh,
             tabs_nsh,
             active_dialog: None,
+            active_sheet: None,
+            toast_host,
             _nsh_theme_sub: nsh_theme_sub,
             control: None,
         };
@@ -1506,6 +1522,19 @@ impl KumuApp {
                     })
                 }),
             )
+            .children(self.active_sheet.as_ref().map(|sheet| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "escape" {
+                            this.active_sheet = None;
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .child(sheet.clone())
+            }))
             .children(self.active_dialog.as_ref().map(|dialog| {
                 div()
                     .absolute()
@@ -1519,12 +1548,46 @@ impl KumuApp {
                     }))
                     .child(dialog.app_view.clone())
             }))
+            .when(self.toast_host.is_visible(), |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(42.))
+                        .right_3()
+                        .w(px(360.))
+                        .h(px(260.))
+                        .child(self.toast_host.app_view.clone()),
+                )
+            })
+    }
+
+    fn reveal_terminal_by_id(
+        &mut self,
+        terminal: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .workspace
+            .update(cx, |workspace, _| workspace.reveal_terminal(terminal));
+        if let Some((pane, project)) = target {
+            let pane = PaneId(pane);
+            let snapshot = self.workspace.read(cx).terminal_snapshot(pane.0);
+            if let Some(view) = self.panes.get(&pane)
+                && let Some(snapshot) = snapshot
+            {
+                view.update(cx, |view, cx| view.attach(project, snapshot, cx));
+            }
+            self.focus_pane(pane, cx);
+            self.focus_terminal(window, cx);
+        }
     }
 }
 
 impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.active_dialog.is_none()
+            && self.active_sheet.is_none()
             && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()
         {
@@ -1549,6 +1612,7 @@ impl Render for KumuApp {
         if !read.is_empty() {
             for &terminal in &read {
                 self.unread_notifications.remove(&terminal);
+                self.toast_host.dismiss(terminal.to_string());
             }
             cx.defer_in(window, move |_, window, cx| {
                 for terminal in read {

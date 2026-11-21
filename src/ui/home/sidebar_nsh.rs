@@ -7,13 +7,13 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui_kit::component::Theme;
-use gpui_kit::{AppContext, Context, Entity, Task, Window};
+use gpui::{AppContext, Context, Entity, Task, Window};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use crate::agent::AgentState;
 use crate::app::layout::PaneId;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
+use crate::theme::KumuTheme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProjectRowSnapshot {
@@ -706,7 +706,7 @@ impl Drop for NshSidebar {
 impl NshSidebar {
     pub(super) fn new<V: 'static>(
         initial: SidebarSnapshot,
-        theme: &Theme,
+        theme: &KumuTheme,
         window: &mut Window,
         cx: &mut Context<V>,
         mut on_action: impl FnMut(&mut V, SidebarAction, &mut Window, &mut Context<V>) + 'static,
@@ -766,7 +766,7 @@ impl NshSidebar {
         }
     }
 
-    pub(super) fn sync_theme(&self, theme: &Theme, cx: &mut gpui_kit::App) {
+    pub(super) fn sync_theme(&self, theme: &KumuTheme, cx: &mut gpui::App) {
         let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
         self.app_view.update(cx, |view, cx| {
             view.set_theme(Some(mapped), cx);

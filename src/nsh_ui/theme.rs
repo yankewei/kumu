@@ -1,11 +1,12 @@
-//! Maps Kumu's active theme (`themes/light.json` & `themes/dark.json`) to NSH
-//! semantic theme tokens and enforces Kumu's two-step type scale (`AGENTS.md`).
+//! Maps Kumu's active [`KumuTheme`] (`themes/light.json` & `themes/dark.json`)
+//! to NSH semantic theme tokens and enforces Kumu's two-step type scale (`AGENTS.md`).
 
-use gpui_kit::Hsla;
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui::Hsla;
 use nsh_base::theme as active_nsh_theme;
 use nsh_core::Points;
 use nsh_platform_gpui::{AdaptiveColor, Appearance};
+
+use crate::theme::{DEFAULT_FONT_SIZE, KumuTheme, ThemeMode};
 
 /// Base body text size (14px at 16px root): section titles, main empty states, primary content.
 pub const TEXT_SM: Points = Points(14.0);
@@ -58,11 +59,11 @@ pub fn appearance(mode: ThemeMode) -> Appearance {
     }
 }
 
-/// Convert Kumu's active GPUI Kit [`Theme`] into an [`nsh_platform_gpui::Theme`].
+/// Convert Kumu's active [`KumuTheme`] into an [`nsh_platform_gpui::Theme`].
 ///
 /// Called on initial mount and whenever the user switches theme mode or UI font
-/// in Settings, keeping NSH views visually indistinguishable from Kumu's chrome.
-pub fn nsh_theme(theme: &Theme) -> nsh_platform_gpui::Theme {
+/// in Settings, keeping all NSH views visually aligned with `themes/*.json`.
+pub fn nsh_theme(theme: &KumuTheme) -> nsh_platform_gpui::Theme {
     let mut nsh = nsh_platform_gpui::Theme::default();
     let colors = &theme.colors;
     let dark = theme.mode.is_dark();
@@ -115,8 +116,8 @@ pub fn nsh_theme(theme: &Theme) -> nsh_platform_gpui::Theme {
     ] {
         nsh.set_color(name, AdaptiveColor::from(convert_color(c)));
     }
-    nsh.set_number("radius", f32::from(theme.radius));
-    let scale = (f32::from(theme.font_size) / crate::theme::DEFAULT_FONT_SIZE).clamp(0.625, 2.0);
+    nsh.set_number("radius", theme.radius);
+    let scale = (theme.font_size / DEFAULT_FONT_SIZE).clamp(0.625, 2.0);
     nsh.set_number(TOKEN_UI_SCALE, scale);
     nsh.set_font(nsh_core::element::FONT_SANS, theme.font_family.to_string());
     nsh.set_font(
@@ -133,11 +134,11 @@ mod tests {
 
     #[test]
     fn theme_mapping_preserves_colors_radius_and_appearance() {
-        let mut theme = Theme::default();
+        let mut theme = KumuTheme::load_bundled();
         theme.mode = ThemeMode::Dark;
-        theme.radius = gpui_kit::px(6.0);
-        theme.font_size = gpui_kit::px(18.0);
-        theme.colors.primary = gpui_kit::rgb(0x2563eb).into();
+        theme.radius = 6.0;
+        theme.font_size = 18.0;
+        theme.colors.primary = gpui::rgb(0x2563eb).into();
 
         let mapped = nsh_theme(&theme);
         assert_eq!(appearance(theme.mode), Appearance::Dark);
