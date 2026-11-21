@@ -8,8 +8,10 @@ mod control_handler;
 mod dialogs;
 mod plugins_host;
 mod sidebar;
+mod sidebar_nsh;
 mod sprites;
 mod tabs;
+mod tabs_nsh;
 mod terminal;
 
 use std::collections::{HashMap, HashSet};
@@ -22,6 +24,7 @@ use crate::app::layout::{
     SavedProjectTabs, SavedWorkspace, SplitAxis, TabId, WORKSPACE_STATE_VERSION,
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
+use crate::nsh_ui::dialogs::ActiveDialog;
 use crate::updates::Updater;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
@@ -29,6 +32,8 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
+use sidebar_nsh::{NshSidebar, SidebarSnapshot};
+use tabs_nsh::{NshTabBar, TabBarSnapshot};
 use terminal::TerminalEvent;
 pub(crate) use terminal::TerminalView;
 
@@ -174,6 +179,14 @@ pub struct KumuApp {
     plugin_views: HashMap<&'static str, AnyView>,
     /// Width of the open plugin panel in px, chosen by dragging its divider.
     plugin_width: f32,
+    /// Pure Rust NSH left sidebar view.
+    sidebar_nsh: NshSidebar,
+    /// Pure Rust NSH top tab strip view.
+    tabs_nsh: NshTabBar,
+    /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
+    active_dialog: Option<ActiveDialog>,
+    /// Syncs GPUI theme/font updates into `sidebar_nsh`, `tabs_nsh`, and `active_dialog`.
+    _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
     control: Option<crate::control::ControlHandle>,
@@ -455,6 +468,30 @@ impl KumuApp {
         })
         .detach();
 
+        let initial_theme = cx.theme().clone();
+        let sidebar_nsh = NshSidebar::new(
+            SidebarSnapshot::default(),
+            &initial_theme,
+            window,
+            cx,
+            |app, action, window, cx| app.handle_sidebar_action(action, window, cx),
+        );
+        let tabs_nsh = NshTabBar::new(
+            TabBarSnapshot::Hidden,
+            &initial_theme,
+            window,
+            cx,
+            |app, action, window, cx| app.handle_tab_bar_action(action, window, cx),
+        );
+        let nsh_theme_sub = cx.observe_global::<Theme>(|app: &mut Self, cx| {
+            let theme = cx.theme().clone();
+            app.sidebar_nsh.sync_theme(&theme, cx);
+            app.tabs_nsh.sync_theme(&theme, cx);
+            if let Some(dialog) = &app.active_dialog {
+                dialog.sync_theme(&theme, cx);
+            }
+        });
+
         let mut app = Self {
             workspace,
             updater,
@@ -479,6 +516,10 @@ impl KumuApp {
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
+            sidebar_nsh,
+            tabs_nsh,
+            active_dialog: None,
+            _nsh_theme_sub: nsh_theme_sub,
             control: None,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
@@ -487,6 +528,10 @@ impl KumuApp {
         app.start_control(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
+        let sidebar_snap = app.build_sidebar_snapshot(cx);
+        app.sidebar_nsh.sync(sidebar_snap);
+        let tab_snap = app.build_tab_bar_snapshot();
+        app.tabs_nsh.sync(tab_snap);
         app.persist_workspace(cx);
         app
     }
@@ -1314,7 +1359,13 @@ impl KumuApp {
                     .h_full()
                     .min_w_0()
                     .min_h_0()
-                    .child(self.render_tab_bar(cx))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_full()
+                            .h(px(36.))
+                            .child(self.tabs_nsh.app_view.clone()),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1368,6 +1419,7 @@ impl KumuApp {
             .child(plugins);
 
         v_flex()
+            .relative()
             .size_full()
             .font_family(theme.font_family.clone())
             .bg(theme.background)
@@ -1410,7 +1462,7 @@ impl KumuApp {
                                 .size(px(self.sidebar_width))
                                 .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
                                 .fixed()
-                                .child(self.render_sidebar(cx)),
+                                .child(div().size_full().child(self.sidebar_nsh.app_view.clone())),
                         )
                         .child(split_panel(Axis::Horizontal, 1).child(right));
                     if self.open_plugin.is_some() {
@@ -1454,12 +1506,26 @@ impl KumuApp {
                     })
                 }),
             )
+            .children(self.active_dialog.as_ref().map(|dialog| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "escape" {
+                            this.active_dialog = None;
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .child(dialog.app_view.clone())
+            }))
     }
 }
 
 impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(pane) = self.pending_focus.take()
+        if self.active_dialog.is_none()
+            && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()
         {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -1490,6 +1556,10 @@ impl Render for KumuApp {
                 }
             });
         }
+        let sidebar_snap = self.build_sidebar_snapshot(cx);
+        self.sidebar_nsh.sync(sidebar_snap);
+        let tab_snap = self.build_tab_bar_snapshot();
+        self.tabs_nsh.sync(tab_snap);
         self.render_home(window, cx)
     }
 }
