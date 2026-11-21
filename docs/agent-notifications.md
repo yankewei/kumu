@@ -17,13 +17,13 @@ Kumu 不改写用户的 Agent 启动命令，不添加 `-c`、`--settings` 或 `
 | Oh My Pi | `~/.omp/agent/extensions/kumu-notifications/` | `agent_end`、`tool_approval_requested`、提问工具事件、输入／确认／选择对话框 |
 | Cursor CLI | `~/.cursor/hooks.json` | `stop`（只覆盖任务结束） |
 | Grok Build | `~/.grok/hooks/kumu-notifications.json` | `Stop`、`Notification` |
-| Antigravity CLI | `~/.gemini/config/hooks.json` 的 `kumu-notifications` | `SessionStart`（静默上报会话 id）、`Stop`（任务结束或失败，取消不提醒） |
+| Antigravity CLI | `~/.gemini/config/hooks.json` 的 `kumu-notifications` | `SessionStart`（静默上报会话 id）、`PreInvocation`（每次调用模型前上报运行中）、`Stop`（任务结束或失败，取消不提醒） |
 
 Cursor 的钩子文件是扁平结构：事件直接对应处理器数组，处理器自身就是命令（不像 Claude／Codex／Grok 那样再嵌一层 `hooks`），因此 Kumu 用单独的读改写逻辑处理它，并保留 `version` 字段与其他事件。Cursor 没有“等待权限”事件：`beforeShellExecution` 是权限闸门，返回格式错误会阻断命令，因此不用它发送通知，Cursor 只提供任务结束提醒。
 
 Grok 的钩子格式与 Claude 相同，可以复用同一套 CST 逻辑；Kumu 写自己的 `~/.grok/hooks/kumu-notifications.json`，不修改用户已有的 hook 文件。
 
-Antigravity 的全局 `hooks.json` 以顶层命名键组织钩子，没有外层 `hooks` 字段，且 `SessionStart`／`Stop` 为扁平处理器数组。Kumu 只管理自己的 `kumu-notifications` 键，保留同文件内的其他命名钩子与注释；由于同一全局文件会被 Antigravity IDE 与桌面端读取，命令在结束时固定向标准输出打印 `{}`，保证在非 Kumu 环境中也是合法的空响应。Antigravity 的 `PreToolUse` 是要求返回 `decision` 的权限闸门，因此不用于通知，只覆盖会话上报与任务结束。
+Antigravity 的全局 `hooks.json` 以顶层命名键组织钩子，没有外层 `hooks` 字段，且 `SessionStart`／`PreInvocation`／`Stop` 为扁平处理器数组。Kumu 只管理自己的 `kumu-notifications` 键，保留同文件内的其他命名钩子与注释；由于同一全局文件会被 Antigravity IDE 与桌面端读取，命令在结束时固定向标准输出打印 `{}`，保证在非 Kumu 环境中也是合法的空响应。Antigravity 的 `PreToolUse` 是要求返回 `decision` 的权限闸门，因此不用于通知；Antigravity 没有提交提示词事件，用 `PreInvocation` 标记运行中并以 `lastUserInput` 作为首个提示词标题。已启用的 Antigravity hooks 与 Claude 一样在 Kumu 启动时自动升级。
 
 Pi 与 Oh My Pi 共用 `~/.kumu/agent-integration/pi/` 下的一份扩展；安装时只创建各自的自动发现链接。扩展通过 OMP 独有的 `ctx.agent` 区分宿主（Pi 没有这个字段），因此两者即使通过 `PI_CODING_AGENT_DIR` 指向同一个 agent 目录，也不需要重复安装，更不会互相占用链接。共用同一目录时，移除其中一个链接也会让另一个失效，重新为任一 Agent 接入即可恢复。
 
@@ -76,7 +76,7 @@ Agent 不一定从「新建 Agent 窗格」启动：手动在普通 shell 窗格
 
 - 存活即入列：只要 Agent 窗格存在或普通 shell 中启动的 Agent 上报了会话／状态，就会持续留在侧边栏全局列表中，点击只跨项目／跨页签跳转聚焦，**不因查看清除**；只有进程退出回 shell 或关闭窗格时移出。
 - 标题优先级：Agent 协议上报（`kumu-title:`） > 终端 OSC 0/2 标题（清洗前缀符号并过滤通用程序名／路径） > 回退到 Agent 名称；不再通过拦截终端按键猜测输入标题。
-- 状态流转：新建或重启后为空闲（窗格标题栏不显示胶囊）；提交任务（`UserPromptSubmit`／`agent_start`／`session.execution.started`）进入 `running`；权限或提问进入 `waiting`，确认后继续执行（`PostToolUse`／`replied`／对话框结束）发送 `resume` 从 `waiting` 回到 `running`；本轮结束为 `completed`，失败为 `failed`；用户取消中断（OpenCode `interrupted`、Pi `aborted`、OMP `ompInterrupted`、Antigravity `USER_CANCELED`）发送 `idle` 回到空闲。
+- 状态流转：新建或重启后为空闲（窗格标题栏不显示胶囊）；提交任务（`UserPromptSubmit`／`agent_start`／`session.execution.started`／Antigravity `PreInvocation`）进入 `running`；权限或提问进入 `waiting`，确认后继续执行（`PostToolUse`／`replied`／对话框结束）发送 `resume` 从 `waiting` 回到 `running`；本轮结束为 `completed`，失败为 `failed`；用户取消中断（OpenCode `interrupted`、Pi `aborted`、OMP `ompInterrupted`、Antigravity `USER_CANCELED`）发送 `idle` 回到空闲。
 
 状态只用于界面，不替代任务结果判断；`Stop` 仍表示本轮结束，不表示改动已验证。
 
