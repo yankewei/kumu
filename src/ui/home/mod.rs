@@ -64,6 +64,20 @@ fn agent_display_name(id: &str) -> Option<String> {
 /// container's real size on its first paint.
 const RATIO_SCALE: f32 = 10_000.;
 
+/// A resizable panel after a divider reserves the 1px leading hairline that
+/// `ResizablePanel` paints after its children, so a focused pane's 1px border
+/// stays visible on all four sides instead of being painted over by the handle.
+fn split_panel(axis: Axis, index: usize) -> ResizablePanel {
+    let panel = resizable_panel();
+    if index == 0 {
+        return panel;
+    }
+    match axis {
+        Axis::Horizontal => panel.pl(px(1.)),
+        Axis::Vertical => panel.pt(px(1.)),
+    }
+}
+
 /// The sidebar's opening width and the range the divider beside it lets the
 /// user drag it through. The maximum still leaves room for the panes on the
 /// app's minimum window width.
@@ -1242,8 +1256,9 @@ impl KumuApp {
                 if let Some(state) = self.group_states.get(id) {
                     group = group.with_state(state);
                 }
-                for child in children {
-                    group = group.child(resizable_panel().child(self.render_node(child, cx)));
+                for (index, child) in children.iter().enumerate() {
+                    group =
+                        group.child(split_panel(*axis, index).child(self.render_node(child, cx)));
                 }
                 // A drag ends here: write the new fractions before another
                 // change can replace them.
@@ -1372,10 +1387,10 @@ impl KumuApp {
                                 .fixed()
                                 .child(self.render_sidebar(cx)),
                         )
-                        .child(resizable_panel().child(right));
+                        .child(split_panel(Axis::Horizontal, 1).child(right));
                     if self.open_plugin.is_some() {
                         split = split.child(
-                            resizable_panel()
+                            split_panel(Axis::Horizontal, 2)
                                 .size(px(self.plugin_width))
                                 .size_range(px(PLUGIN_MIN_WIDTH)..px(PLUGIN_MAX_WIDTH))
                                 .fixed()
@@ -1456,7 +1471,17 @@ impl Render for KumuApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_prompt, submits_after_paste};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui_kit::base::ElementExt as _;
+    use gpui_kit::component::{h_resizable, v_resizable};
+    use gpui_kit::{
+        Axis, Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
+        TestAppContext, Window, div, px,
+    };
+
+    use super::{shell_prompt, split_panel, submits_after_paste};
 
     /// Only a pane started as an agent may receive Enter after the paste; a
     /// shell would run the review notes as a command.
@@ -1475,5 +1500,73 @@ mod tests {
             shell_prompt("请修改：\n\nsrc/a.rs:12\n这里先检查\n"),
             "请修改： src/a.rs:12 这里先检查"
         );
+    }
+
+    /// Trailing split panels leave 1px on their leading edge for the resize
+    /// handle hairline, so a focused pane's 1px border is visible on all four
+    /// sides instead of being painted over by the divider.
+    #[gpui::test]
+    fn split_panels_clear_the_leading_resize_handle_for_pane_borders(cx: &mut TestAppContext) {
+        struct SplitHarness {
+            axis: Axis,
+            first: Rc<Cell<Option<Bounds<Pixels>>>>,
+            second: Rc<Cell<Option<Bounds<Pixels>>>>,
+        }
+
+        impl Render for SplitHarness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let first = self.first.clone();
+                let second = self.second.clone();
+                let group = match self.axis {
+                    Axis::Horizontal => h_resizable("test-split-h"),
+                    Axis::Vertical => v_resizable("test-split-v"),
+                };
+                div().w(px(400.)).h(px(300.)).child(
+                    group
+                        .child(
+                            split_panel(self.axis, 0).child(div().size_full().on_prepaint(
+                                move |bounds, _, _| {
+                                    first.set(Some(bounds));
+                                },
+                            )),
+                        )
+                        .child(
+                            split_panel(self.axis, 1).child(div().size_full().on_prepaint(
+                                move |bounds, _, _| {
+                                    second.set(Some(bounds));
+                                },
+                            )),
+                        ),
+                )
+            }
+        }
+
+        cx.update(gpui_kit::init);
+        for axis in [Axis::Horizontal, Axis::Vertical] {
+            let first = Rc::new(Cell::new(None));
+            let second = Rc::new(Cell::new(None));
+            let (_, window_cx) = cx.add_window_view({
+                let first = first.clone();
+                let second = second.clone();
+                move |_, _| SplitHarness {
+                    axis,
+                    first,
+                    second,
+                }
+            });
+            window_cx.update(|window, cx| window.draw(cx).clear(cx));
+            let a = first.get().expect("first pane was laid out");
+            let b = second.get().expect("second pane was laid out");
+            match axis {
+                Axis::Horizontal => {
+                    assert_eq!(b.left(), a.right() + px(1.));
+                    assert_eq!(b.right(), px(400.));
+                }
+                Axis::Vertical => {
+                    assert_eq!(b.top(), a.bottom() + px(1.));
+                    assert_eq!(b.bottom(), px(300.));
+                }
+            }
+        }
     }
 }
