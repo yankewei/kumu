@@ -17,6 +17,8 @@ pub const TEXT_XS: Points = Points(12.0);
 pub const TOKEN_CARD_SURFACE: &str = "kumu-card";
 pub const TOKEN_ICON_TILE: &str = "kumu-tile";
 pub const TOKEN_LINK: &str = "kumu-link";
+pub const TOKEN_WARNING: &str = "kumu-warning";
+pub const TOKEN_SUCCESS: &str = "kumu-success";
 pub const TOKEN_ACCENT_PILL_BG: &str = "kumu-accent-pill-bg";
 pub const TOKEN_UI_SCALE: &str = "kumu-ui-scale";
 
@@ -107,6 +109,8 @@ pub fn nsh_theme(theme: &Theme) -> nsh_platform_gpui::Theme {
         (TOKEN_CARD_SURFACE, card_surface),
         (TOKEN_ICON_TILE, icon_tile),
         (TOKEN_LINK, colors.link),
+        (TOKEN_WARNING, colors.warning),
+        (TOKEN_SUCCESS, colors.success),
         (TOKEN_ACCENT_PILL_BG, colors.primary.opacity(0.14)),
     ] {
         nsh.set_color(name, AdaptiveColor::from(convert_color(c)));
