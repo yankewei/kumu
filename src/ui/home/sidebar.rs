@@ -417,7 +417,13 @@ impl KumuApp {
                             .h(px(16.))
                             .gap_1()
                             .items_center()
-                            .child(div().flex_none().text_xs().text_color(muted_fg).child(row.agent))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(row.agent),
+                            )
                             .child(div().flex_none().text_xs().text_color(muted_fg).child("·"))
                             .child(
                                 div()
