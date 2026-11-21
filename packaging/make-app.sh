@@ -18,7 +18,7 @@
 # seal for local use. packaging/release.sh sets it when it has a Developer ID
 # identity, and falls back to Xcode's cloud signing when it does not.
 #
-# Usage: packaging/make-app.sh [release|debug] [--open]
+# Usage: packaging/make-app.sh [release|debug] [--open] [--no-build] [--locked]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=lib.sh
@@ -27,20 +27,27 @@ source packaging/lib.sh
 profile=release
 open_after=false
 skip_build=false
+locked=false
 for arg in "$@"; do
     case "$arg" in
         release|debug) profile="$arg" ;;
         --open) open_after=true ;;
         --no-build) skip_build=true ;;
-        *) echo "usage: $0 [release|debug] [--open] [--no-build]" >&2; exit 2 ;;
+        --locked) locked=true ;;
+        *) echo "usage: $0 [release|debug] [--open] [--no-build] [--locked]" >&2; exit 2 ;;
     esac
 done
 
+cargo_flags=()
+if [[ "$locked" == true ]]; then
+    cargo_flags+=(--locked)
+fi
+
 if [[ "$profile" == release ]]; then
-    [[ "$skip_build" == true ]] || cargo build --release
+    [[ "$skip_build" == true ]] || cargo build --release ${cargo_flags[@]+"${cargo_flags[@]}"}
     target_dir=target/release
 else
-    [[ "$skip_build" == true ]] || cargo build
+    [[ "$skip_build" == true ]] || cargo build ${cargo_flags[@]+"${cargo_flags[@]}"}
     target_dir=target/debug
 fi
 
