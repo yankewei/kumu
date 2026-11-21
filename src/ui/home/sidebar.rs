@@ -8,8 +8,8 @@ use gpui_kit::*;
 use gpui_updater::UpdateStatus;
 
 use super::KumuApp;
-use super::panes::PaneId;
 use crate::agent::AgentState;
+use crate::app::layout::PaneId;
 use crate::ui::tooltip::HoverLabel as _;
 
 /// One live agent row in the global sidebar list.

@@ -6,8 +6,8 @@ use futures::StreamExt;
 use gpui_kit::*;
 
 use super::KumuApp;
-use super::panes::{PaneDirection, PaneId, ProjectTabs};
 use crate::agent::launch::PaneLaunch;
+use crate::app::layout::{PaneDirection, PaneId, ProjectTabs, SplitAxis};
 use crate::term::KeyInput;
 
 /// How long a control split waits for the new agent to draw its prompt before
@@ -297,8 +297,8 @@ impl KumuApp {
             return;
         }
         let axis = match direction.trim().to_ascii_lowercase().as_str() {
-            "right" | "horizontal" => Axis::Horizontal,
-            "down" | "vertical" => Axis::Vertical,
+            "right" | "horizontal" => SplitAxis::Horizontal,
+            "down" | "vertical" => SplitAxis::Vertical,
             other => {
                 let _ = reply.send(Err(ControlError::new(
                     "unknownDirection",
@@ -440,7 +440,7 @@ impl KumuApp {
         project_id: i64,
         tab_index: usize,
         parent: PaneId,
-        axis: Axis,
+        axis: SplitAxis,
         launch: PaneLaunch,
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {

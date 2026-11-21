@@ -7,8 +7,8 @@ use gpui_kit::*;
 
 use super::{TerminalEvent, TerminalView};
 use crate::agent::{AGENTS, AgentState, installed};
+use crate::app::layout::PaneId;
 use crate::term::Snapshot;
-use crate::ui::home::panes::PaneId;
 use crate::ui::tooltip::HoverLabel as _;
 
 impl TerminalView {

@@ -23,9 +23,9 @@ use gpui_kit::*;
 
 use self::chrome::{header_identity, header_note, terminal_header};
 use self::paint::{GridPaint, RowOp, Typeface, cell_size, grid_origin, paint_color, paint_grid};
-use super::panes::{PaneDirection, PaneId};
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
+use crate::app::layout::{PaneDirection, PaneId};
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::link;
 use crate::term::{Cell as TermCell, MouseAction, Rgb, SelectStep, Snapshot};

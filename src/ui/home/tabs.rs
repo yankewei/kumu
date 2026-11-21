@@ -7,8 +7,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs, TabId};
 use crate::agent::AgentState;
+use crate::app::layout::{PaneId, PaneNode, ProjectTab, ProjectTabs, TabId};
 use crate::ui::tooltip::HoverLabel as _;
 
 impl KumuApp {

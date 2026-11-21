@@ -5,12 +5,12 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
 use super::{FindBar, GridAt, TerminalEvent, TerminalView};
+use crate::app::layout::PaneDirection;
 use crate::term::link;
 use crate::term::{
     Cell as TermCell, KeyInput, MouseAction, MouseButton as TermMouseButton, MouseInput, MouseMods,
     SelectStep,
 };
-use crate::ui::home::panes::PaneDirection;
 
 /// Direction for a ⌘⌥arrow focus move.
 fn pane_direction(key: &str) -> Option<PaneDirection> {

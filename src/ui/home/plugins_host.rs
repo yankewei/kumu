@@ -5,10 +5,10 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs};
 use super::{AgentEntry, KumuApp, agent_display_name, shell_prompt, submits_after_paste};
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
+use crate::app::layout::{PaneId, PaneNode, ProjectTab, ProjectTabs, SplitAxis};
 use crate::db::TodoStatus;
 use crate::plugins::{
     AgentPaneInfo, DispatchMode, PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome,
@@ -180,7 +180,7 @@ impl KumuApp {
                     .map(|tab| tab.focused)
                     .unwrap_or(self.focused);
                 let before = self.focused;
-                self.split_pane_with(anchor, Axis::Horizontal, launch, cx);
+                self.split_pane_with(anchor, SplitAxis::Horizontal, launch, cx);
                 if self.focused == before {
                     return Err("无法在当前页签分屏启动 Agent".to_string());
                 }

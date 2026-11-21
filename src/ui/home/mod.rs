@@ -6,7 +6,6 @@
 
 mod control_handler;
 mod dialogs;
-mod panes;
 mod plugins_host;
 mod sidebar;
 mod sprites;
@@ -18,6 +17,10 @@ use std::collections::{HashMap, HashSet};
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::agent::status::clean_osc_title;
 use crate::agent::{AgentState, StatusSignal};
+use crate::app::layout::{
+    self, PaneDirection, PaneId, PaneNode, ProjectTab, ProjectTabs, SavedProjectTab,
+    SavedProjectTabs, SavedWorkspace, SplitAxis, TabId, WORKSPACE_STATE_VERSION,
+};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
@@ -25,10 +28,6 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_updater::Updater;
-use panes::{
-    PaneDirection, PaneId, PaneNode, ProjectTab, ProjectTabs, SavedProjectTab, SavedProjectTabs,
-    SavedWorkspace, TabId, WORKSPACE_STATE_VERSION,
-};
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
 use terminal::{TerminalEvent, TerminalView};
 
@@ -526,7 +525,7 @@ impl KumuApp {
             return false;
         };
 
-        let panes::RestoredWorkspace {
+        let layout::RestoredWorkspace {
             tabs,
             selected,
             group_sizes,
@@ -792,7 +791,7 @@ impl KumuApp {
         projects.sort_by_key(|project| project.project);
         let state = SavedWorkspace {
             version: WORKSPACE_STATE_VERSION,
-            layout: panes::SavedNode::ProjectTabs {
+            layout: layout::SavedNode::ProjectTabs {
                 selected: self.selected,
                 projects,
                 launches: self
@@ -820,11 +819,11 @@ impl KumuApp {
     fn on_terminal_event(&mut self, pane: PaneId, ev: &TerminalEvent, cx: &mut Context<Self>) {
         match ev {
             TerminalEvent::Activated => self.focus_pane(pane, cx),
-            TerminalEvent::SplitRight => self.split_pane(pane, Axis::Horizontal, cx),
-            TerminalEvent::SplitDown => self.split_pane(pane, Axis::Vertical, cx),
+            TerminalEvent::SplitRight => self.split_pane(pane, SplitAxis::Horizontal, cx),
+            TerminalEvent::SplitDown => self.split_pane(pane, SplitAxis::Vertical, cx),
             TerminalEvent::AgentPane(agent) => self.split_pane_with(
                 pane,
-                Axis::Horizontal,
+                SplitAxis::Horizontal,
                 PaneLaunch::Agent {
                     agent: agent.clone(),
                     session: None,
@@ -1088,7 +1087,7 @@ impl KumuApp {
 
     /// Split `pane` along `axis`, open another shell in the same tab, and
     /// focus the new pane.
-    fn split_pane(&mut self, pane: PaneId, axis: Axis, cx: &mut Context<Self>) {
+    fn split_pane(&mut self, pane: PaneId, axis: SplitAxis, cx: &mut Context<Self>) {
         self.split_pane_with(pane, axis, PaneLaunch::Shell, cx);
     }
 
@@ -1096,7 +1095,7 @@ impl KumuApp {
     fn split_pane_with(
         &mut self,
         pane: PaneId,
-        axis: Axis,
+        axis: SplitAxis,
         launch: PaneLaunch,
         cx: &mut Context<Self>,
     ) {
@@ -1244,7 +1243,7 @@ impl KumuApp {
             .is_some_and(|tab| !tab.layout.panes().is_empty());
         if had_panes {
             self.select_project(project_id, cx);
-            self.split_pane(self.focused, Axis::Horizontal, cx);
+            self.split_pane(self.focused, SplitAxis::Horizontal, cx);
         } else {
             self.ensure_project_layout(project_id, cx);
             self.select_project(project_id, cx);
@@ -1270,16 +1269,20 @@ impl KumuApp {
                     .into_any_element()
             }
             PaneNode::Group { id, axis, children } => {
-                let mut group = match axis {
-                    Axis::Horizontal => h_resizable(format!("pane-split-{id}")),
-                    Axis::Vertical => v_resizable(format!("pane-split-{id}")),
+                let (mut group, gpui_axis) = match axis {
+                    SplitAxis::Horizontal => {
+                        (h_resizable(format!("pane-split-{id}")), Axis::Horizontal)
+                    }
+                    SplitAxis::Vertical => {
+                        (v_resizable(format!("pane-split-{id}")), Axis::Vertical)
+                    }
                 };
                 if let Some(state) = self.group_states.get(id) {
                     group = group.with_state(state);
                 }
                 for (index, child) in children.iter().enumerate() {
-                    group =
-                        group.child(split_panel(*axis, index).child(self.render_node(child, cx)));
+                    group = group
+                        .child(split_panel(gpui_axis, index).child(self.render_node(child, cx)));
                 }
                 // A drag ends here: write the new fractions before another
                 // change can replace them.

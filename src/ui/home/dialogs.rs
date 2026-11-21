@@ -8,7 +8,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::KumuApp;
-use super::panes::PaneId;
+use crate::app::layout::PaneId;
 use crate::git::WorktreeEntry;
 use crate::ui::SettingsWindow;
 
