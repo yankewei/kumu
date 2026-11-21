@@ -1,17 +1,11 @@
-//! Frontend UI: one module per window, shared widgets in `widgets`.
+//! Frontend UI: Home window + Pure Rust NSH Settings window.
 
 pub(crate) mod home;
-mod tooltip;
 
 pub use crate::nsh_ui::settings::SettingsWindow;
 pub use home::KumuApp;
 
-pub fn init(cx: &mut gpui_kit::App) {
-    // Every window's Root mounts one tooltip overlay; elements find it
-    // through `Root::read(window, cx).plugin::<Tooltips>()`.
-    gpui_kit::base::Root::register_plugin::<tooltip::Tooltips>(cx, |_, cx| {
-        tooltip::Tooltips::new(cx)
-    });
+pub fn init(cx: &mut gpui::App) {
     if !cx.has_global::<crate::app::NotificationSettings>() {
         cx.set_global(crate::app::NotificationSettings {
             enabled: crate::db::get_setting(crate::db::SETTING_NOTIFICATIONS).as_deref()
@@ -23,8 +17,8 @@ pub fn init(cx: &mut gpui_kit::App) {
     // Root's focus-navigation actions run before on_key_down. Let the
     // focused terminal receive completion keys through its normal encoder.
     cx.bind_keys([
-        gpui_kit::KeyBinding::new("tab", gpui_kit::NoAction, Some("Terminal")),
-        gpui_kit::KeyBinding::new("shift-tab", gpui_kit::NoAction, Some("Terminal")),
+        gpui::KeyBinding::new("tab", gpui::NoAction, Some("Terminal")),
+        gpui::KeyBinding::new("shift-tab", gpui::NoAction, Some("Terminal")),
     ]);
 }
 

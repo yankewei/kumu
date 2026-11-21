@@ -6,7 +6,9 @@
 
 mod control_handler;
 mod dialogs;
+mod native_host;
 mod plugins_host;
+mod shell_nsh;
 mod sidebar;
 mod sidebar_nsh;
 mod sprites;
@@ -25,17 +27,19 @@ use crate::app::layout::{
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::nsh_ui::dialogs::ActiveDialog;
-use crate::nsh_ui::toast::{NshToastHost, ToastItem};
+use crate::nsh_ui::toast::ToastItem;
 use crate::theme::KumuTheme;
 use crate::updates::Updater;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use native_host::NativeViewRegistry;
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
-use sidebar_nsh::{NshSidebar, SidebarSnapshot};
-use tabs_nsh::{NshTabBar, TabBarSnapshot};
+use shell_nsh::{
+    CenterModeSnapshot, HomeShellAction, HomeShellSnapshot, LayoutNodeSnapshot, NshHomeShell,
+    PluginPanelSnapshot,
+};
 use terminal::TerminalEvent;
 pub(crate) use terminal::TerminalView;
 
@@ -66,31 +70,12 @@ fn agent_display_name(id: &str) -> Option<String> {
         .map(|agent| agent.name.to_string())
 }
 
-/// Arbitrary units fed to `ResizableState::insert_panel` when restoring split
-/// ratios. Only the relative values matter: the group rescales them to the
-/// container's real size on its first paint.
-const RATIO_SCALE: f32 = 10_000.;
-
-/// A resizable panel after a divider reserves the 1px leading hairline that
-/// `ResizablePanel` paints after its children, so a focused pane's 1px border
-/// stays visible on all four sides instead of being painted over by the handle.
-fn split_panel(axis: Axis, index: usize) -> ResizablePanel {
-    let panel = resizable_panel();
-    if index == 0 {
-        return panel;
-    }
-    match axis {
-        Axis::Horizontal => panel.pl(px(1.)),
-        Axis::Vertical => panel.pt(px(1.)),
-    }
-}
-
 /// The sidebar's opening width and the range the divider beside it lets the
 /// user drag it through. The maximum still leaves room for the panes on the
 /// app's minimum window width.
 const SIDEBAR_WIDTH: f32 = 256.;
-const SIDEBAR_MIN_WIDTH: f32 = 180.;
-const SIDEBAR_MAX_WIDTH: f32 = 520.;
+pub(super) const SIDEBAR_MIN_WIDTH: f32 = 180.;
+pub(super) const SIDEBAR_MAX_WIDTH: f32 = 520.;
 
 /// What the sidebar, pane header and tab strip know about a live agent.
 #[derive(Clone, Debug)]
@@ -153,8 +138,8 @@ pub struct KumuApp {
     panes: HashMap<PaneId, Entity<TerminalView>>,
     /// Each project's independent tab list; the selected tab's tree is shown.
     tabs_by_project: HashMap<i64, ProjectTabs>,
-    /// Resizable state per split group, so drag sizes can be saved and restored.
-    group_states: HashMap<u64, Entity<ResizableState>>,
+    /// Saved split ratios per split group (normalized, summing to 1.0).
+    group_ratios: HashMap<u64, Vec<f32>>,
     /// Focused pane in the selected project's selected tab.
     focused: PaneId,
     /// Focus this pane's terminal on the next paint (after a split / select).
@@ -181,17 +166,15 @@ pub struct KumuApp {
     plugin_views: HashMap<&'static str, AnyView>,
     /// Width of the open plugin panel in px, chosen by dragging its divider.
     plugin_width: f32,
-    /// Pure Rust NSH left sidebar view.
-    sidebar_nsh: NshSidebar,
-    /// Pure Rust NSH top tab strip view.
-    tabs_nsh: NshTabBar,
+    /// Registry backing `"kumu.terminal"` and `"kumu.plugin"` native NSH slots.
+    native_registry: NativeViewRegistry,
+    /// Unified Pure Rust NSH home shell (sidebar + tabs + split pane grid + plugin slot + toast stack).
+    shell_nsh: NshHomeShell,
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
     active_dialog: Option<ActiveDialog>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
     pub(super) active_sheet: Option<AnyView>,
-    /// Pure Rust NSH foreground toast stack overlay (mounted only while non-empty).
-    toast_host: NshToastHost,
-    /// Syncs KumuTheme updates into NSH surfaces (`sidebar_nsh`, `tabs_nsh`, `toast_host`, `active_dialog`).
+    /// Syncs KumuTheme updates into `shell_nsh` and `active_dialog`.
     _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
@@ -246,8 +229,8 @@ impl KumuApp {
                 this.unread_notifications.insert(*terminal, *project);
                 let terminal = *terminal;
                 if window.is_window_active() {
-                    // Foreground window uses Pure Rust NSH toast stack.
-                    this.toast_host.push(
+                    // Foreground window uses Pure Rust NSH toast stack inside the home shell.
+                    this.shell_nsh.push_toast(
                         ToastItem::info(terminal.to_string(), Some(title), message).clickable(true),
                     );
                 } else {
@@ -465,42 +448,22 @@ impl KumuApp {
         .detach();
 
         let initial_theme = KumuTheme::global(cx).clone();
-        let sidebar_nsh = NshSidebar::new(
-            SidebarSnapshot::default(),
-            &initial_theme,
-            window,
-            cx,
-            |app, action, window, cx| app.handle_sidebar_action(action, window, cx),
-        );
-        let tabs_nsh = NshTabBar::new(
-            TabBarSnapshot::Hidden,
-            &initial_theme,
-            window,
-            cx,
-            |app, action, window, cx| app.handle_tab_bar_action(action, window, cx),
-        );
-        let toast_host = NshToastHost::new(
-            &initial_theme,
-            window,
-            cx,
-            |app, id, window, cx| {
-                if let Ok(terminal) = id.parse::<u64>() {
-                    app.reveal_terminal_by_id(terminal, window, cx);
-                }
+        let native_registry = NativeViewRegistry::new();
+        let shell_nsh = NshHomeShell::new(
+            HomeShellSnapshot {
+                sidebar_width,
+                plugin_width: PLUGIN_WIDTH,
+                ..Default::default()
             },
-            |app, count, cx| {
-                let was_visible = app.toast_host.is_visible();
-                app.toast_host.set_active_count(count);
-                if was_visible != app.toast_host.is_visible() {
-                    cx.notify();
-                }
-            },
+            &native_registry,
+            &initial_theme,
+            window,
+            cx,
+            |app, action, window, cx| app.handle_shell_action(action, window, cx),
         );
         let nsh_theme_sub = cx.observe_global::<KumuTheme>(|app: &mut Self, cx| {
             let theme = KumuTheme::global(cx).clone();
-            app.sidebar_nsh.sync_theme(&theme, cx);
-            app.tabs_nsh.sync_theme(&theme, cx);
-            app.toast_host.sync_theme(&theme, cx);
+            app.shell_nsh.sync_theme(&theme, cx);
             if let Some(dialog) = &app.active_dialog {
                 dialog.sync_theme(&theme, cx);
             }
@@ -517,7 +480,7 @@ impl KumuApp {
             store_error: startup_error,
             panes: HashMap::new(),
             tabs_by_project: HashMap::new(),
-            group_states: HashMap::new(),
+            group_ratios: HashMap::new(),
             focused: PaneId(1),
             pending_focus: None,
             pending_close_tab: None,
@@ -530,11 +493,10 @@ impl KumuApp {
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
-            sidebar_nsh,
-            tabs_nsh,
+            native_registry,
+            shell_nsh,
             active_dialog: None,
             active_sheet: None,
-            toast_host,
             _nsh_theme_sub: nsh_theme_sub,
             control: None,
         };
@@ -544,10 +506,8 @@ impl KumuApp {
         app.start_control(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
-        let sidebar_snap = app.build_sidebar_snapshot(cx);
-        app.sidebar_nsh.sync(sidebar_snap);
-        let tab_snap = app.build_tab_bar_snapshot();
-        app.tabs_nsh.sync(tab_snap);
+        let shell_snap = app.build_shell_snapshot(cx);
+        app.shell_nsh.sync(shell_snap);
         app.persist_workspace(cx);
         app
     }
@@ -614,10 +574,9 @@ impl KumuApp {
         self.selected = selected;
         self.next_pane = next_pane;
         self.next_group = next_group;
-        self.group_states.clear();
+        self.group_ratios.clear();
         for (group, ratios) in group_sizes {
-            let state = Self::new_group_state(&ratios, cx);
-            self.group_states.insert(group, state);
+            self.group_ratios.insert(group, ratios);
         }
         self.focused = self
             .selected
@@ -723,24 +682,9 @@ impl KumuApp {
             this.on_terminal_event(pane, ev, cx);
         })
         .detach();
+        self.native_registry.register_pane(pane.0, terminal.clone());
         self.panes.insert(pane, terminal.clone());
         terminal
-    }
-
-    /// A resizable state for one split group, optionally seeded with ratios.
-    /// Seeding before the first paint is what makes `adopt_sizes` — which is
-    /// private upstream — unnecessary: the group rescales these values to the
-    /// container on its first prepaint.
-    fn new_group_state(ratios: &[f32], cx: &mut Context<Self>) -> Entity<ResizableState> {
-        let state = cx.new(|_| ResizableState::default());
-        if !ratios.is_empty() {
-            state.update(cx, |state, cx| {
-                for ratio in ratios {
-                    state.insert_panel(Some(px(ratio * RATIO_SCALE)), None, cx);
-                }
-            });
-        }
-        state
     }
 
     /// Forget launches borrowed from an agent that is no longer running.
@@ -795,23 +739,22 @@ impl KumuApp {
             .flat_map(|tabs| &tabs.tabs)
             .flat_map(|tab| PaneNode::group_ids(&tab.layout))
             .collect();
-        self.group_states
+        self.group_ratios
             .retain(|group, _| live_groups.contains(group));
 
         let ratios: HashMap<u64, Vec<f32>> = self
-            .group_states
+            .group_ratios
             .iter()
-            .filter_map(|(group, state)| {
-                let sizes = state.read(cx).sizes();
-                let total: f32 = sizes.iter().map(|size| f32::from(*size)).sum();
-                if sizes.is_empty() || !total.is_finite() || total <= 0. {
+            .filter_map(|(group, ratios)| {
+                let total: f32 = ratios.iter().sum();
+                if ratios.is_empty() || !total.is_finite() || total <= 0. {
                     return None;
                 }
-                let ratios: Vec<f32> = sizes.iter().map(|size| f32::from(*size) / total).collect();
-                ratios
+                let normalized: Vec<f32> = ratios.iter().map(|r| r / total).collect();
+                normalized
                     .iter()
                     .all(|ratio| ratio.is_finite() && *ratio > 0.)
-                    .then_some((*group, ratios))
+                    .then_some((*group, normalized))
             })
             .collect();
         let live_panes: HashSet<PaneId> = self
@@ -883,22 +826,13 @@ impl KumuApp {
             TerminalEvent::Activated => self.focus_pane(pane, cx),
             TerminalEvent::SplitRight => self.split_pane(pane, SplitAxis::Horizontal, cx),
             TerminalEvent::SplitDown => self.split_pane(pane, SplitAxis::Vertical, cx),
-            TerminalEvent::AgentPane(agent) => self.split_pane_with(
-                pane,
-                SplitAxis::Horizontal,
-                PaneLaunch::Agent {
-                    agent: agent.clone(),
-                    session: None,
-                },
-                cx,
-            ),
             TerminalEvent::NewTab => self.new_tab(cx),
             TerminalEvent::NextTab => self.switch_tab(1, cx),
             TerminalEvent::PrevTab => self.switch_tab(-1, cx),
             TerminalEvent::SelectTab(index) => self.select_tab(*index, cx),
             TerminalEvent::CloseTab => self.close_selected_tab(cx),
             TerminalEvent::Focus(direction) => self.focus_neighbor(pane, *direction, cx),
-            TerminalEvent::Close => self.close_pane(pane, cx),
+            TerminalEvent::ChromeChanged => cx.notify(),
         }
     }
 
@@ -1193,8 +1127,7 @@ impl KumuApp {
         self.next_group += 1;
 
         if made_group {
-            let state = Self::new_group_state(&[], cx);
-            self.group_states.insert(group_id, state);
+            self.group_ratios.remove(&group_id);
         }
         if launch.is_shell() {
             self.launches.remove(&new_id);
@@ -1264,6 +1197,7 @@ impl KumuApp {
             workspace.unbind_pane_todos(pane.0, cx);
         });
         self.panes.remove(&pane);
+        self.native_registry.unregister_pane(pane.0);
         self.launches.remove(&pane);
         self.agent_status.remove(&pane);
         self.sync_pane_chrome(cx);
@@ -1312,119 +1246,157 @@ impl KumuApp {
         }
     }
 
-    fn render_panes(&self, cx: &Context<Self>) -> AnyElement {
-        self.selected
-            .and_then(|project_id| self.active_tab(project_id))
-            .map(|tab| self.render_node(&tab.layout, cx))
-            .unwrap_or_else(|| div().into_any_element())
+    fn build_layout_snapshot(&self, node: &PaneNode) -> LayoutNodeSnapshot {
+        match node {
+            PaneNode::Leaf(id) => LayoutNodeSnapshot::Leaf(*id),
+            PaneNode::Group { id, axis, children } => LayoutNodeSnapshot::Group {
+                id: *id,
+                axis: *axis,
+                ratios: self.group_ratios.get(id).cloned().unwrap_or_default(),
+                children: children
+                    .iter()
+                    .map(|c| self.build_layout_snapshot(c))
+                    .collect(),
+            },
+        }
     }
 
-    fn render_node(&self, node: &PaneNode, cx: &Context<Self>) -> AnyElement {
-        match node {
-            PaneNode::Leaf(id) => {
-                let Some(terminal) = self.panes.get(id) else {
-                    return div().into_any_element();
-                };
-                terminal
-                    .clone()
-                    .cached(StyleRefinement::default().size_full().min_h_0().min_w_0())
-                    .into_any_element()
+    fn build_shell_snapshot(&self, cx: &Context<Self>) -> HomeShellSnapshot {
+        let has_projects = !self.workspace.read(cx).projects().is_empty();
+        let active_tab = self.selected.and_then(|project| self.active_tab(project));
+        let (center, pane_chrome) = match active_tab {
+            Some(tab) if !tab.layout.panes().is_empty() => {
+                let mut chrome = HashMap::new();
+                for pane_id in tab.layout.panes() {
+                    if let Some(view) = self.panes.get(&pane_id) {
+                        chrome.insert(pane_id, view.read(cx).chrome_snapshot());
+                    }
+                }
+                (
+                    CenterModeSnapshot::Panes(self.build_layout_snapshot(&tab.layout)),
+                    chrome,
+                )
             }
-            PaneNode::Group { id, axis, children } => {
-                let (mut group, gpui_axis) = match axis {
-                    SplitAxis::Horizontal => {
-                        (h_resizable(format!("pane-split-{id}")), Axis::Horizontal)
-                    }
-                    SplitAxis::Vertical => {
-                        (v_resizable(format!("pane-split-{id}")), Axis::Vertical)
-                    }
-                };
-                if let Some(state) = self.group_states.get(id) {
-                    group = group.with_state(state);
-                }
-                for (index, child) in children.iter().enumerate() {
-                    group = group
-                        .child(split_panel(gpui_axis, index).child(self.render_node(child, cx)));
-                }
-                // A drag ends here: write the new fractions before another
-                // change can replace them.
-                group = group.on_resize({
-                    let weak = cx.entity().downgrade();
-                    move |_, _, cx| {
-                        let _ = weak.update(cx, |app, cx| app.persist_workspace(cx));
-                    }
+            _ if has_projects => (CenterModeSnapshot::EmptyTerminals, HashMap::new()),
+            _ => (CenterModeSnapshot::EmptyProjects, HashMap::new()),
+        };
+
+        let open_plugin =
+            self.open_plugin
+                .and_then(crate::plugins::spec)
+                .map(|spec| PluginPanelSnapshot {
+                    id: spec.id,
+                    title: spec.title,
+                    icon: spec.icon,
                 });
-                group.into_any_element()
+
+        HomeShellSnapshot {
+            store_error: self.store_error.clone(),
+            sidebar_width: self.sidebar_width,
+            plugin_width: self.plugin_width,
+            sidebar: self.build_sidebar_snapshot(cx),
+            tab_bar: self.build_tab_bar_snapshot(),
+            center,
+            pane_chrome,
+            open_plugin,
+        }
+    }
+
+    fn handle_shell_action(
+        &mut self,
+        action: HomeShellAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            HomeShellAction::Sidebar(a) => self.handle_sidebar_action(a, window, cx),
+            HomeShellAction::TabBar(a) => self.handle_tab_bar_action(a, window, cx),
+            HomeShellAction::DismissStoreError => {
+                self.store_error = None;
+                cx.notify();
+            }
+            HomeShellAction::EmptyAddTerminal => {
+                self.add_terminal(None, cx);
+                self.focus_terminal(window, cx);
+                cx.notify();
+            }
+            HomeShellAction::EmptyAddProject => {
+                self.add_project(cx);
+            }
+            HomeShellAction::ClosePlugin => {
+                self.open_plugin = None;
+                self.plugin_views.clear();
+                self.native_registry.clear_plugins();
+                cx.notify();
+            }
+            HomeShellAction::ResizeOuter {
+                sidebar_width,
+                plugin_width,
+            } => {
+                let width = sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                if (width - self.sidebar_width).abs() >= 1.0 {
+                    crate::db::set_setting(crate::db::SETTING_SIDEBAR_WIDTH, &format!("{width}"))
+                        .ok();
+                    self.sidebar_width = width;
+                }
+                if let Some(pw) = plugin_width {
+                    self.plugin_width = pw.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH);
+                }
+            }
+            HomeShellAction::ResizeGroup { group_id, ratios } => {
+                self.group_ratios.insert(group_id, ratios);
+                self.persist_workspace(cx);
+            }
+            HomeShellAction::FocusPane(pane) => {
+                self.focus_pane(pane, cx);
+                self.focus_terminal(window, cx);
+                cx.notify();
+            }
+            HomeShellAction::SplitRight(pane) => {
+                self.split_pane(pane, SplitAxis::Horizontal, cx);
+            }
+            HomeShellAction::SplitDown(pane) => {
+                self.split_pane(pane, SplitAxis::Vertical, cx);
+            }
+            HomeShellAction::ClosePane(pane) => {
+                self.close_pane(pane, cx);
+            }
+            HomeShellAction::AgentPane { pane, agent } => {
+                self.split_pane_with(
+                    pane,
+                    SplitAxis::Horizontal,
+                    PaneLaunch::Agent {
+                        agent,
+                        session: None,
+                    },
+                    cx,
+                );
+            }
+            HomeShellAction::FindChange { pane, needle } => {
+                if let Some(view) = self.panes.get(&pane).cloned() {
+                    view.update(cx, |v, cx| v.set_find_needle(needle, cx));
+                }
+            }
+            HomeShellAction::FindStep { pane, older } => {
+                if let Some(view) = self.panes.get(&pane).cloned() {
+                    view.update(cx, |v, cx| v.step_find(older, cx));
+                }
+            }
+            HomeShellAction::FindClose(pane) => {
+                if let Some(view) = self.panes.get(&pane).cloned() {
+                    view.update(cx, |v, cx| v.close_find(window, cx));
+                }
+            }
+            HomeShellAction::ToastClicked(id) => {
+                if let Ok(terminal) = id.parse::<u64>() {
+                    self.reveal_terminal_by_id(terminal, window, cx);
+                }
             }
         }
     }
 
     fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let warning = theme.warning;
-        let workspace = self.workspace.read(cx);
-        let has_projects = !workspace.projects().is_empty();
-        let has_panes = self
-            .selected
-            .and_then(|project| self.active_tab(project))
-            .is_some_and(|tab| !tab.layout.panes().is_empty());
-        let right =
-            if has_panes {
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .h(px(36.))
-                            .child(self.tabs_nsh.app_view.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .child(self.render_panes(cx)),
-                    )
-            } else if has_projects {
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .text_color(theme.muted_foreground)
-                    .child(div().text_sm().child("还没有终端"))
-                    .child(Button::new("empty-new").ghost().label("新建终端").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.add_terminal(None, cx);
-                            this.focus_terminal(window, cx);
-                            cx.notify();
-                        }),
-                    ))
-            } else {
-                v_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .text_color(theme.muted_foreground)
-                    .child(div().text_sm().child("还没有项目"))
-                    .child(
-                        Button::new("empty-open")
-                            .ghost()
-                            .label("打开项目")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.add_project(cx);
-                            })),
-                    )
-            };
-
-        // Full-width title bar strip: brand on the left (traffic lights float
-        // to its left), plugin entries on the right; the settings entry lives
-        // in the sidebar's bottom-left.
+        let theme = KumuTheme::global(cx);
         let plugins = h_flex()
             .items_center()
             .gap_1()
@@ -1438,89 +1410,15 @@ impl KumuApp {
             .relative()
             .size_full()
             .font_family(theme.font_family.clone())
-            .bg(theme.background)
-            .text_color(theme.foreground)
+            .bg(theme.colors.background)
+            .text_color(theme.colors.foreground)
             .child(title_bar)
-            .children(self.store_error.clone().map(|message| {
-                h_flex()
-                    .flex_none()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .bg(warning.opacity(0.12))
-                    .text_color(warning)
-                    .child(div().flex_1().min_w_0().text_xs().child(message))
-                    .child(
-                        div()
-                            .id("dismiss-store-error")
-                            .flex_none()
-                            .rounded(theme.radius)
-                            .p_0p5()
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(warning.opacity(0.25)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.store_error = None;
-                                cx.notify();
-                            }))
-                            .child(Icon::new(IconName::Close).small().text_color(warning)),
-                    )
-            }))
             .child(
-                // The sidebar, panes and open plugin panel share one resizable
-                // group, so the dividers are real drag handles rather than
-                // painted lines. The two side panels keep their widths when
-                // the window resizes; only dragging their handles changes them.
-                div().flex_1().min_h_0().min_w_0().child({
-                    let mut split = h_resizable("home-split")
-                        .child(
-                            resizable_panel()
-                                .size(px(self.sidebar_width))
-                                .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
-                                .fixed()
-                                .child(div().size_full().child(self.sidebar_nsh.app_view.clone())),
-                        )
-                        .child(split_panel(Axis::Horizontal, 1).child(right));
-                    if self.open_plugin.is_some() {
-                        split = split.child(
-                            split_panel(Axis::Horizontal, 2)
-                                .size(px(self.plugin_width))
-                                .size_range(px(PLUGIN_MIN_WIDTH)..px(PLUGIN_MAX_WIDTH))
-                                .fixed()
-                                .child(self.render_plugin_panel(cx)),
-                        );
-                    }
-                    // Persist the sidebar width once the drag ends, the same
-                    // way the pane splits save their ratios. The plugin width
-                    // only has to survive a re-render, so it stays in memory.
-                    split.on_resize({
-                        let weak = cx.entity().downgrade();
-                        move |state, _, cx| {
-                            let sizes = state.read(cx).sizes().clone();
-                            let Some(width) = sizes.first().copied() else {
-                                return;
-                            };
-                            let width =
-                                f32::from(width).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
-                            let plugin_width = sizes.get(2).copied().map(|width| {
-                                f32::from(width).clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH)
-                            });
-                            let _ = weak.update(cx, move |app, _| {
-                                if (width - app.sidebar_width).abs() >= 1.0 {
-                                    crate::db::set_setting(
-                                        crate::db::SETTING_SIDEBAR_WIDTH,
-                                        &format!("{width}"),
-                                    )
-                                    .ok();
-                                    app.sidebar_width = width;
-                                }
-                                if let Some(width) = plugin_width {
-                                    app.plugin_width = width;
-                                }
-                            });
-                        }
-                    })
-                }),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(self.shell_nsh.app_view.clone()),
             )
             .children(self.active_sheet.as_ref().map(|sheet| {
                 div()
@@ -1548,17 +1446,6 @@ impl KumuApp {
                     }))
                     .child(dialog.app_view.clone())
             }))
-            .when(self.toast_host.is_visible(), |root| {
-                root.child(
-                    div()
-                        .absolute()
-                        .top(px(42.))
-                        .right_3()
-                        .w(px(360.))
-                        .h(px(260.))
-                        .child(self.toast_host.app_view.clone()),
-                )
-            })
     }
 
     fn reveal_terminal_by_id(
@@ -1612,7 +1499,7 @@ impl Render for KumuApp {
         if !read.is_empty() {
             for &terminal in &read {
                 self.unread_notifications.remove(&terminal);
-                self.toast_host.dismiss(terminal.to_string());
+                self.shell_nsh.dismiss_toast(terminal.to_string());
             }
             cx.defer_in(window, move |_, window, cx| {
                 for terminal in read {
@@ -1620,27 +1507,15 @@ impl Render for KumuApp {
                 }
             });
         }
-        let sidebar_snap = self.build_sidebar_snapshot(cx);
-        self.sidebar_nsh.sync(sidebar_snap);
-        let tab_snap = self.build_tab_bar_snapshot();
-        self.tabs_nsh.sync(tab_snap);
+        let shell_snap = self.build_shell_snapshot(cx);
+        self.shell_nsh.sync(shell_snap);
         self.render_home(window, cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    use gpui_kit::base::ElementExt as _;
-    use gpui_kit::component::{h_resizable, v_resizable};
-    use gpui_kit::{
-        Axis, Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
-        TestAppContext, Window, div, px,
-    };
-
-    use super::{shell_prompt, split_panel, submits_after_paste};
+    use super::{shell_prompt, submits_after_paste};
 
     /// Only a pane started as an agent may receive Enter after the paste; a
     /// shell would run the review notes as a command.
@@ -1659,73 +1534,5 @@ mod tests {
             shell_prompt("请修改：\n\nsrc/a.rs:12\n这里先检查\n"),
             "请修改： src/a.rs:12 这里先检查"
         );
-    }
-
-    /// Trailing split panels leave 1px on their leading edge for the resize
-    /// handle hairline, so a focused pane's 1px border is visible on all four
-    /// sides instead of being painted over by the divider.
-    #[gpui::test]
-    fn split_panels_clear_the_leading_resize_handle_for_pane_borders(cx: &mut TestAppContext) {
-        struct SplitHarness {
-            axis: Axis,
-            first: Rc<Cell<Option<Bounds<Pixels>>>>,
-            second: Rc<Cell<Option<Bounds<Pixels>>>>,
-        }
-
-        impl Render for SplitHarness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let first = self.first.clone();
-                let second = self.second.clone();
-                let group = match self.axis {
-                    Axis::Horizontal => h_resizable("test-split-h"),
-                    Axis::Vertical => v_resizable("test-split-v"),
-                };
-                div().w(px(400.)).h(px(300.)).child(
-                    group
-                        .child(
-                            split_panel(self.axis, 0).child(div().size_full().on_prepaint(
-                                move |bounds, _, _| {
-                                    first.set(Some(bounds));
-                                },
-                            )),
-                        )
-                        .child(
-                            split_panel(self.axis, 1).child(div().size_full().on_prepaint(
-                                move |bounds, _, _| {
-                                    second.set(Some(bounds));
-                                },
-                            )),
-                        ),
-                )
-            }
-        }
-
-        cx.update(gpui_kit::init);
-        for axis in [Axis::Horizontal, Axis::Vertical] {
-            let first = Rc::new(Cell::new(None));
-            let second = Rc::new(Cell::new(None));
-            let (_, window_cx) = cx.add_window_view({
-                let first = first.clone();
-                let second = second.clone();
-                move |_, _| SplitHarness {
-                    axis,
-                    first,
-                    second,
-                }
-            });
-            window_cx.update(|window, cx| window.draw(cx).clear(cx));
-            let a = first.get().expect("first pane was laid out");
-            let b = second.get().expect("second pane was laid out");
-            match axis {
-                Axis::Horizontal => {
-                    assert_eq!(b.left(), a.right() + px(1.));
-                    assert_eq!(b.right(), px(400.));
-                }
-                Axis::Vertical => {
-                    assert_eq!(b.top(), a.bottom() + px(1.));
-                    assert_eq!(b.bottom(), px(300.));
-                }
-            }
-        }
     }
 }

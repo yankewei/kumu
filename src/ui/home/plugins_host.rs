@@ -468,6 +468,7 @@ impl KumuApp {
         if self.open_plugin == Some(spec.id) {
             self.open_plugin = None;
             self.plugin_views.clear();
+            self.native_registry.clear_plugins();
         } else {
             self.open_plugin = Some(spec.id);
             self.plugin_views
@@ -476,6 +477,7 @@ impl KumuApp {
                 let project = self.plugin_project(cx);
                 let host = self.plugin_host(cx);
                 let view = spec.create(project, host, window, cx);
+                self.native_registry.set_plugin(spec.id, view.clone());
                 self.plugin_views.insert(spec.id, view);
             }
         }
@@ -558,60 +560,6 @@ impl KumuApp {
                     .rounded_full()
                     .bg(dot_color),
             )
-            .into_any_element()
-    }
-
-    /// The open plugin panel: host chrome (title and close) above the plugin's
-    /// own content.
-    pub(super) fn render_plugin_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let Some(id) = self.open_plugin else {
-            return div().into_any_element();
-        };
-        let Some(spec) = crate::plugins::spec(id) else {
-            return div().into_any_element();
-        };
-        let theme = cx.theme();
-        let (muted, border) = (theme.muted_foreground, theme.sidebar_border);
-        v_flex()
-            .size_full()
-            .bg(theme.sidebar)
-            .text_color(theme.sidebar_foreground)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(Icon::empty().path(spec.icon).small().text_color(muted))
-                    .child(div().text_xs().font_medium().child(spec.title))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new(format!("plugin-close-{}", spec.id))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(theme.transparent)
-                                    .foreground(muted)
-                                    .hover(theme.accent.opacity(0.5)),
-                            )
-                            .compact()
-                            .icon(IconName::Close)
-                            .tooltip("收起面板")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_plugin = None;
-                                this.plugin_views.clear();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(self.plugin_views.get(id).cloned().map(|view| {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(view.cached(StyleRefinement::default().size_full().min_h_0().min_w_0()))
-            }))
             .into_any_element()
     }
 }

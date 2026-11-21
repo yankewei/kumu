@@ -16,12 +16,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::component::input::InputState;
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::*;
 
-use self::chrome::{header_identity, header_note, terminal_header};
+#[cfg(test)]
+pub(crate) use self::chrome::FindBarSnapshot;
+pub(crate) use self::chrome::PaneChromeSnapshot;
+use self::chrome::{find_bar_snapshot, header_name, header_note, short_cwd};
 use self::paint::{GridPaint, RowOp, Typeface, cell_size, grid_origin, paint_color, paint_grid};
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
@@ -29,7 +29,7 @@ use crate::app::layout::{PaneDirection, PaneId};
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::link;
 use crate::term::{Cell as TermCell, MouseAction, Rgb, SelectStep, Snapshot};
-use crate::theme::{self, ThemeRevision};
+use crate::theme::{self, KumuTheme, ThemeRevision};
 
 /// Chrome / focus messages from a pane up to the home window.
 pub enum TerminalEvent {
@@ -41,10 +41,6 @@ pub enum TerminalEvent {
     SplitDown,
     /// Move keyboard focus to the pane in this direction.
     Focus(PaneDirection),
-    /// Close this pane and its shell.
-    Close,
-    /// Split this pane to the right and run an agent in the new pane.
-    AgentPane(String),
     /// Open a new tab with one shell.
     NewTab,
     /// Close the current tab (and every terminal in it).
@@ -55,6 +51,8 @@ pub enum TerminalEvent {
     PrevTab,
     /// Show tab `n` (0-based).
     SelectTab(usize),
+    /// Pane header metadata or find-bar state changed; refresh the NSH shell.
+    ChromeChanged,
 }
 
 /// Inset around the cell grid, matching the padded look of a pane TUI.
@@ -136,16 +134,16 @@ pub struct TerminalView {
     /// resize again. Cleared when the attached project changes.
     sent: Rc<Cell<(u16, u16, u32, u32)>>,
     painted: Rc<RefCell<PaintCache>>,
-    /// Open find bar, if any. Its needle lives on the session thread.
-    find: Option<FindBar>,
+    /// Open find bar state, if any. The UI itself renders in Pure Rust NSH.
+    find: Option<FindState>,
+    /// Monotonic counter bumped whenever `⌘F` requests input focus.
+    find_focus_nonce: u64,
 }
 
-/// The find bar's input and the needle last sent for it.
-struct FindBar {
-    input: Entity<InputState>,
+/// The find bar's needle state; its input lives in the NSH pane overlay.
+struct FindState {
     sent: String,
-    /// Dropped with the bar, so a closed bar leaves no listener behind.
-    _subscription: Subscription,
+    focus_nonce: u64,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -200,6 +198,23 @@ impl TerminalView {
                 rows: Vec::new(),
             })),
             find: None,
+            find_focus_nonce: 0,
+        }
+    }
+
+    pub fn chrome_snapshot(&self) -> PaneChromeSnapshot {
+        PaneChromeSnapshot {
+            id: self.pane,
+            name: header_name(&self.snapshot),
+            cwd: short_cwd(&self.snapshot.cwd),
+            note: header_note(&self.snapshot),
+            agent_status: self.agent_status,
+            active: self.active,
+            can_close: self.can_close,
+            find: self
+                .find
+                .as_ref()
+                .map(|bar| find_bar_snapshot(&self.snapshot, &bar.sent, bar.focus_nonce)),
         }
     }
 
@@ -321,6 +336,13 @@ impl TerminalView {
         let Some(snapshot) = self.workspace.read(cx).terminal_snapshot(pane) else {
             return;
         };
+        let prev_chrome = (
+            self.snapshot.title.clone(),
+            self.snapshot.cwd.clone(),
+            self.snapshot.exited,
+            self.snapshot.spawn_error.clone(),
+            self.snapshot.search.clone(),
+        );
         self.snapshot = snapshot;
         // Frames cross from the session thread asynchronously: a snapshot can
         // still carry the previous needle's matches after the input moved on.
@@ -346,6 +368,23 @@ impl TerminalView {
         {
             self.refresh_link(col, row, cx);
         }
+        let next_chrome = (
+            &self.snapshot.title,
+            &self.snapshot.cwd,
+            self.snapshot.exited,
+            &self.snapshot.spawn_error,
+            &self.snapshot.search,
+        );
+        if (
+            &prev_chrome.0,
+            &prev_chrome.1,
+            prev_chrome.2,
+            &prev_chrome.3,
+            &prev_chrome.4,
+        ) != next_chrome
+        {
+            cx.emit(TerminalEvent::ChromeChanged);
+        }
         cx.notify();
     }
 }
@@ -353,7 +392,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_theme(cx);
-        let theme = cx.theme();
+        let colors = &KumuTheme::global(cx).colors;
         let (font_family, font_px) = theme::term_font(cx);
         let snapshot = self.snapshot.clone();
         let marked = self.marked.clone();
@@ -369,30 +408,11 @@ impl Render for TerminalView {
         let input_focus = self.focus.clone();
         let input_view = cx.entity();
         let mouse_view = cx.entity().downgrade();
-        let (mark, name, cwd) = header_identity(&snapshot, cx);
-        let note = header_note(&snapshot);
-        let active = self.active;
-        let can_close = self.can_close;
         let pane = self.pane;
-        let border = if active {
-            theme.blue
-        } else {
-            theme.transparent
-        };
-        let header_bg = if active {
-            theme.secondary.opacity(0.45)
-        } else {
-            theme.transparent
-        };
-        let muted = theme.muted_foreground;
-        let fg = theme.foreground;
-        let warning = theme.warning;
-        let radius = theme.radius;
-        let hover = theme.accent.opacity(0.5);
         // Find-bar highlights; copied out of the theme before the grid's
         // paint closure (which must be 'static) captures them.
-        let search_hit = theme.selection.opacity(0.55);
-        let search_active = theme.warning.opacity(0.55);
+        let search_hit = colors.selection.opacity(0.55);
+        let search_active = colors.warning.opacity(0.55);
         // The link under a ⌘-hovered cell: its runs are underlined and each is
         // a hitbox, so the pointer turns into a hand over it.
         let link_spans: Vec<link::Span> = self
@@ -404,22 +424,6 @@ impl Render for TerminalView {
         let link_hitboxes: Rc<Cell<Vec<Hitbox>>> = Rc::new(Cell::new(Vec::new()));
         let link_spans_layout = link_spans.clone();
         let link_hitboxes_layout = link_hitboxes.clone();
-        let header = terminal_header(
-            pane,
-            mark,
-            name,
-            cwd,
-            note,
-            self.agent_status,
-            header_bg,
-            can_close,
-            muted,
-            fg,
-            warning,
-            radius,
-            hover,
-            cx,
-        );
         let typeface = Typeface {
             family: font_family,
             size: font_px,
@@ -428,269 +432,211 @@ impl Render for TerminalView {
         let typeface_paint = typeface;
         let term_bg = paint_color(snapshot.bg);
         let term_id = format!("kumu-term-{}", pane.0);
-        v_flex()
+        div()
+            .id(term_id)
             .size_full()
             .min_h_0()
             .min_w_0()
-            .border_1()
-            .border_color(border)
+            .overflow_hidden()
             .bg(term_bg)
-            .child(header)
+            .track_focus(&self.focus)
+            .key_context("Terminal")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    this.focus.focus(window, cx);
+                    cx.emit(TerminalEvent::Activated);
+                    // ⌘-click opens the link under the pointer,
+                    // like Ghostty on macOS; it is never the
+                    // start of a selection.
+                    if ev.modifiers.platform && this.open_link(ev.position, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
+                        if this.project.is_some() {
+                            let pane = this.pane.0;
+                            this.workspace.update(cx, |workspace, _| {
+                                workspace.terminal_clear_selection(pane);
+                            });
+                        }
+                    } else if !this.reported.contains(&ev.button) {
+                        this.start_selection(ev.position, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    this.focus.focus(window, cx);
+                    cx.emit(TerminalEvent::Activated);
+                    if !this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
+                        this.paste(cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    this.focus.focus(window, cx);
+                    cx.emit(TerminalEvent::Activated);
+                    this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                }),
+            )
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
+                this.on_scroll(ev, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key(event, window, cx);
+            }))
             .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id(term_id)
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .size_full()
-                            .track_focus(&self.focus)
-                            .key_context("Terminal")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    cx.emit(TerminalEvent::Activated);
-                                    // ⌘-click opens the link under the pointer,
-                                    // like Ghostty on macOS; it is never the
-                                    // start of a selection.
-                                    if ev.modifiers.platform && this.open_link(ev.position, cx) {
-                                        cx.stop_propagation();
-                                        return;
-                                    }
-                                    if this.press_mouse(ev.button, ev.position, &ev.modifiers, cx) {
-                                        if this.project.is_some() {
-                                            let pane = this.pane.0;
-                                            this.workspace.update(cx, |workspace, _| {
-                                                workspace.terminal_clear_selection(pane);
-                                            });
-                                        }
-                                    } else if !this.reported.contains(&ev.button) {
-                                        this.start_selection(ev.position, cx);
-                                    }
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Middle,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    cx.emit(TerminalEvent::Activated);
-                                    if !this.press_mouse(ev.button, ev.position, &ev.modifiers, cx)
-                                    {
-                                        this.paste(cx);
-                                    }
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    cx.emit(TerminalEvent::Activated);
-                                    this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
-                                }),
-                            )
-                            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
-                                this.on_scroll(ev, cx);
-                            }))
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                                this.on_key(event, window, cx);
-                            }))
-                            .child(
-                                canvas(
-                                    move |bounds, window, cx| {
-                                        let (cell_w, cell_h) = cell_size(window, &typeface_layout);
-                                        let scale = window.scale_factor();
-                                        let cols = ((f32::from(bounds.size.width) - 2. * PAD_X)
-                                            / f32::from(cell_w))
-                                        .floor()
-                                        .max(2.)
-                                            as u16;
-                                        let rows = ((f32::from(bounds.size.height) - 2. * PAD_Y)
-                                            / f32::from(cell_h))
-                                        .floor()
-                                        .max(1.)
-                                            as u16;
-                                        let cell_px = (
-                                            (f32::from(cell_w) * scale).round().max(1.) as u32,
-                                            (f32::from(cell_h) * scale).round().max(1.) as u32,
-                                        );
-                                        let next = (cols, rows, cell_px.0, cell_px.1);
-                                        if sent.get() != next {
-                                            sent.set(next);
-                                            if has_project {
-                                                workspace.update(cx, |workspace, _| {
-                                                    workspace.terminal_resize(
-                                                        pane_term, cols, rows, cell_px.0, cell_px.1,
-                                                    )
-                                                });
-                                            }
-                                        }
-                                        let origin = grid_origin(
-                                            bounds,
-                                            cell_h,
-                                            snapshot_rows,
-                                            window.scale_factor(),
-                                        );
-                                        let hitboxes = link_spans_layout
-                                            .iter()
-                                            .filter(|span| {
-                                                span.to > span.from && span.row < snapshot_rows
-                                            })
-                                            .map(|span| {
-                                                let at = origin
-                                                    + point(
-                                                        cell_w * f32::from(span.from),
-                                                        cell_h * f32::from(span.row),
-                                                    );
-                                                window.insert_hitbox(
-                                                    Bounds::new(
-                                                        at,
-                                                        size(
-                                                            cell_w * f32::from(span.to - span.from),
-                                                            cell_h,
-                                                        ),
-                                                    ),
-                                                    HitboxBehavior::Normal,
-                                                )
-                                            })
-                                            .collect();
-                                        link_hitboxes_layout.set(hitboxes);
-                                        (cell_w, cell_h)
-                                    },
-                                    move |bounds, cell, window, cx| {
-                                        for hitbox in link_hitboxes.take() {
-                                            window.set_cursor_style(
-                                                CursorStyle::PointingHand,
-                                                &hitbox,
-                                            );
-                                        }
-                                        let origin = paint_grid(
-                                            GridPaint {
-                                                bounds,
-                                                snapshot: &snapshot,
-                                                cell,
-                                                focused,
-                                                marked: marked.as_deref(),
-                                                typeface: &typeface_paint,
-                                                painted: &painted,
-                                                cursor_at: &cursor_at,
-                                                search_hit,
-                                                search_active,
-                                                link: &link_spans,
-                                            },
-                                            window,
-                                            cx,
-                                        );
-                                        grid_at.set(GridAt {
-                                            origin,
-                                            cell,
-                                            height: f32::from(cell.1) * snapshot.rows as f32,
-                                            scale: window.scale_factor(),
-                                            bounds,
-                                        });
-                                        let view = mouse_view.clone();
-                                        window.on_mouse_event(
-                                            move |ev: &MouseMoveEvent, phase, _, cx| {
-                                                if phase != DispatchPhase::Capture {
-                                                    return;
-                                                }
-                                                let _ = view.update(cx, |this, cx| {
-                                                    if this.selecting {
-                                                        if ev.pressed_button
-                                                            == Some(MouseButton::Left)
-                                                        {
-                                                            this.apply_select(
-                                                                SelectStep::Drag,
-                                                                ev.position,
-                                                                cx,
-                                                            );
-                                                        } else {
-                                                            this.finish_selection(ev.position, cx);
-                                                        }
-                                                        return;
-                                                    }
-                                                    if let Some(button) = ev.pressed_button
-                                                        && this.reported.contains(&button)
-                                                    {
-                                                        this.send_mouse(
-                                                            MouseAction::Motion,
-                                                            Some(button),
-                                                            ev.position,
-                                                            &ev.modifiers,
-                                                            cx,
-                                                        );
-                                                        return;
-                                                    }
-                                                    // Links only highlight while
-                                                    // ⌘ is held; the modifier
-                                                    // release itself arrives
-                                                    // with the next move.
-                                                    this.hover_link(ev.position, &ev.modifiers, cx);
-                                                });
-                                            },
-                                        );
-                                        let view = mouse_view.clone();
-                                        window.on_mouse_event(
-                                            move |ev: &MouseUpEvent, phase, _, cx| {
-                                                if phase != DispatchPhase::Capture {
-                                                    return;
-                                                }
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.release_mouse(
-                                                        ev.button,
-                                                        ev.position,
-                                                        &ev.modifiers,
-                                                        cx,
-                                                    );
-                                                    if this.selecting
-                                                        && ev.button == MouseButton::Left
-                                                    {
-                                                        this.finish_selection(ev.position, cx);
-                                                        cx.stop_propagation();
-                                                    }
-                                                });
-                                            },
-                                        );
-                                        // ⌘ can be pressed or released while
-                                        // the pointer stands still: neither
-                                        // produces a mouse move of its own. The
-                                        // window-level listener reaches every
-                                        // pane, not just the focused one.
-                                        let view = mouse_view.clone();
-                                        window.on_modifiers_changed(
-                                            move |ev: &ModifiersChangedEvent, window, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.hover_link(
-                                                        window.mouse_position(),
-                                                        &ev.modifiers,
-                                                        cx,
-                                                    );
-                                                });
-                                            },
-                                        );
-                                        if focused {
-                                            window.handle_input(
-                                                &input_focus,
-                                                ElementInputHandler::new(
-                                                    bounds,
-                                                    input_view.clone(),
-                                                ),
-                                                cx,
-                                            );
-                                        }
-                                    },
+                canvas(
+                    move |bounds, window, cx| {
+                        let (cell_w, cell_h) = cell_size(window, &typeface_layout);
+                        let scale = window.scale_factor();
+                        let cols = ((f32::from(bounds.size.width) - 2. * PAD_X) / f32::from(cell_w))
+                            .floor()
+                            .max(2.) as u16;
+                        let rows = ((f32::from(bounds.size.height) - 2. * PAD_Y)
+                            / f32::from(cell_h))
+                        .floor()
+                        .max(1.) as u16;
+                        let cell_px = (
+                            (f32::from(cell_w) * scale).round().max(1.) as u32,
+                            (f32::from(cell_h) * scale).round().max(1.) as u32,
+                        );
+                        let next = (cols, rows, cell_px.0, cell_px.1);
+                        if sent.get() != next {
+                            sent.set(next);
+                            if has_project {
+                                workspace.update(cx, |workspace, _| {
+                                    workspace.terminal_resize(
+                                        pane_term, cols, rows, cell_px.0, cell_px.1,
+                                    )
+                                });
+                            }
+                        }
+                        let origin =
+                            grid_origin(bounds, cell_h, snapshot_rows, window.scale_factor());
+                        let hitboxes = link_spans_layout
+                            .iter()
+                            .filter(|span| span.to > span.from && span.row < snapshot_rows)
+                            .map(|span| {
+                                let at = origin
+                                    + point(
+                                        cell_w * f32::from(span.from),
+                                        cell_h * f32::from(span.row),
+                                    );
+                                window.insert_hitbox(
+                                    Bounds::new(
+                                        at,
+                                        size(cell_w * f32::from(span.to - span.from), cell_h),
+                                    ),
+                                    HitboxBehavior::Normal,
                                 )
-                                .size_full(),
-                            ),
-                    )
-                    .when_some(self.render_find_bar(cx), |wrapper, bar| wrapper.child(bar)),
+                            })
+                            .collect();
+                        link_hitboxes_layout.set(hitboxes);
+                        (cell_w, cell_h)
+                    },
+                    move |bounds, cell, window, cx| {
+                        for hitbox in link_hitboxes.take() {
+                            window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                        }
+                        let origin = paint_grid(
+                            GridPaint {
+                                bounds,
+                                snapshot: &snapshot,
+                                cell,
+                                focused,
+                                marked: marked.as_deref(),
+                                typeface: &typeface_paint,
+                                painted: &painted,
+                                cursor_at: &cursor_at,
+                                search_hit,
+                                search_active,
+                                link: &link_spans,
+                            },
+                            window,
+                            cx,
+                        );
+                        grid_at.set(GridAt {
+                            origin,
+                            cell,
+                            height: f32::from(cell.1) * snapshot.rows as f32,
+                            scale: window.scale_factor(),
+                            bounds,
+                        });
+                        let view = mouse_view.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = view.update(cx, |this, cx| {
+                                if this.selecting {
+                                    if ev.pressed_button == Some(MouseButton::Left) {
+                                        this.apply_select(SelectStep::Drag, ev.position, cx);
+                                    } else {
+                                        this.finish_selection(ev.position, cx);
+                                    }
+                                    return;
+                                }
+                                if let Some(button) = ev.pressed_button
+                                    && this.reported.contains(&button)
+                                {
+                                    this.send_mouse(
+                                        MouseAction::Motion,
+                                        Some(button),
+                                        ev.position,
+                                        &ev.modifiers,
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                // Links only highlight while
+                                // ⌘ is held; the modifier
+                                // release itself arrives
+                                // with the next move.
+                                this.hover_link(ev.position, &ev.modifiers, cx);
+                            });
+                        });
+                        let view = mouse_view.clone();
+                        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = view.update(cx, |this, cx| {
+                                this.release_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                                if this.selecting && ev.button == MouseButton::Left {
+                                    this.finish_selection(ev.position, cx);
+                                    cx.stop_propagation();
+                                }
+                            });
+                        });
+                        // ⌘ can be pressed or released while
+                        // the pointer stands still: neither
+                        // produces a mouse move of its own. The
+                        // window-level listener reaches every
+                        // pane, not just the focused one.
+                        let view = mouse_view.clone();
+                        window.on_modifiers_changed(
+                            move |ev: &ModifiersChangedEvent, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.hover_link(window.mouse_position(), &ev.modifiers, cx);
+                                });
+                            },
+                        );
+                        if focused {
+                            window.handle_input(
+                                &input_focus,
+                                ElementInputHandler::new(bounds, input_view.clone()),
+                                cx,
+                            );
+                        }
+                    },
+                )
+                .size_full(),
             )
     }
 }

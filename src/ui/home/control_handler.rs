@@ -457,8 +457,7 @@ impl KumuApp {
         self.next_pane += 1;
         self.next_group += 1;
         if made_group {
-            let state = Self::new_group_state(&[], cx);
-            self.group_states.insert(group_id, state);
+            self.group_ratios.remove(&group_id);
         }
         if launch.is_shell() {
             self.launches.remove(&new_id);

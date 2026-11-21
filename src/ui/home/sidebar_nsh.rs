@@ -1,19 +1,18 @@
 //! Pure Rust NSH UI for the left-hand Sidebar (projects, worktrees, live
 //! global Agent status section, update notice, and settings entry).
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use futures::StreamExt;
+#[cfg(test)]
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui::{AppContext, Context, Entity, Task, Window};
-use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use crate::agent::AgentState;
 use crate::app::layout::PaneId;
-use crate::nsh_ui::theme::{appearance, nsh_theme};
-use crate::theme::KumuTheme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProjectRowSnapshot {
@@ -49,6 +48,8 @@ pub(super) struct SidebarSnapshot {
     pub(super) update_notice: Option<UpdateNoticeSnapshot>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(super) enum SidebarHostEvent {
     Snapshot(SidebarSnapshot),
@@ -70,19 +71,24 @@ pub(super) enum SidebarAction {
     OpenSettings(bool),
 }
 
+#[cfg(test)]
 struct SidebarMount {
     initial: SidebarSnapshot,
     events_rx: UnboundedReceiver<SidebarHostEvent>,
     actions_tx: UnboundedSender<SidebarAction>,
 }
 
+#[cfg(test)]
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
 static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, SidebarMount>>> = OnceLock::new();
 
+#[cfg(test)]
 fn pending_mounts() -> &'static Mutex<HashMap<u64, SidebarMount>> {
     PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
 fn register_mount(mount: SidebarMount) -> u64 {
     let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pending_mounts().lock() {
@@ -91,11 +97,13 @@ fn register_mount(mount: SidebarMount) -> u64 {
     id
 }
 
+#[cfg(test)]
 fn take_mount(id: u64) -> Option<SidebarMount> {
     pending_mounts().lock().ok()?.remove(&id)
 }
 
-mod view {
+pub(super) mod view {
+    #[cfg(test)]
     use futures::StreamExt;
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::theme as active_theme;
@@ -104,17 +112,17 @@ mod view {
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{
-        AgentRowSnapshot, ProjectRowSnapshot, SidebarAction, SidebarHostEvent, SidebarSnapshot,
-        take_mount,
-    };
+    use super::{AgentRowSnapshot, ProjectRowSnapshot, SidebarAction, SidebarSnapshot};
+    #[cfg(test)]
+    use super::{SidebarHostEvent, take_mount};
     use crate::agent::AgentState;
     use crate::nsh_ui::assets::icon_svg;
-    use crate::nsh_ui::components::meta_text;
+    use crate::nsh_ui::components::{kumu_tooltip, meta_text};
     use crate::nsh_ui::theme::{
         TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size,
     };
 
+    #[cfg(test)]
     #[derive(Clone, Debug, PartialEq, Props)]
     pub(super) struct SidebarRootProps {
         pub(super) mount_id: Prop<u64>,
@@ -306,6 +314,7 @@ mod view {
         items
     }
 
+    #[cfg(test)]
     #[component]
     pub(super) fn SidebarRoot(props: SidebarRootProps) -> impl IntoElement {
         let mount = take_mount(props.mount_id.get_untracked());
@@ -315,7 +324,6 @@ mod view {
         };
 
         let state = signal(initial);
-        let hovered_project = signal(Option::<i64>::None);
 
         if let Some(mut rx) = events_rx {
             spawn(async move {
@@ -326,6 +334,15 @@ mod view {
                 }
             });
         }
+
+        render_sidebar(state, actions_tx)
+    }
+
+    pub(in crate::ui::home) fn render_sidebar(
+        state: Signal<SidebarSnapshot>,
+        actions_tx: Option<UnboundedSender<SidebarAction>>,
+    ) -> impl IntoElement {
+        let hovered_project = signal(Option::<i64>::None);
 
         let tx_add = actions_tx.clone();
         let header = view()
@@ -347,6 +364,7 @@ mod view {
                 view()
                     .role(AccessibilityRole::Button)
                     .label("打开项目")
+                    .tooltip(kumu_tooltip("打开项目"))
                     .rounded(move || active_theme().radius)
                     .p_0p5()
                     .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
@@ -658,6 +676,7 @@ mod view {
                     view()
                         .role(AccessibilityRole::Button)
                         .label("设置")
+                        .tooltip(kumu_tooltip("设置"))
                         .rounded(move || active_theme().radius)
                         .p_1()
                         .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
@@ -685,93 +704,6 @@ mod view {
             .child(header)
             .child(middle)
             .child(footer)
-    }
-}
-
-/// Host handle for the Pure Rust NSH sidebar owned by `KumuApp`.
-pub(super) struct NshSidebar {
-    mount_id: u64,
-    pub(super) app_view: Entity<AppView>,
-    events_tx: UnboundedSender<SidebarHostEvent>,
-    last_snapshot: SidebarSnapshot,
-    _actions_task: Task<()>,
-}
-
-impl Drop for NshSidebar {
-    fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
-    }
-}
-
-impl NshSidebar {
-    pub(super) fn new<V: 'static>(
-        initial: SidebarSnapshot,
-        theme: &KumuTheme,
-        window: &mut Window,
-        cx: &mut Context<V>,
-        mut on_action: impl FnMut(&mut V, SidebarAction, &mut Window, &mut Context<V>) + 'static,
-    ) -> Self {
-        let (events_tx, events_rx) = unbounded::<SidebarHostEvent>();
-        let (actions_tx, mut actions_rx) = unbounded::<SidebarAction>();
-        let mount_id = register_mount(SidebarMount {
-            initial: initial.clone(),
-            events_rx,
-            actions_tx,
-        });
-
-        let mapped = nsh_theme(theme);
-        let mode = appearance(theme.mode);
-        let app_view = cx.new(|cx| {
-            let options = AppOptions {
-                title: "Kumu Sidebar".to_owned(),
-                ..Default::default()
-            };
-            let view = AppView::new(options, window, cx);
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-            view.load(nsh_platform_gpui::App::Rust(
-                Root::new::<view::SidebarRoot>(move || view::SidebarRootProps {
-                    mount_id: mount_id.into(),
-                }),
-            ));
-            view
-        });
-
-        let actions_task = cx.spawn_in(window, async move |this, cx| {
-            while let Some(action) = actions_rx.next().await {
-                let res = this.update_in(cx, |host, window, cx| {
-                    on_action(host, action, window, cx);
-                });
-                if res.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            mount_id,
-            app_view,
-            events_tx,
-            last_snapshot: initial,
-            _actions_task: actions_task,
-        }
-    }
-
-    pub(super) fn sync(&mut self, snapshot: SidebarSnapshot) {
-        if self.last_snapshot != snapshot {
-            self.last_snapshot = snapshot.clone();
-            let _ = self
-                .events_tx
-                .unbounded_send(SidebarHostEvent::Snapshot(snapshot));
-        }
-    }
-
-    pub(super) fn sync_theme(&self, theme: &KumuTheme, cx: &mut gpui::App) {
-        let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
-        self.app_view.update(cx, |view, cx| {
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-        });
     }
 }
 

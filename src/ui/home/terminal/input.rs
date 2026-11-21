@@ -1,10 +1,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::*;
+use gpui::*;
 
-use super::{FindBar, GridAt, TerminalEvent, TerminalView};
+use super::{FindState, GridAt, TerminalEvent, TerminalView};
 use crate::app::layout::PaneDirection;
 use crate::term::link;
 use crate::term::{
@@ -185,84 +184,56 @@ impl TerminalView {
             .update(cx, |workspace, _| workspace.terminal_paste(pane, text));
     }
 
-    /// Open the find bar and focus its input. ⌘F on an open bar just brings
-    /// focus back to the input.
-    pub(super) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the find bar and request input focus. ⌘F on an open bar bumps the
+    /// focus nonce so the NSH find input re-focuses.
+    pub(super) fn open_find(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.project.is_none() {
             return;
         }
-        if let Some(bar) = &self.find {
-            let input = bar.input.clone();
-            input.update(cx, |input, cx| input.focus(window, cx));
-            return;
+        self.find_focus_nonce = self.find_focus_nonce.wrapping_add(1);
+        let nonce = self.find_focus_nonce;
+        match &mut self.find {
+            Some(bar) => bar.focus_nonce = nonce,
+            None => {
+                self.find = Some(FindState {
+                    sent: String::new(),
+                    focus_nonce: nonce,
+                });
+            }
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("在当前终端中查找"));
-        let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
-            this.on_find_event(&input, event, cx);
-        });
-        input.update(cx, |input, cx| input.focus(window, cx));
-        self.find = Some(FindBar {
-            input,
-            sent: String::new(),
-            _subscription: subscription,
-        });
+        cx.emit(TerminalEvent::ChromeChanged);
         cx.notify();
     }
 
-    fn on_find_event(
-        &mut self,
-        input: &Entity<InputState>,
-        event: &InputEvent,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn set_find_needle(&mut self, value: String, cx: &mut Context<Self>) {
         let Some(bar) = &mut self.find else {
             return;
         };
-        match event {
-            InputEvent::Change => {
-                let value = input.read(cx).value().to_string();
-                if value == bar.sent {
-                    return;
-                }
-                bar.sent = value.clone();
-                // A result frame from the previous needle must not paint or
-                // report itself as this query's answer while the session
-                // thread still works on the new one.
-                self.snapshot.search = None;
-                let pane = self.pane.0;
-                self.workspace.update(cx, |workspace, _| {
-                    workspace.terminal_search_set(pane, &value);
-                });
-                cx.notify();
-            }
-            // Enter walks toward older content, matching Ghostty's find bar;
-            // Shift+Enter goes back toward newer output.
-            InputEvent::PressEnter { shift, .. } => {
-                let pane = self.pane.0;
-                self.workspace.update(cx, |workspace, _| {
-                    workspace.terminal_search_step(pane, !shift);
-                });
-                cx.notify();
-            }
-            _ => {}
+        if value == bar.sent {
+            return;
         }
+        bar.sent = value.clone();
+        // A result frame from the previous needle must not paint or report
+        // itself as this query's answer while the session thread still works.
+        self.snapshot.search = None;
+        let pane = self.pane.0;
+        self.workspace.update(cx, |workspace, _| {
+            workspace.terminal_search_set(pane, &value);
+        });
+        cx.emit(TerminalEvent::ChromeChanged);
+        cx.notify();
     }
 
-    pub(super) fn step_find(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn step_find(&mut self, older: bool, cx: &mut Context<Self>) {
         let pane = self.pane.0;
         self.workspace.update(cx, |workspace, _| {
             workspace.terminal_search_step(pane, older);
         });
-        // Keep the input focused so Enter keeps walking matches.
-        if let Some(bar) = &self.find {
-            bar.input.update(cx, |input, cx| input.focus(window, cx));
-        } else {
-            self.focus.focus(window, cx);
-        }
+        cx.emit(TerminalEvent::ChromeChanged);
         cx.notify();
     }
 
-    pub(super) fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.take().is_none() {
             return;
         }
@@ -271,6 +242,7 @@ impl TerminalView {
             workspace.terminal_search_clear(pane);
         });
         self.focus.focus(window, cx);
+        cx.emit(TerminalEvent::ChromeChanged);
         cx.notify();
     }
 

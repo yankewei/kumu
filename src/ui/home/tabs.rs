@@ -329,6 +329,7 @@ impl KumuApp {
                 workspace.unbind_pane_todos(pane.0, cx);
             });
             self.panes.remove(&pane);
+            self.native_registry.unregister_pane(pane.0);
             self.launches.remove(&pane);
             self.agent_status.remove(&pane);
         }

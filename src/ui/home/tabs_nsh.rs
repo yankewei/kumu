@@ -1,17 +1,16 @@
 //! Pure Rust NSH UI for the project-level Tab Bar above the terminal pane grid.
 
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use futures::StreamExt;
+#[cfg(test)]
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui::{AppContext, Context, Entity, Task, Window};
-use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use crate::app::layout::TabId;
-use crate::nsh_ui::theme::{appearance, nsh_theme};
-use crate::theme::KumuTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TabAttention {
@@ -44,6 +43,7 @@ pub(super) enum TabBarSnapshot {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(super) enum TabBarHostEvent {
     Snapshot(TabBarSnapshot),
@@ -59,19 +59,24 @@ pub(super) enum TabBarAction {
     PromptRename { project_id: i64, tab_id: TabId },
 }
 
+#[cfg(test)]
 struct TabBarMount {
     initial: TabBarSnapshot,
     events_rx: UnboundedReceiver<TabBarHostEvent>,
     actions_tx: UnboundedSender<TabBarAction>,
 }
 
+#[cfg(test)]
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
 static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, TabBarMount>>> = OnceLock::new();
 
+#[cfg(test)]
 fn pending_mounts() -> &'static Mutex<HashMap<u64, TabBarMount>> {
     PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
 fn register_mount(mount: TabBarMount) -> u64 {
     let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pending_mounts().lock() {
@@ -80,11 +85,13 @@ fn register_mount(mount: TabBarMount) -> u64 {
     id
 }
 
+#[cfg(test)]
 fn take_mount(id: u64) -> Option<TabBarMount> {
     pending_mounts().lock().ok()?.remove(&id)
 }
 
-mod view {
+pub(super) mod view {
+    #[cfg(test)]
     use futures::StreamExt;
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::theme as active_theme;
@@ -92,11 +99,14 @@ mod view {
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{TabAttention, TabBarAction, TabBarHostEvent, TabBarSnapshot, take_mount};
+    use super::{TabAttention, TabBarAction, TabBarSnapshot};
+    #[cfg(test)]
+    use super::{TabBarHostEvent, take_mount};
     use crate::nsh_ui::assets::icon_svg;
-    use crate::nsh_ui::components::{ButtonVariant, kumu_button};
+    use crate::nsh_ui::components::{ButtonVariant, kumu_button, kumu_tooltip};
     use crate::nsh_ui::theme::{TOKEN_WARNING, kumu_color, text_xs_size};
 
+    #[cfg(test)]
     #[derive(Clone, Debug, PartialEq, Props)]
     pub(super) struct TabBarRootProps {
         pub(super) mount_id: Prop<u64>,
@@ -112,6 +122,7 @@ mod view {
         kumu_color(TOKEN_WARNING, |t| t.destructive)
     }
 
+    #[cfg(test)]
     #[component]
     pub(super) fn TabBarRoot(props: TabBarRootProps) -> impl IntoElement {
         let mount = take_mount(props.mount_id.get_untracked());
@@ -132,7 +143,14 @@ mod view {
             });
         }
 
-        let tx_root = actions_tx.clone();
+        render_tab_bar(state, actions_tx)
+    }
+
+    pub(in crate::ui::home) fn render_tab_bar(
+        state: Signal<TabBarSnapshot>,
+        actions_tx: Option<UnboundedSender<TabBarAction>>,
+    ) -> impl IntoElement {
+        let tx_root = actions_tx;
         dynamic(move || match state.get() {
             TabBarSnapshot::Hidden => view().w_full().h_full().into_element(),
             TabBarSnapshot::ConfirmClose {
@@ -291,6 +309,7 @@ mod view {
                         view()
                             .role(AccessibilityRole::Button)
                             .label("新建页签")
+                            .tooltip(kumu_tooltip("新建页签 ⌘T"))
                             .flex_shrink_0()
                             .rounded(move || active_theme().radius)
                             .p_0p5()
@@ -305,6 +324,7 @@ mod view {
                         view()
                             .role(AccessibilityRole::Button)
                             .label("页签操作")
+                            .tooltip(kumu_tooltip("页签操作"))
                             .flex_shrink_0()
                             .rounded(move || active_theme().radius)
                             .p_0p5()
@@ -338,93 +358,6 @@ mod view {
                     .into_element()
             }
         })
-    }
-}
-
-/// Host handle for the Pure Rust NSH tab strip owned by `KumuApp`.
-pub(super) struct NshTabBar {
-    mount_id: u64,
-    pub(super) app_view: Entity<AppView>,
-    events_tx: UnboundedSender<TabBarHostEvent>,
-    last_snapshot: TabBarSnapshot,
-    _actions_task: Task<()>,
-}
-
-impl Drop for NshTabBar {
-    fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
-    }
-}
-
-impl NshTabBar {
-    pub(super) fn new<V: 'static>(
-        initial: TabBarSnapshot,
-        theme: &KumuTheme,
-        window: &mut Window,
-        cx: &mut Context<V>,
-        mut on_action: impl FnMut(&mut V, TabBarAction, &mut Window, &mut Context<V>) + 'static,
-    ) -> Self {
-        let (events_tx, events_rx) = unbounded::<TabBarHostEvent>();
-        let (actions_tx, mut actions_rx) = unbounded::<TabBarAction>();
-        let mount_id = register_mount(TabBarMount {
-            initial: initial.clone(),
-            events_rx,
-            actions_tx,
-        });
-
-        let mapped = nsh_theme(theme);
-        let mode = appearance(theme.mode);
-        let app_view = cx.new(|cx| {
-            let options = AppOptions {
-                title: "Kumu Tabs".to_owned(),
-                ..Default::default()
-            };
-            let view = AppView::new(options, window, cx);
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-            view.load(nsh_platform_gpui::App::Rust(Root::new::<view::TabBarRoot>(
-                move || view::TabBarRootProps {
-                    mount_id: mount_id.into(),
-                },
-            )));
-            view
-        });
-
-        let actions_task = cx.spawn_in(window, async move |this, cx| {
-            while let Some(action) = actions_rx.next().await {
-                let res = this.update_in(cx, |host, window, cx| {
-                    on_action(host, action, window, cx);
-                });
-                if res.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            mount_id,
-            app_view,
-            events_tx,
-            last_snapshot: initial,
-            _actions_task: actions_task,
-        }
-    }
-
-    pub(super) fn sync(&mut self, snapshot: TabBarSnapshot) {
-        if self.last_snapshot != snapshot {
-            self.last_snapshot = snapshot.clone();
-            let _ = self
-                .events_tx
-                .unbounded_send(TabBarHostEvent::Snapshot(snapshot));
-        }
-    }
-
-    pub(super) fn sync_theme(&self, theme: &KumuTheme, cx: &mut gpui::App) {
-        let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
-        self.app_view.update(cx, |view, cx| {
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-        });
     }
 }
 

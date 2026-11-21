@@ -5,15 +5,19 @@
 //! or the unified Home NSH root), and also provides [`NshToastHost`] for GPUI
 //! windows hosting foreground notifications with click-to-action and dismissal.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::rc::Rc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui::{App, AppContext, Context, Entity, Task, Window};
+#[cfg(test)]
+use futures::channel::mpsc::unbounded;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use nsh_base::{
     Anchor, ToastManager, ToastMotion, ToastOptions, ToastStackState, ToastTransitionStatus,
     theme as active_theme, toast, toast_stack,
@@ -21,13 +25,9 @@ use nsh_base::{
 use nsh_core::element::AccessibilityRole;
 use nsh_core::prelude::*;
 use nsh_core::time::now;
-use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use super::assets::icon_svg;
-use super::theme::{
-    TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, appearance, kumu_color, nsh_theme, text_xs_size,
-};
-use crate::theme::KumuTheme;
+use super::theme::{TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -294,18 +294,23 @@ pub fn render_toast_stack(
     )
 }
 
+#[cfg(test)]
 struct ToastOverlayMount {
     cmd_rx: UnboundedReceiver<ToastCommand>,
     event_tx: UnboundedSender<ToastHostEvent>,
 }
 
+#[cfg(test)]
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
 static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, ToastOverlayMount>>> = OnceLock::new();
 
+#[cfg(test)]
 fn pending_mounts() -> &'static Mutex<HashMap<u64, ToastOverlayMount>> {
     PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
 fn register_mount(mount: ToastOverlayMount) -> u64 {
     let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = pending_mounts().lock() {
@@ -314,10 +319,12 @@ fn register_mount(mount: ToastOverlayMount) -> u64 {
     id
 }
 
+#[cfg(test)]
 fn take_mount(id: u64) -> Option<ToastOverlayMount> {
     pending_mounts().lock().ok()?.remove(&id)
 }
 
+#[cfg(test)]
 mod overlay_view {
     use nsh_base::Anchor;
     use nsh_core::prelude::*;
@@ -341,101 +348,6 @@ mod overlay_view {
             .w_full()
             .h_full()
             .child(render_toast_stack(cmd_rx, Anchor::TopRight, event_tx))
-    }
-}
-
-/// Standalone NSH toast overlay host used by GPUI windows that have not yet
-/// unified their root view into a single NSH tree.
-pub struct NshToastHost {
-    mount_id: u64,
-    pub app_view: Entity<AppView>,
-    cmd_tx: UnboundedSender<ToastCommand>,
-    active_count: usize,
-    _task: Task<()>,
-}
-
-impl Drop for NshToastHost {
-    fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
-    }
-}
-
-impl NshToastHost {
-    pub fn new<V: 'static>(
-        theme: &KumuTheme,
-        window: &mut Window,
-        cx: &mut Context<V>,
-        mut on_click: impl FnMut(&mut V, String, &mut Window, &mut Context<V>) + 'static,
-        mut on_count: impl FnMut(&mut V, usize, &mut Context<V>) + 'static,
-    ) -> Self {
-        let (cmd_tx, cmd_rx) = unbounded::<ToastCommand>();
-        let (event_tx, mut event_rx) = unbounded::<ToastHostEvent>();
-        let mount_id = register_mount(ToastOverlayMount { cmd_rx, event_tx });
-
-        let mapped = nsh_theme(theme);
-        let mode = appearance(theme.mode);
-        let app_view = cx.new(|cx| {
-            let options = AppOptions {
-                title: "Kumu Toasts".to_owned(),
-                ..Default::default()
-            };
-            let view = AppView::new(options, window, cx);
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-            view.load(nsh_platform_gpui::App::Rust(Root::new::<
-                overlay_view::ToastOverlayRoot,
-            >(move || {
-                overlay_view::ToastOverlayRootProps {
-                    mount_id: mount_id.into(),
-                }
-            })));
-            view
-        });
-
-        let task = cx.spawn_in(window, async move |this, cx| {
-            while let Some(ev) = event_rx.next().await {
-                let res = this.update_in(cx, |host, window, cx| match ev {
-                    ToastHostEvent::Clicked(id) => on_click(host, id, window, cx),
-                    ToastHostEvent::CountChanged(count) => on_count(host, count, cx),
-                });
-                if res.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            mount_id,
-            app_view,
-            cmd_tx,
-            active_count: 0,
-            _task: task,
-        }
-    }
-
-    pub fn push(&mut self, item: ToastItem) {
-        self.active_count = self.active_count.max(1);
-        let _ = self.cmd_tx.unbounded_send(ToastCommand::Push(item));
-    }
-
-    pub fn dismiss(&self, id: String) {
-        let _ = self.cmd_tx.unbounded_send(ToastCommand::Dismiss(id));
-    }
-
-    pub fn set_active_count(&mut self, count: usize) {
-        self.active_count = count;
-    }
-
-    pub fn is_visible(&self) -> bool {
-        self.active_count > 0
-    }
-
-    pub fn sync_theme(&self, theme: &KumuTheme, cx: &mut App) {
-        let (mapped, mode) = (nsh_theme(theme), appearance(theme.mode));
-        self.app_view.update(cx, |view, cx| {
-            view.set_theme(Some(mapped), cx);
-            view.set_appearance(mode, cx);
-        });
     }
 }
 
