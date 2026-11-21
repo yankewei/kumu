@@ -12,6 +12,9 @@ use futures::StreamExt;
 use gpui_kit::{Context, EventEmitter, Global};
 
 use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX, authenticated_session};
+use crate::agent::status::{
+    STATUS_PREFIX, StatusSignal, TITLE_PREFIX, TITLE_PROMPT_PREFIX, clean_reported_title,
+};
 use crate::db::{Project, Store, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
@@ -80,6 +83,27 @@ pub enum WorkspaceEvent {
         agent: String,
         session: String,
     },
+    /// An agent reported a status transition on its silent OSC channel.
+    AgentStatus {
+        pane: u64,
+        project: i64,
+        agent: String,
+        signal: StatusSignal,
+    },
+    /// An agent reported a session or first-prompt title on its silent OSC channel.
+    AgentTitle {
+        pane: u64,
+        project: i64,
+        agent: String,
+        title: String,
+        is_prompt: bool,
+    },
+    /// A terminal's OSC 0/2 window title changed (visible or parked).
+    PaneTitle {
+        pane: u64,
+        project: i64,
+        title: String,
+    },
 }
 
 /// One native TUI process and where it is drawn.
@@ -100,6 +124,8 @@ struct LiveTerm {
     /// conversation the user actually ended.
     started: Instant,
     last_notification: Option<(Instant, TermNotification)>,
+    /// Last observed OSC 0/2 title, so `PaneTitle` only fires on change.
+    last_title: String,
 }
 
 /// Projects and each live terminal.
@@ -356,6 +382,11 @@ impl Workspace {
         self.live_for_pane(pane).map(|live| live.launch.is_shell())
     }
 
+    /// Last OSC 0/2 title observed for `pane` (visible or parked).
+    pub fn pane_title(&self, pane: u64) -> Option<String> {
+        self.live_for_pane(pane).map(|live| live.last_title.clone())
+    }
+
     /// Snapshot the current process table once so callers checking several
     /// panes do not spawn `/bin/ps` repeatedly on the UI thread.
     pub fn process_tree_snapshot() -> Option<String> {
@@ -428,6 +459,7 @@ impl Workspace {
                 launch,
                 started: Instant::now(),
                 last_notification: None,
+                last_title: String::new(),
             },
         );
         self.pane_term.insert(pane, term_id);
@@ -731,6 +763,41 @@ impl Workspace {
                             }
                             continue;
                         }
+                        // The status channel is silent too: the sidebar and
+                        // pane chrome read it, no banner is shown.
+                        if let Some(signal) = notification
+                            .body
+                            .strip_prefix(STATUS_PREFIX)
+                            .and_then(StatusSignal::parse)
+                        {
+                            if let Some(pane) = owning_pane {
+                                cx.emit(WorkspaceEvent::AgentStatus {
+                                    pane,
+                                    project: project_id,
+                                    agent: notification.title.clone(),
+                                    signal,
+                                });
+                            }
+                            continue;
+                        }
+                        if let Some(rest) = notification.body.strip_prefix(TITLE_PREFIX) {
+                            let (is_prompt, raw) = match rest.strip_prefix(TITLE_PROMPT_PREFIX) {
+                                Some(prompt) => (true, prompt),
+                                None => (false, rest),
+                            };
+                            if let Some(pane) = owning_pane
+                                && let Some(title) = clean_reported_title(raw, is_prompt)
+                            {
+                                cx.emit(WorkspaceEvent::AgentTitle {
+                                    pane,
+                                    project: project_id,
+                                    agent: notification.title.clone(),
+                                    title,
+                                    is_prompt,
+                                });
+                            }
+                            continue;
+                        }
                         let now = Instant::now();
                         if !live
                             .last_notification
@@ -745,6 +812,16 @@ impl Workspace {
                                 terminal: term_id,
                                 project: project_id,
                                 notification,
+                            });
+                        }
+                    }
+                    if snapshot.title != live.last_title {
+                        live.last_title = snapshot.title.clone();
+                        if let Some(pane) = owning_pane {
+                            cx.emit(WorkspaceEvent::PaneTitle {
+                                pane,
+                                project: project_id,
+                                title: snapshot.title.clone(),
                             });
                         }
                     }
@@ -1138,6 +1215,7 @@ mod tests {
                     launch: PaneLaunch::Shell,
                     started: Instant::now(),
                     last_notification: None,
+                    last_title: String::new(),
                 },
             );
         }
@@ -1238,6 +1316,7 @@ mod tests {
                         launch: PaneLaunch::Shell,
                         started: Instant::now(),
                         last_notification: None,
+                        last_title: String::new(),
                     },
                 );
                 if id != 3 {

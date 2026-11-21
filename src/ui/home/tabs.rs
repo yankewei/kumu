@@ -8,6 +8,7 @@ use gpui_kit::*;
 
 use super::KumuApp;
 use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs, TabId};
+use crate::agent::AgentState;
 use crate::ui::tooltip::HoverLabel as _;
 
 impl KumuApp {
@@ -87,6 +88,7 @@ impl KumuApp {
             };
             let launch = self.launches.get(&pane).cloned().unwrap_or_default();
             terminal.update(cx, |terminal, cx| terminal.show(project, &launch, cx));
+            self.sync_pane_agent_status(pane, cx);
         }
     }
 
@@ -347,6 +349,7 @@ impl KumuApp {
                 .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
             self.panes.remove(&pane);
             self.launches.remove(&pane);
+            self.agent_status.remove(&pane);
         }
         if self.selected == Some(project) {
             if leaving_project {
@@ -435,7 +438,26 @@ impl KumuApp {
         for index in 0..tabs.tabs.len() {
             let active = index == tabs.selected;
             let name = Self::tab_name(tabs, index);
-            let tab_id = tabs.tabs[index].id;
+            let tab = &tabs.tabs[index];
+            let tab_id = tab.id;
+            // Only waiting and failed need a glance from a hidden tab; the
+            // running/completed detail is in the pane header and sidebar.
+            let mut waiting = 0;
+            let mut failed = 0;
+            for pane in tab.layout.panes() {
+                match self.agent_status.get(&pane).and_then(|entry| entry.state) {
+                    Some(AgentState::Waiting) => waiting += 1,
+                    Some(AgentState::Failed) => failed += 1,
+                    _ => {}
+                }
+            }
+            let attention = if waiting > 0 {
+                Some((true, theme.warning, format!("{waiting} 个等待输入")))
+            } else if failed > 0 {
+                Some((false, theme.danger, format!("{failed} 个执行失败")))
+            } else {
+                None
+            };
             strip = strip.child(
                 h_flex()
                     .id(format!("project-tab-{project}-{}", tab_id.0))
@@ -473,6 +495,29 @@ impl KumuApp {
                             .text_color(if active { fg } else { muted })
                             .child(name),
                     )
+                    .when_some(attention, |row, (is_waiting, color, detail)| {
+                        row.child(if is_waiting {
+                            div()
+                                .id(format!("project-tab-attention-{project}-{}", tab_id.0))
+                                .flex_none()
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(color)
+                                .hover_label(detail)
+                                .into_any_element()
+                        } else {
+                            div()
+                                .id(format!("project-tab-attention-{project}-{}", tab_id.0))
+                                .flex_none()
+                                .hover_label(detail)
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .with_size(px(12.))
+                                        .text_color(color),
+                                )
+                                .into_any_element()
+                        })
+                    })
                     .child(
                         div()
                             .id(format!("project-tab-close-{project}-{}", tab_id.0))

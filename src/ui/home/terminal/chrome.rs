@@ -6,7 +6,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{TerminalEvent, TerminalView};
-use crate::agent::{AGENTS, installed};
+use crate::agent::{AGENTS, AgentState, installed};
 use crate::term::Snapshot;
 use crate::ui::home::panes::PaneId;
 use crate::ui::tooltip::HoverLabel as _;
@@ -125,6 +125,63 @@ impl TerminalView {
     }
 }
 
+/// The full status pill the pane header keeps: one glyph and a short label,
+/// tinted with the state's semantic color.
+fn agent_status_badge(
+    state: AgentState,
+    link: Hsla,
+    warning: Hsla,
+    success: Hsla,
+    danger: Hsla,
+    radius: Pixels,
+) -> AnyElement {
+    let color = match state {
+        AgentState::Running => link,
+        AgentState::Waiting => warning,
+        AgentState::Completed => success,
+        AgentState::Failed => danger,
+    };
+    let glyph = match state {
+        AgentState::Running => gpui_kit::component::spinner::Spinner::new()
+            .with_size(px(12.))
+            .color(color)
+            .into_any_element(),
+        AgentState::Waiting => div()
+            .size(px(7.))
+            .rounded_full()
+            .bg(color)
+            .into_any_element(),
+        AgentState::Completed => Icon::new(IconName::Check)
+            .with_size(px(12.))
+            .text_color(color)
+            .into_any_element(),
+        AgentState::Failed => Icon::new(IconName::TriangleAlert)
+            .with_size(px(12.))
+            .text_color(color)
+            .into_any_element(),
+    };
+    // The design's tinted badge backgrounds are 14–16% of the state color.
+    let tint = if state == AgentState::Running {
+        0.14
+    } else {
+        0.16
+    };
+    h_flex()
+        .flex_none()
+        .h(px(20.))
+        .gap_1()
+        .px_1p5()
+        .items_center()
+        .rounded(radius)
+        .bg(color.opacity(tint))
+        .text_xs()
+        .font_medium()
+        .text_color(color)
+        .child(glyph)
+        .child(state.label())
+        .into_any_element()
+}
+
 /// Top bar like the reference pane chrome: mark, name, shortened cwd, split /
 /// close actions.
 #[allow(clippy::too_many_arguments)]
@@ -134,6 +191,7 @@ pub(super) fn terminal_header(
     name: String,
     cwd: String,
     note: Option<String>,
+    status: Option<AgentState>,
     header_bg: Hsla,
     can_close: bool,
     muted: Hsla,
@@ -144,6 +202,10 @@ pub(super) fn terminal_header(
     cx: &mut Context<TerminalView>,
 ) -> impl IntoElement {
     let path = short_cwd(&cwd);
+    let (link, success, danger) = {
+        let theme = cx.theme();
+        (theme.link, theme.success, theme.danger)
+    };
 
     h_flex()
         .id(format!("pane-head-{}", pane.0))
@@ -185,6 +247,11 @@ pub(super) fn terminal_header(
         )
         .when_some(note, |row, text| {
             row.child(div().flex_none().text_xs().text_color(warning).child(text))
+        })
+        .when_some(status, |row, status| {
+            row.child(agent_status_badge(
+                status, link, warning, success, danger, radius,
+            ))
         })
         .child(agent_menu_button(pane, muted, hover, cx))
         .child(chrome_button(

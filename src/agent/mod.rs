@@ -16,6 +16,8 @@ mod config;
 pub mod integration;
 pub mod launch;
 mod registry;
+pub mod status;
 
 pub use config::{executable, installed, installed_with_shell_env};
 pub use registry::{AGENTS, id_for};
+pub use status::{AgentState, StatusSignal};

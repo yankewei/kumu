@@ -455,6 +455,7 @@ impl KumuApp {
                         .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
                     self.panes.remove(&pane);
                     self.launches.remove(&pane);
+                    self.agent_status.remove(&pane);
                 }
             }
         }

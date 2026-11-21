@@ -10,8 +10,8 @@ Kumu 不改写用户的 Agent 启动命令，不添加 `-c`、`--settings` 或 `
 
 | Agent | 默认注册位置 | 事件来源 |
 | --- | --- | --- |
-| Codex | `~/.codex/hooks.json` | `Stop`、`PermissionRequest`、匹配 `request_user_input` 的 `PreToolUse` |
-| Claude Code | `~/.claude/settings.json` 的 `hooks` | `Stop`、`PermissionRequest`、提问／计划确认的 `PreToolUse`、MCP elicitation 的 `Notification` |
+| Codex | `~/.codex/hooks.json` | `UserPromptSubmit`、`PostToolUse`、`Stop`、`PermissionRequest`、匹配 `request_user_input` 的 `PreToolUse` |
+| Claude Code | `~/.claude/settings.json` 的 `hooks` | `UserPromptSubmit`、`PostToolUse`、`PostToolUseFailure`、`Stop`、`PermissionRequest`、提问／计划确认的 `PreToolUse`、MCP elicitation 的 `Notification` |
 | OpenCode | `~/.config/opencode/plugins/kumu-notifications/` | 自动发现的插件，支持 V2 TUI 事件和 V1 `server()` hooks |
 | Pi | `~/.pi/agent/extensions/kumu-notifications/` | `agent_settled`、`ui_prompt_start`、提问工具事件 |
 | Oh My Pi | `~/.omp/agent/extensions/kumu-notifications/` | `agent_end`、`tool_approval_requested`、提问工具事件、输入／确认／选择对话框 |
@@ -64,6 +64,21 @@ Agent 窗格需要记住“这是哪个对话”，重启后才知道带哪条 `
 - Kumu 看到 body 以 `kumu-session:` 开头就把它记到窗格上，**不弹提醒**。
 
 Agent 不一定从「新建 Agent 窗格」启动：手动在普通 shell 窗格输入的支持恢复的 Agent（OpenCode／Codex／Claude／Cursor／Antigravity CLI）只要发出会话更新，Kumu 就把这个窗格记为对应 Agent，下次启动直接带恢复参数启动（关闭“恢复 Agent 会话”时保持 shell 窗格不变）。会话 id 来自该窗格自己的 PTY，因此不同分栏里的 Agent 不会记错。没有恢复语法的 Agent（Pi、OMP、Grok）不会接管 shell 窗格，否则只会把用户的 shell 换成一个全新的 Agent。
+
+### Agent 状态与标题也走这条通道
+
+侧边栏全局的「Agent 状态」、窗格标题栏的状态胶囊和页签的注意提示使用同一条 OSC 通道上的静默消息：
+
+- 状态：`OSC 777;notify;<agent>;kumu-status:<running|waiting|completed|failed|resume|idle>`；
+- 标题：`OSC 777;notify;<agent>;kumu-title:<session-title>`（权威会话标题）或 `kumu-title:prompt:<first-prompt>`（首轮提示词）。
+
+它们都不弹提醒，只更新该 PTY 所属窗格的状态与标题：
+
+- 存活即入列：只要 Agent 窗格存在或普通 shell 中启动的 Agent 上报了会话／状态，就会持续留在侧边栏全局列表中，点击只跨项目／跨页签跳转聚焦，**不因查看清除**；只有进程退出回 shell 或关闭窗格时移出。
+- 标题优先级：Agent 协议上报（`kumu-title:`） > 终端 OSC 0/2 标题（清洗前缀符号并过滤通用程序名／路径） > 回退到 Agent 名称；不再通过拦截终端按键猜测输入标题。
+- 状态流转：新建或重启后为空闲（窗格标题栏不显示胶囊）；提交任务（`UserPromptSubmit`／`agent_start`／`session.execution.started`）进入 `running`；权限或提问进入 `waiting`，确认后继续执行（`PostToolUse`／`replied`／对话框结束）发送 `resume` 从 `waiting` 回到 `running`；本轮结束为 `completed`，失败为 `failed`；用户取消中断（OpenCode `interrupted`、Pi `aborted`、OMP `ompInterrupted`、Antigravity `USER_CANCELED`）发送 `idle` 回到空闲。
+
+状态只用于界面，不替代任务结果判断；`Stop` 仍表示本轮结束，不表示改动已验证。
 
 这个接管有一个已知边界：Kumu 收不到“Agent 主动退出、shell 还在”的事件，只在退出 App 或关闭窗口时用进程树判断被接管的 Agent 是否仍在运行。已经退出的 Agent 会被释放，窗格恢复为 shell；仍在运行的会话会被恢复。但 App 运行期间窗格会一直带着这个 launch：如果随后在同一个窗格里启动另一个可恢复的 Agent，会替换掉原来的记录；如果启动的是 Pi／OMP／Grok，原记录会保留。需要撤销时，关闭该窗格再新开，或重启后退出被恢复的 Agent。
 

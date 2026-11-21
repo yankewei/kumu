@@ -16,6 +16,8 @@ mod terminal;
 use std::collections::{HashMap, HashSet};
 
 use crate::agent::launch::{PaneLaunch, session_launch};
+use crate::agent::status::clean_osc_title;
+use crate::agent::{AgentState, StatusSignal};
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
@@ -69,6 +71,44 @@ const SIDEBAR_WIDTH: f32 = 256.;
 const SIDEBAR_MIN_WIDTH: f32 = 180.;
 const SIDEBAR_MAX_WIDTH: f32 = 520.;
 
+/// What the sidebar, pane header and tab strip know about a live agent.
+#[derive(Clone, Debug)]
+pub(super) struct AgentEntry {
+    /// Active state, or `None` when the agent is alive and idle/ready.
+    pub(super) state: Option<AgentState>,
+    /// Authoritative session title reported via `kumu-title:<title>`.
+    pub(super) session_title: Option<String>,
+    /// First prompt reported via `kumu-title:prompt:<text>`.
+    pub(super) prompt_title: Option<String>,
+    /// Cleaned OSC 0/2 window title (`snapshot.title`).
+    pub(super) osc_title: Option<String>,
+    /// Agent id (e.g. `"claude"`, `"opencode"`).
+    pub(super) agent: String,
+}
+
+impl AgentEntry {
+    fn idle(agent: String) -> Self {
+        Self {
+            state: None,
+            session_title: None,
+            prompt_title: None,
+            osc_title: None,
+            agent,
+        }
+    }
+
+    /// Title priority: reported session title > first prompt > OSC 0/2 title > agent name.
+    pub(super) fn display_title(&self) -> String {
+        self.session_title
+            .as_deref()
+            .or(self.prompt_title.as_deref())
+            .or(self.osc_title.as_deref())
+            .map(str::to_string)
+            .or_else(|| agent_display_name(&self.agent))
+            .unwrap_or_else(|| self.agent.clone())
+    }
+}
+
 pub struct KumuApp {
     /// Projects and their live shells; the home view draws it and hands it
     /// every user action.
@@ -81,6 +121,10 @@ pub struct KumuApp {
     /// Terminals that requested attention while unattended, mapped to their
     /// project for the sidebar marker.
     unread_notifications: HashMap<u64, i64>,
+    /// Active agent state per pane. Idle and plain shell panes have no entry.
+    agent_status: HashMap<PaneId, AgentEntry>,
+    /// Whether the sidebar's agent section is collapsed to its summary line.
+    agents_collapsed: bool,
     /// A persistence failure the workspace reported, shown above the panes
     /// until dismissed.
     store_error: Option<String>,
@@ -241,6 +285,15 @@ impl KumuApp {
                 } else {
                     this.launches.insert(pane, next.clone());
                 }
+                // When the agent exits back to a shell it is no longer alive,
+                // so it leaves the global agent list. A broken resume that
+                // restarts fresh comes back idle with no stale title.
+                if next.is_shell() {
+                    this.agent_status.remove(&pane);
+                } else if let PaneLaunch::Agent { agent, .. } = &next {
+                    this.agent_status
+                        .insert(pane, AgentEntry::idle(agent.clone()));
+                }
                 // Only the visible tab's panes are on screen. Restarting a
                 // hidden one would spend a process nobody can see; it starts
                 // when its tab is selected.
@@ -252,6 +305,7 @@ impl KumuApp {
                         terminal.show(*project, &next, cx);
                     });
                 }
+                this.sync_pane_agent_status(pane, cx);
                 this.persist_workspace(cx);
                 cx.notify();
             }
@@ -268,25 +322,70 @@ impl KumuApp {
                 // overwrite the spec of the agent that runs in it now. Only a
                 // shell pane may switch agents: that is the user starting a
                 // different one in the same shell.
+                let previous_session = match this.launches.get(&pane) {
+                    Some(PaneLaunch::Agent { session, .. }) => session.clone(),
+                    _ => None,
+                };
                 let shell_pane = this
                     .workspace
                     .read(cx)
                     .pane_is_shell(pane.0)
                     .unwrap_or(false);
-                let Some(launch) = session_launch(
+                if let Some(launch) = session_launch(
                     this.launches.get(&pane),
                     agent,
                     session,
                     this.auto_resume,
                     shell_pane,
-                ) else {
-                    return;
-                };
-                if this.launches.get(&pane) == Some(&launch) {
-                    return;
+                ) && this.launches.get(&pane) != Some(&launch)
+                {
+                    this.launches.insert(pane, launch);
+                    this.persist_workspace(cx);
                 }
-                this.launches.insert(pane, launch);
-                this.persist_workspace(cx);
+                let osc_title = this
+                    .workspace
+                    .read(cx)
+                    .pane_title(pane.0)
+                    .and_then(|title| clean_osc_title(&title, agent));
+                let entry = this.agent_status.entry(pane).or_insert_with(|| {
+                    let mut entry = AgentEntry::idle(agent.to_string());
+                    entry.osc_title = osc_title;
+                    entry
+                });
+                let agent_changed = entry.agent != agent;
+                let session_changed = previous_session
+                    .as_deref()
+                    .is_some_and(|prev| prev != session);
+                if agent_changed || session_changed {
+                    entry.session_title = None;
+                    entry.prompt_title = None;
+                }
+                entry.agent = agent.to_string();
+                cx.notify();
+            }
+            WorkspaceEvent::AgentStatus {
+                pane,
+                project,
+                agent,
+                signal,
+            } => {
+                this.note_agent_status(PaneId(*pane), *project, agent, *signal, cx);
+            }
+            WorkspaceEvent::AgentTitle {
+                pane,
+                project,
+                agent,
+                title,
+                is_prompt,
+            } => {
+                this.note_agent_title(PaneId(*pane), *project, agent, title, *is_prompt, cx);
+            }
+            WorkspaceEvent::PaneTitle {
+                pane,
+                project,
+                title,
+            } => {
+                this.note_pane_title(PaneId(*pane), *project, title, cx);
             }
         })
         .detach();
@@ -342,6 +441,8 @@ impl KumuApp {
             settings_window: None,
             selected: None,
             unread_notifications: HashMap::new(),
+            agent_status: HashMap::new(),
+            agents_collapsed: false,
             store_error: startup_error,
             panes: HashMap::new(),
             tabs_by_project: HashMap::new(),
@@ -415,6 +516,13 @@ impl KumuApp {
         } = restored;
         self.tabs_by_project = tabs;
         self.launches = launches;
+        self.agent_status.clear();
+        for (pane, launch) in &self.launches {
+            if let PaneLaunch::Agent { agent, .. } = launch {
+                self.agent_status
+                    .insert(*pane, AgentEntry::idle(agent.clone()));
+            }
+        }
         if !self.auto_resume {
             // The panes still come back as agent panes; only the conversations
             // stay behind.
@@ -713,6 +821,120 @@ impl KumuApp {
         }
     }
 
+    /// The agent id a pane was launched with, or `None` for a shell.
+    fn pane_agent_id(&self, pane: PaneId) -> Option<String> {
+        match self.launches.get(&pane) {
+            Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
+            _ => None,
+        }
+    }
+
+    /// Ensure an `AgentEntry` exists for `pane`, seeding its OSC 0/2 title if
+    /// the terminal already set one.
+    fn ensure_agent_entry(
+        &mut self,
+        pane: PaneId,
+        reported_agent: &str,
+        cx: &Context<Self>,
+    ) -> &mut AgentEntry {
+        let launched = self.pane_agent_id(pane);
+        let agent = crate::agent::id_for(reported_agent)
+            .map(str::to_string)
+            .or(launched)
+            .unwrap_or_else(|| reported_agent.to_string());
+        let osc_title = self
+            .workspace
+            .read(cx)
+            .pane_title(pane.0)
+            .and_then(|title| clean_osc_title(&title, &agent));
+        let entry = self.agent_status.entry(pane).or_insert_with(|| {
+            let mut entry = AgentEntry::idle(agent.clone());
+            entry.osc_title = osc_title;
+            entry
+        });
+        if !agent.is_empty() && entry.agent != agent {
+            entry.agent = agent;
+            entry.session_title = None;
+            entry.prompt_title = None;
+        }
+        entry
+    }
+
+    /// Record a status signal an agent reported on its silent OSC channel.
+    fn note_agent_status(
+        &mut self,
+        pane: PaneId,
+        project: i64,
+        agent: &str,
+        signal: StatusSignal,
+        cx: &mut Context<Self>,
+    ) {
+        // A stale process must not write into a pane that now belongs to
+        // another project.
+        if self.pane_tab(pane).map(|(owner, _)| owner) != Some(project) {
+            return;
+        }
+        let entry = self.ensure_agent_entry(pane, agent, cx);
+        match signal {
+            StatusSignal::Active(state) => entry.state = Some(state),
+            StatusSignal::Resume => {
+                if entry.state == Some(AgentState::Waiting) {
+                    entry.state = Some(AgentState::Running);
+                }
+            }
+            StatusSignal::Idle => entry.state = None,
+        }
+        self.sync_pane_agent_status(pane, cx);
+        cx.notify();
+    }
+
+    /// Record a session or first-prompt title reported on `kumu-title:`.
+    fn note_agent_title(
+        &mut self,
+        pane: PaneId,
+        project: i64,
+        agent: &str,
+        title: &str,
+        is_prompt: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pane_tab(pane).map(|(owner, _)| owner) != Some(project) {
+            return;
+        }
+        let entry = self.ensure_agent_entry(pane, agent, cx);
+        if !is_prompt {
+            entry.session_title = Some(title.to_string());
+        } else if entry.prompt_title.is_none() {
+            entry.prompt_title = Some(title.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Keep a live agent's OSC 0/2 fallback title up to date when the terminal
+    /// changes its window title.
+    fn note_pane_title(&mut self, pane: PaneId, project: i64, title: &str, cx: &mut Context<Self>) {
+        if self.pane_tab(pane).map(|(owner, _)| owner) != Some(project) {
+            return;
+        }
+        let Some(entry) = self.agent_status.get_mut(&pane) else {
+            return;
+        };
+        let next = clean_osc_title(title, &entry.agent);
+        if next != entry.osc_title {
+            entry.osc_title = next;
+            cx.notify();
+        }
+    }
+
+    /// Push the active state the pane's header should draw (`None` for idle
+    /// agents and plain shells).
+    pub(super) fn sync_pane_agent_status(&self, pane: PaneId, cx: &mut Context<Self>) {
+        let state = self.agent_status.get(&pane).and_then(|entry| entry.state);
+        if let Some(view) = self.panes.get(&pane) {
+            view.update(cx, |view, cx| view.set_agent_status(state, cx));
+        }
+    }
+
     /// The project that owns `pane`, including panes in hidden tabs.
     fn pane_project(&self, pane: PaneId, cx: &Context<Self>) -> Option<i64> {
         self.pane_tab(pane).map(|(project, _)| project).or_else(|| {
@@ -883,6 +1105,10 @@ impl KumuApp {
         if launch.is_shell() {
             self.launches.remove(&new_id);
         } else {
+            if let PaneLaunch::Agent { agent, .. } = &launch {
+                self.agent_status
+                    .insert(new_id, AgentEntry::idle(agent.clone()));
+            }
             self.launches.insert(new_id, launch.clone());
         }
         let terminal = self.install_pane(new_id, cx);
@@ -943,6 +1169,7 @@ impl KumuApp {
             .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
         self.panes.remove(&pane);
         self.launches.remove(&pane);
+        self.agent_status.remove(&pane);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);

@@ -24,6 +24,7 @@ use gpui_kit::*;
 use self::chrome::{header_identity, header_note, terminal_header};
 use self::paint::{GridPaint, RowOp, Typeface, cell_size, grid_origin, paint_color, paint_grid};
 use super::panes::{PaneDirection, PaneId};
+use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::link;
@@ -106,6 +107,8 @@ pub struct TerminalView {
     theme_rev: u64,
     /// IME composition preview ("nihao" before 你好).
     marked: Option<String>,
+    /// Active agent state for the pane header's status pill.
+    agent_status: Option<AgentState>,
     cursor_at: Rc<Cell<CursorAt>>,
     grid_at: Rc<Cell<GridAt>>,
     /// Left-button selection drag in progress.
@@ -169,6 +172,7 @@ impl TerminalView {
             can_close: false,
             theme_rev: u64::MAX,
             marked: None,
+            agent_status: None,
             cursor_at: Rc::new(Cell::new(CursorAt {
                 bounds: None,
                 cell: (px(0.), px(0.)),
@@ -210,6 +214,15 @@ impl TerminalView {
         }
         self.active = active;
         self.can_close = can_close;
+        cx.notify();
+    }
+
+    /// The state the pane header shows beside the path, or `None` for a shell.
+    pub fn set_agent_status(&mut self, status: Option<AgentState>, cx: &mut Context<Self>) {
+        if self.agent_status == status {
+            return;
+        }
+        self.agent_status = status;
         cx.notify();
     }
 
@@ -392,7 +405,19 @@ impl Render for TerminalView {
         let link_spans_layout = link_spans.clone();
         let link_hitboxes_layout = link_hitboxes.clone();
         let header = terminal_header(
-            pane, mark, name, cwd, note, header_bg, can_close, muted, fg, warning, radius, hover,
+            pane,
+            mark,
+            name,
+            cwd,
+            note,
+            self.agent_status,
+            header_bg,
+            can_close,
+            muted,
+            fg,
+            warning,
+            radius,
+            hover,
             cx,
         );
         let typeface = Typeface {

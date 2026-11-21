@@ -9,6 +9,10 @@ use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
 use serde_json::{Value, json};
 
 use super::launch::{SESSION_PREFIX, clean_session};
+use super::status::{
+    AgentState, STATUS_PREFIX, StatusSignal, TITLE_PREFIX, TITLE_PROMPT_PREFIX,
+    clean_reported_title,
+};
 use crate::term::SESSION_TOKEN_ENV;
 
 const MARKER: &str = " # kumu-notifications";
@@ -124,6 +128,9 @@ fn hook_groups(agent: &str) -> Vec<(&'static str, Value)> {
         // same turn. Keep only MCP elicitation forms, which have no
         // PermissionRequest event of their own.
         "claude" => vec![
+            ("UserPromptSubmit", None, "start"),
+            ("PostToolUse", None, "resume"),
+            ("PostToolUseFailure", None, "resume"),
             ("Stop", None, "complete"),
             ("PermissionRequest", None, "permission"),
             ("PreToolUse", Some("AskUserQuestion|ExitPlanMode"), "input"),
@@ -133,6 +140,8 @@ fn hook_groups(agent: &str) -> Vec<(&'static str, Value)> {
         // channel that carries a permission prompt or a question.
         "grok" => vec![("Stop", None, "complete"), ("Notification", None, "input")],
         _ => vec![
+            ("UserPromptSubmit", None, "start"),
+            ("PostToolUse", None, "resume"),
             ("Stop", None, "complete"),
             ("PermissionRequest", None, "permission"),
             ("PreToolUse", Some("^request_user_input$"), "input"),
@@ -789,6 +798,22 @@ fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Bring Kumu's managed registrations up to date at startup.
+///
+/// Native extensions (OpenCode, Pi, OMP) are refreshed whenever their link
+/// already points at Kumu. Claude Code hooks are upgraded in place when
+/// already enabled (Claude reloads settings without a separate trust step);
+/// Codex is left for the Settings UI because changing `hooks.json` requires
+/// re-trusting in `/hooks`.
+pub fn refresh_installed() {
+    refresh_native();
+    if matches!(status("claude"), Ok(Status::NeedsRepair))
+        && let Err(error) = install("claude")
+    {
+        eprintln!("[agent] 刷新 claude hooks 失败：{error}");
+    }
+}
+
 /// Bring Kumu's own extension files up to date at startup, for an agent whose
 /// registration already points at them.
 pub fn refresh_native() {
@@ -1005,6 +1030,17 @@ pub fn run_cli() -> Option<i32> {
     {
         sequence.push_str(&update);
     }
+    if kind == "start"
+        && let Some(prompt) = payload.as_ref().and_then(hook_prompt)
+        && let Some(update) = title_sequence(&agent, &prompt, true)
+    {
+        sequence.push_str(&update);
+    }
+    // The sidebar tracks the active states plus resume/idle transitions; the
+    // human notification below fires only for user-facing events.
+    if let Some(signal) = notification_status(&agent, &kind, payload.as_ref()) {
+        sequence.push_str(&status_sequence(&agent, signal));
+    }
     if let Some(message) = notification_message(&agent, &kind, payload.as_ref()) {
         sequence.push_str(&format!("\x1b]777;notify;{agent};{message}\x07"));
     }
@@ -1033,14 +1069,11 @@ pub fn run_cli() -> Option<i32> {
 }
 
 fn notification_message(agent: &str, kind: &str, payload: Option<&Value>) -> Option<&'static str> {
-    if kind == "session" {
+    if matches!(kind, "session" | "start" | "resume" | "idle") {
         return None;
     }
     if agent == "agy" && kind == "complete" {
-        match payload
-            .and_then(|value| value.get("terminationReason"))
-            .and_then(Value::as_str)
-        {
+        match agy_termination(payload) {
             Some("USER_CANCELED") => return None,
             Some("ERROR") => return Some("任务执行失败"),
             _ => {}
@@ -1051,6 +1084,57 @@ fn notification_message(agent: &str, kind: &str, payload: Option<&Value>) -> Opt
         "permission" => "需要你确认操作权限",
         _ => "需要你输入、确认或选择",
     })
+}
+
+fn agy_termination(payload: Option<&Value>) -> Option<&str> {
+    payload
+        .and_then(|value| value.get("terminationReason"))
+        .and_then(Value::as_str)
+}
+
+/// The status signal a hook kind reports to the sidebar. `session` is only a
+/// conversation id; a cancelled Antigravity turn returns the pane to idle.
+fn notification_status(agent: &str, kind: &str, payload: Option<&Value>) -> Option<StatusSignal> {
+    match kind {
+        "start" => Some(StatusSignal::Active(AgentState::Running)),
+        "resume" => Some(StatusSignal::Resume),
+        "idle" => Some(StatusSignal::Idle),
+        "permission" | "input" | "ask" => Some(StatusSignal::Active(AgentState::Waiting)),
+        "failed" => Some(StatusSignal::Active(AgentState::Failed)),
+        "complete" if agent == "agy" => match agy_termination(payload) {
+            Some("USER_CANCELED") => Some(StatusSignal::Idle),
+            Some("ERROR") => Some(StatusSignal::Active(AgentState::Failed)),
+            _ => Some(StatusSignal::Active(AgentState::Completed)),
+        },
+        "complete" => Some(StatusSignal::Active(AgentState::Completed)),
+        _ => None,
+    }
+}
+
+/// The silent status update; the same notification-shaped OSC every hook
+/// already writes, with a body the pane records instead of showing.
+fn status_sequence(agent: &str, signal: StatusSignal) -> String {
+    format!(
+        "\x1b]777;notify;{agent};{STATUS_PREFIX}{}\x07",
+        signal.as_str()
+    )
+}
+
+fn hook_prompt(payload: &Value) -> Option<String> {
+    payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn title_sequence(agent: &str, raw: &str, is_prompt: bool) -> Option<String> {
+    let title = clean_reported_title(raw, is_prompt)?;
+    let prefix = if is_prompt {
+        format!("{TITLE_PREFIX}{TITLE_PROMPT_PREFIX}")
+    } else {
+        TITLE_PREFIX.to_string()
+    };
+    Some(format!("\x1b]777;notify;{agent};{prefix}{title}\x07"))
 }
 
 /// The hook event as JSON, or `None` when stdin is a terminal or stays silent.
@@ -1139,6 +1223,58 @@ mod tests {
         assert!(session_sequence("codex", "a;b", None).is_none());
         assert!(session_sequence("codex", "a\x07b", None).is_none());
         assert!(session_sequence("codex", "--yolo", Some("tok99")).is_none());
+    }
+
+    #[test]
+    fn statuses_and_prompt_titles_are_silent_oscs() {
+        assert_eq!(
+            status_sequence("codex", StatusSignal::Active(AgentState::Waiting)),
+            "\x1b]777;notify;codex;kumu-status:waiting\x07"
+        );
+        assert_eq!(
+            status_sequence("claude", StatusSignal::Resume),
+            "\x1b]777;notify;claude;kumu-status:resume\x07"
+        );
+        assert_eq!(
+            title_sequence("claude", "Fix sidebar status\nmore details", true).as_deref(),
+            Some("\x1b]777;notify;claude;kumu-title:prompt:Fix sidebar status\x07")
+        );
+        assert_eq!(title_sequence("claude", "/compact", true), None);
+        assert_eq!(
+            notification_status("claude", "start", None),
+            Some(StatusSignal::Active(AgentState::Running))
+        );
+        assert_eq!(
+            notification_status("claude", "resume", None),
+            Some(StatusSignal::Resume)
+        );
+        assert_eq!(notification_message("claude", "start", None), None);
+        assert_eq!(notification_message("claude", "resume", None), None);
+        assert_eq!(
+            notification_status("claude", "complete", None),
+            Some(StatusSignal::Active(AgentState::Completed))
+        );
+        assert_eq!(
+            notification_status("claude", "permission", None),
+            Some(StatusSignal::Active(AgentState::Waiting))
+        );
+        assert_eq!(notification_status("claude", "session", None), None);
+        assert_eq!(
+            notification_status(
+                "agy",
+                "complete",
+                Some(&json!({"terminationReason": "ERROR"}))
+            ),
+            Some(StatusSignal::Active(AgentState::Failed))
+        );
+        assert_eq!(
+            notification_status(
+                "agy",
+                "complete",
+                Some(&json!({"terminationReason": "USER_CANCELED"}))
+            ),
+            Some(StatusSignal::Idle)
+        );
     }
 
     #[test]

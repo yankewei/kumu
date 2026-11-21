@@ -464,18 +464,26 @@ impl SettingsWindow {
                 let agent = a.id;
                 let status = self.integrations.get(agent);
                 let registered = matches!(status, Some(Ok(integration::Status::Registered)));
+                let needs_repair = matches!(status, Some(Ok(integration::Status::NeedsRepair)));
                 // Installed and registered are separate facts. Without the CLI
                 // there is nothing to register against, so the row only reports
                 // the absence. Once installed, one button carries the
-                // notification state: enable when it is off, disable when it is
-                // on.
-                let notification_pill =
-                    (installed && registered).then_some((PillTone::Accent, "已开启"));
+                // notification state: enable when it is off, upgrade when new
+                // hook events were added, disable when it is on.
+                let notification_pill = if installed && registered {
+                    Some((PillTone::Accent, "已开启"))
+                } else if installed && needs_repair {
+                    Some((PillTone::Neutral, "需更新"))
+                } else {
+                    None
+                };
                 // The codex hint is the one thing the row itself cannot say.
-                let hint = (installed && registered && agent == "codex")
+                let hint = (installed && (registered || needs_repair) && agent == "codex")
                     .then_some("在 Codex /hooks 中确认信任");
                 let (action, removing) = if registered {
                     ("关闭通知", true)
+                } else if needs_repair {
+                    ("更新配置", false)
                 } else {
                     ("开启通知", false)
                 };

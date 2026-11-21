@@ -43,10 +43,9 @@ fn main() {
     if let Some(code) = agent::integration::run_cli().or_else(control::run_cli) {
         std::process::exit(code);
     }
-    // A registered native extension (OpenCode, Pi, OMP) is a copy of this
-    // build's files, so an app update has to refresh it before any agent pane
-    // starts. Hook-based agents run this binary and need nothing here.
-    agent::integration::refresh_native();
+    // Keep registered native extensions (OpenCode, Pi, OMP) and Claude hooks
+    // aligned with this build before any agent pane starts.
+    agent::integration::refresh_installed();
     // Capture the login shell's environment before any pane starts: an agent
     // pane runs its binary directly and would otherwise miss what `~/.zshrc`
     // exports (PATH, API keys) when Kumu was opened from Finder.

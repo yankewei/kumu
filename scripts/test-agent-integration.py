@@ -23,6 +23,9 @@ BINARY = Path(__file__).resolve().parents[1] / "target/debug/kumu"
 def detached_env(**extra):
     env = dict(os.environ, KUMU_TERMINAL="1", KUMU_APP_BINARY=str(BINARY))
     env.pop("KUMU_TTY", None)
+    # Running these tests inside a Kumu pane must not add the pane's token to
+    # the expected sequences.
+    env.pop("KUMU_SESSION_TOKEN", None)
     env.update(extra)
     return env
 
@@ -131,17 +134,22 @@ printf 'ORIGINAL=<%s>\\n' "$@"
             (
                 "complete",
                 {"conversationId": "conv-123", "terminationReason": "USER_CANCELED"},
-                "\x1b]777;notify;agy;kumu-session:conv-123\x07",
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07"
+                "\x1b]777;notify;agy;kumu-status:idle\x07",
             ),
             (
                 "complete",
                 {"conversationId": "conv-123", "terminationReason": "ERROR"},
-                "\x1b]777;notify;agy;kumu-session:conv-123\x07\x1b]777;notify;agy;任务执行失败\x07",
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07"
+                "\x1b]777;notify;agy;kumu-status:failed\x07"
+                "\x1b]777;notify;agy;任务执行失败\x07",
             ),
             (
                 "complete",
                 {"conversationId": "conv-123", "terminationReason": "NO_TOOL_CALL"},
-                "\x1b]777;notify;agy;kumu-session:conv-123\x07\x1b]777;notify;agy;本轮任务已结束\x07",
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07"
+                "\x1b]777;notify;agy;kumu-status:completed\x07"
+                "\x1b]777;notify;agy;本轮任务已结束\x07",
             ),
         ]
         for event, payload, expected in cases:
@@ -166,6 +174,31 @@ printf 'ORIGINAL=<%s>\\n' "$@"
                     os.close(master)
                 self.assertEqual((process.returncode, stdout, stderr), (0, b"", b""))
                 self.assertEqual(output, expected)
+
+    def test_start_and_resume_hooks_emit_silent_status_and_prompt_title(self):
+        process = subprocess.run(
+            [BINARY, "--kumu-notify", "claude", "start"],
+            env=detached_env(),
+            input=json.dumps({"session_id": "s1", "prompt": "Implement status\nmore"}).encode(),
+            capture_output=True,
+            timeout=5,
+            preexec_fn=os.setsid,
+        )
+        self.assertEqual((process.returncode, process.stderr), (0, b""))
+        sequence = json.loads(process.stdout)["terminalSequence"]
+        self.assertEqual(
+            sequence,
+            "\x1b]777;notify;claude;kumu-session:s1\x07"
+            "\x1b]777;notify;claude;kumu-title:prompt:Implement status\x07"
+            "\x1b]777;notify;claude;kumu-status:running\x07",
+        )
+
+        resume = run_hook(["claude", "resume"], detached_env())
+        self.assertEqual((resume.returncode, resume.stderr), (0, b""))
+        self.assertEqual(
+            json.loads(resume.stdout)["terminalSequence"],
+            "\x1b]777;notify;claude;kumu-status:resume\x07",
+        )
 
     def test_callbacks_are_silent_outside_kumu(self):
         for agent in ("codex", "claude", "grok", "cursor", "agy"):

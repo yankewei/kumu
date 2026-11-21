@@ -8,7 +8,21 @@ use gpui_kit::*;
 use gpui_updater::UpdateStatus;
 
 use super::KumuApp;
+use super::panes::PaneId;
+use crate::agent::AgentState;
 use crate::ui::tooltip::HoverLabel as _;
+
+/// One live agent row in the global sidebar list.
+pub(super) struct AgentRow {
+    pane: PaneId,
+    project_name: String,
+    project_path: String,
+    tab_name: String,
+    agent: String,
+    title: String,
+    state: Option<AgentState>,
+    focused: bool,
+}
 
 impl KumuApp {
     pub(super) fn render_sidebar(&self, cx: &Context<Self>) -> Div {
@@ -77,6 +91,18 @@ impl KumuApp {
             }
         }
 
+        // The agent section floats between the projects and the footer,
+        // slightly below the midpoint: two parts of free space above it and
+        // one below. Without agents a single spacer keeps the footer down.
+        let agent_zone: Vec<AnyElement> = match self.render_agents_section(cx) {
+            Some(section) => vec![
+                div().flex_grow(2.).min_h_0().into_any_element(),
+                section,
+                div().flex_grow(1.).min_h_0().into_any_element(),
+            ],
+            None => vec![div().flex_1().min_h_0().into_any_element()],
+        };
+
         v_flex()
             // The resizable panel beside the workspace owns the width; the
             // column just fills it.
@@ -115,12 +141,17 @@ impl KumuApp {
                     ),
             )
             .child(
+                // Content height, so the flexible spacers around the Agent
+                // section decide where it sits; a long project list scrolls
+                // instead of pushing the footer down.
                 div()
-                    .flex_1()
+                    .flex_shrink_1()
+                    .min_h_0()
                     .id("project-list")
                     .overflow_y_scroll()
                     .children(tree),
             )
+            .children(agent_zone)
             .child(
                 v_flex()
                     .px_3()
@@ -159,6 +190,265 @@ impl KumuApp {
                         ),
                     ),
             )
+    }
+
+    /// Every live agent across all projects and worktrees, across all tabs.
+    /// Waiting comes first, idle last; panes in the same state keep project
+    /// tree and layout order.
+    fn agent_rows(&self, cx: &Context<Self>) -> Vec<AgentRow> {
+        let workspace = self.workspace.read(cx);
+        let projects = workspace.projects();
+        let mut ordered = Vec::with_capacity(projects.len());
+        let mut seen = std::collections::HashSet::with_capacity(projects.len());
+        let roots = projects.iter().filter(|project| {
+            project.parent_id.is_none_or(|parent| {
+                parent == project.id || !projects.iter().any(|candidate| candidate.id == parent)
+            })
+        });
+        for project in roots {
+            if seen.insert(project.id) {
+                ordered.push(project);
+            }
+            for worktree in projects
+                .iter()
+                .filter(|worktree| worktree.parent_id == Some(project.id))
+            {
+                if seen.insert(worktree.id) {
+                    ordered.push(worktree);
+                }
+            }
+        }
+        for project in projects {
+            if seen.insert(project.id) {
+                ordered.push(project);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for project in ordered {
+            let Some(tabs) = self.tabs_by_project.get(&project.id) else {
+                continue;
+            };
+            for (index, tab) in tabs.tabs.iter().enumerate() {
+                let tab_name = Self::tab_name(tabs, index);
+                for pane in tab.layout.panes() {
+                    let Some(entry) = self.agent_status.get(&pane) else {
+                        continue;
+                    };
+                    rows.push(AgentRow {
+                        pane,
+                        project_name: project.name.clone(),
+                        project_path: project.path.clone(),
+                        tab_name: tab_name.clone(),
+                        agent: entry.agent.clone(),
+                        title: entry.display_title(),
+                        state: entry.state,
+                        focused: self.selected == Some(project.id) && self.focused == pane,
+                    });
+                }
+            }
+        }
+        rows.sort_by_key(|row| row.state.map_or(4, AgentState::priority));
+        rows
+    }
+
+    /// The global agent section between the project list and settings footer.
+    /// Disappears only when no live agent exists in any project.
+    fn render_agents_section(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let rows = self.agent_rows(cx);
+        if rows.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (muted_fg, sidebar_fg, sidebar_border, sidebar_accent) = (
+            theme.muted_foreground,
+            theme.sidebar_foreground,
+            theme.sidebar_border,
+            theme.sidebar_accent,
+        );
+        let collapsed = self.agents_collapsed;
+        let count = rows.len();
+
+        let mut header = h_flex()
+            .id("agents-header")
+            .w_full()
+            .h(px(32.))
+            .px_3()
+            .gap_1p5()
+            .flex_none()
+            .items_center()
+            .cursor_pointer()
+            .hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.agents_collapsed = !this.agents_collapsed;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(muted_fg)
+                    .child("Agent 状态"),
+            )
+            .child(div().flex_1());
+        if collapsed {
+            header = header.child(render_agent_summary(&rows, theme));
+        } else {
+            header = header.child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(muted_fg)
+                    .child(count.to_string()),
+            );
+        }
+        header = header.child(
+            Icon::new(if collapsed {
+                IconName::ChevronRight
+            } else {
+                IconName::ChevronDown
+            })
+            .with_size(px(12.))
+            .text_color(muted_fg),
+        );
+
+        // The section's height is content-driven, so the list must not use
+        // `flex_1` (flex-basis 0 would collapse it to nothing). Let it take
+        // its content height and only shrink when the 40% cap is reached.
+        let mut list = v_flex()
+            .id("agent-list")
+            .w_full()
+            .flex_shrink_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        if !collapsed {
+            for row in rows {
+                list = list.child(self.render_agent_row(row, sidebar_fg, cx));
+            }
+        }
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_none()
+                // The design caps the section at about 40% of the sidebar;
+                // a long list scrolls instead of squeezing the projects out.
+                .max_h(relative(0.4))
+                .overflow_hidden()
+                .child(div().w_full().h(px(1.)).flex_none().bg(sidebar_border))
+                .child(header)
+                .when(!collapsed, |section| section.child(list))
+                .child(div().w_full().h(px(1.)).flex_none().bg(sidebar_border))
+                .into_any_element(),
+        )
+    }
+
+    fn render_agent_row(&self, row: AgentRow, sidebar_fg: Hsla, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted_fg, sidebar_accent, sidebar_accent_fg) = (
+            theme.muted_foreground,
+            theme.sidebar_accent,
+            theme.sidebar_accent_foreground,
+        );
+        let color = match row.state {
+            Some(AgentState::Running) => theme.link,
+            Some(AgentState::Waiting) => theme.warning,
+            Some(AgentState::Completed) => theme.success,
+            Some(AgentState::Failed) => theme.danger,
+            None => muted_fg,
+        };
+        let status_label = row.state.map_or("空闲", AgentState::label);
+        let title_color = if row.focused {
+            sidebar_accent_fg
+        } else if matches!(row.state, None | Some(AgentState::Completed)) {
+            muted_fg
+        } else {
+            sidebar_fg
+        };
+        let hover = if row.project_path.is_empty() {
+            format!("{}\n{} · {}", row.title, row.project_name, row.tab_name)
+        } else {
+            format!(
+                "{}\n{} · {}\n{}",
+                row.title, row.project_name, row.tab_name, row.project_path
+            )
+        };
+        let pane = row.pane;
+        let status = row.state;
+
+        h_flex()
+            .id(format!("agent-row-{}", pane.0))
+            .w_full()
+            .h(px(40.))
+            .flex_none()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .cursor_pointer()
+            .when(row.focused, |el| el.bg(sidebar_accent))
+            .when(!row.focused, |el| {
+                el.hover(move |style| style.bg(sidebar_accent.opacity(0.5)))
+            })
+            .hover_label(hover)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.reveal_agent(pane, window, cx);
+            }))
+            .child(agent_status_glyph(status, color))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(title_color)
+                            .child(row.title),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .h(px(16.))
+                            .gap_1()
+                            .items_center()
+                            .child(div().flex_none().text_xs().text_color(muted_fg).child(row.agent))
+                            .child(div().flex_none().text_xs().text_color(muted_fg).child("·"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(row.project_name),
+                            )
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_none()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_right()
+                                    .text_color(color)
+                                    .child(status_label),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Switch to the row's project/tab and focus its pane without clearing its
+    /// status: a live agent stays in the list for its entire lifetime.
+    fn reveal_agent(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_pane(pane, cx);
+        self.focus_terminal(window, cx);
+        cx.notify();
     }
 
     /// One project or worktree row. A worktree is indented under its
@@ -371,6 +661,98 @@ impl KumuApp {
             )
             .into_any_element()
     }
+}
+
+/// The collapsed section's color-coded one-line summary, e.g. `1 等待 · 1 失败`.
+/// Summarizes active states first; falls back to the idle total when all agents
+/// are idle.
+fn render_agent_summary(rows: &[AgentRow], theme: &Theme) -> AnyElement {
+    let mut waiting = 0;
+    let mut failed = 0;
+    let mut running = 0;
+    let mut completed = 0;
+    for row in rows {
+        match row.state {
+            Some(AgentState::Waiting) => waiting += 1,
+            Some(AgentState::Failed) => failed += 1,
+            Some(AgentState::Running) => running += 1,
+            Some(AgentState::Completed) => completed += 1,
+            None => {}
+        }
+    }
+    let muted_fg = theme.muted_foreground;
+    let parts: Vec<(String, Hsla)> = [
+        (waiting, "等待", theme.warning),
+        (failed, "失败", theme.danger),
+        (running, "运行中", theme.link),
+        (completed, "已完成", theme.success),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, label, color)| (format!("{count} {label}"), color))
+    .collect();
+
+    if parts.is_empty() {
+        return div()
+            .flex_none()
+            .text_xs()
+            .font_medium()
+            .text_color(muted_fg)
+            .child(format!("{} 空闲", rows.len()))
+            .into_any_element();
+    }
+
+    let mut line = h_flex().min_w_0().overflow_hidden().gap_1().items_center();
+    for (index, (text, color)) in parts.into_iter().enumerate() {
+        if index > 0 {
+            line = line.child(div().flex_none().text_xs().text_color(muted_fg).child("·"));
+        }
+        line = line.child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_medium()
+                .text_color(color)
+                .child(text),
+        );
+    }
+    line.into_any_element()
+}
+
+/// A 12px slot holding the state's dot, hollow idle ring, or glyph.
+fn agent_status_glyph(state: Option<AgentState>, color: Hsla) -> AnyElement {
+    let glyph = match state {
+        Some(AgentState::Running) => gpui_kit::component::spinner::Spinner::new()
+            .with_size(px(12.))
+            .color(color)
+            .into_any_element(),
+        Some(AgentState::Waiting) => div()
+            .size(px(7.))
+            .rounded_full()
+            .bg(color)
+            .into_any_element(),
+        Some(AgentState::Completed) => Icon::new(IconName::Check)
+            .with_size(px(12.))
+            .text_color(color)
+            .into_any_element(),
+        Some(AgentState::Failed) => Icon::new(IconName::TriangleAlert)
+            .with_size(px(12.))
+            .text_color(color)
+            .into_any_element(),
+        None => div()
+            .size(px(7.))
+            .rounded_full()
+            .border(px(1.5))
+            .border_color(color)
+            .into_any_element(),
+    };
+    h_flex()
+        .size(px(12.))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .child(glyph)
+        .into_any_element()
 }
 
 /// Show `path` in a Finder window without blocking the UI thread. `open`
