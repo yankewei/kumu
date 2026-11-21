@@ -181,7 +181,7 @@ impl KumuApp {
                     .unwrap_or(self.focused);
                 let before = self.focused;
                 self.split_pane_with(anchor, Axis::Horizontal, launch, cx);
-                if self.focused == before && !self.launches.contains_key(&self.focused) {
+                if self.focused == before {
                     return Err("无法在当前页签分屏启动 Agent".to_string());
                 }
                 self.focused
@@ -464,18 +464,30 @@ impl KumuApp {
 
     /// Tell the open panel which project is selected. The panel ignores a
     /// project it is already showing.
+    ///
+    /// Deferred on `App` so a plugin callback into the host (dispatching an
+    /// agent or revealing a pane) never re-enters `panel.update(...)` while
+    /// the plugin entity is already leased on the call stack.
     pub(super) fn sync_plugin_project(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.open_plugin else {
+        if self.open_plugin.is_none() {
             return;
-        };
-        let Some(view) = self.plugin_views.get(id).cloned() else {
-            return;
-        };
-        let Some(spec) = crate::plugins::spec(id) else {
-            return;
-        };
-        let project = self.plugin_project(cx);
-        spec.set_project(&view, project, cx);
+        }
+        let home = cx.entity().downgrade();
+        (**cx).defer(move |cx| {
+            let Some((spec, view, project)) = home
+                .read_with(cx, |app, cx| {
+                    let id = app.open_plugin?;
+                    let view = app.plugin_views.get(id).cloned()?;
+                    let spec = crate::plugins::spec(id)?;
+                    Some((spec, view, app.plugin_project(cx)))
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            spec.set_project(&view, project, cx);
+        });
     }
 
     /// One title-bar entry per registered plugin; the open panel's entry stays
