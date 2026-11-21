@@ -374,11 +374,7 @@ impl Render for TerminalView {
         let active = self.active;
         let can_close = self.can_close;
         let pane = self.pane;
-        let border = if active {
-            theme.border
-        } else {
-            theme.transparent
-        };
+        let border = if active { theme.blue } else { theme.transparent };
         let header_bg = if active {
             theme.secondary.opacity(0.45)
         } else {
