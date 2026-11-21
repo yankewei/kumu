@@ -4568,7 +4568,7 @@
                       "width": 659,
                       "height": "fill_container",
                       "fill": "$bg",
-                      "stroke": "$border",
+                      "stroke": "$primary",
                       "strokeWidth": 1,
                       "strokeAlignment": "inner",
                       "layout": "vertical",
@@ -11025,6 +11025,28 @@
                       "fill": "$mutedFg"
                     }
                   ]
+                },
+                {
+                  "type": "frame",
+                  "id": "Jc0kB",
+                  "name": "Plugin Button / TODO",
+                  "width": 20,
+                  "height": 20,
+                  "cornerRadius": 6,
+                  "justifyContent": "center",
+                  "alignItems": "center",
+                  "children": [
+                    {
+                      "type": "icon",
+                      "id": "s2sxD9",
+                      "name": "Icon",
+                      "width": 15,
+                      "height": 15,
+                      "icon": "list-todo",
+                      "library": "lucide",
+                      "fill": "$mutedFg"
+                    }
+                  ]
                 }
               ]
             },
@@ -11620,20 +11642,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "D6oFF0",
-                                  "name": "Status Label",
-                                  "fill": "$warning",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "等待输入",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -11764,20 +11772,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "kE1kR",
-                                  "name": "Status Label",
-                                  "fill": "$danger",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "执行失败",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -11908,20 +11902,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "PwHVi",
-                                  "name": "Status Label",
-                                  "fill": "$link",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "运行中",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -12052,20 +12032,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "FmsTx",
-                                  "name": "Status Label",
-                                  "fill": "$success",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "已完成",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -12196,20 +12162,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "E02JY",
-                                  "name": "Status Label",
-                                  "fill": "$success",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "已完成",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -12340,20 +12292,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "jKbtl",
-                                  "name": "Status Label",
-                                  "fill": "$mutedFg",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "空闲",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -12658,7 +12596,7 @@
                       "width": 659,
                       "height": "fill_container",
                       "fill": "$bg",
-                      "stroke": "$border",
+                      "stroke": "$primary",
                       "strokeWidth": 1,
                       "strokeAlignment": "inner",
                       "layout": "vertical",
@@ -14730,20 +14668,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "A3rNAB",
-                                  "name": "Status Label",
-                                  "fill": "$warning",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "等待输入",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -14874,20 +14798,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "FijlO",
-                                  "name": "Status Label",
-                                  "fill": "$danger",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "执行失败",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -15018,20 +14928,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "WRTvD",
-                                  "name": "Status Label",
-                                  "fill": "$link",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "运行中",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -15162,20 +15058,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "GLgRP",
-                                  "name": "Status Label",
-                                  "fill": "$success",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "已完成",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -15306,20 +15188,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "osH6b",
-                                  "name": "Status Label",
-                                  "fill": "$success",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "已完成",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -15450,20 +15318,6 @@
                                       "fontWeight": "normal"
                                     }
                                   ]
-                                },
-                                {
-                                  "type": "text",
-                                  "id": "L9GDwI",
-                                  "name": "Status Label",
-                                  "fill": "$mutedFg",
-                                  "textGrowth": "fixed-width",
-                                  "width": 56,
-                                  "content": "空闲",
-                                  "lineHeight": 1.33,
-                                  "textAlign": "right",
-                                  "fontFamily": "Inter",
-                                  "fontSize": 12,
-                                  "fontWeight": "500"
                                 }
                               ]
                             }
@@ -15768,7 +15622,7 @@
                       "width": "fill_container",
                       "height": "fill_container",
                       "fill": "$bg",
-                      "stroke": "$border",
+                      "stroke": "$primary",
                       "strokeWidth": 1,
                       "strokeAlignment": "inner",
                       "layout": "vertical",
@@ -17453,7 +17307,7 @@
                                           "id": "ajPlD",
                                           "name": "Label",
                                           "fill": "$success",
-                                          "content": "opencode · 待确认",
+                                          "content": "OpenCode · 待确认",
                                           "lineHeight": 1.25,
                                           "fontFamily": "Inter",
                                           "fontSize": 12,
@@ -17598,7 +17452,7 @@
                                           "id": "vtuHj",
                                           "name": "Label",
                                           "fill": "$warning",
-                                          "content": "claude · 等待输入",
+                                          "content": "Claude · 等待输入",
                                           "lineHeight": 1.25,
                                           "fontFamily": "Inter",
                                           "fontSize": 12,
@@ -17738,7 +17592,7 @@
                                           "id": "sBURE",
                                           "name": "Label",
                                           "fill": "$link",
-                                          "content": "codex · 运行中",
+                                          "content": "Codex · 运行中",
                                           "lineHeight": 1.25,
                                           "fontFamily": "Inter",
                                           "fontSize": 12,
