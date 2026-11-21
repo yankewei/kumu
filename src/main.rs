@@ -9,11 +9,11 @@
 //!   - primary reserved for the decision commit, internal nav = ghost/default.
 //!
 //! Module layout:
-//!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
-//!     window), `widgets` (theme-token helpers shared across windows);
-//!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `app/`     projects and live terminals;
-//!   - `plugins/` right-hand plugin panels opened from the title bar;
+//!   - `nsh_ui/`  Pure Rust NSH foundation (theme, components, assets, dialogs, settings);
+//!   - `ui/`      GPUI window shell, GPU Ghostty VT `TerminalView`, split grid, and NSH hosts for sidebar & tab bar;
+//!   - `theme.rs` themes/*.json loading into the ThemeRegistry (shared with NSH);
+//!   - `app/`     framework-agnostic `WorkspaceCore` + `layout` tree and thin GPUI adapter;
+//!   - `plugins/` Pure Rust NSH right-hand plugin panels (TODO board, Git Log & Diff Review);
 //!   - `git.rs`   worktree creation and commit history;
 //!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
 //!   - `term/`    PTY + VT for shells and the agent TUIs they launch;
@@ -64,16 +64,8 @@ fn main() {
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);
-        cx.spawn(async move |cx| {
-            cx.update(|cx| {
-                if std::env::var_os("KUMU_NSH_VERIFY").is_some() {
-                    nsh_ui::verify_window::open_verify_window(cx);
-                } else {
-                    open_main_window(cx);
-                }
-            })
-        })
-        .detach();
+        cx.spawn(async move |cx| cx.update(open_main_window))
+            .detach();
     });
 }
 

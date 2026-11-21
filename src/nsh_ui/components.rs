@@ -115,7 +115,7 @@ pub fn kumu_button(
 }
 
 /// Styled Kumu single-line input over `nsh_base::input()`.
-pub fn kumu_input(placeholder: &'static str) -> Input {
+pub fn kumu_input(placeholder: impl IntoReactive<String>) -> Input {
     input()
         .placeholder(placeholder)
         .placeholder_color(move || theme().muted_foreground.light)

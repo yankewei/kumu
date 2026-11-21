@@ -91,15 +91,14 @@ fn take_mount(id: u64) -> Option<DialogMount> {
 
 mod view {
     use futures::channel::mpsc::UnboundedSender;
-    use nsh_base::{input, theme as active_theme};
+    use nsh_base::theme as active_theme;
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
     use super::{DialogOutcome, DialogSpec, take_mount};
     use crate::nsh_ui::components::{
-        ButtonVariant, kumu_button, meta_text, row_title, section_title,
+        ButtonVariant, kumu_button, kumu_input, meta_text, row_title, section_title,
     };
-    use crate::nsh_ui::theme::text_xs_size;
 
     #[derive(Clone, Debug, PartialEq, Props)]
     pub(super) struct DialogRootProps {
@@ -167,19 +166,9 @@ mod view {
                 }
                 col = col
                     .child(
-                        input()
+                        kumu_input(placeholder)
                             .auto_focus(true)
                             .w_full()
-                            .px_2p5()
-                            .py_1p5()
-                            .rounded(move || active_theme().radius)
-                            .border_1()
-                            .border_color(move || active_theme().input)
-                            .bg(move || active_theme().background)
-                            .placeholder(placeholder)
-                            .placeholder_color(move || active_theme().muted_foreground.light)
-                            .text_size(text_xs_size)
-                            .text_color(move || active_theme().foreground)
                             .value(move || draft.get())
                             .on_change(move |v: &str| draft.set(v.to_owned()))
                             .on_submit(move |_: &str| submit_now(&tx_submit)),
