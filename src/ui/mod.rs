@@ -1,12 +1,10 @@
 //! Frontend UI: one module per window, shared widgets in `widgets`.
 
 pub(crate) mod home;
-mod settings;
 mod tooltip;
-pub mod widgets;
 
+pub use crate::nsh_ui::settings::SettingsWindow;
 pub use home::KumuApp;
-pub use settings::SettingsWindow;
 
 pub fn init(cx: &mut gpui_kit::App) {
     // Every window's Root mounts one tooltip overlay; elements find it

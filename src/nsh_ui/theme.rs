@@ -3,14 +3,22 @@
 
 use gpui_kit::Hsla;
 use gpui_kit::component::{Theme, ThemeMode};
+use nsh_base::theme as active_nsh_theme;
 use nsh_core::Points;
 use nsh_platform_gpui::{AdaptiveColor, Appearance};
 
-/// Body text size (14px): section titles, main empty states, primary content.
+/// Base body text size (14px at 16px root): section titles, main empty states, primary content.
 pub const TEXT_SM: Points = Points(14.0);
 
-/// Secondary/meta text size (12px): sidebar rows, labels, pills, captions.
+/// Base secondary/meta text size (12px at 16px root): sidebar rows, labels, pills, captions.
 pub const TEXT_XS: Points = Points(12.0);
+
+/// Custom token names layered on top of shadcn's standard NSH theme tokens.
+pub const TOKEN_CARD_SURFACE: &str = "kumu-card";
+pub const TOKEN_ICON_TILE: &str = "kumu-tile";
+pub const TOKEN_LINK: &str = "kumu-link";
+pub const TOKEN_ACCENT_PILL_BG: &str = "kumu-accent-pill-bg";
+pub const TOKEN_UI_SCALE: &str = "kumu-ui-scale";
 
 fn convert_color(c: Hsla) -> nsh_platform_gpui::Hsla {
     nsh_platform_gpui::Hsla {
@@ -19,6 +27,24 @@ fn convert_color(c: Hsla) -> nsh_platform_gpui::Hsla {
         l: c.l,
         a: c.a,
     }
+}
+
+/// Reactive body text size (`14px` scaled by the user's UI font-size setting).
+pub fn text_sm_size() -> Points {
+    let scale = active_nsh_theme().number(TOKEN_UI_SCALE).unwrap_or(1.0);
+    Points(TEXT_SM.0 * scale)
+}
+
+/// Reactive secondary/meta text size (`12px` scaled by the user's UI font-size setting).
+pub fn text_xs_size() -> Points {
+    let scale = active_nsh_theme().number(TOKEN_UI_SCALE).unwrap_or(1.0);
+    Points(TEXT_XS.0 * scale)
+}
+
+/// Reactive lookup of a Kumu custom color token with a fallback semantic token.
+pub fn kumu_color(name: &str, fallback: fn(&nsh_base::Theme) -> AdaptiveColor) -> AdaptiveColor {
+    let t = active_nsh_theme();
+    t.color(name).unwrap_or_else(|| fallback(&t))
 }
 
 /// Convert Kumu's light/dark mode to NSH's [`Appearance`].
@@ -37,11 +63,19 @@ pub fn appearance(mode: ThemeMode) -> Appearance {
 pub fn nsh_theme(theme: &Theme) -> nsh_platform_gpui::Theme {
     let mut nsh = nsh_platform_gpui::Theme::default();
     let colors = &theme.colors;
+    let dark = theme.mode.is_dark();
+    let card_surface = if dark { colors.muted } else { colors.popover };
+    let icon_tile = if dark {
+        colors.background
+    } else {
+        colors.muted
+    };
+
     for (name, c) in [
         ("background", colors.background),
         ("foreground", colors.foreground),
-        ("card", colors.group_box),
-        ("card-foreground", colors.group_box_foreground),
+        ("card", card_surface),
+        ("card-foreground", colors.foreground),
         ("popover", colors.popover),
         ("popover-foreground", colors.popover_foreground),
         ("primary", colors.primary),
@@ -70,10 +104,16 @@ pub fn nsh_theme(theme: &Theme) -> nsh_platform_gpui::Theme {
         ),
         ("sidebar-border", colors.sidebar_border),
         ("sidebar-ring", colors.ring),
+        (TOKEN_CARD_SURFACE, card_surface),
+        (TOKEN_ICON_TILE, icon_tile),
+        (TOKEN_LINK, colors.link),
+        (TOKEN_ACCENT_PILL_BG, colors.primary.opacity(0.14)),
     ] {
         nsh.set_color(name, AdaptiveColor::from(convert_color(c)));
     }
     nsh.set_number("radius", f32::from(theme.radius));
+    let scale = (f32::from(theme.font_size) / crate::theme::DEFAULT_FONT_SIZE).clamp(0.625, 2.0);
+    nsh.set_number(TOKEN_UI_SCALE, scale);
     nsh.set_font(nsh_core::element::FONT_SANS, theme.font_family.to_string());
     nsh.set_font(
         nsh_core::element::FONT_MONO,
@@ -92,11 +132,13 @@ mod tests {
         let mut theme = Theme::default();
         theme.mode = ThemeMode::Dark;
         theme.radius = gpui_kit::px(6.0);
+        theme.font_size = gpui_kit::px(18.0);
         theme.colors.primary = gpui_kit::rgb(0x2563eb).into();
 
         let mapped = nsh_theme(&theme);
         assert_eq!(appearance(theme.mode), Appearance::Dark);
         assert_eq!(Color::from(mapped.primary.dark), Color(0x2563ebff));
         assert_eq!(mapped.radius, Points(6.0));
+        assert!((mapped.number(TOKEN_UI_SCALE).unwrap() - 18.0 / 16.0).abs() < 1e-4);
     }
 }
