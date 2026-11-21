@@ -1,6 +1,6 @@
 //! Frontend UI: one module per window, shared widgets in `widgets`.
 
-mod home;
+pub(crate) mod home;
 mod settings;
 mod tooltip;
 pub mod widgets;

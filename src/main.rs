@@ -28,6 +28,7 @@ mod db;
 mod dock_icon;
 mod fonts;
 mod git;
+mod nsh_ui;
 mod plugins;
 mod term;
 mod theme;
@@ -63,8 +64,16 @@ fn main() {
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);
-        cx.spawn(async move |cx| cx.update(open_main_window))
-            .detach();
+        cx.spawn(async move |cx| {
+            cx.update(|cx| {
+                if std::env::var_os("KUMU_NSH_VERIFY").is_some() {
+                    nsh_ui::verify_window::open_verify_window(cx);
+                } else {
+                    open_main_window(cx);
+                }
+            })
+        })
+        .detach();
     });
 }
 
@@ -85,7 +94,7 @@ fn open_main_window(cx: &mut App) {
     let mut window_options = TitleBar::window_options();
     window_options.window_bounds = Some(
         window_state::load(cx)
-            .unwrap_or_else(|| WindowBounds::centered(size(px(1360.), px(900.)), cx)),
+            .unwrap_or_else(|| WindowBounds::centered(None, size(px(1360.), px(900.)), cx)),
     );
     window_options.window_min_size = Some(size(
         px(window_state::MIN_WIDTH),

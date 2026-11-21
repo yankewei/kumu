@@ -8,6 +8,7 @@ use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
 use crate::theme;
+use crate::updates::{ErrorKind, UpdateStatus, Updater};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -18,7 +19,6 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_updater::{ErrorKind, UpdateStatus, Updater};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsPage {

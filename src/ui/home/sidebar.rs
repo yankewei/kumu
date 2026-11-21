@@ -1,11 +1,11 @@
 //! Left column: projects and the settings entry.
 
+use crate::updates::UpdateStatus;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_updater::UpdateStatus;
 
 use super::KumuApp;
 use crate::agent::AgentState;

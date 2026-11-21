@@ -499,7 +499,7 @@ impl KumuApp {
             return;
         }
         let mut options = TitleBar::window_options();
-        options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
+        options.window_bounds = Some(WindowBounds::centered(None, size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
         if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {

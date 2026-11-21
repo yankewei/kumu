@@ -22,14 +22,15 @@ use crate::app::layout::{
     SavedProjectTabs, SavedWorkspace, SplitAxis, TabId, WORKSPACE_STATE_VERSION,
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
+use crate::updates::Updater;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::{Notification, NotificationDelivery};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_updater::Updater;
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
-use terminal::{TerminalEvent, TerminalView};
+use terminal::TerminalEvent;
+pub(crate) use terminal::TerminalView;
 
 /// Whether panes come back with the conversation they were running.
 fn auto_resume_enabled() -> bool {
