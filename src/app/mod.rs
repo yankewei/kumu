@@ -15,7 +15,7 @@ use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX, authenticat
 use crate::agent::status::{
     STATUS_PREFIX, StatusSignal, TITLE_PREFIX, TITLE_PROMPT_PREFIX, clean_reported_title,
 };
-use crate::db::{Project, Store, db_path};
+use crate::db::{Project, Store, TodoItem, TodoPatch, TodoStatus, db_path};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
 use crate::theme;
 
@@ -104,6 +104,8 @@ pub enum WorkspaceEvent {
         project: i64,
         title: String,
     },
+    /// A repository's TODO board changed. Payload is the root board project id.
+    TodosChanged(i64),
 }
 
 /// One native TUI process and where it is drawn.
@@ -260,6 +262,191 @@ impl Workspace {
 
     pub fn project(&self, id: i64) -> Option<&Project> {
         self.projects.iter().find(|project| project.id == id)
+    }
+
+    /// Root repository id that owns the TODO board for `project_id`.
+    /// Worktrees share their parent repository's board.
+    pub fn board_project_id(&self, project_id: i64) -> i64 {
+        board_root_id(&self.projects, project_id)
+    }
+
+    /// All project ids (the root repository plus its worktrees) that share
+    /// `board_id`'s TODO board.
+    pub fn board_member_project_ids(&self, board_id: i64) -> Vec<i64> {
+        self.projects
+            .iter()
+            .filter(|project| board_root_id(&self.projects, project.id) == board_id)
+            .map(|project| project.id)
+            .collect()
+    }
+
+    /// All TODO items for the repository owning `project_id`.
+    pub fn todos_for_project(&self, project_id: i64) -> Vec<TodoItem> {
+        let board_id = self.board_project_id(project_id);
+        match self.store.todos(board_id) {
+            Ok(items) => items,
+            Err(error) => {
+                eprintln!("[app] 读取 TODO 列表失败：{error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Look up one TODO item by id.
+    pub fn todo(&self, id: i64) -> Option<TodoItem> {
+        match self.store.todo(id) {
+            Ok(item) => item,
+            Err(error) => {
+                eprintln!("[app] 读取 TODO #{id} 失败：{error}");
+                None
+            }
+        }
+    }
+
+    /// Create a TODO item on the board owning `project_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_todo(
+        &self,
+        project_id: i64,
+        title: &str,
+        description: &str,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<TodoItem> {
+        let board_id = self.board_project_id(project_id);
+        match self.store.insert_todo(
+            board_id,
+            title,
+            description,
+            status,
+            pane_id,
+            agent_id,
+            agent_session_id,
+        ) {
+            Ok(item) => {
+                cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                Some(item)
+            }
+            Err(error) => {
+                Self::failed(cx, "创建 TODO 失败", error);
+                None
+            }
+        }
+    }
+
+    /// Update one TODO item and notify subscribers.
+    pub fn update_todo(
+        &self,
+        id: i64,
+        patch: &TodoPatch,
+        cx: &mut Context<Self>,
+    ) -> Option<TodoItem> {
+        match self.store.update_todo(id, patch) {
+            Ok(Some(item)) => {
+                cx.emit(WorkspaceEvent::TodosChanged(item.project_id));
+                Some(item)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                Self::failed(cx, "更新 TODO 失败", error);
+                None
+            }
+        }
+    }
+
+    /// Delete one TODO item and notify subscribers.
+    pub fn delete_todo(&self, id: i64, cx: &mut Context<Self>) -> bool {
+        let board_id = self.todo(id).map(|item| item.project_id);
+        match self.store.delete_todo(id) {
+            Ok(true) => {
+                if let Some(board_id) = board_id {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                Self::failed(cx, "删除 TODO 失败", error);
+                false
+            }
+        }
+    }
+
+    /// Clear all completed TODO items on the board owning `project_id`.
+    pub fn clear_done_todos(&self, project_id: i64, cx: &mut Context<Self>) -> usize {
+        let board_id = self.board_project_id(project_id);
+        match self.store.clear_done_todos(board_id) {
+            Ok(removed) => {
+                if removed > 0 {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+                removed
+            }
+            Err(error) => {
+                Self::failed(cx, "清理已完成 TODO 失败", error);
+                0
+            }
+        }
+    }
+
+    /// Mark in-progress TODOs bound to `pane_id` as awaiting human confirmation.
+    pub fn mark_pane_todos_review(&self, pane_id: u64, cx: &mut Context<Self>) {
+        match self.store.mark_pane_todos_review(pane_id) {
+            Ok(boards) => {
+                for board_id in boards {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 更新 TODO 待确认状态失败：{error}"),
+        }
+    }
+
+    /// Clear `awaiting_review` on TODOs bound to `pane_id` when the agent runs again.
+    pub fn clear_pane_todos_review(&self, pane_id: u64, cx: &mut Context<Self>) {
+        match self.store.clear_pane_todos_review(pane_id) {
+            Ok(boards) => {
+                for board_id in boards {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 清除 TODO 待确认状态失败：{error}"),
+        }
+    }
+
+    /// Record the latest agent id and session id for TODOs linked to `pane_id`.
+    pub fn update_pane_todos_session(
+        &self,
+        pane_id: u64,
+        agent_id: &str,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .store
+            .update_pane_todos_session(pane_id, agent_id, session_id)
+        {
+            Ok(boards) => {
+                for board_id in boards {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 更新 TODO 会话记录失败：{error}"),
+        }
+    }
+
+    /// Detach `pane_id` from TODOs when that pane closes or exits back to a shell.
+    pub fn unbind_pane_todos(&self, pane_id: u64, cx: &mut Context<Self>) {
+        match self.store.unbind_pane_todos(pane_id) {
+            Ok(boards) => {
+                for board_id in boards {
+                    cx.emit(WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 解绑 TODO 窗格失败：{error}"),
+        }
     }
 
     /// The first project, creating the first-run one when the list is empty.
@@ -1147,6 +1334,26 @@ fn tree_runs(ps: &str, root: u32, program: &str) -> bool {
     false
 }
 
+/// Resolve a project or worktree id to the root repository id that owns its
+/// TODO board, guarding against missing parents or corrupted cycles.
+fn board_root_id(projects: &[Project], project_id: i64) -> i64 {
+    let mut current = project_id;
+    for _ in 0..8 {
+        let Some(parent) = projects
+            .iter()
+            .find(|project| project.id == current)
+            .and_then(|project| project.parent_id)
+        else {
+            break;
+        };
+        if parent == current || !projects.iter().any(|project| project.id == parent) {
+            break;
+        }
+        current = parent;
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1471,5 +1678,32 @@ mod tests {
                 name: "kumu".to_string()
             }
         );
+    }
+
+    #[test]
+    fn worktrees_share_their_root_repository_board_id() {
+        let projects = vec![
+            Project {
+                id: 1,
+                name: "kumu".into(),
+                path: "/repo/kumu".into(),
+                parent_id: None,
+            },
+            Project {
+                id: 2,
+                name: "feat-todo".into(),
+                path: "/repo/kumu-feat-todo".into(),
+                parent_id: Some(1),
+            },
+            Project {
+                id: 3,
+                name: "orphan".into(),
+                path: "/repo/orphan".into(),
+                parent_id: Some(99),
+            },
+        ];
+        assert_eq!(super::board_root_id(&projects, 1), 1);
+        assert_eq!(super::board_root_id(&projects, 2), 1);
+        assert_eq!(super::board_root_id(&projects, 3), 3);
     }
 }

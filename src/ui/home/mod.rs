@@ -290,6 +290,8 @@ impl KumuApp {
                 // restarts fresh comes back idle with no stale title.
                 if next.is_shell() {
                     this.agent_status.remove(&pane);
+                    this.workspace
+                        .update(cx, |workspace, cx| workspace.unbind_pane_todos(pane.0, cx));
                 } else if let PaneLaunch::Agent { agent, .. } = &next {
                     this.agent_status
                         .insert(pane, AgentEntry::idle(agent.clone()));
@@ -361,6 +363,9 @@ impl KumuApp {
                     entry.prompt_title = None;
                 }
                 entry.agent = agent.to_string();
+                this.workspace.update(cx, |workspace, cx| {
+                    workspace.update_pane_todos_session(pane.0, agent, session, cx);
+                });
                 cx.notify();
             }
             WorkspaceEvent::AgentStatus {
@@ -387,6 +392,7 @@ impl KumuApp {
             } => {
                 this.note_pane_title(PaneId(*pane), *project, title, cx);
             }
+            WorkspaceEvent::TodosChanged(_) => cx.notify(),
         })
         .detach();
 
@@ -884,6 +890,18 @@ impl KumuApp {
             }
             StatusSignal::Idle => entry.state = None,
         }
+        match signal {
+            StatusSignal::Active(AgentState::Completed) => {
+                self.workspace
+                    .update(cx, |workspace, cx| workspace.mark_pane_todos_review(pane.0, cx));
+            }
+            StatusSignal::Active(AgentState::Running) | StatusSignal::Resume => {
+                self.workspace.update(cx, |workspace, cx| {
+                    workspace.clear_pane_todos_review(pane.0, cx);
+                });
+            }
+            _ => {}
+        }
         self.sync_pane_agent_status(pane, cx);
         cx.notify();
     }
@@ -1165,8 +1183,10 @@ impl KumuApp {
             self.focused = focused;
             self.pending_focus = Some(focused);
         }
-        self.workspace
-            .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.drop_terminal(pane.0);
+            workspace.unbind_pane_todos(pane.0, cx);
+        });
         self.panes.remove(&pane);
         self.launches.remove(&pane);
         self.agent_status.remove(&pane);

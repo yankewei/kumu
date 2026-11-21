@@ -1,20 +1,29 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::panes::ProjectTabs;
-use super::{KumuApp, agent_display_name, shell_prompt, submits_after_paste};
+use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs};
+use super::{AgentEntry, KumuApp, agent_display_name, shell_prompt, submits_after_paste};
+use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
-use crate::plugins::{PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome};
+use crate::db::TodoStatus;
+use crate::plugins::{
+    AgentPaneInfo, DispatchMode, PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome,
+};
 use crate::term::KeyInput;
 
 /// The plugin panel's opening width and the range its divider allows.
-pub(super) const PLUGIN_WIDTH: f32 = 280.;
-pub(super) const PLUGIN_MIN_WIDTH: f32 = 220.;
+pub(super) const PLUGIN_WIDTH: f32 = 300.;
+pub(super) const PLUGIN_MIN_WIDTH: f32 = 240.;
 pub(super) const PLUGIN_MAX_WIDTH: f32 = 480.;
+
+/// How long a newly dispatched TODO agent pane waits to draw before sending its prompt.
+const DISPATCH_PROMPT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Brief settle window after the first drawn frame so bracketed paste does not race startup.
+const DISPATCH_PROMPT_SETTLE: Duration = Duration::from_millis(400);
 
 impl KumuApp {
     /// The project a plugin panel shows, if one is selected.
@@ -30,6 +39,10 @@ impl KumuApp {
     pub(super) fn plugin_host(&self, cx: &Context<Self>) -> PluginHost {
         let home = cx.entity().downgrade();
         let listing = home.clone();
+        let agent_listing = home.clone();
+        let dispatcher = home.clone();
+        let any_sender = home.clone();
+        let revealer = home.clone();
         PluginHost::with_panes(
             move |project, pane, text, cx| {
                 let Some(home) = home.upgrade() else {
@@ -44,6 +57,281 @@ impl KumuApp {
                     .unwrap_or_default()
             },
         )
+        .with_agent_tools(
+            self.workspace.clone(),
+            move |board_id, cx| {
+                agent_listing
+                    .upgrade()
+                    .map(|home| home.read(cx).plugin_agent_panes(board_id, cx))
+                    .unwrap_or_default()
+            },
+            move |project_id, agent_id, mode, prompt, cx| {
+                let Some(home) = dispatcher.upgrade() else {
+                    return Err("窗口已关闭".to_string());
+                };
+                home.update(cx, |app, cx| {
+                    app.dispatch_agent_for_todo(project_id, agent_id, mode, prompt, cx)
+                })
+            },
+            move |pane, text, cx| {
+                let Some(home) = any_sender.upgrade() else {
+                    return Err("窗口已关闭".to_string());
+                };
+                home.update(cx, |app, cx| app.send_text_to_any_pane(pane, text, cx))
+            },
+            move |pane, window, cx| {
+                if let Some(home) = revealer.upgrade() {
+                    home.update(cx, |app, cx| app.reveal_agent(PaneId(pane), window, cx));
+                }
+            },
+        )
+    }
+
+    /// Live agent panes belonging to `board_id` and its worktrees, across all tabs.
+    pub(super) fn plugin_agent_panes(&self, board_id: i64, cx: &App) -> Vec<AgentPaneInfo> {
+        let workspace = self.workspace.read(cx);
+        let member_projects = workspace.board_member_project_ids(board_id);
+        let mut out = Vec::new();
+        for project_id in member_projects {
+            let Some(project) = workspace.project(project_id) else {
+                continue;
+            };
+            let Some(tabs) = self.tabs_by_project.get(&project_id) else {
+                continue;
+            };
+            for (tab_index, tab) in tabs.tabs.iter().enumerate() {
+                let tab_name = Self::tab_name(tabs, tab_index);
+                for (ordinal_index, pane) in tab.layout.panes().into_iter().enumerate() {
+                    let agent = self
+                        .agent_status
+                        .get(&pane)
+                        .map(|entry| entry.agent.clone())
+                        .or_else(|| match self.launches.get(&pane) {
+                            Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
+                            _ => None,
+                        });
+                    let Some(agent) = agent else {
+                        continue;
+                    };
+                    let state = self.agent_status.get(&pane).and_then(|entry| entry.state);
+                    let title = self
+                        .agent_status
+                        .get(&pane)
+                        .map(AgentEntry::display_title)
+                        .or_else(|| {
+                            workspace
+                                .terminal_handle(pane.0)
+                                .map(|term| term.label())
+                                .filter(|label| !label.is_empty())
+                        })
+                        .or_else(|| agent_display_name(&agent))
+                        .unwrap_or_else(|| agent.clone());
+                    out.push(AgentPaneInfo {
+                        pane: pane.0,
+                        project_id,
+                        project_name: project.name.clone(),
+                        tab_name: tab_name.clone(),
+                        ordinal: ordinal_index + 1,
+                        agent,
+                        title,
+                        state,
+                        focused: self.selected == Some(project_id) && self.focused == pane,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|row| row.state.map_or(4, AgentState::priority));
+        out
+    }
+
+    /// Launch a fresh Agent pane for a TODO card (either split beside the
+    /// active pane or inside a new tab) and submit `prompt` once the TUI draws.
+    pub(super) fn dispatch_agent_for_todo(
+        &mut self,
+        project_id: i64,
+        agent_id: &str,
+        mode: DispatchMode,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) -> Result<u64, String> {
+        let Some(agent) = crate::agent::id_for(agent_id) else {
+            return Err(format!("未知的 Agent：{agent_id}"));
+        };
+        if !crate::agent::installed(agent) {
+            return Err(format!("{agent} 尚未在本机安装"));
+        }
+        if self.workspace.read(cx).project(project_id).is_none() {
+            return Err("项目不存在".to_string());
+        }
+        let launch = PaneLaunch::Agent {
+            agent: agent.to_string(),
+            session: None,
+        };
+        let added = match mode {
+            DispatchMode::SplitRight => {
+                if !self.tabs_by_project.contains_key(&project_id) {
+                    self.ensure_project_layout(project_id, cx);
+                }
+                if self.selected != Some(project_id) {
+                    self.select_project(project_id, cx);
+                }
+                let anchor = self
+                    .active_tab(project_id)
+                    .map(|tab| tab.focused)
+                    .unwrap_or(self.focused);
+                let before = self.focused;
+                self.split_pane_with(anchor, Axis::Horizontal, launch, cx);
+                if self.focused == before && !self.launches.contains_key(&self.focused) {
+                    return Err("无法在当前页签分屏启动 Agent".to_string());
+                }
+                self.focused
+            }
+            DispatchMode::NewTab { tab_name } => {
+                self.open_agent_tab(project_id, tab_name, launch, cx)
+            }
+        };
+
+        if !prompt.trim().is_empty() {
+            let prompt_text = prompt;
+            cx.spawn(async move |this, cx| {
+                let deadline = Instant::now() + DISPATCH_PROMPT_TIMEOUT;
+                loop {
+                    let ready = this.update(cx, |app, cx| app.control_prompt_state(added, cx));
+                    match ready {
+                        Ok(Ok(true)) => break,
+                        Ok(Ok(false)) => {}
+                        Ok(Err(_)) | Err(_) => return,
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(150))
+                        .await;
+                }
+                cx.background_executor().timer(DISPATCH_PROMPT_SETTLE).await;
+                let _ = this.update(cx, |app, cx| {
+                    let _ = app.send_text_to_any_pane(added.0, &prompt_text, cx);
+                });
+            })
+            .detach();
+        }
+        Ok(added.0)
+    }
+
+    /// Open a new tab in `project_id` running `launch` directly.
+    fn open_agent_tab(
+        &mut self,
+        project_id: i64,
+        tab_name: String,
+        launch: PaneLaunch,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
+        let pane = PaneId(self.next_pane);
+        self.next_pane += 1;
+        let name: String = tab_name.trim().chars().take(24).collect();
+        let tabs = self
+            .tabs_by_project
+            .entry(project_id)
+            .or_insert_with(|| ProjectTabs {
+                tabs: Vec::new(),
+                selected: 0,
+            });
+        let index = if tabs.tabs.is_empty() {
+            0
+        } else {
+            (tabs.selected + 1).min(tabs.tabs.len())
+        };
+        tabs.tabs
+            .insert(index, ProjectTab::new(name, PaneNode::leaf(pane), pane));
+        tabs.selected = index;
+        if let PaneLaunch::Agent { agent, .. } = &launch {
+            self.agent_status
+                .insert(pane, AgentEntry::idle(agent.clone()));
+            self.launches.insert(pane, launch);
+        }
+        if self.selected != Some(project_id) {
+            if let Some(previous) = self.selected {
+                self.hide_project_panes(previous, cx);
+            }
+            self.selected = Some(project_id);
+        }
+        self.focused = pane;
+        self.pending_focus = Some(pane);
+        self.pending_close_tab = None;
+        self.show_selected_tab(project_id, cx);
+        self.sync_pane_chrome(cx);
+        self.sync_plugin_project(cx);
+        self.persist_workspace(cx);
+        cx.notify();
+        pane
+    }
+
+    /// Paste `text` into any live pane (across tabs or worktrees).
+    pub(super) fn send_text_to_any_pane(
+        &self,
+        pane: u64,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<SendOutcome, String> {
+        let workspace = self.workspace.read(cx);
+        let Some(term) = workspace.terminal_for_pane(pane) else {
+            return Err("目标窗格没有运行中的终端".to_string());
+        };
+        let snapshot = term.snapshot();
+        if snapshot.exited || snapshot.spawn_error.is_some() {
+            return Err("目标窗格已退出".to_string());
+        }
+        let shell = workspace.pane_is_shell(pane);
+        if shell == Some(true) {
+            term.paste(shell_prompt(text));
+        } else {
+            term.paste(text);
+        }
+        if !submits_after_paste(shell) {
+            return Ok(SendOutcome::Pasted);
+        }
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            term.key(KeyInput {
+                key: "enter".into(),
+                key_char: Some("\r".into()),
+                shift: false,
+                control: false,
+                alt: false,
+            });
+        })
+        .detach();
+        Ok(SendOutcome::Submitted)
+    }
+
+    /// Semantic attention color for the title-bar TODO icon, if the selected
+    /// project's board has a Waiting agent (warning) or awaiting-review task (success).
+    fn todo_attention_color(&self, cx: &Context<Self>) -> Option<Hsla> {
+        let project = self.selected?;
+        let todos = self.workspace.read(cx).todos_for_project(project);
+        let theme = cx.theme();
+        let mut has_review = false;
+        for todo in todos {
+            if todo.status != TodoStatus::InProgress {
+                continue;
+            }
+            if let Some(pane) = todo.pane_id
+                && self
+                    .agent_status
+                    .get(&PaneId(pane))
+                    .and_then(|entry| entry.state)
+                    == Some(AgentState::Waiting)
+            {
+                return Some(theme.warning);
+            }
+            if todo.awaiting_review {
+                has_review = true;
+            }
+        }
+        has_review.then_some(theme.success)
     }
 
     /// The panes a plugin may hand text to, in layout order. The header's label
@@ -205,7 +493,10 @@ impl KumuApp {
         } else {
             theme.muted_foreground
         };
-        Button::new(format!("plugin-toggle-{}", spec.id))
+        let attention = (spec.id == "todo")
+            .then(|| self.todo_attention_color(cx))
+            .flatten();
+        let button = Button::new(format!("plugin-toggle-{}", spec.id))
             .custom(
                 ButtonCustomVariant::new(cx)
                     .color(background)
@@ -217,7 +508,23 @@ impl KumuApp {
             .tooltip(spec.title)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_plugin(spec.clone(), window, cx);
-            }))
+            }));
+        let Some(dot_color) = attention else {
+            return button.into_any_element();
+        };
+        div()
+            .relative()
+            .child(button)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .right(px(2.))
+                    .w(px(6.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(dot_color),
+            )
             .into_any_element()
     }
 

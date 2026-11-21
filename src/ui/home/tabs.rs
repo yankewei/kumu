@@ -345,8 +345,10 @@ impl KumuApp {
             }
         }
         for pane in panes {
-            self.workspace
-                .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
+            self.workspace.update(cx, |workspace, cx| {
+                workspace.drop_terminal(pane.0);
+                workspace.unbind_pane_todos(pane.0, cx);
+            });
             self.panes.remove(&pane);
             self.launches.remove(&pane);
             self.agent_status.remove(&pane);

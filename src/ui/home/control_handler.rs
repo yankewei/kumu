@@ -111,6 +111,141 @@ impl KumuApp {
                     submitted: enter,
                 }));
             }
+            Command::TodoList {
+                from,
+                status,
+                mine,
+                reply,
+            } => {
+                let answer = self.control_todo_board(from, cx).map(|board_id| {
+                    let mut items = self.workspace.read(cx).todos_for_project(board_id);
+                    if let Some(status) = status {
+                        items.retain(|item| item.status == status);
+                    }
+                    if mine {
+                        let caller = from.or(Some(self.focused.0));
+                        items.retain(|item| item.pane_id == caller);
+                    }
+                    items
+                });
+                let _ = reply.send(answer);
+            }
+            Command::TodoShow { id, from, reply } => {
+                let answer = self.control_todo_board(from, cx).and_then(|board_id| {
+                    self.workspace
+                        .read(cx)
+                        .todo(id)
+                        .filter(|item| item.project_id == board_id)
+                        .ok_or_else(|| {
+                            ControlError::new("unknownTodo", format!("todo #{id} not found"))
+                        })
+                });
+                let _ = reply.send(answer);
+            }
+            Command::TodoAdd {
+                from,
+                title,
+                description,
+                status,
+                bind,
+                reply,
+            } => {
+                let answer = self.control_todo_board(from, cx).and_then(|board_id| {
+                    let trimmed = title.trim();
+                    if trimmed.is_empty() {
+                        return Err(ControlError::new("badRequest", "todo title cannot be empty"));
+                    }
+                    let (pane_id, agent_id, session_id) = if bind {
+                        self.control_todo_binding(from)
+                    } else {
+                        (None, None, None)
+                    };
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.add_todo(
+                                board_id,
+                                trimmed,
+                                description.trim(),
+                                status,
+                                pane_id,
+                                agent_id.as_deref(),
+                                session_id.as_deref(),
+                                cx,
+                            )
+                        })
+                        .ok_or_else(|| ControlError::new("internal", "failed to create todo"))
+                });
+                let _ = reply.send(answer);
+            }
+            Command::TodoUpdate {
+                id,
+                from,
+                title,
+                description,
+                status,
+                awaiting_review,
+                bind,
+                unbind,
+                reply,
+            } => {
+                let answer = self.control_todo_board(from, cx).and_then(|board_id| {
+                    let existing = self
+                        .workspace
+                        .read(cx)
+                        .todo(id)
+                        .filter(|item| item.project_id == board_id)
+                        .ok_or_else(|| {
+                            ControlError::new("unknownTodo", format!("todo #{id} not found"))
+                        })?;
+                    let mut patch = crate::db::TodoPatch {
+                        title: title.map(|t| t.trim().to_string()),
+                        description: description.map(|d| d.trim().to_string()),
+                        status,
+                        awaiting_review,
+                        ..Default::default()
+                    };
+                    if patch.title.as_deref().is_some_and(str::is_empty) {
+                        return Err(ControlError::new("badRequest", "todo title cannot be empty"));
+                    }
+                    if unbind {
+                        patch.pane_id = Some(None);
+                    } else if bind || (awaiting_review == Some(true) && existing.pane_id.is_none() && from.is_some()) {
+                        let (pane_id, agent_id, session_id) = self.control_todo_binding(from);
+                        if pane_id.is_some() {
+                            patch.pane_id = Some(pane_id);
+                            if agent_id.is_some() {
+                                patch.agent_id = Some(agent_id);
+                            }
+                            if session_id.is_some() {
+                                patch.agent_session_id = Some(session_id);
+                            }
+                        }
+                    }
+                    self.workspace
+                        .update(cx, |workspace, cx| workspace.update_todo(id, &patch, cx))
+                        .ok_or_else(|| ControlError::new("internal", "failed to update todo"))
+                });
+                let _ = reply.send(answer);
+            }
+            Command::TodoRemove { id, from, reply } => {
+                let answer = self.control_todo_board(from, cx).and_then(|board_id| {
+                    let exists = self
+                        .workspace
+                        .read(cx)
+                        .todo(id)
+                        .is_some_and(|item| item.project_id == board_id);
+                    if !exists {
+                        return Err(ControlError::new(
+                            "unknownTodo",
+                            format!("todo #{id} not found"),
+                        ));
+                    }
+                    Ok(self
+                        .workspace
+                        .update(cx, |workspace, cx| workspace.delete_todo(id, cx)))
+                });
+                let _ = reply.send(answer);
+            }
         }
     }
 
@@ -351,10 +486,44 @@ impl KumuApp {
         self.focus_pane(pane, cx);
     }
 
+    /// Resolve the root repository board id for a `kumu todo` caller: prefers
+    /// the caller's own `$KUMU_PANE`, else falls back to the selected project.
+    fn control_todo_board(
+        &self,
+        from: Option<u64>,
+        cx: &Context<Self>,
+    ) -> Result<i64, crate::control::ControlError> {
+        let project_id = from
+            .and_then(|pane| self.pane_project(PaneId(pane), cx))
+            .or(self.selected)
+            .ok_or_else(|| {
+                crate::control::ControlError::new("noProject", "no active project selected")
+            })?;
+        Ok(self.workspace.read(cx).board_project_id(project_id))
+    }
+
+    /// Capture `(pane_id, agent_id, session_id)` for a `kumu todo ... --bind` call.
+    fn control_todo_binding(&self, from: Option<u64>) -> (Option<u64>, Option<String>, Option<String>) {
+        let pane = self.control_anchor(from);
+        if !self.control_owns(pane) {
+            return (None, None, None);
+        }
+        let (agent_id, session_id) = match self.launches.get(&pane) {
+            Some(PaneLaunch::Agent { agent, session }) => (Some(agent.clone()), session.clone()),
+            _ => (
+                self.agent_status
+                    .get(&pane)
+                    .map(|entry| entry.agent.clone()),
+                None,
+            ),
+        };
+        (Some(pane.0), agent_id, session_id)
+    }
+
     /// Whether a freshly started pane has drawn its own input line, or why it
     /// never will: a pane that failed to start or stopped being an agent is
     /// reported at once instead of after the ready timeout.
-    fn control_prompt_state(
+    pub(super) fn control_prompt_state(
         &self,
         pane: PaneId,
         cx: &Context<Self>,
