@@ -38,7 +38,6 @@ jobs:
       # Smaller debuginfo keeps target/debug caches fast to transfer while
       # preserving file:line panic backtraces in test failures.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      GHOSTTY_VT_LIB_DIR: ${{ runner.temp }}/ghostty-vt-prebuilt
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,7 +45,9 @@ jobs:
 
       - name: Resolve vendor/ghostty revision
         id: ghostty
-        run: echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "GHOSTTY_VT_LIB_DIR=$RUNNER_TEMP/ghostty-vt-prebuilt" >> "$GITHUB_ENV"
 
       - name: Cache prebuilt libghostty-vt
         id: ghostty-cache
@@ -104,8 +105,6 @@ jobs:
     name: Release build and package
     runs-on: macos-latest
     timeout-minutes: 60
-    env:
-      GHOSTTY_VT_LIB_DIR: ${{ runner.temp }}/ghostty-vt-prebuilt
     steps:
       - uses: actions/checkout@v7
         with:
@@ -113,7 +112,9 @@ jobs:
 
       - name: Resolve vendor/ghostty revision
         id: ghostty
-        run: echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "GHOSTTY_VT_LIB_DIR=$RUNNER_TEMP/ghostty-vt-prebuilt" >> "$GITHUB_ENV"
 
       - name: Cache prebuilt libghostty-vt
         id: ghostty-cache
