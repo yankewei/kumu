@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Set when [`Store::open`] refuses a newer-schema database so standalone
@@ -26,6 +27,82 @@ pub struct Project {
     pub name: String,
     pub path: String,
     pub parent_id: Option<i64>,
+}
+
+/// The three columns of a project's TODO board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Todo,
+    InProgress,
+    Done,
+}
+
+impl TodoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "todo" | "待办" => Some(Self::Todo),
+            "in_progress" | "in-progress" | "inprogress" | "进行中" => Some(Self::InProgress),
+            "done" | "completed" | "已完成" => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Todo => "待办",
+            Self::InProgress => "进行中",
+            Self::Done => "已完成",
+        }
+    }
+}
+
+/// One task on a repository's TODO board.
+///
+/// `project_id` always points at the root repository so worktrees share the
+/// same board. `pane_id` links the task to a live Agent pane; `agent_id` stays
+/// as history even after that pane closes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    pub id: i64,
+    pub project_id: i64,
+    pub title: String,
+    pub description: String,
+    pub status: TodoStatus,
+    pub position: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    pub awaiting_review: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+/// Partial update for [`Store::update_todo`]. `None` leaves a field untouched;
+/// double-Option fields distinguish "leave untouched" from "clear to NULL".
+#[derive(Clone, Debug, Default)]
+pub struct TodoPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<TodoStatus>,
+    pub pane_id: Option<Option<u64>>,
+    pub agent_id: Option<Option<String>>,
+    pub agent_session_id: Option<Option<String>>,
+    pub awaiting_review: Option<bool>,
 }
 
 pub struct Store {
@@ -71,7 +148,7 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in `PRAGMA user_version`. Bump it with a new
 /// `migrate_vN` step; opening an older database applies the steps it is
 /// missing exactly once.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
@@ -154,6 +231,9 @@ impl Store {
         }
         if version < 5 {
             Self::migrate_v5_conn(&transaction)?;
+        }
+        if version < 6 {
+            Self::migrate_v6_conn(&transaction)?;
         }
         if version < SCHEMA_VERSION {
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -327,6 +407,33 @@ impl Store {
         Ok(())
     }
 
+    /// Per-repository TODO board items, optionally linked to a live agent pane.
+    fn migrate_v6_conn(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo'
+                    CHECK (status IN ('todo', 'in_progress', 'done')),
+                position INTEGER NOT NULL DEFAULT 0,
+                pane_id INTEGER,
+                agent_id TEXT,
+                agent_session_id TEXT,
+                awaiting_review INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS todos_project_status_pos
+                ON todos(project_id, status, position, id);
+            CREATE INDEX IF NOT EXISTS todos_pane
+                ON todos(pane_id) WHERE pane_id IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
             .conn
@@ -422,6 +529,282 @@ impl Store {
             params![json],
         )?;
         Ok(())
+    }
+
+    fn todo_from_row(row: &rusqlite::Row<'_>) -> Result<TodoItem> {
+        let status_raw: String = row.get(4)?;
+        let pane_raw: Option<i64> = row.get(6)?;
+        let awaiting_raw: i64 = row.get(9)?;
+        Ok(TodoItem {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            title: row.get(2)?,
+            description: row.get(3)?,
+            status: TodoStatus::parse(&status_raw).unwrap_or(TodoStatus::Todo),
+            position: row.get(5)?,
+            pane_id: pane_raw.and_then(|value| u64::try_from(value).ok()),
+            agent_id: row.get(7)?,
+            agent_session_id: row.get(8)?,
+            awaiting_review: awaiting_raw != 0,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+            completed_at: row.get(12)?,
+        })
+    }
+
+    /// All TODO items belonging to one root repository board.
+    pub fn todos(&self, project_id: i64) -> Result<Vec<TodoItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, title, description, status, position,
+                    pane_id, agent_id, agent_session_id, awaiting_review,
+                    created_at, updated_at, completed_at
+             FROM todos
+             WHERE project_id = ?1
+             ORDER BY position ASC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], Self::todo_from_row)?;
+        rows.collect()
+    }
+
+    /// Look up one TODO item by id.
+    pub fn todo(&self, id: i64) -> Result<Option<TodoItem>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, title, description, status, position,
+                        pane_id, agent_id, agent_session_id, awaiting_review,
+                        created_at, updated_at, completed_at
+                 FROM todos
+                 WHERE id = ?1",
+                params![id],
+                Self::todo_from_row,
+            )
+            .optional()
+    }
+
+    /// Create a new TODO item at the end of its status lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_todo(
+        &self,
+        project_id: i64,
+        title: &str,
+        description: &str,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+    ) -> Result<TodoItem> {
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM todos WHERE project_id = ?1 AND status = ?2",
+            params![project_id, status.as_str()],
+            |row| row.get(0),
+        )?;
+        let pane_sql = pane_id.and_then(|id| i64::try_from(id).ok());
+        let completed_at_sql = (status == TodoStatus::Done).then_some("now");
+        self.conn.execute(
+            "INSERT INTO todos (
+                project_id, title, description, status, position,
+                pane_id, agent_id, agent_session_id, awaiting_review, completed_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, 0,
+                CASE WHEN ?9 IS NOT NULL THEN datetime('now') ELSE NULL END
+             )",
+            params![
+                project_id,
+                title,
+                description,
+                status.as_str(),
+                next_pos,
+                pane_sql,
+                agent_id,
+                agent_session_id,
+                completed_at_sql,
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.todo(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Apply a partial update to one TODO item, returning the updated row.
+    pub fn update_todo(&self, id: i64, patch: &TodoPatch) -> Result<Option<TodoItem>> {
+        let Some(existing) = self.todo(id)? else {
+            return Ok(None);
+        };
+        let title = patch.title.as_deref().unwrap_or(&existing.title);
+        let description = patch
+            .description
+            .as_deref()
+            .unwrap_or(&existing.description);
+        let status = patch.status.unwrap_or(existing.status);
+        let pane_id = patch.pane_id.unwrap_or(existing.pane_id);
+        let agent_id = match &patch.agent_id {
+            Some(next) => next.as_deref(),
+            None => existing.agent_id.as_deref(),
+        };
+        let agent_session_id = match &patch.agent_session_id {
+            Some(next) => next.as_deref(),
+            None => existing.agent_session_id.as_deref(),
+        };
+        // Moving out of `in_progress` clears `awaiting_review` unless explicitly
+        // overridden.
+        let awaiting_review = match patch.awaiting_review {
+            Some(value) => value && status == TodoStatus::InProgress,
+            None => existing.awaiting_review && status == TodoStatus::InProgress,
+        };
+        let position = if status != existing.status {
+            self.conn.query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM todos WHERE project_id = ?1 AND status = ?2",
+                params![existing.project_id, status.as_str()],
+                |row| row.get(0),
+            )?
+        } else {
+            existing.position
+        };
+        let pane_sql = pane_id.and_then(|id| i64::try_from(id).ok());
+        let set_completed = status == TodoStatus::Done && existing.status != TodoStatus::Done;
+        let clear_completed = status != TodoStatus::Done && existing.completed_at.is_some();
+        self.conn.execute(
+            "UPDATE todos
+             SET title = ?1,
+                 description = ?2,
+                 status = ?3,
+                 position = ?4,
+                 pane_id = ?5,
+                 agent_id = ?6,
+                 agent_session_id = ?7,
+                 awaiting_review = ?8,
+                 updated_at = datetime('now'),
+                 completed_at = CASE
+                     WHEN ?9 = 1 THEN datetime('now')
+                     WHEN ?10 = 1 THEN NULL
+                     ELSE completed_at
+                 END
+             WHERE id = ?11",
+            params![
+                title,
+                description,
+                status.as_str(),
+                position,
+                pane_sql,
+                agent_id,
+                agent_session_id,
+                i64::from(awaiting_review),
+                i64::from(set_completed),
+                i64::from(clear_completed),
+                id,
+            ],
+        )?;
+        self.todo(id)
+    }
+
+    /// Delete one TODO item. Returns whether a row was removed.
+    pub fn delete_todo(&self, id: i64) -> Result<bool> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM todos WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
+    /// Remove all `done` TODO items for one root repository board.
+    pub fn clear_done_todos(&self, project_id: i64) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM todos WHERE project_id = ?1 AND status = 'done'",
+            params![project_id],
+        )
+    }
+
+    /// Mark in-progress TODOs bound to `pane_id` as awaiting human review.
+    /// Returns the distinct root project ids whose boards changed.
+    pub fn mark_pane_todos_review(&self, pane_id: u64) -> Result<Vec<i64>> {
+        let Ok(pane_sql) = i64::try_from(pane_id) else {
+            return Ok(Vec::new());
+        };
+        let projects = self
+            .projects_with_pane_todos(pane_sql, "status = 'in_progress' AND awaiting_review = 0")?;
+        if projects.is_empty() {
+            return Ok(projects);
+        }
+        self.conn.execute(
+            "UPDATE todos
+             SET awaiting_review = 1, updated_at = datetime('now')
+             WHERE pane_id = ?1 AND status = 'in_progress' AND awaiting_review = 0",
+            params![pane_sql],
+        )?;
+        Ok(projects)
+    }
+
+    /// Clear `awaiting_review` on TODOs bound to `pane_id` when the agent resumes running.
+    pub fn clear_pane_todos_review(&self, pane_id: u64) -> Result<Vec<i64>> {
+        let Ok(pane_sql) = i64::try_from(pane_id) else {
+            return Ok(Vec::new());
+        };
+        let projects = self.projects_with_pane_todos(pane_sql, "awaiting_review = 1")?;
+        if projects.is_empty() {
+            return Ok(projects);
+        }
+        self.conn.execute(
+            "UPDATE todos
+             SET awaiting_review = 0, updated_at = datetime('now')
+             WHERE pane_id = ?1 AND awaiting_review = 1",
+            params![pane_sql],
+        )?;
+        Ok(projects)
+    }
+
+    /// Keep `agent_id` and `agent_session_id` fresh when a bound pane reports its session.
+    pub fn update_pane_todos_session(
+        &self,
+        pane_id: u64,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<i64>> {
+        let Ok(pane_sql) = i64::try_from(pane_id) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT project_id FROM todos
+             WHERE pane_id = ?1
+               AND (COALESCE(agent_id, '') != ?2 OR COALESCE(agent_session_id, '') != ?3)",
+        )?;
+        let changed: Vec<i64> = stmt
+            .query_map(params![pane_sql, agent_id, session_id], |row| row.get(0))?
+            .collect::<Result<_>>()?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.conn.execute(
+            "UPDATE todos
+             SET agent_id = ?2, agent_session_id = ?3, updated_at = datetime('now')
+             WHERE pane_id = ?1",
+            params![pane_sql, agent_id, session_id],
+        )?;
+        Ok(changed)
+    }
+
+    /// Detach `pane_id` from TODOs when that pane closes, keeping `agent_id` as history.
+    pub fn unbind_pane_todos(&self, pane_id: u64) -> Result<Vec<i64>> {
+        let Ok(pane_sql) = i64::try_from(pane_id) else {
+            return Ok(Vec::new());
+        };
+        let projects = self.projects_with_pane_todos(pane_sql, "1 = 1")?;
+        if projects.is_empty() {
+            return Ok(projects);
+        }
+        self.conn.execute(
+            "UPDATE todos
+             SET pane_id = NULL, updated_at = datetime('now')
+             WHERE pane_id = ?1",
+            params![pane_sql],
+        )?;
+        Ok(projects)
+    }
+
+    fn projects_with_pane_todos(&self, pane_sql: i64, predicate: &str) -> Result<Vec<i64>> {
+        let sql =
+            format!("SELECT DISTINCT project_id FROM todos WHERE pane_id = ?1 AND {predicate}");
+        let mut stmt = self.conn.prepare(&sql)?;
+        stmt.query_map(params![pane_sql], |row| row.get(0))?
+            .collect()
     }
 }
 
@@ -710,6 +1093,9 @@ pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 /// Setting key holding the sidebar's width in px, chosen by dragging the
 /// divider beside it.
 pub const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
+
+/// Setting key holding the last agent id chosen for one-click TODO dispatch.
+pub const SETTING_TODO_DEFAULT_AGENT: &str = "todo_default_agent";
 
 /// Settings use a short-lived connection instead of the UI-owned Store: they
 /// are read once at startup (before any window exists) and written rarely
@@ -1180,5 +1566,74 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn todos_crud_review_transitions_and_project_cascade_work() {
+        let store = store();
+        let root = store.insert_project("kumu", "/tmp/kumu").unwrap();
+
+        let item = store
+            .insert_todo(
+                root,
+                "Implement TODO board",
+                "Wire up SQLite and panel UI",
+                TodoStatus::Todo,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(item.status, TodoStatus::Todo);
+        assert!(!item.awaiting_review);
+        assert_eq!(store.todos(root).unwrap().len(), 1);
+
+        // Bind to pane 7 and move to in_progress.
+        let active = store
+            .update_todo(
+                item.id,
+                &TodoPatch {
+                    status: Some(TodoStatus::InProgress),
+                    pane_id: Some(Some(7)),
+                    agent_id: Some(Some("claude".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, TodoStatus::InProgress);
+        assert_eq!(active.pane_id, Some(7));
+        assert_eq!(active.agent_id.as_deref(), Some("claude"));
+
+        // Agent completes -> awaiting review; agent resumes -> cleared.
+        assert_eq!(store.mark_pane_todos_review(7).unwrap(), vec![root]);
+        assert!(store.todo(item.id).unwrap().unwrap().awaiting_review);
+        assert_eq!(store.clear_pane_todos_review(7).unwrap(), vec![root]);
+        assert!(!store.todo(item.id).unwrap().unwrap().awaiting_review);
+
+        // Unbinding a closed pane clears pane_id while preserving agent_id.
+        assert_eq!(store.unbind_pane_todos(7).unwrap(), vec![root]);
+        let detached = store.todo(item.id).unwrap().unwrap();
+        assert_eq!(detached.pane_id, None);
+        assert_eq!(detached.agent_id.as_deref(), Some("claude"));
+
+        // Completing sets completed_at and clears awaiting_review.
+        let done = store
+            .update_todo(
+                item.id,
+                &TodoPatch {
+                    status: Some(TodoStatus::Done),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, TodoStatus::Done);
+        assert!(done.completed_at.is_some());
+        assert!(!done.awaiting_review);
+
+        // Deleting the root project cascades to its todos.
+        store.delete_project(root).unwrap();
+        assert!(store.todos(root).unwrap().is_empty());
     }
 }

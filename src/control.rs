@@ -25,6 +25,8 @@ use futures::channel::mpsc::UnboundedSender;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::db::{TodoItem, TodoStatus};
+
 /// How long the server waits for the UI to answer one request. A split that
 /// waits for the agent to draw its prompt is the slow one.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -111,10 +113,65 @@ pub enum Request {
         #[serde(default = "submit_by_default")]
         enter: bool,
     },
+    /// List TODO items on the caller's repository board.
+    TodoList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TodoStatus>,
+        #[serde(default)]
+        mine: bool,
+    },
+    /// Show one TODO item in detail.
+    TodoShow {
+        id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+    },
+    /// Create a TODO item on the caller's repository board.
+    TodoAdd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default = "todo_status_default")]
+        status: TodoStatus,
+        #[serde(default)]
+        bind: bool,
+    },
+    /// Update one TODO item's fields, status, review mark, or pane link.
+    TodoUpdate {
+        id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TodoStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        awaiting_review: Option<bool>,
+        #[serde(default)]
+        bind: bool,
+        #[serde(default)]
+        unbind: bool,
+    },
+    /// Remove one TODO item.
+    TodoRemove {
+        id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+    },
 }
 
 fn submit_by_default() -> bool {
     true
+}
+
+fn todo_status_default() -> TodoStatus {
+    TodoStatus::Todo
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -225,6 +282,41 @@ pub enum Command {
         text: String,
         enter: bool,
         reply: Sender<Result<SendResult, ControlError>>,
+    },
+    TodoList {
+        from: Option<u64>,
+        status: Option<TodoStatus>,
+        mine: bool,
+        reply: Sender<Result<Vec<TodoItem>, ControlError>>,
+    },
+    TodoShow {
+        id: i64,
+        from: Option<u64>,
+        reply: Sender<Result<TodoItem, ControlError>>,
+    },
+    TodoAdd {
+        from: Option<u64>,
+        title: String,
+        description: String,
+        status: TodoStatus,
+        bind: bool,
+        reply: Sender<Result<TodoItem, ControlError>>,
+    },
+    TodoUpdate {
+        id: i64,
+        from: Option<u64>,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<TodoStatus>,
+        awaiting_review: Option<bool>,
+        bind: bool,
+        unbind: bool,
+        reply: Sender<Result<TodoItem, ControlError>>,
+    },
+    TodoRemove {
+        id: i64,
+        from: Option<u64>,
+        reply: Sender<Result<bool, ControlError>>,
     },
 }
 
@@ -561,6 +653,70 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
             enter,
             reply,
         }),
+        Request::TodoList { from, status, mine } => {
+            let (reply, answer) = mpsc::channel();
+            commands
+                .unbounded_send(Command::TodoList {
+                    from,
+                    status,
+                    mine,
+                    reply,
+                })
+                .map_err(|_| unavailable())?;
+            match answer.recv_timeout(REPLY_TIMEOUT) {
+                Ok(Ok(todos)) => Ok(json!({ "todos": todos })),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(ControlError::new("timeout", "kumu did not answer")),
+            }
+        }
+        Request::TodoShow { id, from } => {
+            exchange(commands, |reply| Command::TodoShow { id, from, reply })
+        }
+        Request::TodoAdd {
+            from,
+            title,
+            description,
+            status,
+            bind,
+        } => exchange(commands, |reply| Command::TodoAdd {
+            from,
+            title,
+            description,
+            status,
+            bind,
+            reply,
+        }),
+        Request::TodoUpdate {
+            id,
+            from,
+            title,
+            description,
+            status,
+            awaiting_review,
+            bind,
+            unbind,
+        } => exchange(commands, |reply| Command::TodoUpdate {
+            id,
+            from,
+            title,
+            description,
+            status,
+            awaiting_review,
+            bind,
+            unbind,
+            reply,
+        }),
+        Request::TodoRemove { id, from } => {
+            let (reply, answer) = mpsc::channel();
+            commands
+                .unbounded_send(Command::TodoRemove { id, from, reply })
+                .map_err(|_| unavailable())?;
+            match answer.recv_timeout(REPLY_TIMEOUT) {
+                Ok(Ok(removed)) => Ok(json!({ "id": id, "removed": removed })),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(ControlError::new("timeout", "kumu did not answer")),
+            }
+        }
     }
 }
 
@@ -606,6 +762,7 @@ pub fn run_cli() -> Option<i32> {
     match first.as_str() {
         "panes" => Some(panes_cli(&rest)),
         "pane" => Some(pane_cli(&rest)),
+        "todo" => Some(todo_cli(&rest)),
         _ => None,
     }
 }
@@ -616,6 +773,13 @@ usage:
   kumu pane read [TARGET] [--history N] [--tail N] [--json]
   kumu pane split right|down --agent <id> [--prompt TEXT] [--json]
   kumu pane send <TARGET> <TEXT...> [--no-enter] [--json]
+  kumu todo list [--status todo|in_progress|done] [--mine] [--json]
+  kumu todo show <ID> [--json]
+  kumu todo add <TITLE...> [--desc TEXT] [--status todo|in_progress|done] [--bind] [--json]
+  kumu todo update <ID> [--title TEXT] [--desc TEXT] [--status todo|in_progress|done] [--review|--no-review] [--bind|--unbind] [--json]
+  kumu todo review <ID> [--json]
+  kumu todo done <ID> [--json]
+  kumu todo remove <ID> [--json]
 
 TARGET is a pane id, left/right/up/down (relative to $KUMU_PANE), or focused
 (the default). --history N reads N scrollback rows; --tail N keeps the last N
@@ -858,6 +1022,367 @@ fn pane_send(args: &[String]) -> i32 {
     println!("{}", summary_line(&send.pane));
     println!("{}", if send.submitted { "sent" } else { "typed" });
     0
+}
+
+fn todo_cli(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("list" | "ls") => todo_list(&args[1..]),
+        Some("show" | "get") => todo_show(&args[1..]),
+        Some("add" | "new") => todo_add(&args[1..]),
+        Some("update" | "edit") => todo_update(&args[1..]),
+        Some("review") => todo_review(&args[1..]),
+        Some("done" | "complete") => todo_done(&args[1..]),
+        Some("remove" | "rm" | "delete") => todo_remove(&args[1..]),
+        Some("-h" | "--help" | "help") => {
+            println!("{USAGE}");
+            0
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            2
+        }
+    }
+}
+
+fn todo_list(args: &[String]) -> i32 {
+    let mut status = None;
+    let mut mine = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--mine" => mine = true,
+            "--status" | "-s" => {
+                let Some(raw) = iter.next() else {
+                    return usage_error("--status needs todo, in_progress, or done");
+                };
+                let Some(parsed) = TodoStatus::parse(raw) else {
+                    return usage_error(&format!(
+                        "unknown status '{raw}': use todo, in_progress, or done"
+                    ));
+                };
+                status = Some(parsed);
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other => return usage_error(&format!("unknown option {other}")),
+        }
+    }
+    let value = match call(&Request::TodoList {
+        from: caller_pane(),
+        status,
+        mine,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    if json {
+        let Some(todos) = value.get("todos").filter(|v| v.is_array()) else {
+            return runtime_error("unexpected reply: missing todos array");
+        };
+        println!("{todos}");
+        return 0;
+    }
+    let todos: Vec<TodoItem> = match serde_json::from_value(value["todos"].clone()) {
+        Ok(todos) => todos,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if todos.is_empty() {
+        println!("no todos");
+        return 0;
+    }
+    for todo in &todos {
+        println!("{}", todo_summary_line(todo));
+    }
+    0
+}
+
+fn todo_show(args: &[String]) -> i32 {
+    let (json, rest) = match flags(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let [raw_id] = rest.as_slice() else {
+        return usage_error("give one todo id");
+    };
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return usage_error(&format!("invalid todo id '{raw_id}'"));
+    };
+    let value = match call(&Request::TodoShow {
+        id,
+        from: caller_pane(),
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let item: TodoItem = match serde_json::from_value(value) {
+        Ok(item) => item,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&item);
+    }
+    println!("{}", todo_summary_line(&item));
+    if !item.description.trim().is_empty() {
+        println!("---");
+        println!("{}", item.description.trim_end());
+    }
+    0
+}
+
+fn todo_add(args: &[String]) -> i32 {
+    let mut title_words = Vec::new();
+    let mut description = String::new();
+    let mut status = TodoStatus::Todo;
+    let mut bind = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--bind" => bind = true,
+            "--desc" | "-d" => match iter.next() {
+                Some(text) => description = text.clone(),
+                None => return usage_error("--desc needs text"),
+            },
+            "--status" | "-s" => {
+                let Some(raw) = iter.next() else {
+                    return usage_error("--status needs todo, in_progress, or done");
+                };
+                let Some(parsed) = TodoStatus::parse(raw) else {
+                    return usage_error(&format!(
+                        "unknown status '{raw}': use todo, in_progress, or done"
+                    ));
+                };
+                status = parsed;
+            }
+            "-h" | "--help" if title_words.is_empty() => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other if other.starts_with('-') && title_words.is_empty() => {
+                return usage_error(&format!("unknown option {other}"));
+            }
+            other => title_words.push(other),
+        }
+    }
+    let title = title_words.join(" ").trim().to_string();
+    if title.is_empty() {
+        return usage_error("give a title for the todo");
+    }
+    let value = match call(&Request::TodoAdd {
+        from: caller_pane(),
+        title,
+        description,
+        status,
+        bind,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let item: TodoItem = match serde_json::from_value(value) {
+        Ok(item) => item,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&item);
+    }
+    println!("{}", todo_summary_line(&item));
+    0
+}
+
+fn todo_update(args: &[String]) -> i32 {
+    let mut id = None;
+    let mut title = None;
+    let mut description = None;
+    let mut status = None;
+    let mut awaiting_review = None;
+    let mut bind = false;
+    let mut unbind = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--bind" => bind = true,
+            "--unbind" => unbind = true,
+            "--review" => awaiting_review = Some(true),
+            "--no-review" => awaiting_review = Some(false),
+            "--title" | "-t" => match iter.next() {
+                Some(text) => title = Some(text.clone()),
+                None => return usage_error("--title needs text"),
+            },
+            "--desc" | "-d" => match iter.next() {
+                Some(text) => description = Some(text.clone()),
+                None => return usage_error("--desc needs text"),
+            },
+            "--status" | "-s" => {
+                let Some(raw) = iter.next() else {
+                    return usage_error("--status needs todo, in_progress, or done");
+                };
+                let Some(parsed) = TodoStatus::parse(raw) else {
+                    return usage_error(&format!(
+                        "unknown status '{raw}': use todo, in_progress, or done"
+                    ));
+                };
+                status = Some(parsed);
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other if other.starts_with('-') => {
+                return usage_error(&format!("unknown option {other}"));
+            }
+            other if id.is_none() => match other.parse::<i64>() {
+                Ok(parsed) => id = Some(parsed),
+                Err(_) => return usage_error(&format!("invalid todo id '{other}'")),
+            },
+            other => return usage_error(&format!("unexpected argument '{other}'")),
+        }
+    }
+    let Some(id) = id else {
+        return usage_error("give the todo id to update");
+    };
+    if bind && unbind {
+        return usage_error("use either --bind or --unbind, not both");
+    }
+    let value = match call(&Request::TodoUpdate {
+        id,
+        from: caller_pane(),
+        title,
+        description,
+        status,
+        awaiting_review,
+        bind,
+        unbind,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let item: TodoItem = match serde_json::from_value(value) {
+        Ok(item) => item,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&item);
+    }
+    println!("{}", todo_summary_line(&item));
+    0
+}
+
+fn todo_review(args: &[String]) -> i32 {
+    let (json, rest) = match flags(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let [raw_id] = rest.as_slice() else {
+        return usage_error("give one todo id");
+    };
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return usage_error(&format!("invalid todo id '{raw_id}'"));
+    };
+    let value = match call(&Request::TodoUpdate {
+        id,
+        from: caller_pane(),
+        title: None,
+        description: None,
+        status: Some(TodoStatus::InProgress),
+        awaiting_review: Some(true),
+        bind: false,
+        unbind: false,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let item: TodoItem = match serde_json::from_value(value) {
+        Ok(item) => item,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&item);
+    }
+    println!("{}", todo_summary_line(&item));
+    0
+}
+
+fn todo_done(args: &[String]) -> i32 {
+    let (json, rest) = match flags(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let [raw_id] = rest.as_slice() else {
+        return usage_error("give one todo id");
+    };
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return usage_error(&format!("invalid todo id '{raw_id}'"));
+    };
+    let value = match call(&Request::TodoUpdate {
+        id,
+        from: caller_pane(),
+        title: None,
+        description: None,
+        status: Some(TodoStatus::Done),
+        awaiting_review: Some(false),
+        bind: false,
+        unbind: false,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let item: TodoItem = match serde_json::from_value(value) {
+        Ok(item) => item,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&item);
+    }
+    println!("{}", todo_summary_line(&item));
+    0
+}
+
+fn todo_remove(args: &[String]) -> i32 {
+    let (json, rest) = match flags(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let [raw_id] = rest.as_slice() else {
+        return usage_error("give one todo id");
+    };
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return usage_error(&format!("invalid todo id '{raw_id}'"));
+    };
+    let value = match call(&Request::TodoRemove {
+        id,
+        from: caller_pane(),
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    if json {
+        println!("{value}");
+        return 0;
+    }
+    println!("removed #{id}");
+    0
+}
+
+fn todo_summary_line(todo: &TodoItem) -> String {
+    let mut line = format!("#{} [{}]", todo.id, todo.status.as_str());
+    if todo.awaiting_review {
+        line.push_str(" [review]");
+    }
+    line.push_str(&format!(" {}", todo.title));
+    if let Some(agent) = &todo.agent_id {
+        line.push_str(&format!(" · {agent}"));
+    }
+    if let Some(pane) = todo.pane_id {
+        line.push_str(&format!(" (pane {pane})"));
+    }
+    line
 }
 
 fn usage_error(message: &str) -> i32 {
@@ -1184,6 +1709,37 @@ mod tests {
                             }))
                             .expect("send reply");
                     }
+                    Command::TodoList {
+                        from,
+                        status,
+                        mine,
+                        reply,
+                    } => {
+                        assert_eq!(from, Some(3));
+                        assert_eq!(status, Some(TodoStatus::InProgress));
+                        assert!(mine);
+                        reply
+                            .send(Ok(vec![TodoItem {
+                                id: 9,
+                                project_id: 1,
+                                title: "Ship TODO board".into(),
+                                description: String::new(),
+                                status: TodoStatus::InProgress,
+                                position: 0,
+                                pane_id: Some(3),
+                                agent_id: Some("claude".into()),
+                                agent_session_id: None,
+                                awaiting_review: true,
+                                created_at: "2026-11-21 00:00:00".into(),
+                                updated_at: "2026-11-21 00:00:00".into(),
+                                completed_at: None,
+                            }]))
+                            .expect("todo list reply");
+                    }
+                    Command::TodoShow { .. }
+                    | Command::TodoAdd { .. }
+                    | Command::TodoUpdate { .. }
+                    | Command::TodoRemove { .. } => {}
                 }
             }
         });
@@ -1227,6 +1783,18 @@ mod tests {
         )
         .expect("send");
         assert_eq!(send["submitted"], true);
+
+        let todos = call_here(
+            &path,
+            &Request::TodoList {
+                from: Some(3),
+                status: Some(TodoStatus::InProgress),
+                mine: true,
+            },
+        )
+        .expect("todo list");
+        assert_eq!(todos["todos"][0]["id"], 9);
+        assert_eq!(todos["todos"][0]["awaitingReview"], true);
 
         // A pane of another Kumu must not read this one's panes: the reply
         // carries the serving pid, so the client can refuse the answer.
