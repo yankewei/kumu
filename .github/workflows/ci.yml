@@ -34,17 +34,55 @@ jobs:
     name: Clippy and tests
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      # Smaller debuginfo keeps target/debug caches fast to transfer while
+      # preserving file:line panic backtraces in test failures.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      GHOSTTY_VT_LIB_DIR: ${{ runner.temp }}/ghostty-vt-prebuilt
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      # vendor/ghostty's build.zig.zon requires Zig 0.17.0. setup-zig also
-      # caches Zig's global cache, which is where the libghostty-vt artifacts
-      # live between runs.
+      - name: Resolve vendor/ghostty revision
+        id: ghostty
+        run: echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache prebuilt libghostty-vt
+        id: ghostty-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ghostty-vt-prebuilt
+          key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-zig-0.17.0-${{ steps.ghostty.outputs.sha }}
+
+      # vendor/ghostty's build.zig.zon requires Zig 0.17.0. Only install Zig
+      # and compile libghostty-vt when the submodule revision is not cached.
       - uses: mlugg/setup-zig@v2
+        if: steps.ghostty-cache.outputs.cache-hit != 'true'
         with:
           version: 0.17.0
+          use-cache: false
+
+      - name: Build prebuilt libghostty-vt
+        if: steps.ghostty-cache.outputs.cache-hit != 'true'
+        run: |
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64|aarch64) zig_target="aarch64-macos" ;;
+            x86_64) zig_target="x86_64-macos" ;;
+            *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+          esac
+          (
+            cd vendor/ghostty
+            zig build \
+              -Demit-lib-vt \
+              -Demit-xcframework=false \
+              -Doptimize=ReleaseFast \
+              -Dtarget="$zig_target" \
+              --prefix "$RUNNER_TEMP/ghostty-vt-out"
+          )
+          mkdir -p "$GHOSTTY_VT_LIB_DIR"
+          cp "$RUNNER_TEMP/ghostty-vt-out/lib/libghostty-vt.a" "$GHOSTTY_VT_LIB_DIR/libghostty-vt.a"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,38 +90,73 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: target
-          key: test
+          shared-key: test-ci
           cache-on-failure: true
 
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # Cargo.toml enables opt-level = 3 for dev dependencies so local GUI runs
+      # stay smooth; CI only runs headless unit tests, so opt-level = 0 cuts
+      # cold dependency compile times in half.
+      - run: cargo clippy --all-targets --locked --config 'profile.dev.package."*".opt-level=0' -- -D warnings
+      - run: cargo test --locked --config 'profile.dev.package."*".opt-level=0'
       - run: node --test src/agent/integration/adapters.test.mjs
 
   package:
     name: Release build and package
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      GHOSTTY_VT_LIB_DIR: ${{ runner.temp }}/ghostty-vt-prebuilt
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
 
+      - name: Resolve vendor/ghostty revision
+        id: ghostty
+        run: echo "sha=$(git ls-tree HEAD vendor/ghostty | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache prebuilt libghostty-vt
+        id: ghostty-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ghostty-vt-prebuilt
+          key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-zig-0.17.0-${{ steps.ghostty.outputs.sha }}
+
       - uses: mlugg/setup-zig@v2
+        if: steps.ghostty-cache.outputs.cache-hit != 'true'
         with:
           version: 0.17.0
+          use-cache: false
+
+      - name: Build prebuilt libghostty-vt
+        if: steps.ghostty-cache.outputs.cache-hit != 'true'
+        run: |
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64|aarch64) zig_target="aarch64-macos" ;;
+            x86_64) zig_target="x86_64-macos" ;;
+            *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+          esac
+          (
+            cd vendor/ghostty
+            zig build \
+              -Demit-lib-vt \
+              -Demit-xcframework=false \
+              -Doptimize=ReleaseFast \
+              -Dtarget="$zig_target" \
+              --prefix "$RUNNER_TEMP/ghostty-vt-out"
+          )
+          mkdir -p "$GHOSTTY_VT_LIB_DIR"
+          cp "$RUNNER_TEMP/ghostty-vt-out/lib/libghostty-vt.a" "$GHOSTTY_VT_LIB_DIR/libghostty-vt.a"
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
-      # A separate cache key keeps the release profile's artifacts from being
+      # A separate shared-key keeps the release profile's artifacts from being
       # evicted or overwritten by the dev-profile test runs (and vice versa)
       # when both jobs run in parallel.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: target
-          key: release
+          shared-key: release-ci
           cache-on-failure: true
 
       # The release binary is what packaging/make-app.sh bundles and signs.

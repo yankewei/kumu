@@ -30,6 +30,14 @@ fn zig_bin() -> String {
     "zig".to_string()
 }
 
+fn static_lib_names() -> (&'static str, &'static str) {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        ("ghostty-vt-static.lib", "ghostty-vt.lib")
+    } else {
+        ("libghostty-vt.a", "libghostty-vt.a")
+    }
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest
@@ -38,47 +46,62 @@ fn main() {
         .expect("vendor/ghostty missing: git submodule update --init");
     let src = PathBuf::from(src.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    for path in ["src", "build.zig", "build.zig.zon", "include"] {
-        println!("cargo:rerun-if-changed={}", src.join(path).display());
-    }
-    println!("cargo:rerun-if-env-changed=ZIG");
-
-    let zig = zig_bin();
-    let status = Command::new(&zig)
-        .current_dir(&src)
-        .args([
-            "build",
-            "-Demit-lib-vt",
-            "-Demit-xcframework=false",
-            "-Doptimize=ReleaseFast",
-        ])
-        .arg(format!(
-            "-Dtarget={}",
-            zig_target(&std::env::var("TARGET").unwrap())
-        ))
-        .arg("--prefix")
-        .arg(out.join("zig-out"))
-        .arg("--cache-dir")
-        .arg(out.join("zig-cache"))
-        .status()
-        .unwrap_or_else(|e| panic!("cannot run {zig:?} (Zig 0.17 required): {e}"));
-    assert!(
-        status.success(),
-        "zig build of libghostty-vt failed: {status}"
-    );
-
     let lib = out.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        std::fs::copy(
-            out.join("zig-out/lib/ghostty-vt-static.lib"),
-            lib.join("ghostty-vt.lib"),
-        )
-        .unwrap();
+
+    println!("cargo:rerun-if-changed={}", src.join("include").display());
+    println!("cargo:rerun-if-env-changed=GHOSTTY_VT_LIB_DIR");
+
+    let (zig_lib_name, lib_name) = static_lib_names();
+    if let Ok(prebuilt_dir) = std::env::var("GHOSTTY_VT_LIB_DIR")
+        && !prebuilt_dir.is_empty()
+    {
+        let prebuilt = PathBuf::from(&prebuilt_dir).join(lib_name);
+        assert!(
+            prebuilt.is_file(),
+            "GHOSTTY_VT_LIB_DIR={prebuilt_dir:?} does not contain {lib_name}"
+        );
+        println!("cargo:rerun-if-changed={}", prebuilt.display());
+        std::fs::copy(&prebuilt, lib.join(lib_name)).unwrap();
     } else {
+        for path in ["src", "build.zig", "build.zig.zon"] {
+            println!("cargo:rerun-if-changed={}", src.join(path).display());
+        }
+        println!("cargo:rerun-if-env-changed=ZIG");
+        println!("cargo:rerun-if-env-changed=ZIG_LOCAL_CACHE_DIR");
+
+        let zig = zig_bin();
+        let mut cmd = Command::new(&zig);
+        cmd.current_dir(&src)
+            .args([
+                "build",
+                "-Demit-lib-vt",
+                "-Demit-xcframework=false",
+                "-Doptimize=ReleaseFast",
+            ])
+            .arg(format!(
+                "-Dtarget={}",
+                zig_target(&std::env::var("TARGET").unwrap())
+            ))
+            .arg("--prefix")
+            .arg(out.join("zig-out"));
+        if std::env::var_os("ZIG_LOCAL_CACHE_DIR")
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            cmd.arg("--cache-dir").arg(out.join("zig-cache"));
+        }
+        let status = cmd
+            .status()
+            .unwrap_or_else(|e| panic!("cannot run {zig:?} (Zig 0.17 required): {e}"));
+        assert!(
+            status.success(),
+            "zig build of libghostty-vt failed: {status}"
+        );
+
         std::fs::copy(
-            out.join("zig-out/lib/libghostty-vt.a"),
-            lib.join("libghostty-vt.a"),
+            out.join("zig-out/lib").join(zig_lib_name),
+            lib.join(lib_name),
         )
         .unwrap();
     }
@@ -100,6 +123,7 @@ fn main() {
             }
         }
     } else if Command::new("clang").arg("--version").output().is_err() {
+        let zig = zig_bin();
         let zig_env = Command::new(&zig).arg("env").output().expect("zig env");
         let zig_env = String::from_utf8_lossy(&zig_env.stdout);
         let zig_lib = zig_env
