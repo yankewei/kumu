@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use gpui_kit::{Context, EventEmitter, Global};
+use gpui::{Context, EventEmitter, Global};
 
 pub use self::core::{NotificationSettings, SpawnedTerminal, WorkspaceCore, WorkspaceEvent};
 use crate::agent::launch::PaneLaunch;
@@ -489,12 +489,12 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     #[gpui::test]
-    fn shell_exit_reports_both_visible_and_parked_panes(cx: &mut gpui_kit::TestAppContext) {
+    fn shell_exit_reports_both_visible_and_parked_panes(cx: &mut gpui::TestAppContext) {
         use super::core::LiveTerm;
         use super::{SpawnedTerminal, Workspace, WorkspaceCore, WorkspaceEvent};
         use crate::agent::launch::PaneLaunch;
         use crate::term::{Term, TermColors};
-        use gpui_kit::{AppContext, Entity};
+        use gpui::{AppContext, Entity};
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};

@@ -1,6 +1,7 @@
-//! Frontend UI: Home window + Pure Rust NSH Settings window.
+//! Frontend UI: Home window, native macOS title bar, and Pure Rust NSH Settings window.
 
 pub(crate) mod home;
+pub(crate) mod titlebar;
 
 pub use crate::nsh_ui::settings::SettingsWindow;
 pub use home::KumuApp;
@@ -14,8 +15,8 @@ pub fn init(cx: &mut gpui::App) {
                 != Some("0"),
         });
     }
-    // Root's focus-navigation actions run before on_key_down. Let the
-    // focused terminal receive completion keys through its normal encoder.
+    // Let the focused terminal receive completion keys through its normal encoder
+    // instead of any outer focus-navigation binding.
     cx.bind_keys([
         gpui::KeyBinding::new("tab", gpui::NoAction, Some("Terminal")),
         gpui::KeyBinding::new("shift-tab", gpui::NoAction, Some("Terminal")),
@@ -24,12 +25,11 @@ pub fn init(cx: &mut gpui::App) {
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{KeyContext, Keystroke, TestAppContext};
+    use gpui::{KeyContext, Keystroke, TestAppContext};
 
     #[gpui::test]
     fn terminal_completion_keys_bypass_root_focus_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_kit::init(cx);
             super::init(cx);
             let keymap = cx.key_bindings();
             let keymap = keymap.borrow();
@@ -41,9 +41,6 @@ mod tests {
                     keymap.bindings_for_input(&input, &[root.clone(), terminal.clone()]);
                 assert!(bindings.is_empty(), "{key} must reach on_key_down");
                 assert!(!pending, "{key} must not wait for another keystroke");
-
-                let (bindings, _) = keymap.bindings_for_input(&input, std::slice::from_ref(&root));
-                assert_eq!(bindings.len(), 1, "{key} still navigates outside terminals");
             }
         });
     }

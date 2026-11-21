@@ -6,7 +6,7 @@ A macOS workspace that runs local coding agents in their own terminal interfaces
 2. 有需求先进行设计再进行开发
 
 ## Constraints
-1. Build business UI (windows, panels, sidebar, tabs, dialogs) with Pure Rust `nsh` (`nsh-core` + `nsh-base` + `src/nsh_ui/components.rs` wrappers) hosted on `nsh-platform-gpui`; reserve `gpui-kit` / `gpui-fast` for the macOS window shell (TitleBar, Notifications), splitable terminal grid (`h_resizable`/`v_resizable`), and the GPU-accelerated Ghostty VT `TerminalView`
+1. Build all business UI (sidebar, tabs, splitable workspace shell, pane headers, `⌘F` find bar, dialogs, settings, toasts, tooltips, plugin panels, diff sheet) with Pure Rust `nsh` (`nsh-core` + `nsh-base` + `src/nsh_ui/` wrappers) hosted on `nsh-platform-gpui`; reserve bare `gpui` (`gpui-fast`) exclusively for the macOS window/titlebar shell (`src/ui/titlebar.rs`), native `SystemNotification`, and the GPU-accelerated Ghostty VT `TerminalView` embedded as an NSH `NativeView` (do not re-introduce `gpui-kit`)
 2. Keep core domain logic (`src/app/core.rs`, `src/app/layout.rs`, `src/term/`, `src/agent/`, `src/db.rs`, `src/git.rs`, `src/control.rs`) free of UI framework dependencies
 3. 在写测试的时候只需要写有必要的测试，没有必要覆盖非常边缘的可能性
 

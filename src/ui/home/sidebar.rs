@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use gpui_kit::{App, ClipboardItem, Context, Window};
+use gpui::{App, ClipboardItem, Context, Window};
 
 use super::KumuApp;
 use super::sidebar_nsh::{

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use gpui_kit::gpui::AssetSource;
+use gpui::AssetSource;
 use nsh_base::theme;
 use nsh_core::element::{ImageSrc, Svg, image, svg};
 use nsh_core::prelude::*;

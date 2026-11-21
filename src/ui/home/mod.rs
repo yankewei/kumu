@@ -30,10 +30,7 @@ use crate::nsh_ui::dialogs::ActiveDialog;
 use crate::nsh_ui::toast::ToastItem;
 use crate::theme::KumuTheme;
 use crate::updates::Updater;
-use gpui_kit::component::notification::{Notification, NotificationDelivery};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::*;
 use native_host::NativeViewRegistry;
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
 use shell_nsh::{
@@ -238,17 +235,12 @@ impl KumuApp {
                     // event should not surface as both a banner and a toast. The
                     // sidebar's unread marker is the in-app fallback when macOS
                     // declines delivery or kumu runs unbundled.
-                    let weak = cx.entity().downgrade();
-                    let note = Notification::info(message)
-                        .title(title)
-                        .id1::<NotificationSettings>(terminal.to_string())
-                        .delivery(NotificationDelivery::System)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.reveal_terminal_by_id(terminal, window, cx);
-                            });
-                        });
-                    window.push_notification(note, cx);
+                    cx.show_system_notification(SystemNotification {
+                        tag: terminal.to_string().into(),
+                        title: title.into(),
+                        body: message.into(),
+                        actions: Vec::new(),
+                    });
                 }
                 cx.notify();
             }
@@ -433,6 +425,18 @@ impl KumuApp {
             true
         });
         let window_handle = window.window_handle();
+        let notif_weak = cx.entity().downgrade();
+        let notif_window = window_handle;
+        cx.on_system_notification_response(move |response, cx| {
+            if let Ok(terminal) = response.tag.parse::<u64>() {
+                let _ = notif_window.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let _ = notif_weak.update(cx, |this, cx| {
+                        this.reveal_terminal_by_id(terminal, window, cx);
+                    });
+                });
+            }
+        });
         cx.on_app_quit(move |app, cx| {
             // The last word on the layout: a quit is also the moment a pane's
             // launch or a split ratio is most likely to differ from what was
@@ -1397,16 +1401,21 @@ impl KumuApp {
 
     fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = KumuTheme::global(cx);
-        let plugins = h_flex()
+        let plugins = div()
+            .flex()
+            .flex_row()
             .items_center()
             .gap_1()
-            .pr_2()
             .children(crate::plugins::specs().map(|spec| self.render_plugin_button(spec, cx)));
-        let title_bar = TitleBar::new()
-            .child(div().text_sm().font_bold().child("kumu"))
-            .child(plugins);
+        let title_bar = crate::ui::titlebar::title_bar(
+            "home-titlebar",
+            theme,
+            Some(plugins.into_any_element()),
+        );
 
-        v_flex()
+        div()
+            .flex()
+            .flex_col()
             .relative()
             .size_full()
             .font_family(theme.font_family.clone())
@@ -1500,12 +1509,8 @@ impl Render for KumuApp {
             for &terminal in &read {
                 self.unread_notifications.remove(&terminal);
                 self.shell_nsh.dismiss_toast(terminal.to_string());
+                cx.dismiss_system_notification(&terminal.to_string());
             }
-            cx.defer_in(window, move |_, window, cx| {
-                for terminal in read {
-                    window.remove_notification1::<NotificationSettings>(terminal.to_string(), cx);
-                }
-            });
         }
         let shell_snap = self.build_shell_snapshot(cx);
         self.shell_nsh.sync(shell_snap);

@@ -1,9 +1,6 @@
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::*;
 
 use super::{AgentEntry, KumuApp, agent_display_name, shell_prompt, submits_after_paste};
 use crate::agent::AgentState;
@@ -14,6 +11,7 @@ use crate::plugins::{
     AgentPaneInfo, DispatchMode, PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome,
 };
 use crate::term::KeyInput;
+use crate::theme::KumuTheme;
 
 /// The plugin panel's opening width and the range its divider allows.
 pub(super) const PLUGIN_WIDTH: f32 = 300.;
@@ -333,7 +331,7 @@ impl KumuApp {
     fn todo_attention_color(&self, cx: &Context<Self>) -> Option<Hsla> {
         let project = self.selected?;
         let todos = self.workspace.read(cx).todos_for_project(project);
-        let theme = cx.theme();
+        let colors = &KumuTheme::global(cx).colors;
         let mut has_review = false;
         for todo in todos {
             if todo.status != TodoStatus::InProgress {
@@ -346,13 +344,13 @@ impl KumuApp {
                     .and_then(|entry| entry.state)
                     == Some(AgentState::Waiting)
             {
-                return Some(theme.warning);
+                return Some(colors.warning);
             }
             if todo.awaiting_review {
                 has_review = true;
             }
         }
-        has_review.then_some(theme.success)
+        has_review.then_some(colors.success)
     }
 
     /// The panes a plugin may hand text to, in layout order. The header's label
@@ -516,34 +514,39 @@ impl KumuApp {
     /// One title-bar entry per registered plugin; the open panel's entry stays
     /// highlighted.
     pub(super) fn render_plugin_button(&self, spec: PluginSpec, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
+        let colors = &KumuTheme::global(cx).colors;
         let active = self.open_plugin == Some(spec.id);
         let background = if active {
-            theme.accent
+            colors.accent
         } else {
-            theme.transparent
+            colors.transparent
         };
+        let hover_bg = colors.accent.opacity(0.5);
         let foreground = if active {
-            theme.link
+            colors.link
         } else {
-            theme.muted_foreground
+            colors.muted_foreground
         };
         let attention = (spec.id == "todo")
             .then(|| self.todo_attention_color(cx))
             .flatten();
-        let button = Button::new(format!("plugin-toggle-{}", spec.id))
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(background)
-                    .foreground(foreground)
-                    .hover(theme.accent.opacity(0.5)),
-            )
-            .compact()
-            .icon(Icon::empty().path(spec.icon))
-            .tooltip(spec.title)
+        let icon = spec.icon;
+        let button = div()
+            .id(SharedString::from(format!("plugin-toggle-{}", spec.id)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.))
+            .h(px(24.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .bg(background)
+            .hover(move |style| style.bg(hover_bg))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_plugin(spec.clone(), window, cx);
-            }));
+            }))
+            .child(svg().path(icon).size(px(14.)).text_color(foreground));
         let Some(dot_color) = attention else {
             return button.into_any_element();
         };

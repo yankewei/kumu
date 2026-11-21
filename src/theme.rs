@@ -436,10 +436,6 @@ fn parse_theme_json(json: &str, name: &str, fallback_mode: ThemeMode) -> ThemePr
 /// and user font settings.
 pub fn load_kumu_themes(cx: &mut App) {
     cx.set_global(KumuTheme::load_bundled());
-    // Transitional: keep gpui-kit ThemeRegistry populated for the remaining
-    // GPUI window shell / terminal chrome until Stage 3 removes gpui-kit.
-    init_legacy_gpui_kit_themes(cx);
-
     let mode =
         theme_mode_from_setting(crate::db::get_setting(crate::db::SETTING_THEME_MODE).as_deref());
     apply_mode(mode, None, cx);
@@ -463,12 +459,11 @@ pub fn change_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     apply_mode(mode, window, cx);
 }
 
-fn apply_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
+fn apply_mode(mode: ThemeMode, _window: Option<&mut Window>, cx: &mut App) {
     if !cx.has_global::<KumuTheme>() {
         cx.set_global(KumuTheme::load_bundled());
     }
     KumuTheme::global_mut(cx).apply_preset(mode);
-    sync_legacy_gpui_kit_mode(mode, window, cx);
     cx.default_global::<ThemeRevision>().0 += 1;
     apply_saved_font(cx);
 }
@@ -544,14 +539,12 @@ fn clamp_font_size(size: f32) -> f32 {
 /// Set the app-wide UI font family and redraw every window.
 pub fn set_font_family(cx: &mut App, family: &str) {
     KumuTheme::global_mut(cx).font_family = SharedString::from(family.to_owned());
-    sync_legacy_gpui_kit_font(cx);
     cx.refresh_windows();
 }
 
 /// Set the app-wide UI font size, in px.
 pub fn set_font_size(cx: &mut App, size: f32) {
     KumuTheme::global_mut(cx).font_size = clamp_font_size(size);
-    sync_legacy_gpui_kit_font(cx);
     cx.refresh_windows();
 }
 
@@ -569,7 +562,6 @@ pub fn apply_saved_font(cx: &mut App) {
         }
         theme.font_size = size;
     }
-    sync_legacy_gpui_kit_font(cx);
     cx.refresh_windows();
 }
 
@@ -596,62 +588,6 @@ pub fn system_fonts(cx: &App) -> Vec<(SharedString, SharedString)> {
         (label, family)
     }));
     items
-}
-
-// ---------------------------------------------------------------------------
-// Transitional gpui-kit theme mirror (removed in Stage 3 when gpui-kit is dropped)
-// ---------------------------------------------------------------------------
-
-fn init_legacy_gpui_kit_themes(cx: &mut App) {
-    if !cx.has_global::<gpui_kit::component::ThemeRegistry>() {
-        return;
-    }
-    let (light, dark) = {
-        let registry = gpui_kit::component::ThemeRegistry::global_mut(cx);
-        let _ = registry.load_themes_from_str(THEME_LIGHT);
-        let _ = registry.load_themes_from_str(THEME_DARK);
-        (
-            registry.themes().get(THEME_LIGHT_NAME).cloned(),
-            registry.themes().get(THEME_DARK_NAME).cloned(),
-        )
-    };
-    if cx.has_global::<gpui_kit::component::Theme>() {
-        let theme = gpui_kit::component::Theme::global_mut(cx);
-        if let Some(t) = light {
-            theme.light_theme = t;
-        }
-        if let Some(t) = dark {
-            theme.dark_theme = t;
-        }
-    }
-}
-
-fn sync_legacy_gpui_kit_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
-    if !cx.has_global::<gpui_kit::component::Theme>() {
-        return;
-    }
-    let legacy = if mode.is_dark() {
-        gpui_kit::component::ThemeMode::Dark
-    } else {
-        gpui_kit::component::ThemeMode::Light
-    };
-    gpui_kit::component::Theme::change(legacy, window, cx);
-}
-
-fn sync_legacy_gpui_kit_font(cx: &mut App) {
-    if !cx.has_global::<gpui_kit::component::Theme>() {
-        return;
-    }
-    let (family, size) = {
-        let t = KumuTheme::global(cx);
-        (t.font_family.clone(), t.font_size)
-    };
-    {
-        let legacy = gpui_kit::component::Theme::global_mut(cx);
-        legacy.font_family = family;
-        legacy.font_size = gpui::px(size);
-    }
-    gpui_kit::component::Theme::sync_base(cx);
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use gpui_kit::{App, AppContext, Context, Entity, Global, Task};
+use gpui::{App, AppContext, Context, Entity, Global, Task};
 pub use gpui_updater_core::{
     CancelToken, CodeSigning, EngineConfig, Error, ErrorKind, GitHubSource, Release, UpdateEngine,
     UpdateSource, UpdateStatus, Verification, Version,

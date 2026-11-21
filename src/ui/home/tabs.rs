@@ -1,4 +1,4 @@
-use gpui_kit::{Context, Window};
+use gpui::{Context, Window};
 
 use super::KumuApp;
 use super::tabs_nsh::{TabAttention, TabBarAction, TabBarSnapshot, TabItemSnapshot};

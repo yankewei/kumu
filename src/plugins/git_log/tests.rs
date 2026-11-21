@@ -100,7 +100,6 @@ fn fixture() -> (PathBuf, PathBuf) {
 
 #[gpui::test]
 fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let (dir, path) = fixture();
     let history = crate::git::history(&path).unwrap();
     let commit = history.commits[0].clone();
@@ -136,7 +135,6 @@ fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_diff_view_parses_an_uncommitted_change(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let (dir, path) = fixture();
     std::fs::write(path.join("new"), "new\n").unwrap();
     let changes = crate::git::changes(&path).unwrap();
@@ -219,7 +217,6 @@ diff --git a/src/b.rs b/src/b.rs
 
 #[gpui::test]
 fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let sent = Rc::new(RefCell::new(None::<(i64, Option<u64>, String)>));
     let host = PluginHost::with_panes(
         {
@@ -282,7 +279,6 @@ fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppCo
 
 #[gpui::test]
 fn a_closed_sheet_restores_its_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let store = empty_store();
     let commit = PatchSource::Commit {
         root: PathBuf::from("/nonexistent"),

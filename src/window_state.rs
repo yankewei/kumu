@@ -4,7 +4,7 @@
 //! restored rectangle is validated against the displays present now, so a
 //! window saved on a monitor that is no longer attached opens centered.
 
-use gpui_kit::*;
+use gpui::*;
 
 use crate::db;
 
@@ -124,7 +124,7 @@ pub fn save_bounds(bounds: WindowBounds) {
 
 #[cfg(test)]
 mod tests {
-    // `use gpui_kit::*` in the parent brings gpui's own `test` attribute into
+    // `use gpui::*` in the parent brings gpui's own `test` attribute into
     // scope through the glob, so the built-in one is imported explicitly.
     use super::*;
     use core::prelude::v1::test;

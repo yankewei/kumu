@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use gpui_kit::*;
+use gpui::*;
 
 use super::KumuApp;
 use crate::agent::launch::PaneLaunch;

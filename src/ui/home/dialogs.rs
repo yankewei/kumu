@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use gpui_kit::component::{Root, TitleBar};
-use gpui_kit::{
-    AnyView, App, AppContext, Context, PathPromptOptions, Window, WindowBounds, px, size,
-};
+use gpui::{AnyView, App, AppContext, Context, PathPromptOptions, Window, WindowBounds, px, size};
 
 use super::KumuApp;
 use crate::app::layout::PaneId;
@@ -406,10 +403,7 @@ impl KumuApp {
     /// Focus the settings window if it's open, else open a new one.
     pub(super) fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
         let activate = |view: AnyView, window: &mut Window, cx: &mut App| {
-            if show_updates
-                && let Ok(root) = view.downcast::<Root>()
-                && let Ok(settings) = root.read(cx).view().clone().downcast::<SettingsWindow>()
-            {
+            if show_updates && let Ok(settings) = view.downcast::<SettingsWindow>() {
                 settings.update(cx, |settings, cx| settings.show_updates(window, cx));
             }
             window.activate_window();
@@ -419,13 +413,14 @@ impl KumuApp {
         {
             return;
         }
-        let mut options = TitleBar::window_options();
+        let mut options = crate::ui::titlebar::window_options();
         options.window_bounds = Some(WindowBounds::centered(None, size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
-        if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
+        if let Ok(handle) = cx.open_window(options, |window, cx| {
             cx.new(|cx| SettingsWindow::new(updater, window, cx))
         }) {
+            let handle: gpui::AnyWindowHandle = handle.into();
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
         }

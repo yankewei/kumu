@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::App;
+use gpui::App;
 
 /// Terminal body text unless the theme picks another mono family.
 pub const TERM_FONT: &str = "JetBrains Mono";

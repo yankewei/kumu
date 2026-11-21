@@ -12,7 +12,6 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task,
     Window, div,
 };
-use gpui_kit::component::{StyledExt, TitleBar};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
 use super::theme::{appearance, nsh_theme};
@@ -1306,7 +1305,7 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = KumuTheme::global(cx);
-        let title_bar = TitleBar::new().child(div().text_sm().font_bold().child("kumu"));
+        let title_bar = crate::ui::titlebar::title_bar("settings-titlebar", theme, None);
         div()
             .flex()
             .flex_col()
