@@ -1,17 +1,308 @@
+//! Pure-Rust review domain & unified-diff line index for the Git panel.
+//!
+//! Zero GPUI imports: tracks review drafts, sent receipts, comment prompt
+//! formatting, and exact mapping between `nsh_base::DiffView`'s joined 0-based
+//! patch coordinates and real `(file_path, 1-based line)` locations.
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui_kit::component::Theme;
-use gpui_kit::component::diff::{DiffLineRange, DiffSide};
-use gpui_kit::component::input::TextareaState;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
 use sha2::{Digest, Sha256};
 
 use crate::git::{Change, Patch};
 use crate::plugins::PluginHost;
+
+/// Which side of a diff a review comment targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ReviewSide {
+    Original,
+    Modified,
+}
+
+impl From<nsh_base::DiffSide> for ReviewSide {
+    fn from(side: nsh_base::DiffSide) -> Self {
+        match side {
+            nsh_base::DiffSide::Old => Self::Original,
+            nsh_base::DiffSide::New => Self::Modified,
+        }
+    }
+}
+
+impl From<ReviewSide> for nsh_base::DiffSide {
+    fn from(side: ReviewSide) -> Self {
+        match side {
+            ReviewSide::Original => Self::Old,
+            ReviewSide::Modified => Self::New,
+        }
+    }
+}
+
+/// A 1-based line range within one file of a patch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ReviewRange {
+    pub(super) path: String,
+    pub(super) side: ReviewSide,
+    pub(super) end_side: ReviewSide,
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
+impl ReviewRange {
+    pub(super) fn new(path: impl Into<String>, side: ReviewSide, start: usize, end: usize) -> Self {
+        Self {
+            path: path.into(),
+            side,
+            end_side: side,
+            start,
+            end,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_end_side(mut self, end_side: ReviewSide) -> Self {
+        self.end_side = end_side;
+        self
+    }
+
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(super) fn side(&self) -> ReviewSide {
+        self.side
+    }
+
+    pub(super) fn end_side(&self) -> ReviewSide {
+        self.end_side
+    }
+
+    pub(super) fn start(&self) -> usize {
+        self.start
+    }
+
+    pub(super) fn end(&self) -> usize {
+        self.end
+    }
+}
+
+/// Exact mapping between `nsh_base::DiffView`'s joined 0-based line indices
+/// (across all files in a unified patch) and `(file_path, 1-based line)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PatchIndex {
+    pub(super) file_count: usize,
+    /// `old_lines[joined_0_based] = (file_path, 1_based_old_line)`
+    pub(super) old_lines: Vec<(String, usize)>,
+    /// `new_lines[joined_0_based] = (file_path, 1_based_new_line)`
+    pub(super) new_lines: Vec<(String, usize)>,
+}
+
+impl PatchIndex {
+    /// Resolve an `nsh_base::DiffLineRange` (0-based joined lines on one side)
+    /// into a real 1-based [`ReviewRange`].
+    pub(super) fn resolve_range(&self, range: nsh_base::DiffLineRange) -> Option<ReviewRange> {
+        let side = ReviewSide::from(range.side);
+        let table = match side {
+            ReviewSide::Original => &self.old_lines,
+            ReviewSide::Modified => &self.new_lines,
+        };
+        let (path, start) = table.get(range.start as usize)?;
+        let end = table
+            .get(range.end as usize)
+            .filter(|(p, _)| p == path)
+            .map_or(*start, |(_, line)| *line);
+        let (lo, hi) = if *start <= end {
+            (*start, end)
+        } else {
+            (end, *start)
+        };
+        Some(ReviewRange::new(path.clone(), side, lo, hi))
+    }
+
+    /// Map a persisted [`ReviewRange`] back to a joined 0-based
+    /// `(DiffSide, line)` anchor for `nsh_base::DiffAnnotation`.
+    pub(super) fn anchor_for(&self, range: &ReviewRange) -> Option<(nsh_base::DiffSide, u32)> {
+        let table = match range.side {
+            ReviewSide::Original => &self.old_lines,
+            ReviewSide::Modified => &self.new_lines,
+        };
+        let target_line = range.end.max(range.start);
+        let idx = table
+            .iter()
+            .position(|(p, l)| p == &range.path && *l == target_line)
+            .or_else(|| {
+                table
+                    .iter()
+                    .position(|(p, l)| p == &range.path && *l == range.start)
+            })?;
+        Some((range.side.into(), idx as u32))
+    }
+}
+
+fn parse_hunk_coords(header: &str) -> Option<(usize, usize, usize, usize, String)> {
+    let rest = header.strip_prefix("@@ ")?;
+    let (coords, suffix) = rest.split_once(" @@")?;
+    let mut parts = coords.split_whitespace();
+    let old_part = parts.next()?.strip_prefix('-')?;
+    let new_part = parts.next()?.strip_prefix('+')?;
+    let parse_pair = |s: &str| -> Option<(usize, usize)> {
+        match s.split_once(',') {
+            Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
+            None => Some((s.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_count) = parse_pair(old_part)?;
+    let (new_start, new_count) = parse_pair(new_part)?;
+    Some((
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        suffix.to_string(),
+    ))
+}
+
+fn strip_git_prefix(raw: &str, prefix: &str) -> Option<String> {
+    let s = raw.split('\t').next().unwrap_or(raw).trim();
+    if s == "/dev/null" {
+        return None;
+    }
+    let unquoted = s.trim_matches('"');
+    Some(
+        unquoted
+            .strip_prefix(prefix)
+            .unwrap_or(unquoted)
+            .to_string(),
+    )
+}
+
+/// Normalize a raw unified diff (fixing any truncated final hunk header counts
+/// so `nsh_base::DiffView` always parses it cleanly) and build a [`PatchIndex`]
+/// whose joined 0-based line indices match `nsh_base`'s `diff/files.rs` 1-to-1.
+pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, PatchIndex) {
+    let mut lines: Vec<&str> = raw.split('\n').collect();
+    if raw.ends_with('\n') {
+        lines.pop();
+    }
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut index = PatchIndex::default();
+    let mut current_old_path: Option<String> = None;
+    let mut current_new_path: Option<String> = None;
+    let mut in_git = false;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].strip_suffix('\r').unwrap_or(lines[i]);
+        if let Some(names) = line.strip_prefix("diff --git ") {
+            in_git = true;
+            index.file_count += 1;
+            current_old_path = None;
+            current_new_path = None;
+            if let Some((a, b)) = names.split_once(" b/") {
+                current_old_path = Some(a.strip_prefix("a/").unwrap_or(a).trim_matches('"').into());
+                current_new_path = Some(b.trim_matches('"').into());
+            }
+            out_lines.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if line.starts_with("--- ")
+            && lines
+                .get(i + 1)
+                .is_some_and(|next| next.starts_with("+++ "))
+        {
+            if !in_git {
+                index.file_count += 1;
+            }
+            let next = lines[i + 1].strip_suffix('\r').unwrap_or(lines[i + 1]);
+            current_old_path = strip_git_prefix(&line[4..], if in_git { "a/" } else { "" });
+            current_new_path = strip_git_prefix(&next[4..], if in_git { "b/" } else { "" });
+            out_lines.push(line.to_string());
+            out_lines.push(next.to_string());
+            i += 2;
+            continue;
+        }
+        if line.starts_with("@@ ")
+            && let Some((old_start, old_count, new_start, new_count, suffix)) =
+                parse_hunk_coords(line)
+        {
+            if index.file_count == 0 {
+                index.file_count = 1;
+            }
+            let path = current_new_path
+                .clone()
+                .or_else(|| current_old_path.clone())
+                .unwrap_or_default();
+            let (mut old_left, mut new_left) = (old_count, new_count);
+            let mut actual_old = 0usize;
+            let mut actual_new = 0usize;
+            let mut hunk_body: Vec<String> = Vec::new();
+            let mut old_cursor = old_start.max(1);
+            let mut new_cursor = new_start.max(1);
+
+            i += 1;
+            while i < lines.len() {
+                let next = lines[i];
+                if old_left == 0 && new_left == 0 && !next.starts_with('\\') {
+                    break;
+                }
+                match next.as_bytes().first() {
+                    Some(b'\\') => {
+                        hunk_body.push(next.to_string());
+                    }
+                    Some(b'+') if new_left > 0 => {
+                        index.new_lines.push((path.clone(), new_cursor));
+                        new_cursor += 1;
+                        actual_new += 1;
+                        new_left -= 1;
+                        hunk_body.push(next.to_string());
+                    }
+                    Some(b'-') if old_left > 0 => {
+                        index.old_lines.push((path.clone(), old_cursor));
+                        old_cursor += 1;
+                        actual_old += 1;
+                        old_left -= 1;
+                        hunk_body.push(next.to_string());
+                    }
+                    Some(b' ') | None if old_left > 0 && new_left > 0 => {
+                        index.old_lines.push((path.clone(), old_cursor));
+                        index.new_lines.push((path.clone(), new_cursor));
+                        old_cursor += 1;
+                        new_cursor += 1;
+                        actual_old += 1;
+                        actual_new += 1;
+                        old_left -= 1;
+                        new_left -= 1;
+                        hunk_body.push(next.to_string());
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+
+            if truncated && (old_left > 0 || new_left > 0) {
+                out_lines.push(format!(
+                    "@@ -{old_start},{actual_old} +{new_start},{actual_new} @@{suffix}"
+                ));
+            } else {
+                out_lines.push(line.to_string());
+            }
+            out_lines.extend(hunk_body);
+            continue;
+        }
+
+        out_lines.push(line.to_string());
+        i += 1;
+    }
+
+    let mut normalized = out_lines.join("\n");
+    if !normalized.is_empty() {
+        normalized.push('\n');
+    }
+    (normalized, index)
+}
 
 /// Where a [`PatchView`] reads its patch from.
 #[derive(Clone)]
@@ -71,14 +362,14 @@ impl PatchKey {
 
 /// One comment as it was when its sheet closed, so reopening the patch brings
 /// the editors back with what the user typed.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DraftComment {
-    pub(super) range: DiffLineRange,
+    pub(super) range: ReviewRange,
     pub(super) text: String,
 }
 
 /// The last review a patch sent, shown on its row as a receipt.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SentReview {
     pub(super) count: usize,
     pub(super) target: String,
@@ -91,8 +382,15 @@ pub(super) struct ReviewStore {
     pub(super) sent: HashMap<PatchKey, SentReview>,
 }
 
-/// A snapshot of [`ReviewStore`] the panel's row closures can carry.
-#[derive(Default, Clone)]
+/// Which marker badge a Git panel row shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewMark {
+    Draft,
+    Sent,
+}
+
+/// A pure-Rust snapshot of [`ReviewStore`] for row rendering.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReviewMarks {
     drafts: HashSet<PatchKey>,
     sent: HashMap<PatchKey, SentReview>,
@@ -106,28 +404,11 @@ impl ReviewMarks {
         }
     }
 
-    /// The small mark a patch row wears: a draft marker while a comment waits,
-    /// or a receipt once a review reached a pane. A draft takes precedence,
-    /// because it is the one thing still asking for the user.
-    pub(super) fn mark(&self, key: &PatchKey, theme: &Theme) -> Option<AnyElement> {
+    pub(super) fn mark(&self, key: &PatchKey) -> Option<ReviewMark> {
         if self.drafts.contains(key) {
-            return Some(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.warning)
-                    .child("草稿")
-                    .into_any_element(),
-            );
+            return Some(ReviewMark::Draft);
         }
-        self.sent.get(key).map(|_| {
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(theme.success)
-                .child("已审查")
-                .into_any_element()
-        })
+        self.sent.contains_key(key).then_some(ReviewMark::Sent)
     }
 }
 
@@ -145,25 +426,22 @@ pub(super) struct PatchRequest {
 }
 
 /// One review comment, edited beneath the line it targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReviewComment {
-    /// Distinguishes this comment's elements from an earlier one's.
     pub(super) index: u64,
-    pub(super) range: DiffLineRange,
-    /// The latest text, kept even before a textarea exists, so a restored
-    /// comment is never mistaken for an empty one.
+    pub(super) range: ReviewRange,
     pub(super) text: String,
-    /// Created on the first paint, which is the first moment a window exists.
-    pub(super) input: Option<Entity<TextareaState>>,
 }
 
 impl ReviewComment {
-    pub(super) fn annotation_id(&self) -> ElementId {
-        ElementId::named_usize("git-diff-comment", self.index as usize)
+    pub(super) fn annotation_id(&self) -> String {
+        format!("git-diff-comment-{}", self.index)
     }
 }
 
 /// Why the sheet could not submit, or why it left the text on a shell's
 /// command line instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SendNotice {
     /// The text is on the named pane's command line, where Enter would run it.
     Pasted(String),
@@ -176,13 +454,11 @@ pub(super) struct PatchSheet {
     pub(super) project: i64,
     pub(super) key: PatchKey,
     pub(super) source: PatchSource,
-    /// The commit message, shown above the patch; empty for a change.
     pub(super) message: String,
-    /// Where the patch's line numbers point, named when they are sent.
     pub(super) context: String,
     pub(super) host: PluginHost,
     pub(super) reviews: Rc<RefCell<ReviewStore>>,
-    pub(super) notify_panel: Rc<dyn Fn(&mut App)>,
+    pub(super) notify_panel: Rc<dyn Fn(&mut gpui_kit::App)>,
 }
 
 /// A patch's identity for the watcher: the text and whether it was cut.
@@ -195,7 +471,7 @@ pub(super) fn patch_digest(patch: &Patch) -> String {
 
 /// Where a comment points, in the form the agent reads in the patch. A range
 /// can start on one side and end on the other in the unified view.
-pub(super) fn comment_location(range: &DiffLineRange) -> String {
+pub(super) fn comment_location(range: &ReviewRange) -> String {
     let path = range.path();
     if range.side() != range.end_side() {
         return format!(
@@ -209,7 +485,7 @@ pub(super) fn comment_location(range: &DiffLineRange) -> String {
     } else {
         format!("{}-{}", range.start(), range.end())
     };
-    if range.side() == DiffSide::Original {
+    if range.side() == ReviewSide::Original {
         format!("{path}:{lines}（改动前）")
     } else {
         format!("{path}:{lines}")
@@ -217,7 +493,7 @@ pub(super) fn comment_location(range: &DiffLineRange) -> String {
 }
 
 /// Every comment as one instruction, each under the line it targets.
-pub(super) fn compose_comments(context: &str, comments: &[(DiffLineRange, String)]) -> String {
+pub(super) fn compose_comments(context: &str, comments: &[(ReviewRange, String)]) -> String {
     let mut message = if context.is_empty() {
         String::from("请根据以下代码审查意见修改：")
     } else {

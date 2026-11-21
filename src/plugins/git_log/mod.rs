@@ -1,60 +1,115 @@
-//! The Git panel: the selected project's uncommitted changes and its commit
-//! history.
+//! The Git panel rendered in Pure Rust NSH (`nsh-platform-gpui`): uncommitted
+//! changes and virtualized commit history, with an NSH `DiffView` review sheet.
 //!
 //! The panel reads both on the background executor and polls while it is
 //! alive: a poll reads a cheap ref fingerprint and the status listing, and only
-//! takes the full log when a ref moved. Rows stay virtualized, so a repository
-//! with a long history costs the same to draw as a short one. The home window
-//! creates a panel when the user opens it and drops it when they close it, so a
-//! closed panel costs nothing.
-//!
-//! A patch sheet's review comments belong to the panel, keyed by the patch they
-//! discuss, so closing the sheet keeps the draft and the panel can mark the row
-//! that still has one.
+//! takes the full log when a ref moved.
 
 mod patch_view;
 mod review;
 #[cfg(test)]
 mod tests;
+mod view;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use gpui_kit::component::{ActiveTheme, StyledExt, Theme, WindowExt};
+use gpui_kit::{
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, StyleRefinement, Styled,
+    Subscription, Task, Window, div, px,
+};
+use nsh_platform_gpui::{AppOptions, AppView, Root};
 
-use self::patch_view::{PatchFooter, PatchView};
-use self::review::{PatchKey, PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewStore};
+use self::patch_view::PatchView;
+use self::review::{PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewStore};
 use super::{Plugin, PluginHost, PluginProject};
 use crate::git::{Change, Changes, Commit, History};
+use crate::nsh_ui::theme::{appearance, nsh_theme};
 
-/// How often an open panel checks whether the repository moved. Polling rather
-/// than a filesystem watcher stays correct for commits a terminal's git
-/// commands make without adding a platform watcher to the app.
+/// How often an open panel checks whether the repository moved.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Every commit row has the same height, which is what lets the uniform list
-/// virtualize a full history. One compact line: refs, hash and subject.
+/// Commit row height for `virtual_list`.
 const ROW_HEIGHT: f32 = 32.;
 
-/// A change row and its section heading share this height, because the list of
-/// both draws through one uniform list.
+/// Change row and section header height for `virtual_list`.
 const CHANGE_ROW_HEIGHT: f32 = 28.;
 
 /// Which of the panel's two lists is showing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 enum PanelTab {
+    #[default]
     Changes,
     History,
 }
 
-/// One poll's read of the repository: the ref fingerprint, the uncommitted
-/// changes, and the log only when a ref moved since the previous poll.
+/// A row of the changes tab: a section heading or one file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChangeRow {
+    Header(&'static str),
+    File(Change),
+}
+
+/// Immutable snapshot pushed from the GPUI host to the Pure Rust NSH Git view.
+#[derive(Clone, Default)]
+struct GitPanelSnapshot {
+    project_id: Option<i64>,
+    tab: PanelTab,
+    branch: Option<String>,
+    loaded: bool,
+    error: Option<String>,
+    change_count: usize,
+    change_rows: Vec<ChangeRow>,
+    commits: Arc<Vec<Commit>>,
+    filter: Option<Arc<Vec<usize>>>,
+    marks: ReviewMarks,
+}
+
+#[derive(Clone)]
+enum GitHostEvent {
+    Snapshot(GitPanelSnapshot),
+}
+
+#[derive(Clone, Debug)]
+enum GitPanelAction {
+    SelectTab(PanelTab),
+    SetQuery(String),
+    OpenChange(Change),
+    OpenCommit(Commit),
+}
+
+struct GitPanelMount {
+    initial: GitPanelSnapshot,
+    events_rx: UnboundedReceiver<GitHostEvent>,
+    actions_tx: UnboundedSender<GitPanelAction>,
+}
+
+static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
+static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, GitPanelMount>>> = OnceLock::new();
+
+fn pending_mounts() -> &'static Mutex<HashMap<u64, GitPanelMount>> {
+    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_panel_mount(mount: GitPanelMount) -> u64 {
+    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut map) = pending_mounts().lock() {
+        map.insert(id, mount);
+    }
+    id
+}
+
+fn take_panel_mount(id: u64) -> Option<GitPanelMount> {
+    pending_mounts().lock().ok()?.remove(&id)
+}
+
 struct RepoRead {
     fingerprint: String,
     changes: Changes,
@@ -62,37 +117,32 @@ struct RepoRead {
 }
 
 pub struct GitLogPanel {
+    mount_id: u64,
     project: Option<PluginProject>,
     history: Option<History>,
-    /// The same commits as `history`, shared with the list closure.
     commits: Arc<Vec<Commit>>,
-    /// The uncommitted changes, refreshed by every poll.
     changes: Changes,
-    /// Which list the panel shows; changes are what a working session reads.
     tab: PanelTab,
-    /// What the repository looked like when the rows were read. A poll that
-    /// reads the same fingerprint leaves the log alone.
     fingerprint: Option<String>,
-    /// Commit indices matching `query`, or `None` when the search is empty.
-    filter: Option<Rc<Vec<usize>>>,
-    /// Bumped for every filter rebuild, so the scan for an older query is
-    /// dropped instead of overwriting a newer one.
+    filter: Option<Arc<Vec<usize>>>,
     filter_generation: u64,
     query: String,
-    search: Entity<InputState>,
     error: Option<String>,
-    /// A read is running; another request waits for it instead of running a
-    /// second git process.
     loading: bool,
     dirty: bool,
-    /// Changes when the selected project changes, so a read from the previous
-    /// project cannot overwrite the log.
     generation: u64,
-    /// Review comments and the records of reviews already sent, kept across
-    /// sheets so closing one does not throw away what the user wrote.
     reviews: Rc<RefCell<ReviewStore>>,
-    /// How a patch sheet hands its review comments to a terminal.
     host: PluginHost,
+    app_view: Entity<AppView>,
+    events_tx: UnboundedSender<GitHostEvent>,
+    _theme_sub: Subscription,
+    _actions_task: Task<()>,
+}
+
+impl Drop for GitLogPanel {
+    fn drop(&mut self) {
+        let _ = take_panel_mount(self.mount_id);
+    }
 }
 
 impl Plugin for GitLogPanel {
@@ -106,16 +156,79 @@ impl Plugin for GitLogPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索提交信息"));
-        cx.subscribe(&search, |panel, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                panel.query = panel.search.read(cx).value().to_string();
-                panel.rebuild_filter(cx);
-                cx.notify();
+        let (events_tx, events_rx) = unbounded::<GitHostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<GitPanelAction>();
+
+        let initial = GitPanelSnapshot {
+            project_id: project.as_ref().map(|p| p.id),
+            tab: PanelTab::Changes,
+            ..Default::default()
+        };
+        let mount_id = register_panel_mount(GitPanelMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+
+        let gpui_theme = cx.theme();
+        let initial_nsh_theme = nsh_theme(gpui_theme);
+        let initial_appearance = appearance(gpui_theme.mode);
+
+        let app_view = cx.new(|cx| {
+            let options = AppOptions {
+                title: "Kumu Git".to_owned(),
+                ..Default::default()
+            };
+            let view = AppView::new(options, window, cx);
+            view.set_theme(Some(initial_nsh_theme), cx);
+            view.set_appearance(initial_appearance, cx);
+            view.load(nsh_platform_gpui::App::Rust(Root::new::<view::GitLogRoot>(
+                move || view::GitLogRootProps {
+                    mount_id: mount_id.into(),
+                },
+            )));
+            view
+        });
+
+        let theme_sub = cx.observe_global::<Theme>(|panel: &mut Self, cx| {
+            let gpui_theme = cx.theme();
+            let (mapped, mode) = (nsh_theme(gpui_theme), appearance(gpui_theme.mode));
+            panel.app_view.update(cx, |view, cx| {
+                view.set_theme(Some(mapped), cx);
+                view.set_appearance(mode, cx);
+            });
+        });
+
+        let actions_task = cx.spawn_in(window, async move |this, cx| {
+            while let Some(action) = actions_rx.next().await {
+                let res = this.update_in(cx, |panel, window, cx| match action {
+                    GitPanelAction::SelectTab(tab) => {
+                        if panel.tab != tab {
+                            panel.tab = tab;
+                            panel.push_snapshot();
+                            cx.notify();
+                        }
+                    }
+                    GitPanelAction::SetQuery(query) => {
+                        panel.query = query;
+                        panel.rebuild_filter(cx);
+                        panel.push_snapshot();
+                    }
+                    GitPanelAction::OpenChange(change) => {
+                        panel.open_change(change, window, cx);
+                    }
+                    GitPanelAction::OpenCommit(commit) => {
+                        panel.open_commit(commit, window, cx);
+                    }
+                });
+                if res.is_err() {
+                    break;
+                }
             }
-        })
-        .detach();
+        });
+
         let mut panel = Self {
+            mount_id,
             project,
             history: None,
             commits: Arc::default(),
@@ -125,13 +238,16 @@ impl Plugin for GitLogPanel {
             filter: None,
             filter_generation: 0,
             query: String::new(),
-            search,
             error: None,
             loading: false,
             dirty: false,
             generation: 0,
             reviews: Rc::new(RefCell::new(ReviewStore::default())),
             host,
+            app_view,
+            events_tx,
+            _theme_sub: theme_sub,
+            _actions_task: actions_task,
         };
         panel.reload(cx);
         Self::watch(cx);
@@ -147,19 +263,16 @@ impl Plugin for GitLogPanel {
         self.clear_rows();
         self.error = None;
         if self.loading {
-            // The read in flight belongs to the old project. Its completion
-            // starts the read for this one.
             self.dirty = true;
         } else {
             self.reload(cx);
         }
+        self.push_snapshot();
         cx.notify();
     }
 }
 
 impl GitLogPanel {
-    /// Poll while the panel exists. Dropping the panel makes the next update
-    /// fail, which ends the loop.
     fn watch(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let mut interval = REFRESH_INTERVAL;
@@ -169,8 +282,6 @@ impl GitLogPanel {
                     if !panel.loading {
                         panel.reload(cx);
                     }
-                    // Back off when the current folder is not a git repo or
-                    // failed to read so non-git projects do not spawn git every 2s.
                     if panel.error.is_some() {
                         Duration::from_secs(10)
                     } else {
@@ -186,9 +297,31 @@ impl GitLogPanel {
         .detach();
     }
 
-    /// Forget the rows and the fingerprint they came from. Bumping the filter
-    /// generation also drops a scan that is still running, whose indices
-    /// address the list this clears.
+    fn build_snapshot(&self) -> GitPanelSnapshot {
+        let marks = {
+            let store = self.reviews.borrow();
+            ReviewMarks::of(&store)
+        };
+        GitPanelSnapshot {
+            project_id: self.project.as_ref().map(|p| p.id),
+            tab: self.tab,
+            branch: self.history.as_ref().map(|h| h.branch.clone()),
+            loaded: self.history.is_some(),
+            error: self.error.clone(),
+            change_count: self.changes.len(),
+            change_rows: self.change_rows(),
+            commits: self.commits.clone(),
+            filter: self.filter.clone(),
+            marks,
+        }
+    }
+
+    fn push_snapshot(&self) {
+        let _ = self
+            .events_tx
+            .unbounded_send(GitHostEvent::Snapshot(self.build_snapshot()));
+    }
+
     fn clear_rows(&mut self) {
         self.history = None;
         self.commits = Arc::default();
@@ -212,16 +345,12 @@ impl GitLogPanel {
         cx.spawn(async move |this, cx| {
             let read = cx
                 .background_spawn(async move {
-                    // The fingerprint is read first: one taken after the log
-                    // could be newer than the rows it would be stored with.
                     let fingerprint = crate::git::fingerprint(&project.path)?;
                     let history = if known.as_deref() == Some(fingerprint.as_str()) {
                         None
                     } else {
                         Some(crate::git::history(&project.path)?)
                     };
-                    // Read last so the changes reflect everything the user
-                    // saved while the log was being walked.
                     let changes = crate::git::changes(&project.path)?;
                     Ok::<_, String>(RepoRead {
                         fingerprint,
@@ -244,8 +373,6 @@ impl GitLogPanel {
         .detach();
     }
 
-    /// Take one read: nothing new, a new history, new changes, or the error to
-    /// show instead.
     fn apply(&mut self, read: Result<RepoRead, String>, cx: &mut Context<Self>) {
         match read {
             Ok(read) => {
@@ -255,12 +382,10 @@ impl GitLogPanel {
                     if self.history.as_ref() != Some(&history) {
                         self.commits = history.commits.clone();
                         self.history = Some(history);
-                        // Avoid flashing the full unfiltered list when a commit
-                        // lands during an active search.
                         self.filter = if self.query.trim().is_empty() {
                             None
                         } else {
-                            Some(Rc::new(Vec::new()))
+                            Some(Arc::new(Vec::new()))
                         };
                         self.rebuild_filter(cx);
                         changed = true;
@@ -271,24 +396,21 @@ impl GitLogPanel {
                     changed = true;
                 }
                 if changed {
+                    self.push_snapshot();
                     cx.notify();
                 }
             }
             Err(error) => {
-                // A failed read says nothing about the fingerprint, so the next
-                // poll tries the repository again.
                 self.clear_rows();
                 if self.error.as_ref() != Some(&error) {
                     self.error = Some(error);
+                    self.push_snapshot();
                     cx.notify();
                 }
             }
         }
     }
 
-    /// Rebuild the row filter for `query`. The scan runs on the background
-    /// executor so a keystroke never walks a long history on the UI thread; the
-    /// result lands a frame later unless a newer query replaced it first.
     fn rebuild_filter(&mut self, cx: &mut Context<Self>) {
         self.filter_generation += 1;
         let generation = self.filter_generation;
@@ -299,11 +421,10 @@ impl GitLogPanel {
         }
         let commits = self.commits.clone();
         if commits.is_empty() {
-            self.filter = Some(Rc::new(Vec::new()));
+            self.filter = Some(Arc::new(Vec::new()));
             return;
         }
         cx.spawn(async move |this, cx| {
-            // Debounce rapid keystrokes before scanning commit history.
             cx.background_executor()
                 .timer(Duration::from_millis(120))
                 .await;
@@ -328,7 +449,8 @@ impl GitLogPanel {
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 if panel.filter_generation == generation {
-                    panel.filter = Some(Rc::new(matched));
+                    panel.filter = Some(Arc::new(matched));
+                    panel.push_snapshot();
                     cx.notify();
                 }
             });
@@ -336,14 +458,6 @@ impl GitLogPanel {
         .detach();
     }
 
-    fn visible_count(&self) -> usize {
-        self.filter
-            .as_ref()
-            .map_or(self.commits.len(), |filter| filter.len())
-    }
-
-    /// Show the commit's patch in a sheet. The sheet's view owns the read, so
-    /// closing the sheet drops the work with it and this panel keeps none of it.
     fn open_commit(&mut self, commit: Commit, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project.clone() else {
             return;
@@ -366,8 +480,6 @@ impl GitLogPanel {
                     hash: commit.hash.clone(),
                 },
                 message: commit.body.clone(),
-                // The patch's line numbers belong to this commit, not to the
-                // working tree the agent will edit.
                 context: format!("提交 {}", commit.short),
             },
             window,
@@ -375,8 +487,6 @@ impl GitLogPanel {
         );
     }
 
-    /// Show one uncommitted change's patch in a sheet, read from the index for
-    /// a staged change and from the working tree for an unstaged one.
     fn open_change(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project.clone() else {
             return;
@@ -407,7 +517,6 @@ impl GitLogPanel {
         );
     }
 
-    /// Open a sheet around a [`PatchView`], which reads the patch itself.
     fn open_patch(&self, request: PatchRequest, window: &mut Window, cx: &mut Context<Self>) {
         let PatchRequest {
             project,
@@ -419,12 +528,13 @@ impl GitLogPanel {
         } = request;
         let key = source.key(project);
         let reviews = self.reviews.clone();
-        // Sending clears the drafts, which the panel's rows draw; tell it so a
-        // row does not wait for the next poll to drop its draft mark.
         let panel = cx.entity().downgrade();
         let notify: Rc<dyn Fn(&mut App)> = Rc::new(move |cx| {
             if let Some(panel) = panel.upgrade() {
-                panel.update(cx, |_, cx| cx.notify());
+                panel.update(cx, |panel, cx| {
+                    panel.push_snapshot();
+                    cx.notify();
+                });
             }
         });
         let view = cx.new(|cx| {
@@ -441,19 +551,18 @@ impl GitLogPanel {
                 },
                 cx,
             );
-            view.ensure_editors(window, cx);
+            view.ensure_nsh_mounted(window, cx);
             view
         });
-        let footer = cx.new(|cx| PatchFooter::new(view.clone(), cx));
         window.open_sheet(cx, move |sheet, window, cx| {
             let theme = cx.theme();
-            // The sheet is right-anchored at a fixed width, so a narrow window
-            // has to shrink it: the diff's line numbers sit on the left edge.
             let width = px(760.).min(window.viewport_size().width - px(96.));
             sheet
                 .size(width.max(px(320.)))
                 .title(
-                    v_flex()
+                    div()
+                        .flex()
+                        .flex_col()
                         .gap_0p5()
                         .min_w_0()
                         .child(div().text_sm().truncate().child(title.clone()))
@@ -470,450 +579,45 @@ impl GitLogPanel {
                     view.clone()
                         .cached(StyleRefinement::default().size_full().min_h_0().min_w_0()),
                 )
-                .footer(footer.clone())
         });
     }
 
-    fn render_commit(
-        index: usize,
-        total: usize,
-        commit: &Commit,
-        theme: &Theme,
-        mark: Option<AnyElement>,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        let line = theme.sidebar_border;
-        let first = index == 0;
-        let last = index + 1 == total;
-
-        // A single timeline lane. Merge commits get a warning-colored dot so
-        // they stand out without drawing a full multi-branch graph.
-        let lane = div()
-            .relative()
-            .flex_none()
-            .w(px(16.))
-            .h_full()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(7.))
-                    .w(px(1.))
-                    .bg(line)
-                    .top(px(if first { 16. } else { 0. }))
-                    .bottom(px(if last { 16. } else { 0. })),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(4.))
-                    .top(px(12.))
-                    .size_2()
-                    .rounded_full()
-                    .bg(if commit.parents > 1 {
-                        theme.warning
-                    } else {
-                        theme.link
-                    }),
-            );
-
-        let row = h_flex()
-            .id(format!("git-log-row-{}", commit.hash))
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .px_2()
-            .gap_1()
-            .items_center()
-            .hover(move |style| style.bg(theme.accent.opacity(0.35)))
-            .on_click(on_click)
-            .child(lane)
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_xs()
-                    .font_medium()
-                    .text_color(theme.link)
-                    .child(commit.short.clone()),
-            )
-            .children(ref_badges(&commit.refs, theme))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .child(commit.subject.clone()),
-            )
-            .children(mark);
-
-        row.into_any_element()
+    /// The changes tab's rows: a heading above each non-empty section.
+    fn change_rows(&self) -> Vec<ChangeRow> {
+        change_rows_from(&self.changes)
     }
+}
+
+fn change_rows_from(changes: &Changes) -> Vec<ChangeRow> {
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::with_capacity(changes.len() + 2);
+    for (label, list) in [("已暂存", &changes.staged), ("未暂存", &changes.unstaged)] {
+        if list.is_empty() {
+            continue;
+        }
+        rows.push(ChangeRow::Header(label));
+        rows.extend(list.iter().cloned().map(ChangeRow::File));
+    }
+    rows
 }
 
 impl Render for GitLogPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let border = theme.sidebar_border;
-        let branch = self.history.as_ref().map(|history| history.branch.clone());
-        let total = self.commits.len();
-        let visible = self.visible_count();
-        let changes = self.changes.len();
-        let changes_label = if changes > 0 {
-            format!("改动 {changes}")
-        } else {
-            "改动".to_string()
-        };
-        let history_label = if total > 0 {
-            format!("历史 {total}")
-        } else {
-            "历史".to_string()
-        };
-        let project_id = self.project.as_ref().map(|project| project.id);
-        let marks = {
-            let store = self.reviews.borrow();
-            Rc::new(ReviewMarks::of(&store))
-        };
-
-        let toolbar = self.project.is_some().then(|| {
-            let panel = cx.entity();
-            v_flex()
-                .child(
-                    h_flex()
-                        .px_3()
-                        .pt_1p5()
-                        .pb_1()
-                        .gap_2()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(border)
-                        .child(
-                            TabBar::new("git-panel-tabs")
-                                .xsmall()
-                                .flex_none()
-                                .segmented()
-                                .selected_index(match self.tab {
-                                    PanelTab::Changes => 0,
-                                    PanelTab::History => 1,
-                                })
-                                .child(Tab::new().label(changes_label))
-                                .child(Tab::new().label(history_label))
-                                .on_click(move |index, _, cx| {
-                                    let tab = match index {
-                                        0 => PanelTab::Changes,
-                                        _ => PanelTab::History,
-                                    };
-                                    panel.update(cx, |panel, cx| {
-                                        if panel.tab != tab {
-                                            panel.tab = tab;
-                                            cx.notify();
-                                        }
-                                    });
-                                }),
-                        )
-                        .child(
-                            // The branch gives way to the tabs when the panel
-                            // is dragged narrow.
-                            div().flex_1().min_w_0().flex().justify_end().child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(branch.unwrap_or_else(|| "—".to_string())),
-                            ),
-                        ),
-                )
-                .when(self.tab == PanelTab::History, |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1p5()
-                            .border_b_1()
-                            .border_color(border)
-                            .child(
-                                Input::new(&self.search)
-                                    .small()
-                                    .cleanable(true)
-                                    .prefix(Icon::new(IconName::Search).small().text_color(muted)),
-                            ),
-                    )
-                })
-        });
-
-        let body: AnyElement = if self.project.is_none() {
-            empty("没有选中的项目", muted)
-        } else if let Some(error) = &self.error {
-            empty(error, theme.danger)
-        } else if self.history.is_none() {
-            empty("正在读取…", muted)
-        } else if self.tab == PanelTab::Changes {
-            if self.changes.is_empty() {
-                empty("工作区没有未提交的改动", muted)
-            } else {
-                let rows = Rc::new(self.change_rows());
-                let panel = cx.entity();
-                let marks = marks.clone();
-                uniform_list("git-change-list", rows.len(), move |range, _window, cx| {
-                    let theme = cx.theme();
-                    range
-                        .map(|row| {
-                            let row = &rows[row];
-                            let panel = panel.clone();
-                            let clicked = match row {
-                                ChangeRow::File(change) => Some(change.clone()),
-                                ChangeRow::Header(_) => None,
-                            };
-                            let mark = match (row, project_id) {
-                                (ChangeRow::File(change), Some(project)) => {
-                                    marks.mark(&PatchKey::change(project, change), theme)
-                                }
-                                _ => None,
-                            };
-                            Self::render_change(
-                                row,
-                                theme,
-                                mark,
-                                move |_, window: &mut Window, cx: &mut App| {
-                                    if let Some(change) = clicked.clone() {
-                                        panel.update(cx, |panel, cx| {
-                                            panel.open_change(change, window, cx);
-                                        });
-                                    }
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .flex_1()
-                .min_h_0()
-                .into_any_element()
-            }
-        } else if visible == 0 {
-            if self.filter.is_some() {
-                empty("没有匹配的提交", muted)
-            } else {
-                empty("这个仓库还没有提交", muted)
-            }
-        } else {
-            let commits = self.commits.clone();
-            let filter = self.filter.clone();
-            let panel = cx.entity();
-            let marks = marks.clone();
-            uniform_list("git-log-list", visible, move |range, _window, cx| {
-                let theme = cx.theme();
-                range
-                    .map(|row| {
-                        let index = filter.as_ref().map_or(row, |filter| filter[row]);
-                        let commit = &commits[index];
-                        let panel = panel.clone();
-                        let clicked = commit.clone();
-                        let mark = project_id.and_then(|project| {
-                            marks.mark(&PatchKey::commit(project, &commit.hash), theme)
-                        });
-                        Self::render_commit(
-                            row,
-                            visible,
-                            commit,
-                            theme,
-                            mark,
-                            move |_, window: &mut Window, cx: &mut App| {
-                                panel.update(cx, |panel, cx| {
-                                    panel.open_commit(clicked.clone(), window, cx);
-                                });
-                            },
-                        )
-                    })
-                    .collect()
-            })
-            .flex_1()
-            .min_h_0()
-            .into_any_element()
-        };
-
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .min_w_0()
-            .text_color(theme.sidebar_foreground)
-            .children(toolbar)
-            .child(body)
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.app_view.clone())
     }
-}
-
-/// A row of the changes tab: a section heading or one file.
-enum ChangeRow {
-    Header(&'static str),
-    File(Change),
-}
-
-impl GitLogPanel {
-    /// The changes tab's rows: a heading above each non-empty section.
-    fn change_rows(&self) -> Vec<ChangeRow> {
-        let mut rows = Vec::with_capacity(self.changes.len() + 2);
-        for (label, changes) in [
-            ("已暂存", &self.changes.staged),
-            ("未暂存", &self.changes.unstaged),
-        ] {
-            if changes.is_empty() {
-                continue;
-            }
-            rows.push(ChangeRow::Header(label));
-            rows.extend(changes.iter().cloned().map(ChangeRow::File));
-        }
-        rows
-    }
-
-    fn render_change(
-        row: &ChangeRow,
-        theme: &Theme,
-        mark: Option<AnyElement>,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> AnyElement {
-        let muted = theme.muted_foreground;
-        let change = match row {
-            ChangeRow::Header(label) => {
-                return h_flex()
-                    .w_full()
-                    .h(px(CHANGE_ROW_HEIGHT))
-                    .px_2()
-                    .items_center()
-                    .text_xs()
-                    .font_medium()
-                    .text_color(muted)
-                    .child(*label)
-                    .into_any_element();
-            }
-            ChangeRow::File(change) => change,
-        };
-
-        // The name keeps the room; the directory (or where a rename came from)
-        // gives way when the panel is narrow.
-        let trailing = match &change.original {
-            Some(original) => format!("← {original}"),
-            None => parent_dir(&change.path).to_string(),
-        };
-        h_flex()
-            .id(format!(
-                "git-change-{}-{}",
-                if change.staged { "index" } else { "worktree" },
-                change.path
-            ))
-            .w_full()
-            .h(px(CHANGE_ROW_HEIGHT))
-            .px_2()
-            .gap_1p5()
-            .items_center()
-            .hover(move |style| style.bg(theme.accent.opacity(0.35)))
-            .on_click(on_click)
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(12.))
-                    .font_family(theme.mono_font_family.clone())
-                    .text_xs()
-                    .font_medium()
-                    .text_color(status_color(change.status, theme))
-                    .child(change.status.to_string()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .child(file_name(&change.path).to_string()),
-            )
-            .when(!trailing.is_empty(), |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .max_w(relative(0.5))
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(trailing),
-                )
-            })
-            .children(mark)
-            .into_any_element()
-    }
-}
-
-/// Branch, tag and remote refs on a commit, capped so a busy commit cannot
-/// crowd out its subject.
-fn ref_badges(refs: &[String], theme: &Theme) -> Vec<AnyElement> {
-    let shown = refs.len().min(1);
-    let mut badges = Vec::new();
-    for ref_name in refs.iter().take(shown) {
-        let (label, color) = if let Some(name) = ref_name.strip_prefix("HEAD -> ") {
-            (name, theme.link)
-        } else if let Some(name) = ref_name.strip_prefix("tag: ") {
-            (name, theme.warning)
-        } else {
-            (ref_name.as_str(), theme.link)
-        };
-        badges.push(
-            div()
-                .flex_none()
-                .max_w(px(96.))
-                .truncate()
-                .px_1()
-                .py_0p5()
-                .rounded(theme.radius)
-                .bg(color.opacity(0.14))
-                .text_xs()
-                .text_color(color)
-                .child(label.to_string())
-                .into_any_element(),
-        );
-    }
-    if refs.len() > shown {
-        badges.push(
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!("+{}", refs.len() - shown))
-                .into_any_element(),
-        );
-    }
-    badges
-}
-
-fn empty(message: &str, color: Hsla) -> AnyElement {
-    div()
-        .flex_1()
-        .w_full()
-        .px_3()
-        .py_4()
-        .text_xs()
-        .text_color(color)
-        .child(message.to_string())
-        .into_any_element()
 }
 
 /// The last component of a repository-relative path.
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Everything before a repository-relative path's last component, or an empty
 /// string for a file at the root.
-fn parent_dir(path: &str) -> &str {
+pub(super) fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
-}
-
-/// The color of a change's status letter: what happened to the file, not which
-/// side it was read from.
-fn status_color(status: char, theme: &Theme) -> Hsla {
-    match status {
-        'M' | 'T' => theme.warning,
-        'A' | '?' => theme.success,
-        'D' | 'U' => theme.danger,
-        'R' | 'C' => theme.link,
-        _ => theme.muted_foreground,
-    }
 }
 
 /// The status of a change in words, for the sheet's subtitle.
