@@ -388,10 +388,15 @@ fn edit_agy_hooks(text: &str, remove: bool) -> io::Result<String> {
 
 /// Antigravity's `PreToolUse` is a permission gate whose stdout requires a
 /// `decision`, so Kumu does not attach notifications to it. `SessionStart`
-/// reports the conversation id silently when a session opens; `Stop` reports
-/// both the conversation id and turn completion.
+/// reports the conversation id silently when a session opens;
+/// `PreInvocation` runs before every model call and marks the turn running
+/// (Antigravity has no prompt-submit event); `Stop` reports turn completion.
 fn agy_events() -> Vec<(&'static str, &'static str)> {
-    vec![("SessionStart", "session"), ("Stop", "complete")]
+    vec![
+        ("SessionStart", "session"),
+        ("PreInvocation", "start"),
+        ("Stop", "complete"),
+    ]
 }
 
 fn agy_hook(kind: &str) -> Value {
@@ -801,16 +806,18 @@ fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
 /// Bring Kumu's managed registrations up to date at startup.
 ///
 /// Native extensions (OpenCode, Pi, OMP) are refreshed whenever their link
-/// already points at Kumu. Claude Code hooks are upgraded in place when
-/// already enabled (Claude reloads settings without a separate trust step);
-/// Codex is left for the Settings UI because changing `hooks.json` requires
-/// re-trusting in `/hooks`.
+/// already points at Kumu. Claude Code and Antigravity hooks are upgraded in
+/// place when already enabled (both reload them without a separate trust
+/// step); Codex is left for the Settings UI because changing `hooks.json`
+/// requires re-trusting in `/hooks`.
 pub fn refresh_installed() {
     refresh_native();
-    if matches!(status("claude"), Ok(Status::NeedsRepair))
-        && let Err(error) = install("claude")
-    {
-        eprintln!("[agent] 刷新 claude hooks 失败：{error}");
+    for agent in ["claude", "agy"] {
+        if matches!(status(agent), Ok(Status::NeedsRepair))
+            && let Err(error) = install(agent)
+        {
+            eprintln!("[agent] 刷新 {agent} hooks 失败：{error}");
+        }
     }
 }
 
@@ -1120,10 +1127,11 @@ fn status_sequence(agent: &str, signal: StatusSignal) -> String {
     )
 }
 
+/// The submitted prompt; Antigravity names it `lastUserInput`.
 fn hook_prompt(payload: &Value) -> Option<String> {
-    payload
-        .get("prompt")
-        .and_then(Value::as_str)
+    ["prompt", "lastUserInput"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
         .map(str::to_string)
 }
 
@@ -1473,6 +1481,7 @@ mod tests {
             "{registered}"
         );
         assert!(registered.contains("\"SessionStart\""), "{registered}");
+        assert!(registered.contains("\"PreInvocation\""), "{registered}");
         assert!(registered.contains("\"Stop\""), "{registered}");
         assert!(registered.contains("printf '{}'"), "{registered}");
         assert_eq!(

@@ -132,6 +132,13 @@ printf 'ORIGINAL=<%s>\\n' "$@"
                 "\x1b]777;notify;agy;kumu-session:conv-123\x07",
             ),
             (
+                "start",
+                {"conversationId": "conv-123", "lastUserInput": "Fix sidebar status"},
+                "\x1b]777;notify;agy;kumu-session:conv-123\x07"
+                "\x1b]777;notify;agy;kumu-title:prompt:Fix sidebar status\x07"
+                "\x1b]777;notify;agy;kumu-status:running\x07",
+            ),
+            (
                 "complete",
                 {"conversationId": "conv-123", "terminationReason": "USER_CANCELED"},
                 "\x1b]777;notify;agy;kumu-session:conv-123\x07"
