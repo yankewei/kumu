@@ -738,6 +738,7 @@ impl PatchView {
                             }
                         }
                         PatchAction::Close => {
+                            view.reviews.borrow().persist();
                             view.host.close_sheet(window, cx);
                         }
                     });
@@ -885,6 +886,7 @@ impl PatchView {
             had_draft != store.drafts.contains_key(&self.key)
         };
         if changed {
+            self.reviews.borrow().persist();
             (self.notify_panel)(cx);
         }
     }
@@ -977,6 +979,7 @@ impl PatchView {
                     store.drafts.remove(&self.key);
                     store.sent.insert(self.key.clone(), record.clone());
                 }
+                self.reviews.borrow().persist();
                 self.sent = Some(record);
                 (self.notify_panel)(cx);
                 self.comments.clear();

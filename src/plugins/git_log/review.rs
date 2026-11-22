@@ -9,13 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::git::{Change, Patch};
 use crate::plugins::PluginHost;
 
 /// Which side of a diff a review comment targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum ReviewSide {
     Original,
     Modified,
@@ -40,7 +41,7 @@ impl From<ReviewSide> for nsh_base::DiffSide {
 }
 
 /// A 1-based line range within one file of a patch.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct ReviewRange {
     pub(super) path: String,
     pub(super) side: ReviewSide,
@@ -342,7 +343,7 @@ impl PatchSource {
 
 /// One patch's identity inside a project. Drafts and sent records survive a
 /// closed sheet under this key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct PatchKey {
     project: i64,
     target: String,
@@ -377,14 +378,14 @@ impl PatchKey {
 
 /// One comment as it was when its sheet closed, so reopening the patch brings
 /// the editors back with what the user typed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct DraftComment {
     pub(super) range: ReviewRange,
     pub(super) text: String,
 }
 
 /// The last review a patch sent, shown on its row as a receipt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct SentReview {
     pub(super) count: usize,
     pub(super) target: String,
@@ -395,6 +396,76 @@ pub(super) struct SentReview {
 pub(super) struct ReviewStore {
     pub(super) drafts: HashMap<PatchKey, Vec<DraftComment>>,
     pub(super) sent: HashMap<PatchKey, SentReview>,
+}
+
+/// JSON shape of [`ReviewStore`]. Map keys are not strings, so reviews are
+/// stored as ordered pairs. Entries are sorted to keep the document stable
+/// across saves.
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedReviews {
+    #[serde(default)]
+    drafts: Vec<(PatchKey, Vec<DraftComment>)>,
+    #[serde(default)]
+    sent: Vec<(PatchKey, SentReview)>,
+}
+
+/// Setting key holding every repository's review drafts and receipts.
+const REVIEW_STORE_SETTING: &str = "git_reviews";
+/// A safety valve for a pathological draft document; review notes are small.
+const MAX_REVIEW_STORE_BYTES: usize = 4 * 1024 * 1024;
+
+impl ReviewStore {
+    /// Load the persisted drafts and receipts. A missing or unreadable document
+    /// simply means there is nothing to restore.
+    pub(super) fn load() -> Self {
+        let Some(json) = crate::db::get_setting(REVIEW_STORE_SETTING) else {
+            return Self::default();
+        };
+        let Ok(persisted) = serde_json::from_str::<PersistedReviews>(&json) else {
+            eprintln!("[git] 忽略无法解析的 review 记录");
+            return Self::default();
+        };
+        Self {
+            drafts: persisted.drafts.into_iter().collect(),
+            sent: persisted.sent.into_iter().collect(),
+        }
+    }
+
+    /// Write drafts and receipts so closing or switching the Git panel no
+    /// longer loses comments the user has not sent yet.
+    pub(super) fn persist(&self) {
+        let mut drafts: Vec<_> = self
+            .drafts
+            .iter()
+            .map(|(key, comments)| (key.clone(), comments.clone()))
+            .collect();
+        drafts.sort_by(|(a, _), (b, _)| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        let mut sent: Vec<_> = self
+            .sent
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
+        sent.sort_by(|(a, _), (b, _)| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        let persisted = PersistedReviews { drafts, sent };
+        let Ok(json) = serde_json::to_string(&persisted) else {
+            return;
+        };
+        if json.len() > MAX_REVIEW_STORE_BYTES {
+            eprintln!("[git] review 记录超过上限，未保存");
+            return;
+        }
+        if let Err(error) = crate::db::set_setting(REVIEW_STORE_SETTING, &json) {
+            eprintln!("[git] 保存 review 记录失败：{error}");
+        }
+    }
 }
 
 /// Which marker badge a Git panel row shows.
@@ -523,4 +594,37 @@ pub(super) fn compose_comments(context: &str, comments: &[(ReviewRange, String)]
         message.push_str(comment);
     }
     message
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn review_drafts_and_receipts_round_trip_through_json() {
+        let key = PatchKey::commit(7, "abc123");
+        let persisted = PersistedReviews {
+            drafts: vec![(
+                key.clone(),
+                vec![DraftComment {
+                    range: ReviewRange::new("src/a.rs", ReviewSide::Modified, 3, 5),
+                    text: "这里需要处理空值".into(),
+                }],
+            )],
+            sent: vec![(
+                key,
+                SentReview {
+                    count: 2,
+                    target: "Codex".into(),
+                },
+            )],
+        };
+        let json = serde_json::to_string(&persisted).expect("serialize reviews");
+        let restored: PersistedReviews = serde_json::from_str(&json).expect("restore reviews");
+        assert_eq!(restored.drafts.len(), 1);
+        assert_eq!(restored.drafts[0].1[0].text, "这里需要处理空值");
+        assert_eq!(restored.drafts[0].1[0].range.path, "src/a.rs");
+        assert_eq!(restored.sent[0].1.count, 2);
+        assert_eq!(restored.sent[0].1.target, "Codex");
+    }
 }

@@ -34,6 +34,10 @@ use crate::theme::KumuTheme;
 
 /// How often an open panel checks whether the repository moved.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Idle polling backs off to this interval after a few unchanged polls. Git
+/// has no change notification, so a user editing in a terminal still gets
+/// picked up, just not at a sub-second cost while nothing is happening.
+const IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(16);
 
 /// Commit row height for `virtual_list`.
 const ROW_HEIGHT: f32 = 32.;
@@ -125,6 +129,9 @@ pub struct GitLogPanel {
     loading: bool,
     dirty: bool,
     generation: u64,
+    /// Consecutive polls that found no change. Polling backs off so a panel
+    /// left open on an idle repository does not spawn git every two seconds.
+    idle_polls: u32,
     reviews: Rc<RefCell<ReviewStore>>,
     host: PluginHost,
     app_view: Entity<AppView>,
@@ -135,6 +142,13 @@ pub struct GitLogPanel {
 
 impl Drop for GitLogPanel {
     fn drop(&mut self) {
+        // The panel is destroyed when it is closed or another plugin is
+        // selected; keep review drafts and receipts for the next open. A
+        // borrow in flight (unlikely at drop time) must not turn this into a
+        // panic while the window is tearing down.
+        if let Ok(reviews) = self.reviews.try_borrow() {
+            reviews.persist();
+        }
         let _ = take_panel_mount(self.mount_id);
     }
 }
@@ -240,7 +254,8 @@ impl Plugin for GitLogPanel {
             loading: false,
             dirty: false,
             generation: 0,
-            reviews: Rc::new(RefCell::new(ReviewStore::default())),
+            idle_polls: 0,
+            reviews: Rc::new(RefCell::new(ReviewStore::load())),
             host,
             app_view,
             events_tx,
@@ -258,6 +273,7 @@ impl Plugin for GitLogPanel {
         }
         self.project = project;
         self.generation += 1;
+        self.idle_polls = 0;
         self.clear_rows();
         self.error = None;
         if self.loading {
@@ -276,14 +292,19 @@ impl GitLogPanel {
             let mut interval = REFRESH_INTERVAL;
             loop {
                 cx.background_executor().timer(interval).await;
+                // Nobody is looking at the app; there is no reason to keep
+                // spawning git at the active-window pace.
+                let app_active = cx.update(|cx| cx.active_window().is_some());
                 let next = this.update(cx, |panel, cx| {
                     if !panel.loading {
                         panel.reload(cx);
                     }
                     if panel.error.is_some() {
                         Duration::from_secs(10)
+                    } else if app_active {
+                        panel.poll_interval()
                     } else {
-                        REFRESH_INTERVAL
+                        IDLE_REFRESH_INTERVAL
                     }
                 });
                 match next {
@@ -293,6 +314,14 @@ impl GitLogPanel {
             }
         })
         .detach();
+    }
+
+    /// Poll quickly right after something changed, then back off while the
+    /// repository stays idle. `reload` is asynchronous, so this reads the
+    /// counter left by the previous completed poll.
+    fn poll_interval(&self) -> Duration {
+        let factor = 1u32 << self.idle_polls.min(3);
+        (REFRESH_INTERVAL * factor).min(IDLE_REFRESH_INTERVAL)
     }
 
     fn build_snapshot(&self) -> GitPanelSnapshot {
@@ -406,8 +435,11 @@ impl GitLogPanel {
                     changed = true;
                 }
                 if changed {
+                    self.idle_polls = 0;
                     self.push_snapshot();
                     cx.notify();
+                } else {
+                    self.idle_polls = self.idle_polls.saturating_add(1);
                 }
             }
             Err(error) => {
