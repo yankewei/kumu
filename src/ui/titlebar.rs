@@ -9,7 +9,7 @@ use gpui::{
 
 use crate::theme::KumuTheme;
 
-const TITLE_BAR_HEIGHT: f32 = 34.0;
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 34.0;
 const MACOS_TRAFFIC_LIGHT_INSET: f32 = 80.0;
 
 /// Base [`WindowOptions`] for windows that render [`title_bar`].

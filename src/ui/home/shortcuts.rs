@@ -126,6 +126,17 @@ impl KumuApp {
             return;
         }
 
+        // New-agent picker guard: Escape dismisses it, other shortcuts wait.
+        if self.active_agent_picker.is_some() {
+            if plain_escape {
+                self.active_agent_picker = None;
+                self.focus_terminal(window, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+
         // Modal dialog or full-window sheet guard: block workspace shortcuts.
         if self.active_dialog.is_some() || self.active_sheet.is_some() {
             if plain_escape {
@@ -159,6 +170,7 @@ impl KumuApp {
     ) {
         if self.active_palette.is_some()
             || self.active_dialog.is_some()
+            || self.active_agent_picker.is_some()
             || self.active_sheet.is_some()
         {
             return;

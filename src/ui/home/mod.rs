@@ -27,6 +27,9 @@ use crate::app::layout::{
     SavedProjectTabs, SavedWorkspace, SplitAxis, TabId, WORKSPACE_STATE_VERSION,
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
+use crate::nsh_ui::agent_picker::{
+    ActiveAgentPicker, AgentPickerAnchor, AgentPickerItem, AgentPickerOutcome,
+};
 use crate::nsh_ui::command_palette::ActiveCommandPalette;
 use crate::nsh_ui::dialogs::ActiveDialog;
 use crate::nsh_ui::toast::ToastItem;
@@ -186,9 +189,12 @@ pub struct KumuApp {
     active_palette: Option<ActiveCommandPalette>,
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
     active_dialog: Option<ActiveDialog>,
+    /// Anchored new-agent popover, mounted only while open (GPUI overlay, so
+    /// presses over the terminal reach it).
+    active_agent_picker: Option<ActiveAgentPicker>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
     pub(super) active_sheet: Option<crate::plugins::ActiveSheet>,
-    /// Syncs KumuTheme updates into `shell_nsh` and `active_dialog`.
+    /// Syncs KumuTheme updates into `shell_nsh` and the NSH overlays.
     _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
@@ -494,6 +500,9 @@ impl KumuApp {
             if let Some(dialog) = &app.active_dialog {
                 dialog.sync_theme(&theme, cx);
             }
+            if let Some(picker) = &app.active_agent_picker {
+                picker.sync_theme(&theme, cx);
+            }
         });
         let window_focus = cx.focus_handle();
 
@@ -531,6 +540,7 @@ impl KumuApp {
             shell_nsh,
             active_palette: None,
             active_dialog: None,
+            active_agent_picker: None,
             active_sheet: None,
             _nsh_theme_sub: nsh_theme_sub,
             control: None,
@@ -1114,6 +1124,54 @@ impl KumuApp {
         }
     }
 
+    /// Show the anchored agent picker for `pane`. The list is resolved here,
+    /// on the UI thread, so the NSH engine never reads the filesystem.
+    fn open_agent_picker(
+        &mut self,
+        pane: PaneId,
+        anchor: AgentPickerAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_agent_picker.is_some() {
+            return;
+        }
+        let items: Vec<AgentPickerItem> = crate::agent::AGENTS
+            .iter()
+            .filter(|agent| crate::agent::installed(agent.id))
+            .map(|agent| AgentPickerItem {
+                id: agent.id.to_owned(),
+                name: agent.name.to_owned(),
+                logo: agent.logo,
+            })
+            .collect();
+        let theme = KumuTheme::global(cx).clone();
+        self.active_agent_picker = Some(ActiveAgentPicker::open(
+            anchor,
+            items,
+            &theme,
+            window,
+            cx,
+            move |this, outcome, window, cx| {
+                this.active_agent_picker = None;
+                match outcome {
+                    AgentPickerOutcome::Selected(agent) => this.split_pane_with(
+                        pane,
+                        SplitAxis::Horizontal,
+                        PaneLaunch::Agent {
+                            agent,
+                            session: None,
+                        },
+                        cx,
+                    ),
+                    AgentPickerOutcome::Dismissed => this.focus_terminal(window, cx),
+                }
+                cx.notify();
+            },
+        ));
+        cx.notify();
+    }
+
     /// Split `pane` along `axis`, open another shell in the same tab, and
     /// focus the new pane.
     fn split_pane(&mut self, pane: PaneId, axis: SplitAxis, cx: &mut Context<Self>) {
@@ -1417,16 +1475,8 @@ impl KumuApp {
             HomeShellAction::ClosePane(pane) => {
                 self.close_pane(pane, cx);
             }
-            HomeShellAction::AgentPane { pane, agent } => {
-                self.split_pane_with(
-                    pane,
-                    SplitAxis::Horizontal,
-                    PaneLaunch::Agent {
-                        agent,
-                        session: None,
-                    },
-                    cx,
-                );
+            HomeShellAction::OpenAgentPicker { pane, anchor } => {
+                self.open_agent_picker(pane, anchor, window, cx);
             }
             HomeShellAction::FindChange { pane, needle } => {
                 if let Some(view) = self.panes.get(&pane).cloned() {
@@ -1511,6 +1561,19 @@ impl KumuApp {
                     }))
                     .child(dialog.app_view.clone())
             }))
+            .children(self.active_agent_picker.as_ref().map(|picker| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "escape" {
+                            this.active_agent_picker = None;
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .child(picker.app_view.clone())
+            }))
             .children(
                 self.active_palette
                     .as_ref()
@@ -1545,6 +1608,7 @@ impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.active_palette.is_none()
             && self.active_dialog.is_none()
+            && self.active_agent_picker.is_none()
             && self.active_sheet.is_none()
             && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()

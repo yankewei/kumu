@@ -4,7 +4,7 @@
 //! - Optional persistence error banner
 //! - Outer `nsh_base::h_resizable()` (Sidebar | Center Tabs + Split Terminal Grid | Right Plugin Panel)
 //! - Recursive `nsh_base::h_resizable()` / `v_resizable()` split pane tree
-//! - Pure Rust NSH Pane Headers (status badge, new-agent `popup_menu`, split/close + tooltips)
+//! - Pure Rust NSH Pane Headers (status badge, new-agent picker trigger, split/close + tooltips)
 //! - Native GPUI `TerminalView` leaves (`native("kumu.terminal")`, `focus_handle() -> None`)
 //! - Floating Pure Rust NSH `⌘F` Find Bar over each pane
 //! - Native right-hand plugin slot (`native("kumu.plugin")`)
@@ -161,9 +161,10 @@ pub(super) enum HomeShellAction {
     SplitRight(PaneId),
     SplitDown(PaneId),
     ClosePane(PaneId),
-    AgentPane {
+    /// Open the anchored agent picker below a pane header's new-agent button.
+    OpenAgentPicker {
         pane: PaneId,
-        agent: String,
+        anchor: crate::nsh_ui::agent_picker::AgentPickerAnchor,
     },
     FindChange {
         pane: PaneId,
@@ -197,7 +198,6 @@ mod view {
         Anchor, HandleEdge, h_resizable, resizable_panel, resize_handle, theme as active_theme,
         v_resizable,
     };
-    use nsh_core::element::desktop::{MenuItem, popup_menu};
     use nsh_core::element::{AccessibilityRole, LayoutCurve, LayoutTransition, native};
     use nsh_core::geometry::Axis;
     use nsh_core::prelude::*;
@@ -217,9 +217,10 @@ mod view {
         };
         LayoutTransition::new(LayoutCurve::Bezier(PANEL_EASE), ms)
     }
-    use crate::agent::{AGENTS, AgentState, installed};
+    use crate::agent::AgentState;
     use crate::app::layout::{PaneId, SplitAxis};
-    use crate::nsh_ui::assets::{asset_src, icon_svg};
+    use crate::nsh_ui::agent_picker::AgentPickerAnchor;
+    use crate::nsh_ui::assets::icon_svg;
     use crate::nsh_ui::components::{
         ButtonVariant, PillTone, body_text, kumu_button, kumu_input, kumu_tooltip, pill,
     };
@@ -392,8 +393,11 @@ mod view {
                         .text_color(move || active_theme().muted_foreground),
                 );
 
+            // Kept in one always-present group so the header actions keep
+            // their place as these come and go.
+            let mut extras = view().flex_row().items_center().gap_2().flex_shrink_0();
             if let Some(note) = snap.note {
-                row = row.child(
+                extras = extras.child(
                     text(note)
                         .flex_shrink_0()
                         .text_size(text_xs_size)
@@ -401,42 +405,45 @@ mod view {
                 );
             }
             if let Some(status) = snap.agent_status {
-                row = row.child(render_agent_badge(status));
+                extras = extras.child(render_agent_badge(status));
             }
             if zoomed {
-                row = row.child(pill("已最大化", PillTone::Neutral).flex_shrink_0());
+                extras = extras.child(pill("已最大化", PillTone::Neutral).flex_shrink_0());
             }
+            row = row.child(extras);
+
+            let agent_trigger = view()
+                .role(AccessibilityRole::Button)
+                .label("新建 Agent 窗格")
+                .tooltip(kumu_tooltip("新建 Agent 窗格"))
+                .flex_shrink_0()
+                .p_0p5()
+                .rounded(move || active_theme().radius)
+                .app_class("cursor-pointer")
+                .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
+                .on_press(move |ev: &PressEvent| {
+                    // A press opens the picker below the pointer; a keyboard or
+                    // assistive-technology activation opens it at the top-right.
+                    let (x, y) = if ev.clicks > 0 {
+                        (ev.page_position.x.0, ev.page_position.y.0)
+                    } else {
+                        (window().width.0 - 16.0, 54.0)
+                    };
+                    send(
+                        &tx_agent,
+                        HomeShellAction::OpenAgentPicker {
+                            pane: pane_id,
+                            anchor: AgentPickerAnchor { x, y },
+                        },
+                    );
+                })
+                .child(
+                    icon_svg("icons/bot.svg", 14.0)
+                        .text_color(move || active_theme().muted_foreground),
+                );
 
             row = row
-                .child(header_icon_button(
-                    "icons/bot.svg",
-                    "新建 Agent 窗格",
-                    move || {
-                        let available: Vec<_> = AGENTS.iter().filter(|a| installed(a.id)).collect();
-                        let items = if available.is_empty() {
-                            vec![MenuItem::new("未安装 Agent").disabled(true)]
-                        } else {
-                            available
-                                .into_iter()
-                                .map(|agent| {
-                                    let tx = tx_agent.clone();
-                                    let id = agent.id.to_string();
-                                    let icon = asset_src(agent.logo.unwrap_or("icons/bot.svg"));
-                                    MenuItem::new(agent.name).icon(icon).on_select(move || {
-                                        send(
-                                            &tx,
-                                            HomeShellAction::AgentPane {
-                                                pane: pane_id,
-                                                agent: id.clone(),
-                                            },
-                                        );
-                                    })
-                                })
-                                .collect()
-                        };
-                        drop(popup_menu(items));
-                    },
-                ))
+                .child(agent_trigger)
                 .child(header_icon_button(
                     "split-right.svg",
                     "向右分屏 ⌘D",
