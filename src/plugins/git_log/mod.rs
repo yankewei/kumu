@@ -593,7 +593,17 @@ impl GitLogPanel {
             view.ensure_nsh_mounted(window, cx);
             view
         });
-        self.host.open_sheet(view.into(), window, cx);
+        let dismiss = {
+            let weak = view.downgrade();
+            move |cx: &mut App| {
+                let _ = weak.update(cx, |patch, _| patch.request_close());
+            }
+        };
+        self.host.open_sheet(
+            crate::plugins::ActiveSheet::new(view.into(), dismiss),
+            window,
+            cx,
+        );
     }
 
     /// The changes tab's rows: a heading above each non-empty section.

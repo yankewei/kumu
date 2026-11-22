@@ -42,6 +42,7 @@ pub(super) struct PatchSnapshot {
 #[derive(Clone, Debug)]
 pub(super) enum PatchHostEvent {
     Snapshot(PatchSnapshot),
+    Dismiss,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,12 +119,14 @@ mod nsh_view {
 
         let state = signal_with(initial, SignalEquals::Never);
         let layout = signal(DiffLayout::Unified);
+        let open = signal(true);
 
         if let Some(mut rx) = events_rx {
             spawn(async move {
                 while let Some(event) = rx.next().await {
                     match event {
                         PatchHostEvent::Snapshot(next) => state.set(next),
+                        PatchHostEvent::Dismiss => open.set(false),
                     }
                 }
             });
@@ -458,13 +461,10 @@ mod nsh_view {
             bar
         });
 
-        let tx_close = actions_tx.clone();
         let tx_sheet = actions_tx.clone();
-        let open = signal(true);
 
         let header = dynamic(move || {
             let snap = state.get();
-            let tx_x = tx_close.clone();
             view()
                 .flex_row()
                 .flex_shrink_0()
@@ -496,7 +496,6 @@ mod nsh_view {
                         .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                         .on_press(move || {
                             open.set(false);
-                            send(&tx_x, PatchAction::Close);
                         })
                         .child(
                             icon_svg("icons/x.svg", 14.0)
@@ -534,8 +533,10 @@ mod nsh_view {
             .on_open_change(move |ev: &nsh_base::SheetEvent| {
                 if matches!(ev, nsh_base::SheetEvent::OpenChange(false, _)) {
                     open.set(false);
-                    send(&tx_sheet, PatchAction::Close);
                 }
+            })
+            .on_close(move || {
+                send(&tx_sheet, PatchAction::Close);
             })
             .child(panel)
     }
@@ -733,7 +734,7 @@ impl PatchView {
                         PatchAction::SetTarget(pane) => view.set_target(pane, cx),
                         PatchAction::SendComments => {
                             if view.send_comments(cx) {
-                                view.host.close_sheet(window, cx);
+                                view.request_close();
                             }
                         }
                         PatchAction::Close => {
@@ -773,6 +774,12 @@ impl PatchView {
         let _ = self
             .events_tx
             .unbounded_send(PatchHostEvent::Snapshot(self.snapshot(cx)));
+    }
+
+    /// Ask the NSH `Sheet` to animate shut; once its exit slide finishes,
+    /// `SheetEvent::Close` emits `PatchAction::Close` to unmount the host view.
+    pub(super) fn request_close(&self) {
+        let _ = self.events_tx.unbounded_send(PatchHostEvent::Dismiss);
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {

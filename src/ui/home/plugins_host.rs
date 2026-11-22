@@ -22,6 +22,9 @@ pub(super) const PLUGIN_MAX_WIDTH: f32 = 480.;
 const DISPATCH_PROMPT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Brief settle window after the first drawn frame so bracketed paste does not race startup.
 const DISPATCH_PROMPT_SETTLE: Duration = Duration::from_millis(400);
+/// Safety upper bound before clearing deferred terminal resizes or a closed
+/// plugin view if the NSH settle callback never arrives.
+const PANEL_SETTLE_FALLBACK: Duration = Duration::from_millis(360);
 
 impl KumuApp {
     /// The project a plugin panel shows, if one is selected.
@@ -476,9 +479,51 @@ impl KumuApp {
         Ok(SendOutcome::Submitted)
     }
 
+    /// Pace live PTY resizes on all panes while a left/right workspace panel
+    /// slides open or shut, then flush the exact final column count on settle.
+    pub(super) fn begin_panel_resize_defer(&mut self, cx: &mut Context<Self>) {
+        self.panel_anim_gen = self.panel_anim_gen.wrapping_add(1);
+        let generation = self.panel_anim_gen;
+        for terminal in self.panes.values() {
+            terminal.update(cx, |term, cx| term.set_panel_animating(true, cx));
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PANEL_SETTLE_FALLBACK).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.panel_anim_gen == generation {
+                    app.finish_panel_resize_defer(cx);
+                    if app.open_plugin.is_none() {
+                        app.plugin_views.clear();
+                        app.native_registry.clear_plugins();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// End animation pacing and flush any remaining 1–2 column delta immediately.
+    pub(super) fn finish_panel_resize_defer(&mut self, cx: &mut Context<Self>) {
+        for terminal in self.panes.values() {
+            terminal.update(cx, |term, cx| term.set_panel_animating(false, cx));
+        }
+    }
+
+    /// Close the active right-hand plugin panel smoothly: keep its native view
+    /// alive until `HomeShellAction::PluginCloseFinished` arrives after the
+    /// slide-out animation completes.
+    pub(super) fn close_plugin(&mut self, cx: &mut Context<Self>) {
+        if self.open_plugin.is_none() {
+            return;
+        }
+        self.begin_panel_resize_defer(cx);
+        self.open_plugin = None;
+        cx.notify();
+    }
+
     /// Open `spec`'s panel, or close it when it is already the open one. The
-    /// panel is built on first open and dropped on close so its refresh loop
-    /// stops with it.
+    /// panel is built on first open and dropped once its close slide finishes
+    /// so its refresh loop stops with it.
     pub(super) fn toggle_plugin(
         &mut self,
         spec: PluginSpec,
@@ -486,20 +531,24 @@ impl KumuApp {
         cx: &mut Context<Self>,
     ) {
         if self.open_plugin == Some(spec.id) {
-            self.open_plugin = None;
-            self.plugin_views.clear();
-            self.native_registry.clear_plugins();
+            self.close_plugin(cx);
+            return;
+        }
+        let was_closed = self.open_plugin.is_none();
+        if was_closed {
+            self.begin_panel_resize_defer(cx);
+        }
+        self.open_plugin = Some(spec.id);
+        self.plugin_views
+            .retain(|id, _| Some(*id) == self.open_plugin);
+        if let Some(existing) = self.plugin_views.get(spec.id).cloned() {
+            self.native_registry.set_plugin(spec.id, existing);
         } else {
-            self.open_plugin = Some(spec.id);
-            self.plugin_views
-                .retain(|id, _| Some(*id) == self.open_plugin);
-            if !self.plugin_views.contains_key(spec.id) {
-                let project = self.plugin_project(cx);
-                let host = self.plugin_host(cx);
-                let view = spec.create(project, host, window, cx);
-                self.native_registry.set_plugin(spec.id, view.clone());
-                self.plugin_views.insert(spec.id, view);
-            }
+            let project = self.plugin_project(cx);
+            let host = self.plugin_host(cx);
+            let view = spec.create(project, host, window, cx);
+            self.native_registry.set_plugin(spec.id, view.clone());
+            self.plugin_views.insert(spec.id, view);
         }
         self.sync_plugin_project(cx);
         cx.notify();

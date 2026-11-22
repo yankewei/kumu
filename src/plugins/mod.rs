@@ -91,8 +91,30 @@ type AgentPanesFn = dyn Fn(i64, &App) -> Vec<AgentPaneInfo>;
 type DispatchFn = dyn Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String>;
 type SendAnyPaneFn = dyn Fn(u64, &str, &mut App) -> Result<SendOutcome, String>;
 type RevealPaneFn = dyn Fn(u64, &mut Window, &mut App);
-type OpenSheetFn = dyn Fn(AnyView, &mut Window, &mut App);
+type DismissSheetFn = dyn Fn(&mut App);
+type OpenSheetFn = dyn Fn(ActiveSheet, &mut Window, &mut App);
 type CloseSheetFn = dyn Fn(&mut Window, &mut App);
+
+/// A mounted full-window sheet overlay together with a graceful dismiss trigger
+/// that plays the sheet's slide-out animation before the host unmounts it.
+#[derive(Clone)]
+pub struct ActiveSheet {
+    pub view: AnyView,
+    dismiss: Rc<DismissSheetFn>,
+}
+
+impl ActiveSheet {
+    pub fn new(view: AnyView, dismiss: impl Fn(&mut App) + 'static) -> Self {
+        Self {
+            view,
+            dismiss: Rc::new(dismiss),
+        }
+    }
+
+    pub fn dismiss(&self, cx: &mut App) {
+        (self.dismiss)(cx);
+    }
+}
 
 /// The panes a panel may hand text to, as the host sees them.
 ///
@@ -135,7 +157,7 @@ impl PluginHost {
     /// Attach full-window Pure Rust NSH sheet open/close handlers.
     pub fn with_sheet_tools(
         mut self,
-        open_sheet: impl Fn(AnyView, &mut Window, &mut App) + 'static,
+        open_sheet: impl Fn(ActiveSheet, &mut Window, &mut App) + 'static,
         close_sheet: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         self.open_sheet = Some(Rc::new(open_sheet));
@@ -236,9 +258,9 @@ impl PluginHost {
     }
 
     /// Present a full-window Pure Rust NSH sheet overlay (e.g. Diff Review).
-    pub fn open_sheet(&self, view: AnyView, window: &mut Window, cx: &mut App) {
+    pub fn open_sheet(&self, sheet: ActiveSheet, window: &mut Window, cx: &mut App) {
         if let Some(open_sheet) = &self.open_sheet {
-            (open_sheet)(view, window, cx);
+            (open_sheet)(sheet, window, cx);
         }
     }
 

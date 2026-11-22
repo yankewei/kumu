@@ -131,12 +131,12 @@ impl KumuApp {
             if plain_escape {
                 if self.active_dialog.is_some() {
                     self.active_dialog = None;
-                } else {
-                    self.active_sheet = None;
+                    self.focus_terminal(window, cx);
+                    cx.notify();
+                } else if let Some(sheet) = self.active_sheet.clone() {
+                    sheet.dismiss(cx);
                 }
-                self.focus_terminal(window, cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             return;
         }
@@ -252,6 +252,7 @@ impl KumuApp {
 
     /// Collapse or expand the left sidebar and persist the preference.
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.begin_panel_resize_defer(cx);
         self.sidebar_visible = !self.sidebar_visible;
         let _ = crate::db::set_setting(
             crate::db::SETTING_SIDEBAR_VISIBLE,

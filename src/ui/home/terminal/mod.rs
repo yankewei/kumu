@@ -16,6 +16,7 @@ mod paint;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::*;
 
@@ -44,6 +45,11 @@ pub enum TerminalEvent {
 /// Inset around the cell grid, matching the padded look of a pane TUI.
 const PAD_X: f32 = 14.;
 const PAD_Y: f32 = 10.;
+
+/// Minimum interval between PTY resizes while a left/right workspace drawer is
+/// sliding open or closed (~35Hz live adaptive reflow without flooding agent
+/// TUIs with 120Hz `SIGWINCH` bursts).
+const PANEL_RESIZE_PACE: Duration = Duration::from_millis(28);
 
 /// Cached drawing for one viewport, keyed by the snapshot's row Arcs.
 struct PaintCache {
@@ -123,6 +129,11 @@ pub struct TerminalView {
     /// The last size sent to the process on screen, so a repaint does not
     /// resize again. Cleared when the attached project changes.
     sent: Rc<Cell<(u16, u16, u32, u32)>>,
+    /// Timestamp of the last PTY resize, used to pace live reflows during
+    /// left/right drawer slide animations.
+    last_resize_at: Rc<Cell<Option<Instant>>>,
+    /// True while a left/right workspace panel is actively sliding open/closed.
+    panel_animating: bool,
     painted: Rc<RefCell<PaintCache>>,
     /// Open find bar state, if any. The UI itself renders in Pure Rust NSH.
     find: Option<FindState>,
@@ -183,6 +194,8 @@ impl TerminalView {
             reported: Vec::new(),
             scrolled: 0.,
             sent: Rc::new(Cell::new((0, 0, 0, 0))),
+            last_resize_at: Rc::new(Cell::new(None)),
+            panel_animating: false,
             painted: Rc::new(RefCell::new(PaintCache {
                 cell: (px(0.), px(0.)),
                 font: (SharedString::from(""), 0),
@@ -246,6 +259,18 @@ impl TerminalView {
         }
         self.agent_status = status;
         cx.notify();
+    }
+
+    /// Pace live PTY resizes while a surrounding workspace drawer slides open
+    /// or closed, then flush the exact final column count once it settles.
+    pub fn set_panel_animating(&mut self, animating: bool, cx: &mut Context<Self>) {
+        if self.panel_animating == animating {
+            return;
+        }
+        self.panel_animating = animating;
+        if !animating {
+            cx.notify();
+        }
     }
 
     fn sync_theme(&mut self, cx: &mut Context<Self>) {
@@ -416,6 +441,8 @@ impl Render for TerminalView {
         let pane_term = self.pane.0;
         let has_project = project.is_some();
         let sent = self.sent.clone();
+        let last_resize_at = self.last_resize_at.clone();
+        let panel_animating = self.panel_animating;
         let painted = self.painted.clone();
         let cursor_at = self.cursor_at.clone();
         let grid_at = self.grid_at.clone();
@@ -526,14 +553,24 @@ impl Render for TerminalView {
                             (f32::from(cell_h) * scale).round().max(1.) as u32,
                         );
                         let next = (cols, rows, cell_px.0, cell_px.1);
-                        if sent.get() != next {
-                            sent.set(next);
-                            if has_project {
-                                workspace.update(cx, |workspace, _| {
-                                    workspace.terminal_resize(
-                                        pane_term, cols, rows, cell_px.0, cell_px.1,
-                                    )
-                                });
+                        let prev = sent.get();
+                        if prev != next {
+                            let now = Instant::now();
+                            let ready = !panel_animating
+                                || prev.0 == 0
+                                || last_resize_at
+                                    .get()
+                                    .is_none_or(|at| now.duration_since(at) >= PANEL_RESIZE_PACE);
+                            if ready {
+                                sent.set(next);
+                                last_resize_at.set(Some(now));
+                                if has_project {
+                                    workspace.update(cx, |workspace, _| {
+                                        workspace.terminal_resize(
+                                            pane_term, cols, rows, cell_px.0, cell_px.1,
+                                        )
+                                    });
+                                }
                             }
                         }
                         let origin =

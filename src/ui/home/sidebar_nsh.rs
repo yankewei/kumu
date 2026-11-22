@@ -474,9 +474,11 @@ pub(super) mod view {
 
             let project_list = scroll().flex_1().min_h_0().child(proj_col);
 
-            // Global Agent status section: persistently anchored with a fixed
-            // 200px list area (5 rows) so starting/exiting agents never shifts
-            // the sidebar vertically. Overflowing agents virtual-scroll inside.
+            // Global Agent status section: sits right under the "项目" header and
+            // always reserves the same fixed-height body (5 rows; 200px) in both
+            // the expanded and collapsed states, so folding it or agents
+            // starting/exiting never shifts the sidebar's project list.
+            // Overflowing agents virtual-scroll inside the expanded body.
             let collapsed = snap.agents_collapsed;
             let tx_toggle = tx_body.clone();
             let mut hdr = view()
@@ -500,9 +502,7 @@ pub(super) mod view {
                 )
                 .child(view().flex_1());
 
-            if collapsed {
-                hdr = hdr.child(render_agent_summary(&snap.agents));
-            } else {
+            if !collapsed {
                 hdr = hdr.child(
                     text(snap.agents.len().to_string())
                         .text_size(text_xs_size)
@@ -522,125 +522,142 @@ pub(super) mod view {
                 .text_color(move || active_theme().muted_foreground),
             );
 
-            let mut section = view()
+            // The Agent-status area always reserves the same fixed height so
+            // folding it — and agents appearing/exiting — never reflows the
+            // sidebar; only the content changes (details list vs. a compact
+            // summary). Collapsing swaps the list for a centered summary.
+            let agent_body: AnyElement = if collapsed {
+                let summary: AnyElement = if snap.agents.is_empty() {
+                    meta_text("暂无运行中的 Agent").into_element()
+                } else {
+                    render_agent_summary(&snap.agents)
+                };
+                view()
+                    .flex_col()
+                    .w_full()
+                    .h(px(AGENT_LIST_HEIGHT))
+                    .flex_shrink_0()
+                    .px_3()
+                    .items_center()
+                    .justify_center()
+                    .child(summary)
+                    .into_element()
+            } else if snap.agents.is_empty() {
+                view()
+                    .flex_col()
+                    .w_full()
+                    .h(px(AGENT_LIST_HEIGHT))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .px_3()
+                    .child(meta_text("暂无运行中的 Agent"))
+                    .into_element()
+            } else {
+                let rows = Arc::new(snap.agents);
+                let row_count = rows.len();
+                let tx_rows = tx_body.clone();
+                virtual_list(row_count, move |pos| {
+                    let Some(row) = rows.get(pos.index()) else {
+                        return view().h(px(AGENT_ROW_HEIGHT)).into_element();
+                    };
+                    let pane = row.pane;
+                    let focused = row.focused;
+                    let state = row.state;
+                    let tx_reveal = tx_rows.clone();
+                    let title_color = move || {
+                        if focused {
+                            active_theme().sidebar_accent_foreground
+                        } else if matches!(state, None | Some(AgentState::Completed)) {
+                            active_theme().muted_foreground
+                        } else {
+                            active_theme().sidebar_foreground
+                        }
+                    };
+                    let hover_detail = if row.project_path.is_empty() {
+                        format!("{}\n{} · {}", row.title, row.project_name, row.tab_name)
+                    } else {
+                        format!(
+                            "{}\n{} · {}\n{}",
+                            row.title, row.project_name, row.tab_name, row.project_path
+                        )
+                    };
+
+                    let mut agent_el = view()
+                        .role(AccessibilityRole::Button)
+                        .flex_row()
+                        .w_full()
+                        .h(px(AGENT_ROW_HEIGHT))
+                        .flex_shrink_0()
+                        .px_3()
+                        .gap_2()
+                        .items_center()
+                        .app_class("cursor-pointer")
+                        .tooltip(kumu_tooltip(hover_detail))
+                        .on_press(move || send(&tx_reveal, SidebarAction::RevealAgent(pane)))
+                        .child(agent_status_glyph(state))
+                        .child(
+                            view()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_0p5()
+                                .child(
+                                    text(row.title.clone())
+                                        .w_full()
+                                        .min_w_0()
+                                        .app_class("truncate")
+                                        .text_size(text_xs_size)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(title_color),
+                                )
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(meta_text(row.agent.clone()).flex_shrink_0())
+                                        .child(meta_text("·").flex_shrink_0())
+                                        .child(
+                                            meta_text(row.project_name.clone())
+                                                .flex_1()
+                                                .min_w_0()
+                                                .app_class("truncate"),
+                                        ),
+                                ),
+                        );
+                    if focused {
+                        agent_el = agent_el.bg(move || active_theme().sidebar_accent);
+                    } else {
+                        agent_el = agent_el
+                            .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)));
+                    }
+                    agent_el.into_element()
+                })
+                .estimated_item_size(px(AGENT_ROW_HEIGHT))
+                .w_full()
+                .h(px(AGENT_LIST_HEIGHT))
+                .flex_shrink_0()
+                .into_element()
+            };
+
+            let section = view()
                 .flex_col()
                 .w_full()
                 .flex_shrink_0()
                 .border_t_1()
                 .border_t_color(move || active_theme().sidebar_border)
-                .child(hdr);
-
-            if !collapsed {
-                let agent_body: AnyElement = if snap.agents.is_empty() {
-                    view()
-                        .flex_col()
-                        .w_full()
-                        .h(px(AGENT_LIST_HEIGHT))
-                        .flex_shrink_0()
-                        .items_center()
-                        .justify_center()
-                        .px_3()
-                        .child(meta_text("暂无运行中的 Agent"))
-                        .into_element()
-                } else {
-                    let rows = Arc::new(snap.agents);
-                    let row_count = rows.len();
-                    let tx_rows = tx_body.clone();
-                    virtual_list(row_count, move |pos| {
-                        let Some(row) = rows.get(pos.index()) else {
-                            return view().h(px(AGENT_ROW_HEIGHT)).into_element();
-                        };
-                        let pane = row.pane;
-                        let focused = row.focused;
-                        let state = row.state;
-                        let tx_reveal = tx_rows.clone();
-                        let title_color = move || {
-                            if focused {
-                                active_theme().sidebar_accent_foreground
-                            } else if matches!(state, None | Some(AgentState::Completed)) {
-                                active_theme().muted_foreground
-                            } else {
-                                active_theme().sidebar_foreground
-                            }
-                        };
-                        let hover_detail = if row.project_path.is_empty() {
-                            format!("{}\n{} · {}", row.title, row.project_name, row.tab_name)
-                        } else {
-                            format!(
-                                "{}\n{} · {}\n{}",
-                                row.title, row.project_name, row.tab_name, row.project_path
-                            )
-                        };
-
-                        let mut agent_el = view()
-                            .role(AccessibilityRole::Button)
-                            .flex_row()
-                            .w_full()
-                            .h(px(AGENT_ROW_HEIGHT))
-                            .flex_shrink_0()
-                            .px_3()
-                            .gap_2()
-                            .items_center()
-                            .app_class("cursor-pointer")
-                            .tooltip(kumu_tooltip(hover_detail))
-                            .on_press(move || send(&tx_reveal, SidebarAction::RevealAgent(pane)))
-                            .child(agent_status_glyph(state))
-                            .child(
-                                view()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_0p5()
-                                    .child(
-                                        text(row.title.clone())
-                                            .w_full()
-                                            .min_w_0()
-                                            .app_class("truncate")
-                                            .text_size(text_xs_size)
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(title_color),
-                                    )
-                                    .child(
-                                        view()
-                                            .flex_row()
-                                            .w_full()
-                                            .min_w_0()
-                                            .gap_1()
-                                            .items_center()
-                                            .child(meta_text(row.agent.clone()).flex_shrink_0())
-                                            .child(meta_text("·").flex_shrink_0())
-                                            .child(
-                                                meta_text(row.project_name.clone())
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .app_class("truncate"),
-                                            ),
-                                    ),
-                            );
-                        if focused {
-                            agent_el = agent_el.bg(move || active_theme().sidebar_accent);
-                        } else {
-                            agent_el = agent_el.hover(|s| {
-                                s.bg(move || active_theme().sidebar_accent.opacity(0.5))
-                            });
-                        }
-                        agent_el.into_element()
-                    })
-                    .estimated_item_size(px(AGENT_ROW_HEIGHT))
-                    .w_full()
-                    .h(px(AGENT_LIST_HEIGHT))
-                    .flex_shrink_0()
-                    .into_element()
-                };
-                section = section.child(agent_body);
-            }
+                .child(hdr)
+                .child(agent_body);
 
             view()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(project_list)
                 .child(section)
+                .child(project_list)
         });
 
         let tx_footer = actions_tx.clone();

@@ -173,6 +173,9 @@ pub struct KumuApp {
     plugin_views: HashMap<&'static str, AnyView>,
     /// Width of the open plugin panel in px, chosen by dragging its divider.
     plugin_width: f32,
+    /// Monotonic token tracking in-flight left/right drawer slide animations
+    /// so deferred terminal PTY resizes always settle on the latest transition.
+    panel_anim_gen: u64,
     /// Title-bar plugin button currently hovered (for pure-GPUI hover tooltip).
     pub(super) hovered_plugin_tooltip: Option<&'static str>,
     /// Registry backing `"kumu.terminal"` and `"kumu.plugin"` native NSH slots.
@@ -184,7 +187,7 @@ pub struct KumuApp {
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
     active_dialog: Option<ActiveDialog>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
-    pub(super) active_sheet: Option<AnyView>,
+    pub(super) active_sheet: Option<crate::plugins::ActiveSheet>,
     /// Syncs KumuTheme updates into `shell_nsh` and `active_dialog`.
     _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
@@ -522,6 +525,7 @@ impl KumuApp {
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
+            panel_anim_gen: 0,
             hovered_plugin_tooltip: None,
             native_registry,
             shell_nsh,
@@ -1370,10 +1374,16 @@ impl KumuApp {
                 self.add_project(cx);
             }
             HomeShellAction::ClosePlugin => {
-                self.open_plugin = None;
-                self.plugin_views.clear();
-                self.native_registry.clear_plugins();
-                cx.notify();
+                self.close_plugin(cx);
+            }
+            HomeShellAction::PanelAnimationSettled => {
+                self.finish_panel_resize_defer(cx);
+            }
+            HomeShellAction::PluginCloseFinished => {
+                if self.open_plugin.is_none() {
+                    self.plugin_views.clear();
+                    self.native_registry.clear_plugins();
+                }
             }
             HomeShellAction::ResizeSidebar(sidebar_width) => {
                 let width = sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
@@ -1479,14 +1489,14 @@ impl KumuApp {
                 div()
                     .absolute()
                     .inset_0()
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                        if ev.keystroke.key == "escape" {
-                            this.active_sheet = None;
-                            this.focus_terminal(window, cx);
-                            cx.notify();
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                        if ev.keystroke.key == "escape"
+                            && let Some(sheet) = this.active_sheet.clone()
+                        {
+                            sheet.dismiss(cx);
                         }
                     }))
-                    .child(sheet.clone())
+                    .child(sheet.view.clone())
             }))
             .children(self.active_dialog.as_ref().map(|dialog| {
                 div()

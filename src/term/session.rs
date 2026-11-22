@@ -151,7 +151,19 @@ impl Inbox {
         if state.closed {
             return;
         }
-        state.control.push_back(msg);
+        // Coalesce queued resizes so animated panel transitions and fast window
+        // drags never back up stale intermediate column widths in the VT thread.
+        if let Msg::Resize { .. } = msg
+            && let Some(existing) = state
+                .control
+                .iter_mut()
+                .rev()
+                .find(|queued| matches!(queued, Msg::Resize { .. }))
+        {
+            *existing = msg;
+        } else {
+            state.control.push_back(msg);
+        }
         self.item_cv.notify_one();
     }
 
