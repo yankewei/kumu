@@ -229,6 +229,9 @@ sleep 3; printf '\033]9;任务完成\007'
 ### 数据存在哪里？会联网吗？
 项目、布局、TODO 和设置全部保存在本机 SQLite 数据库 `~/.kumu/kumu.db`。除检查更新和下载安装包外，Kumu 不访问网络，也不收集任何使用数据。
 
+### 遇到问题需要日志怎么办？
+从 Finder 启动时 Kumu 没有可读的 stderr，因此会把诊断日志写到 `~/Library/Logs/Kumu/kumu.log`（超过 5 MB 轮转为 `kumu.log.1`）。在终端里直接运行 `cargo run` 时仍输出到 stderr；设置 `KUMU_LOG_TO_FILE=1` 可强制写文件。
+
 ---
 
 ## 文档
@@ -237,3 +240,7 @@ sleep 3; printf '\033]9;任务完成\007'
 - [窗格控制 Skill（`kumu-panes`）](skills/kumu-panes/SKILL.md)
 - [TODO 看板 Skill（`kumu-todos`）](skills/kumu-todos/SKILL.md)
 - [开发约定与技术栈（`AGENTS.md`）](AGENTS.md)
+
+## License
+
+[MIT](LICENSE)

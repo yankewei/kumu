@@ -23,6 +23,7 @@
 //!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
 //!   - `term/`    PTY + VT for shells and the agent TUIs they launch;
 //!   - `agent/`   registry and executable lookup;
+//!   - `logging.rs` stderr redirection to `~/Library/Logs/Kumu` for `.app` runs;
 //!   - `window_state.rs` the main window's saved geometry.
 
 mod agent;
@@ -33,6 +34,7 @@ mod db;
 mod dock_icon;
 mod fonts;
 mod git;
+mod logging;
 mod nsh_ui;
 mod plugins;
 mod term;
@@ -48,6 +50,9 @@ fn main() {
     if let Some(code) = agent::integration::run_cli().or_else(control::run_cli) {
         std::process::exit(code);
     }
+    // A Finder-launched app has no readable stderr. Send diagnostics to
+    // ~/Library/Logs/Kumu/kumu.log so users can attach them to a report.
+    logging::init();
     // Keep registered native extensions (OpenCode, Pi, OMP) and Claude hooks
     // aligned with this build before any agent pane starts.
     agent::integration::refresh_installed();

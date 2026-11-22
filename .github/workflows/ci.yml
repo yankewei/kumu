@@ -22,9 +22,11 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Actions are pinned to immutable commit SHAs; the tag is a comment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -39,7 +41,8 @@ jobs:
       # preserving file:line panic backtraces in test failures.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to immutable commit SHAs; the tag is a comment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -51,14 +54,14 @@ jobs:
 
       - name: Cache prebuilt libghostty-vt
         id: ghostty-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/ghostty-vt-prebuilt
           key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-zig-0.17.0-${{ steps.ghostty.outputs.sha }}
 
       # vendor/ghostty's build.zig.zon requires Zig 0.17.0. Only install Zig
       # and compile libghostty-vt when the submodule revision is not cached.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: steps.ghostty-cache.outputs.cache-hit != 'true'
         with:
           version: 0.17.0
@@ -85,11 +88,12 @@ jobs:
           mkdir -p "$GHOSTTY_VT_LIB_DIR"
           cp "$RUNNER_TEMP/ghostty-vt-out/lib/libghostty-vt.a" "$GHOSTTY_VT_LIB_DIR/libghostty-vt.a"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: test-ci
           cache-on-failure: true
@@ -108,7 +112,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to immutable commit SHAs; the tag is a comment.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -120,12 +125,12 @@ jobs:
 
       - name: Cache prebuilt libghostty-vt
         id: ghostty-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ runner.temp }}/ghostty-vt-prebuilt
           key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-zig-0.17.0-${{ steps.ghostty.outputs.sha }}
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: steps.ghostty-cache.outputs.cache-hit != 'true'
         with:
           version: 0.17.0
@@ -152,12 +157,14 @@ jobs:
           mkdir -p "$GHOSTTY_VT_LIB_DIR"
           cp "$RUNNER_TEMP/ghostty-vt-out/lib/libghostty-vt.a" "$GHOSTTY_VT_LIB_DIR/libghostty-vt.a"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
 
       # A separate shared-key keeps the release profile's artifacts from being
       # evicted or overwritten by the dev-profile test runs (and vice versa)
       # when both jobs run in parallel.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: release-ci
           cache-on-failure: true
@@ -167,7 +174,7 @@ jobs:
       - run: packaging/make-app.sh release --no-build
       - run: ditto -c -k --keepParent target/release/Kumu.app target/release/Kumu.app.zip
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: Kumu-app-${{ runner.arch }}
           path: target/release/Kumu.app.zip
