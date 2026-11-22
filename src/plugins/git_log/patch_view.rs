@@ -41,7 +41,7 @@ pub(super) struct PatchSnapshot {
 
 #[derive(Clone, Debug)]
 pub(super) enum PatchHostEvent {
-    Snapshot(PatchSnapshot),
+    Snapshot(Box<PatchSnapshot>),
     Dismiss,
 }
 
@@ -125,7 +125,7 @@ mod nsh_view {
             spawn(async move {
                 while let Some(event) = rx.next().await {
                     match event {
-                        PatchHostEvent::Snapshot(next) => state.set(next),
+                        PatchHostEvent::Snapshot(next) => state.set(*next),
                         PatchHostEvent::Dismiss => open.set(false),
                     }
                 }
@@ -773,7 +773,7 @@ impl PatchView {
     fn push_snapshot(&self, cx: &App) {
         let _ = self
             .events_tx
-            .unbounded_send(PatchHostEvent::Snapshot(self.snapshot(cx)));
+            .unbounded_send(PatchHostEvent::Snapshot(Box::new(self.snapshot(cx))));
     }
 
     /// Ask the NSH `Sheet` to animate shut; once its exit slide finishes,
