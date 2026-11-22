@@ -174,7 +174,7 @@ mod view {
     };
     use crate::agent::{AGENTS, AgentState, installed};
     use crate::app::layout::{PaneId, SplitAxis};
-    use crate::nsh_ui::assets::icon_svg;
+    use crate::nsh_ui::assets::{asset_src, icon_svg};
     use crate::nsh_ui::components::{
         ButtonVariant, body_text, kumu_button, kumu_input, kumu_tooltip,
     };
@@ -370,7 +370,10 @@ mod view {
                                 .map(|agent| {
                                     let tx = tx_agent.clone();
                                     let id = agent.id.to_string();
-                                    MenuItem::new(agent.name).on_select(move || {
+                                    let icon = asset_src(agent.logo.unwrap_or("icons/bot.svg"));
+                                    MenuItem::new(agent.name)
+                                        .icon(icon)
+                                        .on_select(move || {
                                         send(
                                             &tx,
                                             HomeShellAction::AgentPane {
