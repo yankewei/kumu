@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "kumu"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "futures",
