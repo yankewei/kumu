@@ -3,7 +3,7 @@ import tty from "node:tty";
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TOKEN_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const VALID_STATES = new Set(["running", "waiting", "completed", "failed", "resume", "idle"]);
+const VALID_STATES = new Set(["running", "waiting", "completed", "failed", "resume", "idle", "exited"]);
 const MAX_TITLE_CHARS = 160;
 
 function sanitize(value) {

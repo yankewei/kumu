@@ -284,6 +284,17 @@ impl Workspace {
         self.lock().pane_runs_program_in(pane, program, ps)
     }
 
+    /// Every live shell pane (visible or parked) paired with its root child PID.
+    pub fn live_shell_panes(&self) -> Vec<(u64, u32)> {
+        self.lock().live_shell_panes()
+    }
+
+    /// Inspect a single `ps` snapshot to detect which known agent (if any) is
+    /// running below each shell pane. Intended for background threads.
+    pub fn detect_shell_agents(shells: &[(u64, u32)]) -> Option<Vec<(u64, Option<String>)>> {
+        WorkspaceCore::detect_shell_agents(shells)
+    }
+
     /// A removed terminal or the terminal being read no longer needs attention.
     /// `focused_pane` is absent while the home window is inactive.
     pub fn notification_is_read(&self, terminal: u64, focused_pane: Option<u64>) -> bool {

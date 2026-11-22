@@ -2,7 +2,7 @@
 //!
 //! They travel as notification-shaped OSCs so every hook and native extension
 //! reuses the same transport:
-//! - `\x1b]777;notify;<agent>;kumu-status:<running|waiting|completed|failed|resume|idle>\x07`
+//! - `\x1b]777;notify;<agent>;kumu-status:<running|waiting|completed|failed|resume|idle|exited>\x07`
 //! - `\x1b]777;notify;<agent>;kumu-title:<session title>\x07`
 //! - `\x1b]777;notify;<agent>;kumu-title:prompt:<first prompt>\x07`
 
@@ -81,6 +81,9 @@ pub enum StatusSignal {
     /// Returns the agent to the idle state (e.g. after user cancellation) while
     /// keeping the live agent in the sidebar list.
     Idle,
+    /// Marks an agent running inside a shell pane as exited so it leaves the
+    /// sidebar list immediately.
+    Exited,
 }
 
 impl StatusSignal {
@@ -89,6 +92,7 @@ impl StatusSignal {
             Self::Active(state) => state.as_str(),
             Self::Resume => "resume",
             Self::Idle => "idle",
+            Self::Exited => "exited",
         }
     }
 
@@ -96,6 +100,7 @@ impl StatusSignal {
         match value {
             "resume" => Some(Self::Resume),
             "idle" => Some(Self::Idle),
+            "exited" => Some(Self::Exited),
             other => AgentState::parse(other).map(Self::Active),
         }
     }
@@ -219,6 +224,7 @@ mod tests {
             StatusSignal::Active(AgentState::Failed),
             StatusSignal::Resume,
             StatusSignal::Idle,
+            StatusSignal::Exited,
         ] {
             assert_eq!(StatusSignal::parse(signal.as_str()), Some(signal));
         }

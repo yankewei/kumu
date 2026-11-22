@@ -740,6 +740,36 @@ impl WorkspaceCore {
         Some(tree_runs(ps, live.term.child_pid()?, program))
     }
 
+    /// Every live shell pane (visible or parked) paired with its root child PID.
+    pub fn live_shell_panes(&self) -> Vec<(u64, u32)> {
+        self.terms
+            .values()
+            .filter(|live| live.launch.is_shell())
+            .filter_map(|live| {
+                let pane = live.pane.or(live.parked_for)?;
+                let pid = live.term.child_pid()?;
+                Some((pane, pid))
+            })
+            .collect()
+    }
+
+    /// Inspect a single `ps` snapshot to detect which known agent (if any) is
+    /// running below each shell pane. Intended for background threads.
+    pub fn detect_shell_agents(shells: &[(u64, u32)]) -> Option<Vec<(u64, Option<String>)>> {
+        if shells.is_empty() {
+            return Some(Vec::new());
+        }
+        let ps = Self::process_tree_snapshot()?;
+        let tree = ProcessTree::parse(&ps);
+        let programs = agent_program_matchers();
+        Some(
+            shells
+                .iter()
+                .map(|&(pane, pid)| (pane, tree.detect_agent(pid, &programs)))
+                .collect(),
+        )
+    }
+
     /// The live terminal a pane shows, or the one parked for it.
     fn live_for_pane(&self, pane: u64) -> Option<&LiveTerm> {
         if let Some(term_id) = self.pane_term.get(&pane) {
@@ -1287,42 +1317,103 @@ fn command_runs_program(command: &str, program: &str) -> bool {
     false
 }
 
+/// Parsed `ps -axo pid=,ppid=,command=` table for reuse across multiple panes.
+struct ProcessTree<'a> {
+    children: HashMap<u32, Vec<u32>>,
+    commands: HashMap<u32, &'a str>,
+}
+
+impl<'a> ProcessTree<'a> {
+    fn parse(ps: &'a str) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut commands: HashMap<u32, &'a str> = HashMap::new();
+        for line in ps.lines() {
+            let Some((pid, rest)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            let Some((ppid, command)) = rest.trim_start().split_once(' ') else {
+                continue;
+            };
+            let Ok(ppid) = ppid.parse::<u32>() else {
+                continue;
+            };
+            children.entry(ppid).or_default().push(pid);
+            commands.insert(pid, command.trim());
+        }
+        Self { children, commands }
+    }
+
+    /// Return the first descendant command matching `predicate` below `root`.
+    fn find_descendant<T>(
+        &self,
+        root: u32,
+        mut predicate: impl FnMut(&str) -> Option<T>,
+    ) -> Option<T> {
+        // Start below the root: the shell itself is never the agent, even if the
+        // program name happens to match its own.
+        let mut stack: Vec<u32> = self.children.get(&root).cloned().unwrap_or_default();
+        let mut seen = HashSet::new();
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(command) = self.commands.get(&pid)
+                && let Some(found) = predicate(command)
+            {
+                return Some(found);
+            }
+            stack.extend(self.children.get(&pid).into_iter().flatten().copied());
+        }
+        None
+    }
+
+    fn runs_program(&self, root: u32, program: &str) -> bool {
+        self.find_descendant(root, |command| {
+            command_runs_program(command, program).then_some(())
+        })
+        .is_some()
+    }
+
+    fn detect_agent(&self, root: u32, matchers: &[(&'static str, Vec<String>)]) -> Option<String> {
+        self.find_descendant(root, |command| {
+            matchers.iter().find_map(|(id, programs)| {
+                programs
+                    .iter()
+                    .any(|program| command_runs_program(command, program))
+                    .then(|| (*id).to_string())
+            })
+        })
+    }
+}
+
+/// Executable names that identify each registered agent in a `ps` listing.
+/// Generic names like `agent` (Cursor's `~/.local/bin/agent` symlink) are
+/// skipped so unrelated binaries are never misclassified.
+fn agent_program_matchers() -> Vec<(&'static str, Vec<String>)> {
+    crate::agent::AGENTS
+        .iter()
+        .map(|def| {
+            let mut names = Vec::new();
+            if let Some(exe) = crate::agent::executable(def.id)
+                && let Some(name) = Path::new(&exe).file_name().and_then(|n| n.to_str())
+                && name != "agent"
+            {
+                names.push(name.to_string());
+            }
+            if def.id == "cursor" && !names.iter().any(|n| n == "cursor-agent") {
+                names.push("cursor-agent".to_string());
+            }
+            (def.id, names)
+        })
+        .filter(|(_, names)| !names.is_empty())
+        .collect()
+}
+
 fn tree_runs(ps: &str, root: u32, program: &str) -> bool {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut commands: HashMap<u32, &str> = HashMap::new();
-    for line in ps.lines() {
-        let Some((pid, rest)) = line.trim().split_once(' ') else {
-            continue;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
-            continue;
-        };
-        let Some((ppid, command)) = rest.trim_start().split_once(' ') else {
-            continue;
-        };
-        let Ok(ppid) = ppid.parse::<u32>() else {
-            continue;
-        };
-        children.entry(ppid).or_default().push(pid);
-        commands.insert(pid, command.trim());
-    }
-    // Start below the root: the shell itself is never the agent, even if the
-    // program name happens to match its own.
-    let mut stack: Vec<u32> = children.get(&root).cloned().unwrap_or_default();
-    let mut seen = HashSet::new();
-    while let Some(pid) = stack.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        if commands
-            .get(&pid)
-            .is_some_and(|command| command_runs_program(command, program))
-        {
-            return true;
-        }
-        stack.extend(children.get(&pid).into_iter().flatten().copied());
-    }
-    false
+    ProcessTree::parse(ps).runs_program(root, program)
 }
 
 /// Resolve a project or worktree id to the root repository id that owns its
@@ -1595,5 +1686,25 @@ mod tests {
         assert_eq!(super::board_root_id(&projects, 1), 1);
         assert_eq!(super::board_root_id(&projects, 2), 1);
         assert_eq!(super::board_root_id(&projects, 3), 3);
+    }
+
+    #[test]
+    fn process_tree_detects_agent_below_shell_and_ignores_unrelated_commands() {
+        let ps = "\
+  100   1 /bin/zsh -l
+  101 100 node /Users/me/.npm-global/bin/pi
+  200   1 /bin/zsh -l
+  201 200 vim pi
+  300   1 /bin/zsh -l
+  301 300 /opt/homebrew/bin/codex
+";
+        let tree = super::ProcessTree::parse(ps);
+        let matchers = vec![
+            ("pi", vec!["pi".to_string()]),
+            ("codex", vec!["codex".to_string()]),
+        ];
+        assert_eq!(tree.detect_agent(100, &matchers).as_deref(), Some("pi"));
+        assert_eq!(tree.detect_agent(200, &matchers), None);
+        assert_eq!(tree.detect_agent(300, &matchers).as_deref(), Some("codex"));
     }
 }

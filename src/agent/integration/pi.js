@@ -139,7 +139,17 @@ export default function (pi) {
 
   pi.on("session_start", (_event, ctx) => {
     installDialogs(ctx);
+    const host = hostName(ctx);
+    if (!host) return;
     reportSessionName(ctx);
+    notifyStatus(host, "idle");
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    const host = hostName(ctx);
+    if (!host) return;
+    piBusy = false;
+    ompBusy = false;
+    notifyStatus(host, "exited");
   });
   pi.on("tool_approval_requested", (_event, ctx) => {
     if (interactiveOmp(ctx)) {

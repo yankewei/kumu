@@ -143,13 +143,21 @@ test("the shared extension tells Pi and OMP apart from ctx.agent", () => {
   const handlers = {};
   piExtension({ on: (name, callback) => { handlers[name] = callback; } });
   const piCtx = { hasUI: true, hasPendingMessages: () => false, ui: {} };
+  handlers.session_start({}, piCtx);
+  assert.match(statuses().at(-1), /\x1b\]777;notify;Pi;kumu-status:idle\x07$/);
   handlers.agent_start({}, piCtx);
   handlers.agent_settled({ aborted: false }, piCtx);
   assert.match(messages.at(-1), /\x1b\]777;notify;Pi;/);
+  handlers.session_shutdown({}, piCtx);
+  assert.match(statuses().at(-1), /\x1b\]777;notify;Pi;kumu-status:exited\x07$/);
   const ompCtx = { ...piCtx, agent: { kind: "main" } };
+  handlers.session_start({}, ompCtx);
+  assert.match(statuses().at(-1), /\x1b\]777;notify;Oh My Pi;kumu-status:idle\x07$/);
   handlers.agent_start({}, ompCtx);
   handlers.agent_end({ messages: [] }, ompCtx);
   assert.match(messages.at(-1), /\x1b\]777;notify;Oh My Pi;/);
+  handlers.session_shutdown({}, ompCtx);
+  assert.match(statuses().at(-1), /\x1b\]777;notify;Oh My Pi;kumu-status:exited\x07$/);
 });
 
 test("OpenCode 2 scopes events to root sessions and cleans up subscriptions", () => {
@@ -186,6 +194,7 @@ test("OpenCode 2 scopes events to root sessions and cleans up subscriptions", ()
   assert.ok(statuses().some((message) => message.includes("kumu-status:idle")));
   cleanup();
   assert.equal(disposed, 9);
+  assert.match(statuses().at(-1), /kumu-status:exited/);
 });
 
 test("OpenCode 2 ignores sessions in another TUI's project", () => {
@@ -227,6 +236,7 @@ test("OpenCode 2 matches the directory when project IDs are unavailable", () => 
       session: { get: (id) => ({ location: { directory: id === "here" ? "/work/here" : "/work/elsewhere" } }) },
     },
   });
+  messages = [];
   handlers["session.execution.started"]({ data: { sessionID: "elsewhere" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "elsewhere" } });
   assert.equal(messages.length, 0);
@@ -251,6 +261,7 @@ test("OpenCode 2 reads the pane's own directory when the TUI location is missing
       session: { get: (id) => ({ directory: id }) },
     },
   });
+  messages = [];
   handlers["session.execution.started"]({ data: { sessionID: "/work/elsewhere" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "/work/elsewhere" } });
   assert.equal(messages.length, 0, "another project's session stays silent");
@@ -274,6 +285,7 @@ test("OpenCode 2 stays silent for a session it cannot place in a directory", () 
     location: { default: () => ({ directory: process.cwd() }) },
     session: { get: () => ({}) },
   } });
+  messages = [];
   handlers["session.execution.started"]({ data: { sessionID: "nowhere" } });
   handlers["session.execution.succeeded"]({ data: { sessionID: "nowhere" } });
   handlers["permission.asked"]({ data: { sessionID: "nowhere" } });

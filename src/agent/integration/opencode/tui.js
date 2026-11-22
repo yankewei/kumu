@@ -46,6 +46,7 @@ export default {
   id: "kumu.notifications",
   setup(ctx) {
     if (process.env.KUMU_TERMINAL !== "1") return;
+    notifyStatus("OpenCode", "idle");
     const ended = new Set();
     const here = () => ctx?.location?.directory || safeCwd();
     const relevantSession = (id) => {
@@ -138,6 +139,9 @@ export default {
         resumeIfActive(event?.data?.form?.sessionID || event?.data?.sessionID),
       ),
     ];
-    return () => dispose.reverse().forEach((dispose) => dispose());
+    return () => {
+      dispose.reverse().forEach((dispose) => dispose());
+      notifyStatus("OpenCode", "exited");
+    };
   },
 };

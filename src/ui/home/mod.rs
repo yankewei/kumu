@@ -92,6 +92,9 @@ pub(super) struct AgentEntry {
     pub(super) osc_title: Option<String>,
     /// Agent id (e.g. `"claude"`, `"opencode"`).
     pub(super) agent: String,
+    /// Whether the background shell-process watcher has observed this agent's
+    /// process in the pane's process tree (so it can safely prune it on exit).
+    pub(super) process_tracked: bool,
 }
 
 impl AgentEntry {
@@ -102,6 +105,7 @@ impl AgentEntry {
             prompt_title: None,
             osc_title: None,
             agent,
+            process_tracked: false,
         }
     }
 
@@ -554,6 +558,7 @@ impl KumuApp {
             app.start_default(cx);
         }
         app.start_control(cx);
+        app.start_shell_agent_watcher(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
         let shell_snap = app.build_shell_snapshot(cx);
@@ -931,6 +936,17 @@ impl KumuApp {
         if self.pane_tab(pane).map(|(owner, _)| owner) != Some(project) {
             return;
         }
+        if signal == StatusSignal::Exited {
+            if self.workspace.read(cx).pane_is_shell(pane.0) == Some(true)
+                && self.agent_status.remove(&pane).is_some()
+            {
+                self.workspace
+                    .update(cx, |workspace, cx| workspace.unbind_pane_todos(pane.0, cx));
+                self.sync_pane_agent_status(pane, cx);
+                cx.notify();
+            }
+            return;
+        }
         let entry = self.ensure_agent_entry(pane, agent, cx);
         match signal {
             StatusSignal::Active(state) => entry.state = Some(state),
@@ -940,6 +956,7 @@ impl KumuApp {
                 }
             }
             StatusSignal::Idle => entry.state = None,
+            StatusSignal::Exited => unreachable!(),
         }
         match signal {
             StatusSignal::Active(AgentState::Completed) => {
@@ -1002,6 +1019,98 @@ impl KumuApp {
         let state = self.agent_status.get(&pane).and_then(|entry| entry.state);
         if let Some(view) = self.panes.get(&pane) {
             view.update(cx, |view, cx| view.set_agent_status(state, cx));
+        }
+    }
+
+    /// Periodically inspect live shell panes on a background thread so manually
+    /// launched agents appear immediately (even before the first prompt) and
+    /// leave the sidebar when their process exits back to the shell.
+    fn start_shell_agent_watcher(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                let Ok(shells) =
+                    this.update(cx, |app, cx| app.workspace.read(cx).live_shell_panes())
+                else {
+                    break;
+                };
+                if shells.is_empty() {
+                    continue;
+                }
+                let detected = cx
+                    .background_executor()
+                    .spawn(async move { Workspace::detect_shell_agents(&shells) })
+                    .await;
+                let Some(detected) = detected else {
+                    continue;
+                };
+                if this
+                    .update(cx, |app, cx| app.reconcile_shell_agents(detected, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn reconcile_shell_agents(
+        &mut self,
+        detected: Vec<(u64, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        let mut removed_panes = Vec::new();
+        for (pane_raw, detected_agent) in detected {
+            let pane = PaneId(pane_raw);
+            if self.workspace.read(cx).pane_is_shell(pane_raw) != Some(true) {
+                continue;
+            }
+            match detected_agent {
+                Some(agent) => {
+                    if let Some(entry) = self.agent_status.get_mut(&pane) {
+                        entry.process_tracked = true;
+                    } else {
+                        let osc_title = self
+                            .workspace
+                            .read(cx)
+                            .pane_title(pane_raw)
+                            .and_then(|title| clean_osc_title(&title, &agent));
+                        let mut entry = AgentEntry::idle(agent);
+                        entry.osc_title = osc_title;
+                        entry.process_tracked = true;
+                        self.agent_status.insert(pane, entry);
+                        changed = true;
+                    }
+                }
+                None => {
+                    if self
+                        .agent_status
+                        .get(&pane)
+                        .is_some_and(|entry| entry.process_tracked)
+                    {
+                        self.agent_status.remove(&pane);
+                        removed_panes.push(pane);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !removed_panes.is_empty() {
+            self.workspace.update(cx, |workspace, cx| {
+                for pane in &removed_panes {
+                    workspace.unbind_pane_todos(pane.0, cx);
+                }
+            });
+            for pane in removed_panes {
+                self.sync_pane_agent_status(pane, cx);
+            }
+        }
+        if changed {
+            cx.notify();
         }
     }
 

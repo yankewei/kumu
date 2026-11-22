@@ -128,6 +128,8 @@ fn hook_groups(agent: &str) -> Vec<(&'static str, Value)> {
         // same turn. Keep only MCP elicitation forms, which have no
         // PermissionRequest event of their own.
         "claude" => vec![
+            ("SessionStart", None, "idle"),
+            ("SessionEnd", None, "exited"),
             ("UserPromptSubmit", None, "start"),
             ("PostToolUse", None, "resume"),
             ("PostToolUseFailure", None, "resume"),
@@ -1076,7 +1078,7 @@ pub fn run_cli() -> Option<i32> {
 }
 
 fn notification_message(agent: &str, kind: &str, payload: Option<&Value>) -> Option<&'static str> {
-    if matches!(kind, "session" | "start" | "resume" | "idle") {
+    if matches!(kind, "session" | "start" | "resume" | "idle" | "exited") {
         return None;
     }
     if agent == "agy" && kind == "complete" {
@@ -1106,6 +1108,7 @@ fn notification_status(agent: &str, kind: &str, payload: Option<&Value>) -> Opti
         "start" => Some(StatusSignal::Active(AgentState::Running)),
         "resume" => Some(StatusSignal::Resume),
         "idle" => Some(StatusSignal::Idle),
+        "exited" => Some(StatusSignal::Exited),
         "permission" | "input" | "ask" => Some(StatusSignal::Active(AgentState::Waiting)),
         "failed" => Some(StatusSignal::Active(AgentState::Failed)),
         "complete" if agent == "agy" => match agy_termination(payload) {
