@@ -34,8 +34,27 @@ struct Shared {
     notifications: VecDeque<TermNotification>,
 }
 
-fn ok(status: GhosttyResult, what: &str) {
-    assert!(status == GHOSTTY_SUCCESS, "ghostty {what} failed: {status}");
+/// Log a libghostty failure instead of panicking the terminal thread.
+///
+/// Construction paths check the handles they receive and surface a spawn error
+/// to the pane; non-fatal configuration calls keep the terminal usable.
+fn ok(status: GhosttyResult, what: &str) -> bool {
+    if status == GHOSTTY_SUCCESS {
+        true
+    } else {
+        eprintln!("[term] ghostty {what} failed: {status}");
+        false
+    }
+}
+
+/// A libghostty constructor that returned a null handle cannot be used; report
+/// it to the pane instead of dereferencing it later on the terminal thread.
+fn require_handle<T>(handle: *mut T, what: &str) -> Result<(), String> {
+    if handle.is_null() {
+        Err(format!("无法初始化终端（ghostty {what}）"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Copy a borrowed string field out of a terminal. The pointer libghostty
@@ -264,10 +283,10 @@ pub struct Vt {
 impl Vt {
     #[cfg(test)]
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self::with_colors(cols, rows, TermColors::default())
+        Self::with_colors(cols, rows, TermColors::default()).expect("ghostty terminal")
     }
 
-    pub fn with_colors(cols: u16, rows: u16, colors: TermColors) -> Self {
+    pub fn with_colors(cols: u16, rows: u16, colors: TermColors) -> Result<Self, String> {
         unsafe {
             let cols = cols.max(1);
             let rows = rows.max(1);
@@ -276,6 +295,7 @@ impl Vt {
                 ghostty_terminal_new(std::ptr::null(), &mut term, cols, rows),
                 "terminal_new",
             );
+            require_handle(term, "terminal_new")?;
             let cluster = GhosttyTerminalModeConfig {
                 mode: GRAPHEME_CLUSTER,
                 value: true,
@@ -290,41 +310,49 @@ impl Vt {
                 ghostty_render_state_new(std::ptr::null(), &mut state),
                 "render_state_new",
             );
+            require_handle(state, "render_state_new")?;
             let mut rows_it = std::ptr::null_mut();
             ok(
                 ghostty_render_state_row_iterator_new(std::ptr::null(), &mut rows_it),
                 "row_iterator_new",
             );
+            require_handle(rows_it, "row_iterator_new")?;
             let mut cells_it = std::ptr::null_mut();
             ok(
                 ghostty_render_state_row_cells_new(std::ptr::null(), &mut cells_it),
                 "row_cells_new",
             );
+            require_handle(cells_it, "row_cells_new")?;
             let mut keys = std::ptr::null_mut();
             ok(
                 ghostty_key_encoder_new(std::ptr::null(), &mut keys),
                 "key_encoder_new",
             );
+            require_handle(keys, "key_encoder_new")?;
             let mut key_event = std::ptr::null_mut();
             ok(
                 ghostty_key_event_new(std::ptr::null(), &mut key_event),
                 "key_event_new",
             );
+            require_handle(key_event, "key_event_new")?;
             let mut mouse = std::ptr::null_mut();
             ok(
                 ghostty_mouse_encoder_new(std::ptr::null(), &mut mouse),
                 "mouse_encoder_new",
             );
+            require_handle(mouse, "mouse_encoder_new")?;
             let mut mouse_event = std::ptr::null_mut();
             ok(
                 ghostty_mouse_event_new(std::ptr::null(), &mut mouse_event),
                 "mouse_event_new",
             );
+            require_handle(mouse_event, "mouse_event_new")?;
             let mut gesture = std::ptr::null_mut();
             ok(
                 ghostty_selection_gesture_new(std::ptr::null(), &mut gesture),
                 "selection_gesture_new",
             );
+            require_handle(gesture, "selection_gesture_new")?;
             let gesture_event = |kind| {
                 let mut event = std::ptr::null_mut();
                 ok(
@@ -338,6 +366,9 @@ impl Vt {
                 gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG),
                 gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE),
             );
+            require_handle(press, "gesture_event_new")?;
+            require_handle(drag, "gesture_event_new")?;
+            require_handle(release, "gesture_event_new")?;
 
             let shared = NonNull::new(Box::into_raw(Box::new(Shared {
                 state,
@@ -421,7 +452,7 @@ impl Vt {
                 seen_with: (0, Rgb(0, 0, 0), Rgb(0, 0, 0)),
             };
             vt.apply_colors();
-            vt
+            Ok(vt)
         }
     }
 

@@ -44,8 +44,12 @@ impl PaneLaunch {
             return None;
         };
         // An uninstalled agent must not take the pane down: the caller falls
-        // back to a shell when there is nothing to run.
-        if !super::installed(agent) {
+        // back to a shell when there is nothing to run. While the login-shell
+        // capture is still running, "not found" only means the version-manager
+        // PATH is not known yet — the terminal thread waits for the capture
+        // before spawning, so try the launch instead of silently opening a
+        // shell in an agent pane.
+        if !super::installed(agent) && crate::term::shell_env::settled() {
             return None;
         }
         let extra = parse_extra_args(&crate::db::get_agent_args(agent));

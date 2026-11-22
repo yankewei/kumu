@@ -171,11 +171,13 @@ impl Vt {
         }
         let mut search = std::ptr::null_mut();
         unsafe {
-            ok(
+            if !ok(
                 ghostty_search_new(std::ptr::null(), &mut search, self.term),
                 "search_new",
-            )
-        };
+            ) {
+                return None;
+            }
+        }
         // A successful call always yields a handle. Refuse to cache a null one
         // so a later query can try again instead of silently searching nothing.
         if search.is_null() {

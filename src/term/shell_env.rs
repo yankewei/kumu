@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,12 @@ static SHELL_ENV: Mutex<Cache> = Mutex::new(Cache {
     env: None,
     last_failure: None,
 });
+
+/// Set once the first capture attempt has finished, successfully or not.
+/// Launch code uses it to tell "this agent is not installed" apart from "the
+/// login shell's PATH has not been read yet"; treating the latter as missing
+/// would silently start a shell in an agent pane during app startup.
+static CAPTURE_SETTLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -94,6 +101,15 @@ pub fn cached_path() -> Option<OsString> {
     })
 }
 
+/// Whether the first environment capture has finished (successfully or not).
+///
+/// A caller checking whether an agent is installed must not treat `false` as
+/// "not installed": the captured login-shell PATH is what makes nvm/fnm/mise
+/// installs visible, and the capture runs alongside app startup.
+pub fn settled() -> bool {
+    CAPTURE_SETTLED.load(Ordering::Acquire)
+}
+
 /// Lay the captured shell environment under `cmd`. Variables that describe
 /// the app rather than the shell keep Kumu's value; everything else — PATH,
 /// API keys, locale — is whatever the user's shell exports.
@@ -110,12 +126,14 @@ fn captured() -> HashMap<String, String> {
     // the login shell twice; the timeout bounds how long a pane waits.
     let mut slot = SHELL_ENV.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(env) = slot.env.as_ref() {
+        CAPTURE_SETTLED.store(true, Ordering::Release);
         return env.clone();
     }
     if slot
         .last_failure
         .is_some_and(|at| at.elapsed() < RETRY_BACKOFF)
     {
+        CAPTURE_SETTLED.store(true, Ordering::Release);
         return HashMap::new();
     }
     let env = capture();
@@ -125,6 +143,7 @@ fn captured() -> HashMap<String, String> {
         slot.last_failure = None;
         slot.env = Some(env.clone());
     }
+    CAPTURE_SETTLED.store(true, Ordering::Release);
     env
 }
 
@@ -387,6 +406,14 @@ mod tests {
     fn a_partial_or_missing_marker_yields_no_environment() {
         assert!(parse(b"PATH=/usr/bin\r\n").is_empty());
         assert!(parse(b"__kumu_env_begin__\r\nPATH=/usr/bin\r\n").is_empty());
+    }
+
+    #[test]
+    fn a_capture_attempt_settles_launch_checks() {
+        // Tests take the fast path in `capture`, but launch code only needs
+        // to know that the attempt finished, successful or not.
+        let _ = captured();
+        assert!(settled());
     }
 
     #[cfg(target_os = "macos")]

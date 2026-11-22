@@ -382,15 +382,24 @@ impl Term {
             program,
             args,
             cwd,
-            command,
-            cwd_text,
+            command: command.clone(),
+            cwd_text: cwd_text.clone(),
             colors,
             session_token,
         };
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("kumu-term".into())
             .spawn(move || run(launch, thread_inbox, thread_live))
-            .expect("spawn terminal thread");
+        {
+            // Thread creation can fail under memory/thread pressure. Keep the
+            // same error channel every other spawn failure uses instead of
+            // taking the whole app down.
+            let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.fg, colors.bg);
+            snapshot.exited = true;
+            snapshot.spawn_error = Some(format!("无法创建终端线程：{error}"));
+            live.publish(snapshot, true);
+            inbox.close();
+        }
         let _close = Arc::new(Close {
             inbox: Arc::clone(&inbox),
         });
@@ -651,10 +660,25 @@ fn run(launch: Launch, inbox: Arc<Inbox>, live: Arc<Live>) {
         .name("kumu-pty".into())
         .spawn(move || read_pty(&mut reader, &reader_inbox));
 
+    let vt = match Vt::with_colors(80, 24, colors) {
+        Ok(vt) => vt,
+        Err(error) => {
+            // The emulator could not be created, so the pane has no way to
+            // draw this process. Report it like any other spawn failure and
+            // stop the child instead of leaving an unusable thread around.
+            let mut snapshot = Snapshot::blank_with(&command, &cwd_text, colors.fg, colors.bg);
+            snapshot.exited = true;
+            snapshot.spawn_error = Some(error);
+            live.publish(snapshot, true);
+            inbox.close();
+            terminate_process_group(&mut pty.child);
+            return;
+        }
+    };
     let mut session = Running {
         pty,
         write_tx,
-        vt: Vt::with_colors(80, 24, colors),
+        vt,
         command,
         cwd: cwd_text,
         exited: false,
