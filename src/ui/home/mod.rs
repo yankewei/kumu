@@ -434,6 +434,11 @@ impl KumuApp {
             .unwrap_or(SIDEBAR_WIDTH);
         let sidebar_visible =
             crate::db::get_setting(crate::db::SETTING_SIDEBAR_VISIBLE).as_deref() != Some("0");
+        let plugin_width = crate::db::get_setting(crate::db::SETTING_PLUGIN_WIDTH)
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|width| width.is_finite())
+            .map(|width| width.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH))
+            .unwrap_or(PLUGIN_WIDTH);
 
         // Save the window's geometry when it closes. The app-quit path does not
         // hand the callback a window, so it reads the same bounds through the
@@ -482,7 +487,7 @@ impl KumuApp {
             HomeShellSnapshot {
                 sidebar_visible,
                 sidebar_width,
-                plugin_width: PLUGIN_WIDTH,
+                plugin_width,
                 ..Default::default()
             },
             &native_registry,
@@ -533,7 +538,7 @@ impl KumuApp {
             window_focus,
             open_plugin: None,
             plugin_views: HashMap::new(),
-            plugin_width: PLUGIN_WIDTH,
+            plugin_width,
             panel_anim_gen: 0,
             hovered_plugin_tooltip: None,
             native_registry,
@@ -1452,7 +1457,12 @@ impl KumuApp {
                 }
             }
             HomeShellAction::ResizePlugin(plugin_width) => {
-                self.plugin_width = plugin_width.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH);
+                let width = plugin_width.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH);
+                if (width - self.plugin_width).abs() >= 1.0 {
+                    crate::db::set_setting(crate::db::SETTING_PLUGIN_WIDTH, &format!("{width}"))
+                        .ok();
+                    self.plugin_width = width;
+                }
             }
             HomeShellAction::ResizeGroup { group_id, ratios } => {
                 self.group_ratios.insert(group_id, ratios);

@@ -13,6 +13,7 @@ use crate::app::layout::{PaneDirection, PaneId, SplitAxis};
 use crate::nsh_ui::command_palette::{
     ActiveCommandPalette, PaletteIcon, PaletteItem, PaletteOutcome, PaletteSection, PaletteTarget,
 };
+use crate::nsh_ui::toast::ToastItem;
 use crate::theme::{self, DEFAULT_FONT_SIZE, FONT_SIZES, KumuTheme, ThemeMode};
 
 /// Global shortcuts intercepted at the home window root.
@@ -262,13 +263,26 @@ impl KumuApp {
         }
     }
 
+    /// Persist a setting changed by a shortcut. Unlike the settings window,
+    /// these paths have no form of their own to show an inline error, so a
+    /// failed write becomes a toast instead of looking like it worked.
+    fn save_shortcut_setting(&self, key: &str, value: &str, label: &str) {
+        if let Err(error) = crate::db::set_setting(key, value) {
+            self.shell_nsh.push_toast(ToastItem::error(
+                "settings",
+                format!("保存{label}失败：{error}"),
+            ));
+        }
+    }
+
     /// Collapse or expand the left sidebar and persist the preference.
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.begin_panel_resize_defer(cx);
         self.sidebar_visible = !self.sidebar_visible;
-        let _ = crate::db::set_setting(
+        self.save_shortcut_setting(
             crate::db::SETTING_SIDEBAR_VISIBLE,
             if self.sidebar_visible { "1" } else { "0" },
+            "侧边栏状态",
         );
         cx.notify();
     }
@@ -324,7 +338,7 @@ impl KumuApp {
         if next == current {
             return;
         }
-        let _ = crate::db::set_setting(crate::db::SETTING_FONT_SIZE, &next.to_string());
+        self.save_shortcut_setting(crate::db::SETTING_FONT_SIZE, &next.to_string(), "字号");
         theme::set_font_size(cx, next as f32);
         cx.notify();
     }
@@ -334,7 +348,7 @@ impl KumuApp {
         if (KumuTheme::global(cx).font_size - DEFAULT_FONT_SIZE).abs() < f32::EPSILON {
             return;
         }
-        let _ = crate::db::set_setting(crate::db::SETTING_FONT_SIZE, &target.to_string());
+        self.save_shortcut_setting(crate::db::SETTING_FONT_SIZE, &target.to_string(), "字号");
         theme::set_font_size(cx, DEFAULT_FONT_SIZE);
         cx.notify();
     }
@@ -345,9 +359,10 @@ impl KumuApp {
         } else {
             ThemeMode::Dark
         };
-        let _ = crate::db::set_setting(
+        self.save_shortcut_setting(
             crate::db::SETTING_THEME_MODE,
             if next.is_dark() { "dark" } else { "light" },
+            "外观模式",
         );
         theme::change_mode(next, Some(window), cx);
         cx.notify();

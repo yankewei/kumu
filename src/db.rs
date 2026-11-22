@@ -1094,6 +1094,9 @@ pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 /// divider beside it.
 pub const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
 
+/// Width of the right-hand plugin panel, in px.
+pub const SETTING_PLUGIN_WIDTH: &str = "plugin_width";
+
 /// Setting key holding whether the left sidebar is visible ("0" = collapsed).
 pub const SETTING_SIDEBAR_VISIBLE: &str = "sidebar_visible";
 
