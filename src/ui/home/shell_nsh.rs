@@ -198,7 +198,7 @@ mod view {
         Anchor, HandleEdge, h_resizable, resizable_panel, resize_handle, theme as active_theme,
         v_resizable,
     };
-    use nsh_core::element::{AccessibilityRole, LayoutCurve, LayoutTransition, native};
+    use nsh_core::element::{LayoutCurve, LayoutTransition, native};
     use nsh_core::geometry::Axis;
     use nsh_core::prelude::*;
 
@@ -222,7 +222,8 @@ mod view {
     use crate::nsh_ui::agent_picker::AgentPickerAnchor;
     use crate::nsh_ui::assets::icon_svg;
     use crate::nsh_ui::components::{
-        ButtonVariant, PillTone, body_text, kumu_button, kumu_input, kumu_tooltip, pill,
+        ButtonVariant, ControlTone, PillTone, body_text, kumu_button, kumu_icon_button, kumu_input,
+        kumu_list_button, pill,
     };
     use crate::nsh_ui::theme::{
         TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size,
@@ -309,17 +310,12 @@ mod view {
         tooltip_label: &'static str,
         on_press: impl Fn() + 'static,
     ) -> View {
-        view()
-            .role(AccessibilityRole::Button)
-            .label(tooltip_label)
-            .tooltip(kumu_tooltip(tooltip_label))
-            .flex_shrink_0()
-            .p_0p5()
-            .rounded(move || active_theme().radius)
-            .app_class("cursor-pointer")
-            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
-            .on_press(on_press)
-            .child(icon_svg(icon, 14.0).text_color(move || active_theme().muted_foreground))
+        kumu_icon_button(
+            tooltip_label,
+            icon_svg(icon, 14.0).text_color(move || active_theme().muted_foreground),
+            ControlTone::Default,
+            on_press,
+        )
     }
 
     type PaneSignalMap = Rc<RefCell<HashMap<PaneId, Signal<Option<PaneChromeSnapshot>>>>>;
@@ -353,6 +349,7 @@ mod view {
             let tx_sd = tx_hdr.clone();
             let tx_zoom = tx_hdr.clone();
             let tx_close = tx_hdr.clone();
+            let focus_label = format!("聚焦窗格 {}", snap.name);
 
             let mut row = view()
                 .flex_row()
@@ -368,7 +365,11 @@ mod view {
                     } else {
                         AdaptiveColor::TRANSPARENT
                     }
-                })
+                });
+            let focus_button = kumu_list_button(focus_label, active, ControlTone::Pane)
+                .flex_1()
+                .min_w_0()
+                .gap_2()
                 .on_press(move || send(&tx_focus, HomeShellAction::FocusPane(pane_id)))
                 .child(
                     icon_svg("icons/square-terminal.svg", 14.0)
@@ -392,6 +393,7 @@ mod view {
                         .text_size(text_xs_size)
                         .text_color(move || active_theme().muted_foreground),
                 );
+            row = row.child(focus_button);
 
             // Kept in one always-present group so the header actions keep
             // their place as these come and go.
@@ -412,35 +414,31 @@ mod view {
             }
             row = row.child(extras);
 
-            let agent_trigger = view()
-                .role(AccessibilityRole::Button)
-                .label("新建 Agent 窗格")
-                .tooltip(kumu_tooltip("新建 Agent 窗格"))
-                .flex_shrink_0()
-                .p_0p5()
-                .rounded(move || active_theme().radius)
-                .app_class("cursor-pointer")
-                .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
-                .on_press(move |ev: &PressEvent| {
-                    // A press opens the picker below the pointer; a keyboard or
-                    // assistive-technology activation opens it at the top-right.
-                    let (x, y) = if ev.clicks > 0 {
-                        (ev.page_position.x.0, ev.page_position.y.0)
-                    } else {
-                        (window().width.0 - 16.0, 54.0)
-                    };
+            let agent_anchor = signal(AgentPickerAnchor {
+                x: window().width.0 - 16.0,
+                y: 54.0,
+            });
+            let anchor_on_press = agent_anchor;
+            let agent_trigger = kumu_icon_button(
+                "新建 Agent 窗格",
+                icon_svg("icons/bot.svg", 14.0).text_color(move || active_theme().muted_foreground),
+                ControlTone::Default,
+                move || {
                     send(
                         &tx_agent,
                         HomeShellAction::OpenAgentPicker {
                             pane: pane_id,
-                            anchor: AgentPickerAnchor { x, y },
+                            anchor: agent_anchor.get_untracked(),
                         },
                     );
-                })
-                .child(
-                    icon_svg("icons/bot.svg", 14.0)
-                        .text_color(move || active_theme().muted_foreground),
-                );
+                },
+            )
+            .on_press_down(move |ev: &PressEvent| {
+                anchor_on_press.set(AgentPickerAnchor {
+                    x: ev.page_position.x.0,
+                    y: ev.page_position.y.0,
+                });
+            });
 
             row = row
                 .child(agent_trigger)
@@ -973,18 +971,12 @@ mod view {
                         .text_size(text_xs_size)
                         .text_color(warning_color),
                 )
-                .child(
-                    view()
-                        .role(AccessibilityRole::Button)
-                        .label("关闭错误提示")
-                        .flex_shrink_0()
-                        .p_0p5()
-                        .rounded(move || active_theme().radius)
-                        .app_class("cursor-pointer")
-                        .hover(|s| s.bg(move || warning_color().opacity(0.25)))
-                        .on_press(move || send(&tx_x, HomeShellAction::DismissStoreError))
-                        .child(icon_svg("icons/close.svg", 12.0).text_color(warning_color)),
-                )
+                .child(kumu_icon_button(
+                    "关闭错误提示",
+                    icon_svg("icons/close.svg", 12.0).text_color(warning_color),
+                    ControlTone::Default,
+                    move || send(&tx_x, HomeShellAction::DismissStoreError),
+                ))
                 .into_element()
         });
 
@@ -1470,6 +1462,17 @@ mod tests {
 
         app.wait_for("zsh").expect("pane header name renders");
         app.wait_for("1/3").expect("find bar match count renders");
+
+        app.press("label:新建 Agent 窗格")
+            .expect("press accessible Agent picker button");
+        match actions_rx.try_recv().expect("open agent picker action") {
+            HomeShellAction::OpenAgentPicker { pane, anchor } => {
+                assert_eq!(pane, PaneId(1));
+                assert!(anchor.x > 0.0);
+                assert!(anchor.y > 0.0);
+            }
+            action => panic!("unexpected shell action: {action:?}"),
+        }
 
         // Updating match count updates badge reactively without tearing down the find bar.
         let mut updated_chrome = HashMap::new();

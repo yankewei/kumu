@@ -64,7 +64,7 @@ pub(super) mod view {
     use nsh_base::theme as active_theme;
     use nsh_core::ContextMenuEvent;
     use nsh_core::element::desktop::{MenuItem, popup_menu_at};
-    use nsh_core::element::{AccessibilityRole, scroll, virtual_list};
+    use nsh_core::element::{scroll, virtual_list};
     use nsh_core::prelude::*;
 
     const AGENT_ROW_HEIGHT: f32 = 40.0;
@@ -72,7 +72,9 @@ pub(super) mod view {
     use super::{AgentRowSnapshot, ProjectRowSnapshot, SidebarAction, SidebarSnapshot};
     use crate::agent::AgentState;
     use crate::nsh_ui::assets::icon_svg;
-    use crate::nsh_ui::components::{kumu_tooltip, meta_text};
+    use crate::nsh_ui::components::{
+        ControlTone, kumu_icon_button, kumu_list_button, kumu_tooltip, meta_text,
+    };
     use crate::nsh_ui::theme::{
         TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size,
     };
@@ -301,17 +303,13 @@ pub(super) mod view {
             // It sits below the projects; its body virtual-scrolls.
             let collapsed = snap.agents_collapsed;
             let tx_toggle = tx_body.clone();
-            let mut hdr = view()
-                .role(AccessibilityRole::Button)
-                .flex_row()
+            let mut hdr = kumu_list_button("切换 Agent 状态列表", false, ControlTone::Sidebar)
                 .w_full()
                 .h(px(32.0))
                 .px_3()
                 .gap_1p5()
                 .flex_shrink_0()
                 .items_center()
-                .app_class("cursor-pointer")
-                .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
                 .on_press(move || send(&tx_toggle, SidebarAction::ToggleAgentsCollapsed))
                 .child(
                     text("Agent 状态")
@@ -401,57 +399,47 @@ pub(super) mod view {
                         )
                     };
 
-                    let mut agent_el = view()
-                        .role(AccessibilityRole::Button)
-                        .flex_row()
-                        .w_full()
-                        .h(px(AGENT_ROW_HEIGHT))
-                        .flex_shrink_0()
-                        .px_3()
-                        .gap_2()
-                        .items_center()
-                        .app_class("cursor-pointer")
-                        .tooltip(kumu_tooltip(hover_detail))
-                        .on_press(move || send(&tx_reveal, SidebarAction::RevealAgent(pane)))
-                        .child(agent_status_glyph(state))
-                        .child(
-                            view()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_0p5()
-                                .child(
-                                    text(row.title.clone())
-                                        .w_full()
-                                        .min_w_0()
-                                        .app_class("truncate")
-                                        .text_size(text_xs_size)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(title_color),
-                                )
-                                .child(
-                                    view()
-                                        .flex_row()
-                                        .w_full()
-                                        .min_w_0()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(meta_text(row.agent.clone()).flex_shrink_0())
-                                        .child(meta_text("·").flex_shrink_0())
-                                        .child(
-                                            meta_text(row.project_name.clone())
-                                                .flex_1()
-                                                .min_w_0()
-                                                .app_class("truncate"),
-                                        ),
-                                ),
-                        );
-                    if focused {
-                        agent_el = agent_el.bg(move || active_theme().sidebar_accent);
-                    } else {
-                        agent_el = agent_el
-                            .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)));
-                    }
+                    let agent_el = view().tooltip(kumu_tooltip(hover_detail.clone())).child(
+                        kumu_list_button(hover_detail, focused, ControlTone::Sidebar)
+                            .h(px(AGENT_ROW_HEIGHT))
+                            .flex_shrink_0()
+                            .px_3()
+                            .gap_2()
+                            .on_press(move || send(&tx_reveal, SidebarAction::RevealAgent(pane)))
+                            .child(agent_status_glyph(state))
+                            .child(
+                                view()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        text(row.title.clone())
+                                            .w_full()
+                                            .min_w_0()
+                                            .app_class("truncate")
+                                            .text_size(text_xs_size)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(title_color),
+                                    )
+                                    .child(
+                                        view()
+                                            .flex_row()
+                                            .w_full()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(meta_text(row.agent.clone()).flex_shrink_0())
+                                            .child(meta_text("·").flex_shrink_0())
+                                            .child(
+                                                meta_text(row.project_name.clone())
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .app_class("truncate"),
+                                            ),
+                                    ),
+                            ),
+                    );
                     agent_el.into_element()
                 })
                 .estimated_item_size(px(AGENT_ROW_HEIGHT))
@@ -490,21 +478,13 @@ pub(super) mod view {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || active_theme().muted_foreground),
                 )
-                .child(
-                    view()
-                        .role(AccessibilityRole::Button)
-                        .label("打开项目")
-                        .tooltip(kumu_tooltip("打开项目"))
-                        .rounded(move || active_theme().radius)
-                        .p_0p5()
-                        .app_class("cursor-pointer")
-                        .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
-                        .on_press(move || send(&tx_add, SidebarAction::AddProject))
-                        .child(
-                            icon_svg("icons/plus.svg", 14.0)
-                                .text_color(move || active_theme().muted_foreground),
-                        ),
-                );
+                .child(kumu_icon_button(
+                    "打开项目",
+                    icon_svg("icons/plus.svg", 14.0)
+                        .text_color(move || active_theme().muted_foreground),
+                    ControlTone::Sidebar,
+                    move || send(&tx_add, SidebarAction::AddProject),
+                ));
 
             // Project tree
             let mut proj_col = view().flex_col().w_full().pb_2();
@@ -536,47 +516,44 @@ pub(super) mod view {
 
                 let project_path = project.path.clone();
                 let mut row = view()
-                    .role(AccessibilityRole::Button)
                     .flex_row()
                     .w_full()
-                    .py_1p5()
                     .pr_3()
-                    .pl(px(if worktree { 28.0 } else { 12.0 }))
                     .mt(px(if worktree { 2.0 } else { 6.0 }))
-                    .gap_1p5()
                     .items_center()
-                    .app_class("cursor-pointer")
                     .on_mouse_enter(move |_: &nsh_core::MouseEvent| hovered_project.set(Some(id)))
                     .on_mouse_leave(move |_: &nsh_core::MouseEvent| {
                         if hovered_project.get_untracked() == Some(id) {
                             hovered_project.set(None);
                         }
-                    })
-                    .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
-                    .on_context_menu(move |ev: &ContextMenuEvent| {
-                        let items = project_context_menu(tx_ctx.clone(), &ctx_proj);
-                        drop(popup_menu_at(items, ev.page_position));
-                    })
-                    .child(icon_svg(icon_path, 14.0).text_color(fg))
-                    .child(
-                        text(project.name.clone())
-                            .flex_1()
-                            .min_w_0()
-                            .app_class("truncate")
-                            .tooltip(kumu_tooltip(project_path))
-                            .text_size(text_xs_size)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg),
-                    );
+                    });
 
-                if active {
-                    row = row.bg(move || active_theme().sidebar_accent);
-                } else {
-                    row = row.hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)));
-                }
+                let mut project_button =
+                    kumu_list_button(project.name.clone(), active, ControlTone::Sidebar)
+                        .flex_1()
+                        .py_1p5()
+                        .pl(px(if worktree { 28.0 } else { 12.0 }))
+                        .pr_1()
+                        .gap_1p5()
+                        .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
+                        .on_context_menu(move |ev: &ContextMenuEvent| {
+                            let items = project_context_menu(tx_ctx.clone(), &ctx_proj);
+                            drop(popup_menu_at(items, ev.page_position));
+                        })
+                        .child(icon_svg(icon_path, 14.0).text_color(fg))
+                        .child(
+                            text(project.name.clone())
+                                .flex_1()
+                                .min_w_0()
+                                .app_class("truncate")
+                                .tooltip(kumu_tooltip(project_path))
+                                .text_size(text_xs_size)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg),
+                        );
 
                 if project.unread {
-                    row = row.child(
+                    project_button = project_button.child(
                         view()
                             .w(px(6.0))
                             .h(px(6.0))
@@ -599,51 +576,28 @@ pub(super) mod view {
                         if hovered_project.get() == Some(id) {
                             1.0_f32
                         } else {
-                            0.0_f32
+                            0.65_f32
                         }
                     })
-                    .pointer_events(move || {
-                        if hovered_project.get() == Some(id) {
-                            nsh_core::PointerEvents::Auto
-                        } else {
-                            nsh_core::PointerEvents::None
-                        }
-                    })
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label(remove_label)
-                            .tooltip(kumu_tooltip(remove_label))
-                            .rounded(move || active_theme().radius)
-                            .p_0p5()
-                            .app_class("cursor-pointer")
-                            .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.6)))
-                            .on_press(move || {
-                                send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
-                            })
-                            .child(
-                                icon_svg("icons/x.svg", 13.0)
-                                    .text_color(move || active_theme().muted_foreground),
-                            ),
-                    )
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label("新建终端")
-                            .tooltip(kumu_tooltip("新建终端"))
-                            .rounded(move || active_theme().radius)
-                            .p_0p5()
-                            .app_class("cursor-pointer")
-                            .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.6)))
-                            .on_press(move || {
-                                send(&tx_term, SidebarAction::NewTerminal(id));
-                            })
-                            .child(
-                                icon_svg("icons/square-terminal.svg", 13.0)
-                                    .text_color(move || active_theme().muted_foreground),
-                            ),
-                    );
-                row = row.child(row_actions);
+                    .child(kumu_icon_button(
+                        remove_label,
+                        icon_svg("icons/x.svg", 13.0)
+                            .text_color(move || active_theme().muted_foreground),
+                        ControlTone::Sidebar,
+                        move || {
+                            send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
+                        },
+                    ))
+                    .child(kumu_icon_button(
+                        "新建终端",
+                        icon_svg("icons/square-terminal.svg", 13.0)
+                            .text_color(move || active_theme().muted_foreground),
+                        ControlTone::Sidebar,
+                        move || {
+                            send(&tx_term, SidebarAction::NewTerminal(id));
+                        },
+                    ));
+                row = row.child(project_button).child(row_actions);
                 proj_col = proj_col.child(row);
             }
 
@@ -687,17 +641,10 @@ pub(super) mod view {
                     notice_icon = notice_icon.app_class("animate-spin");
                 }
                 col = col.child(
-                    view()
-                        .role(AccessibilityRole::Button)
-                        .flex_row()
-                        .w_full()
+                    kumu_list_button(notice.label.clone(), false, ControlTone::Sidebar)
                         .px_2()
                         .py_1()
                         .gap_1p5()
-                        .rounded(move || active_theme().radius)
-                        .items_center()
-                        .app_class("cursor-pointer")
-                        .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
                         .on_press(move || send(&tx_upd, SidebarAction::OpenSettings(true)))
                         .child(notice_icon)
                         .child(
@@ -712,21 +659,17 @@ pub(super) mod view {
             }
 
             col.child(
-                view().flex_row().w_full().justify_between().child(
-                    view()
-                        .role(AccessibilityRole::Button)
-                        .label("设置")
-                        .tooltip(kumu_tooltip("设置"))
-                        .rounded(move || active_theme().radius)
-                        .p_1()
-                        .app_class("cursor-pointer")
-                        .hover(|s| s.bg(move || active_theme().sidebar_accent.opacity(0.5)))
-                        .on_press(move || send(&tx_set, SidebarAction::OpenSettings(false)))
-                        .child(
-                            icon_svg("icons/settings.svg", 14.0)
-                                .text_color(move || active_theme().muted_foreground),
-                        ),
-                ),
+                view()
+                    .flex_row()
+                    .w_full()
+                    .justify_between()
+                    .child(kumu_icon_button(
+                        "设置",
+                        icon_svg("icons/settings.svg", 14.0)
+                            .text_color(move || active_theme().muted_foreground),
+                        ControlTone::Sidebar,
+                        move || send(&tx_set, SidebarAction::OpenSettings(false)),
+                    )),
             )
         });
 

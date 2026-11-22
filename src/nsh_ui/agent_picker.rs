@@ -48,11 +48,11 @@ static MOUNTS: MountRegistry<AgentPickerMount> = MountRegistry::new();
 mod view {
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::theme as active_theme;
-    use nsh_core::element::AccessibilityRole;
     use nsh_core::prelude::*;
 
     use super::{AgentPickerAnchor, AgentPickerItem, AgentPickerOutcome, MOUNTS};
     use crate::nsh_ui::assets::{asset_src, icon_svg};
+    use crate::nsh_ui::components::{ControlTone, kumu_list_button};
     use crate::nsh_ui::theme::text_xs_size;
     use crate::ui::titlebar::TITLE_BAR_HEIGHT;
 
@@ -122,19 +122,11 @@ mod view {
         let id = item.id.clone();
         let tx_row = tx.clone();
         let label = format!("新建 {} 窗格", item.name);
-        view()
-            .role(AccessibilityRole::Button)
-            .label(label)
-            .flex_row()
+        kumu_list_button(label, false, ControlTone::Default)
             .flex_shrink_0()
-            .w_full()
             .h(px(30.0))
             .px_2()
             .gap_2()
-            .items_center()
-            .rounded(move || active_theme().radius)
-            .app_class("cursor-pointer")
-            .hover(|s| s.bg(move || active_theme().accent.opacity(0.7)))
             .on_press(move || send(&tx_row, AgentPickerOutcome::Selected(id.clone())))
             .child(agent_logo(item))
             .child(

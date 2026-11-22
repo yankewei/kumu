@@ -47,12 +47,14 @@ pub(super) mod view {
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::theme as active_theme;
     use nsh_core::element::desktop::{MenuItem, popup_menu};
-    use nsh_core::element::{AccessibilityRole, scroll};
+    use nsh_core::element::scroll;
     use nsh_core::prelude::*;
 
     use super::{TabAttention, TabBarAction, TabBarSnapshot};
     use crate::nsh_ui::assets::icon_svg;
-    use crate::nsh_ui::components::{ButtonVariant, kumu_button, kumu_tooltip};
+    use crate::nsh_ui::components::{
+        ButtonVariant, ControlTone, kumu_button, kumu_icon_button, kumu_tab_button, kumu_tooltip,
+    };
     use crate::nsh_ui::theme::{TOKEN_WARNING, kumu_color, text_xs_size};
 
     fn send(tx: &Option<UnboundedSender<TabBarAction>>, action: TabBarAction) {
@@ -126,19 +128,12 @@ pub(super) mod view {
                 for tab in tabs {
                     let tab_id = tab.id;
                     let active = tab.active;
+                    let select_label = format!("选择页签 {}", tab.name);
+                    let close_label = format!("关闭「{}」页签 ⌘W", tab.name);
                     let tx_sel = tx_root.clone();
                     let tx_close = tx_root.clone();
 
-                    let mut tab_el = view()
-                        .role(AccessibilityRole::Button)
-                        .flex_row()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap_1()
-                        .h(px(26.0))
-                        .px_2()
-                        .rounded(move || active_theme().radius)
-                        .app_class("cursor-pointer")
+                    let mut tab_button = kumu_tab_button(select_label, active)
                         .on_press(move || {
                             send(&tx_sel, TabBarAction::Select { project_id, tab_id });
                         })
@@ -162,17 +157,8 @@ pub(super) mod view {
                                 }),
                         );
 
-                    if active {
-                        tab_el = tab_el
-                            .bg(move || active_theme().background)
-                            .border_1()
-                            .border_color(move || active_theme().border);
-                    } else {
-                        tab_el = tab_el.hover(|s| s.bg(move || active_theme().accent.opacity(0.5)));
-                    }
-
                     if let Some(att) = tab.attention {
-                        tab_el = tab_el.child(match att {
+                        tab_button = tab_button.child(match att {
                             TabAttention::Waiting(count) => view()
                                 .w(px(7.0))
                                 .h(px(7.0))
@@ -192,27 +178,27 @@ pub(super) mod view {
                         });
                     }
 
-                    tab_el = tab_el.child(
+                    strip = strip.child(
                         view()
-                            .role(AccessibilityRole::Button)
-                            .label("关闭页签")
-                            .tooltip(kumu_tooltip("关闭页签 ⌘W"))
+                            .flex_row()
                             .flex_shrink_0()
-                            .rounded(move || active_theme().radius)
-                            .p_0p5()
-                            .app_class("cursor-pointer")
-                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
-                            .on_press(move || {
-                                send(&tx_close, TabBarAction::RequestClose { project_id, tab_id });
-                            })
-                            .child(
+                            .items_center()
+                            .gap_0p5()
+                            .child(tab_button)
+                            .child(kumu_icon_button(
+                                close_label,
                                 icon_svg("icons/x.svg", 12.0)
                                     .opacity(if active { 1.0 } else { 0.55 })
                                     .text_color(move || active_theme().muted_foreground),
-                            ),
+                                ControlTone::Default,
+                                move || {
+                                    send(
+                                        &tx_close,
+                                        TabBarAction::RequestClose { project_id, tab_id },
+                                    );
+                                },
+                            )),
                     );
-
-                    strip = strip.child(tab_el);
                 }
 
                 let tx_add = tx_root.clone();
@@ -235,58 +221,34 @@ pub(super) mod view {
                             .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
                     })
                     .child(scroll().horizontal().flex_1().min_w_0().child(strip))
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label("新建页签")
-                            .tooltip(kumu_tooltip("新建页签 ⌘T"))
-                            .flex_shrink_0()
-                            .rounded(move || active_theme().radius)
-                            .p_0p5()
-                            .app_class("cursor-pointer")
-                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
-                            .on_press(move || send(&tx_add, TabBarAction::Add))
-                            .child(
-                                icon_svg("icons/plus.svg", 14.0)
-                                    .text_color(move || active_theme().muted_foreground),
-                            ),
-                    )
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label("页签操作")
-                            .tooltip(kumu_tooltip("页签操作"))
-                            .flex_shrink_0()
-                            .rounded(move || active_theme().radius)
-                            .p_0p5()
-                            .app_class("cursor-pointer")
-                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
-                            .on_press(move || {
-                                let Some(tab_id) = selected_tab_id else {
-                                    return;
-                                };
-                                let tx_r = tx_menu.clone();
-                                let tx_c = tx_menu.clone();
-                                drop(popup_menu(vec![
-                                    MenuItem::new("重命名页签").on_select(move || {
-                                        send(
-                                            &tx_r,
-                                            TabBarAction::PromptRename { project_id, tab_id },
-                                        );
-                                    }),
-                                    MenuItem::new("关闭页签").on_select(move || {
-                                        send(
-                                            &tx_c,
-                                            TabBarAction::RequestClose { project_id, tab_id },
-                                        );
-                                    }),
-                                ]));
-                            })
-                            .child(
-                                icon_svg("icons/ellipsis.svg", 14.0)
-                                    .text_color(move || active_theme().muted_foreground),
-                            ),
-                    )
+                    .child(kumu_icon_button(
+                        "新建页签 ⌘T",
+                        icon_svg("icons/plus.svg", 14.0)
+                            .text_color(move || active_theme().muted_foreground),
+                        ControlTone::Default,
+                        move || send(&tx_add, TabBarAction::Add),
+                    ))
+                    .child(kumu_icon_button(
+                        "页签操作",
+                        icon_svg("icons/ellipsis.svg", 14.0)
+                            .text_color(move || active_theme().muted_foreground),
+                        ControlTone::Default,
+                        move || {
+                            let Some(tab_id) = selected_tab_id else {
+                                return;
+                            };
+                            let tx_r = tx_menu.clone();
+                            let tx_c = tx_menu.clone();
+                            drop(popup_menu(vec![
+                                MenuItem::new("重命名页签").on_select(move || {
+                                    send(&tx_r, TabBarAction::PromptRename { project_id, tab_id });
+                                }),
+                                MenuItem::new("关闭页签").on_select(move || {
+                                    send(&tx_c, TabBarAction::RequestClose { project_id, tab_id });
+                                }),
+                            ]));
+                        },
+                    ))
                     .into_element()
             }
         })

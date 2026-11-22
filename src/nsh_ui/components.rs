@@ -13,6 +13,8 @@ use nsh_core::prelude::*;
 
 use super::theme::{TOKEN_ACCENT_PILL_BG, TOKEN_LINK, kumu_color, text_sm_size, text_xs_size};
 
+const CONTROL_COLOR_TRANSITION_MS: f32 = 120.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonVariant {
     Primary,
@@ -20,6 +22,13 @@ pub enum ButtonVariant {
     Outline,
     Ghost,
     Danger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlTone {
+    Default,
+    Sidebar,
+    Pane,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,21 +64,28 @@ pub fn row_title(content: impl IntoReactive<SharedString>) -> Text {
         .text_color(move || theme().foreground)
 }
 
+fn button_frame() -> ButtonElement {
+    button()
+        .rounded(move || theme().radius)
+        .active(|s| s.opacity(0.75))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .disabled_style(|s| s.opacity(0.45))
+        .when(!reduce_motion(), |s| {
+            s.transition_colors().duration(CONTROL_COLOR_TRANSITION_MS)
+        })
+}
+
 /// Styled Kumu button built over `nsh_base::button()`.
 pub fn kumu_button(
     label: impl IntoReactive<SharedString>,
     variant: ButtonVariant,
 ) -> ButtonElement {
-    let base = button()
+    let base = button_frame()
         .flex_row()
         .items_center()
         .justify_center()
         .px_2p5()
-        .py_1()
-        .rounded(move || theme().radius)
-        .app_class("cursor-pointer")
-        .active(|s| s.opacity(0.75))
-        .disabled_style(|s| s.opacity(0.45));
+        .py_1();
 
     match variant {
         ButtonVariant::Primary => base.bg(move || theme().primary).child(
@@ -114,6 +130,93 @@ pub fn kumu_button(
     }
 }
 
+/// Styled icon-only command button. Its label is both the accessible name and
+/// the tooltip, so icon controls stay discoverable to pointer and keyboard users.
+pub fn kumu_icon_button(
+    label: impl Into<SharedString>,
+    icon: impl IntoElement,
+    tone: ControlTone,
+    on_press: impl Fn() + 'static,
+) -> View {
+    let label = label.into();
+    let button = button_frame()
+        .accessibility_label(label.clone())
+        .flex_shrink_0()
+        .size(px(24.0))
+        .items_center()
+        .justify_center()
+        .on_press(on_press);
+
+    let button = match tone {
+        ControlTone::Default => button.hover(|s| s.bg(move || theme().accent.opacity(0.5))),
+        ControlTone::Sidebar => button.hover(|s| s.bg(move || theme().sidebar_accent.opacity(0.5))),
+        ControlTone::Pane => button.hover(|s| s.bg(move || theme().accent.opacity(0.5))),
+    };
+
+    view()
+        .tooltip(kumu_tooltip(label))
+        .child(button.child(icon))
+}
+
+/// Styled row command used for navigation and selectable rows in the sidebar
+/// and small pickers. Callers provide the row's content and layout.
+pub fn kumu_list_button<M>(
+    label: impl Into<SharedString>,
+    selected: impl IntoProp<bool, M>,
+    tone: ControlTone,
+) -> ButtonElement {
+    let button = button_frame()
+        .accessibility_label(label.into())
+        .selected(selected)
+        .flex_row()
+        .w_full()
+        .min_w_0()
+        .items_center();
+
+    match tone {
+        ControlTone::Default => button
+            .selected_style(|s| s.bg(move || theme().accent))
+            .hover(|s| s.bg(move || theme().accent.opacity(0.5))),
+        ControlTone::Sidebar => button
+            .selected_style(|s| s.bg(move || theme().sidebar_accent))
+            .hover(|s| s.bg(move || theme().sidebar_accent.opacity(0.5))),
+        ControlTone::Pane => button
+            .selected_style(|s| s.bg(AdaptiveColor::TRANSPARENT))
+            .hover(|s| s.bg(move || theme().accent.opacity(0.5))),
+    }
+}
+
+/// A tab button that exposes its selected state to accessibility APIs.
+pub fn kumu_tab_button(label: impl Into<SharedString>, selected: bool) -> ButtonElement {
+    button_frame()
+        .accessibility_label(label.into())
+        .selected(selected)
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .h(px(26.0))
+        .px_2()
+        .border_1()
+        .border_color(move || {
+            if selected {
+                theme().border
+            } else {
+                AdaptiveColor::TRANSPARENT
+            }
+        })
+        .hover(|s| {
+            s.bg(move || {
+                if selected {
+                    theme().background
+                } else {
+                    theme().accent.opacity(0.5)
+                }
+            })
+        })
+        .selected_style(|s| s.bg(move || theme().background))
+}
+
 /// Styled Kumu single-line input over `nsh_base::input()`.
 pub fn kumu_input(placeholder: impl IntoReactive<String>) -> Input {
     input()
@@ -135,7 +238,6 @@ pub fn kumu_switch_bare<M>(checked: impl IntoProp<bool, M>) -> SwitchElement {
         .checked(checked)
         .flex_row()
         .items_center()
-        .app_class("cursor-pointer")
         .track_class("w-8 h-4 rounded-full bg-input checked:bg-primary p-0.5")
         .thumb_class("w-3 h-3 rounded-full bg-background checked:translate-x-4")
 }
@@ -201,6 +303,7 @@ mod tests {
         let count = signal(0u32);
         let enabled = signal(false);
         let draft = signal(String::new());
+        let selected = signal(false);
 
         view()
             .flex_1()
@@ -213,6 +316,24 @@ mod tests {
                     .child(
                         kumu_button("Commit", ButtonVariant::Primary)
                             .on_press(move || count.update(|n| *n += 1)),
+                    )
+                    .child(kumu_icon_button(
+                        "增加计数",
+                        text("+"),
+                        ControlTone::Default,
+                        move || count.update(|n| *n += 1),
+                    ))
+                    .child(
+                        kumu_list_button("选择项目", move || selected.get(), ControlTone::Sidebar)
+                            .px_2()
+                            .py_1()
+                            .child(body_text("项目一"))
+                            .child(meta_text(
+                                move || {
+                                    if selected.get() { "已选" } else { "未选" }
+                                },
+                            ))
+                            .on_press(move || selected.update(|value| *value = !*value)),
                     )
                     .child(
                         kumu_switch_bare(move || enabled.get())
@@ -243,6 +364,11 @@ mod tests {
         app.wait_for("OFF").expect("initial pill");
         app.press("Commit").expect("press button");
         app.wait_for("Clicks: 1").expect("button updates signal");
+        app.press("增加计数").expect("press icon button");
+        app.wait_for("Clicks: 2")
+            .expect("icon button updates signal");
+        app.press("选择项目").expect("press selectable row");
+        app.wait_for("已选").expect("selected row updates");
         app.press("Auto Resume").expect("toggle switch");
         app.wait_for("ON").expect("switch updates pill");
     }
