@@ -200,7 +200,7 @@ pub(super) fn terminal_header(
     radius: Pixels,
     hover: Hsla,
     cx: &mut Context<TerminalView>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let path = short_cwd(&cwd);
     let (link, success, danger) = {
         let theme = cx.theme();
@@ -301,7 +301,7 @@ fn agent_menu_button(
     muted: Hsla,
     hover: Hsla,
     cx: &mut Context<TerminalView>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let view = cx.entity().downgrade();
     Button::new(format!("agent-menu-{}", pane.0))
         .custom(

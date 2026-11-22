@@ -4,6 +4,10 @@ use std::sync::Arc;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
+use super::drop::{
+    ClipboardPayload, escape_shell_path, format_dropped_paths, resolve_clipboard,
+    save_clipboard_image,
+};
 use super::{FindBar, GridAt, TerminalEvent, TerminalView};
 use crate::term::link;
 use crate::term::{
@@ -174,15 +178,70 @@ impl TerminalView {
     }
 
     pub(super) fn paste(&mut self, cx: &mut Context<Self>) {
-        if self.project.is_none() {
+        let Some(project) = self.project else {
             return;
-        }
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        };
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(payload) = resolve_clipboard(&item) else {
             return;
         };
         let pane = self.pane.0;
+        match payload {
+            ClipboardPayload::Text(text) => {
+                self.workspace
+                    .update(cx, |workspace, _| workspace.terminal_paste(pane, text));
+            }
+            ClipboardPayload::Image(image) => {
+                let save = cx
+                    .background_executor()
+                    .spawn(async move { save_clipboard_image(&image) });
+                cx.spawn(async move |this, cx| {
+                    let result = save.await;
+                    match result {
+                        Ok(path) => {
+                            let escaped = escape_shell_path(&path);
+                            let _ = this.update(cx, |this, cx| {
+                                if this.project != Some(project) {
+                                    return;
+                                }
+                                let pane = this.pane.0;
+                                this.workspace.update(cx, |workspace, _| {
+                                    workspace.terminal_paste(pane, escaped)
+                                });
+                            });
+                        }
+                        Err(error) => {
+                            eprintln!("[term] 保存剪贴板图片失败：{error}");
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Insert paths dropped onto this pane from Finder or macOS screenshots,
+    /// activating and focusing the pane so the user can keep typing right away.
+    pub(super) fn drop_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.project.is_none() {
+            return;
+        }
+        let Some(text) = format_dropped_paths(paths.paths()) else {
+            return;
+        };
+        self.focus.focus(window, cx);
+        cx.emit(TerminalEvent::Activated);
+        let pane = self.pane.0;
         self.workspace
             .update(cx, |workspace, _| workspace.terminal_paste(pane, text));
+        cx.notify();
     }
 
     /// Open the find bar and focus its input. ⌘F on an open bar just brings

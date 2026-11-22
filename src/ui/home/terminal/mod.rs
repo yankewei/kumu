@@ -9,6 +9,7 @@
 //! cursor cell and the system candidate window anchors there too.
 
 mod chrome;
+mod drop;
 mod input;
 mod paint;
 
@@ -393,6 +394,11 @@ impl Render for TerminalView {
         // paint closure (which must be 'static) captures them.
         let search_hit = theme.selection.opacity(0.55);
         let search_active = theme.warning.opacity(0.55);
+        let drop_accent = theme.blue;
+        let drop_tint = theme.blue.opacity(0.08);
+        let drop_pill_bg = theme.popover;
+        let drop_group: SharedString = format!("pane-drop-{}", pane.0).into();
+        let show_drop_overlay = has_project && cx.has_active_drag();
         // The link under a ⌘-hovered cell: its runs are underlined and each is
         // a hitbox, so the pointer turns into a hand over it.
         let link_spans: Vec<link::Span> = self
@@ -429,12 +435,19 @@ impl Render for TerminalView {
         let term_bg = paint_color(snapshot.bg);
         let term_id = format!("kumu-term-{}", pane.0);
         v_flex()
+            .id(format!("pane-drop-{}", pane.0))
+            .group(drop_group.clone())
             .size_full()
             .min_h_0()
             .min_w_0()
             .border_1()
             .border_color(border)
             .bg(term_bg)
+            .can_drop(move |drag, _, _| has_project && drag.is::<ExternalPaths>())
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(drop_accent))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_paths(paths, window, cx);
+            }))
             .child(header)
             .child(
                 div()
@@ -690,7 +703,47 @@ impl Render for TerminalView {
                                 .size_full(),
                             ),
                     )
-                    .when_some(self.render_find_bar(cx), |wrapper, bar| wrapper.child(bar)),
+                    .when_some(self.render_find_bar(cx), |wrapper, bar| wrapper.child(bar))
+                    .when(show_drop_overlay, |wrapper| {
+                        wrapper.child(
+                            div()
+                                .id(format!("pane-drop-overlay-{}", pane.0))
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .opacity(0.)
+                                .group_drag_over::<ExternalPaths>(drop_group, move |style| {
+                                    style
+                                        .opacity(1.)
+                                        .bg(drop_tint)
+                                        .border_2()
+                                        .border_color(drop_accent)
+                                })
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded(radius)
+                                        .bg(drop_pill_bg)
+                                        .border_1()
+                                        .border_color(drop_accent)
+                                        .shadow_sm()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(fg)
+                                        .child(
+                                            Icon::new(IconName::File)
+                                                .with_size(px(14.))
+                                                .text_color(drop_accent),
+                                        )
+                                        .child("松开以插入路径"),
+                                ),
+                        )
+                    }),
             )
     }
 }
