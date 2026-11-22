@@ -99,6 +99,8 @@ jobs:
       # cold dependency compile times in half.
       - run: cargo clippy --all-targets --locked --config 'profile.dev.package."*".opt-level=0' -- -D warnings
       - run: cargo test --locked --config 'profile.dev.package."*".opt-level=0'
+      - run: cargo build --locked --config 'profile.dev.package."*".opt-level=0'
+      - run: python3 scripts/test-agent-integration.py
       - run: node --test src/agent/integration/adapters.test.mjs
 
   package:

@@ -88,9 +88,10 @@ pub(super) struct PluginPanelSnapshot {
     pub(super) icon: &'static str,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct HomeShellSnapshot {
     pub(super) store_error: Option<String>,
+    pub(super) sidebar_visible: bool,
     pub(super) sidebar_width: f32,
     pub(super) plugin_width: f32,
     pub(super) sidebar: SidebarSnapshot,
@@ -100,9 +101,26 @@ pub(super) struct HomeShellSnapshot {
     pub(super) open_plugin: Option<PluginPanelSnapshot>,
 }
 
+impl Default for HomeShellSnapshot {
+    fn default() -> Self {
+        Self {
+            store_error: None,
+            sidebar_visible: true,
+            sidebar_width: 0.0,
+            plugin_width: 0.0,
+            sidebar: SidebarSnapshot::default(),
+            tab_bar: TabBarSnapshot::default(),
+            center: CenterModeSnapshot::default(),
+            pane_chrome: HashMap::new(),
+            open_plugin: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum ShellHostEvent {
     StoreError(Option<String>),
+    SidebarVisible(bool),
     Sidebar(SidebarSnapshot),
     TabBar(TabBarSnapshot),
     Center(CenterModeSnapshot),
@@ -119,30 +137,17 @@ pub(super) enum HomeShellAction {
     EmptyAddTerminal,
     EmptyAddProject,
     ClosePlugin,
-    ResizeOuter {
-        sidebar_width: f32,
-        plugin_width: Option<f32>,
-    },
-    ResizeGroup {
-        group_id: u64,
-        ratios: Vec<f32>,
-    },
+    ResizeSidebar(f32),
+    ResizePlugin(f32),
+    ResizeGroup { group_id: u64, ratios: Vec<f32> },
     FocusPane(PaneId),
+    ToggleZoomPane(PaneId),
     SplitRight(PaneId),
     SplitDown(PaneId),
     ClosePane(PaneId),
-    AgentPane {
-        pane: PaneId,
-        agent: String,
-    },
-    FindChange {
-        pane: PaneId,
-        needle: String,
-    },
-    FindStep {
-        pane: PaneId,
-        older: bool,
-    },
+    AgentPane { pane: PaneId, agent: String },
+    FindChange { pane: PaneId, needle: String },
+    FindStep { pane: PaneId, older: bool },
     FindClose(PaneId),
     ToastClicked(String),
 }
@@ -176,7 +181,7 @@ mod view {
     use crate::app::layout::{PaneId, SplitAxis};
     use crate::nsh_ui::assets::{asset_src, icon_svg};
     use crate::nsh_ui::components::{
-        ButtonVariant, body_text, kumu_button, kumu_input, kumu_tooltip,
+        ButtonVariant, PillTone, body_text, kumu_button, kumu_input, kumu_tooltip, pill,
     };
     use crate::nsh_ui::theme::{
         TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size,
@@ -299,10 +304,13 @@ mod view {
             };
             let active = snap.active;
             let can_close = snap.can_close;
+            let can_zoom = snap.can_zoom;
+            let zoomed = snap.zoomed;
             let tx_focus = tx_hdr.clone();
             let tx_agent = tx_hdr.clone();
             let tx_sr = tx_hdr.clone();
             let tx_sd = tx_hdr.clone();
+            let tx_zoom = tx_hdr.clone();
             let tx_close = tx_hdr.clone();
 
             let mut row = view()
@@ -355,6 +363,9 @@ mod view {
             if let Some(status) = snap.agent_status {
                 row = row.child(render_agent_badge(status));
             }
+            if zoomed {
+                row = row.child(pill("已最大化", PillTone::Neutral).flex_shrink_0());
+            }
 
             row = row
                 .child(header_icon_button(
@@ -397,10 +408,21 @@ mod view {
                     move || send(&tx_sd, HomeShellAction::SplitDown(pane_id)),
                 ));
 
+            if can_zoom || zoomed {
+                let (icon, tooltip_label) = if zoomed {
+                    ("icons/minimize-2.svg", "还原分屏 ⌘⇧↩")
+                } else {
+                    ("icons/maximize-2.svg", "最大化窗格 ⌘⇧↩")
+                };
+                row = row.child(header_icon_button(icon, tooltip_label, move || {
+                    send(&tx_zoom, HomeShellAction::ToggleZoomPane(pane_id));
+                }));
+            }
+
             if can_close {
                 row = row.child(header_icon_button(
                     "icons/close.svg",
-                    "关闭窗格",
+                    "关闭窗格 ⌘⇧W",
                     move || send(&tx_close, HomeShellAction::ClosePane(pane_id)),
                 ));
             }
@@ -679,6 +701,7 @@ mod view {
         };
 
         let store_error = signal(initial.store_error);
+        let sidebar_visible = signal(initial.sidebar_visible);
         let sidebar_width = signal(
             initial
                 .sidebar_width
@@ -728,6 +751,7 @@ mod view {
                 while let Some(ev) = rx.next().await {
                     match ev {
                         ShellHostEvent::StoreError(err) => store_error.set(err),
+                        ShellHostEvent::SidebarVisible(visible) => sidebar_visible.set(visible),
                         ShellHostEvent::Sidebar(s) => sidebar_sig.set(s),
                         ShellHostEvent::TabBar(t) => tab_bar_sig.set(t),
                         ShellHostEvent::Center(c) => center_sig.set(c),
@@ -906,27 +930,19 @@ mod view {
                 .into_element()
         });
 
-        let tx_outer = actions_tx.clone();
+        let tx_sb_resize = actions_tx.clone();
+        let tx_pl_resize = actions_tx.clone();
         let main_split = h_resizable()
             .handle_class("w-px bg-border group-hover:bg-primary group-active:bg-primary")
-            .on_resize(move |sizes: &Vec<Points>| {
-                let Some(sb) = sizes.first().map(|s| s.0) else {
-                    return;
-                };
-                let pw = sizes.get(2).map(|s| s.0);
-                send(
-                    &tx_outer,
-                    HomeShellAction::ResizeOuter {
-                        sidebar_width: sb,
-                        plugin_width: pw,
-                    },
-                );
-            })
             .child(
                 resizable_panel()
+                    .visible(move || sidebar_visible.get())
                     .size(move || Some(px(sidebar_width.get())))
                     .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
                     .fixed(true)
+                    .on_resize(move |size: &Points| {
+                        send(&tx_sb_resize, HomeShellAction::ResizeSidebar(size.0));
+                    })
                     .child(sidebar_el),
             )
             .child(resizable_panel().min_size(px(280.0)).child(center_column))
@@ -936,6 +952,9 @@ mod view {
                     .size(move || Some(px(plugin_width.get())))
                     .size_range(px(PLUGIN_MIN_W)..px(PLUGIN_MAX_W))
                     .fixed(true)
+                    .on_resize(move |size: &Points| {
+                        send(&tx_pl_resize, HomeShellAction::ResizePlugin(size.0));
+                    })
                     .child(plugin_panel_content),
             );
 
@@ -966,6 +985,7 @@ pub(super) struct NshHomeShell {
     pub(super) app_view: Entity<AppView>,
     events_tx: UnboundedSender<ShellHostEvent>,
     last_error: Option<String>,
+    last_sidebar_visible: bool,
     last_sidebar: SidebarSnapshot,
     last_tab_bar: TabBarSnapshot,
     last_center: CenterModeSnapshot,
@@ -992,6 +1012,7 @@ impl NshHomeShell {
         let (events_tx, events_rx) = unbounded::<ShellHostEvent>();
         let (actions_tx, mut actions_rx) = unbounded::<HomeShellAction>();
         let last_error = initial.store_error.clone();
+        let last_sidebar_visible = initial.sidebar_visible;
         let last_sidebar = initial.sidebar.clone();
         let last_tab_bar = initial.tab_bar.clone();
         let last_center = initial.center.clone();
@@ -1040,6 +1061,7 @@ impl NshHomeShell {
             app_view,
             events_tx,
             last_error,
+            last_sidebar_visible,
             last_sidebar,
             last_tab_bar,
             last_center,
@@ -1055,6 +1077,12 @@ impl NshHomeShell {
             let _ = self
                 .events_tx
                 .unbounded_send(ShellHostEvent::StoreError(next.store_error));
+        }
+        if self.last_sidebar_visible != next.sidebar_visible {
+            self.last_sidebar_visible = next.sidebar_visible;
+            let _ = self
+                .events_tx
+                .unbounded_send(ShellHostEvent::SidebarVisible(next.sidebar_visible));
         }
         if self.last_sidebar != next.sidebar {
             self.last_sidebar = next.sidebar.clone();
@@ -1130,6 +1158,8 @@ mod tests {
                 agent_status: None,
                 active: true,
                 can_close: true,
+                can_zoom: true,
+                zoomed: false,
                 find: Some(FindBarSnapshot {
                     needle: "hello".into(),
                     count_label: "1/3".into(),
@@ -1177,6 +1207,8 @@ mod tests {
                 agent_status: None,
                 active: true,
                 can_close: true,
+                can_zoom: true,
+                zoomed: false,
                 find: Some(FindBarSnapshot {
                     needle: "hello".into(),
                     count_label: "2/3".into(),
@@ -1194,6 +1226,13 @@ mod tests {
         assert_eq!(
             actions_rx.try_recv().ok(),
             Some(HomeShellAction::FindClose(PaneId(1)))
+        );
+
+        app.press("label:最大化窗格 ⌘⇧↩")
+            .expect("press maximize pane");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(HomeShellAction::ToggleZoomPane(PaneId(1)))
         );
 
         events_tx

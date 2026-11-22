@@ -26,12 +26,35 @@ pub fn window_options() -> WindowOptions {
 }
 
 /// Full-width 34px title bar with macOS traffic-light clearance, drag-to-move,
-/// double-click-to-zoom, left brand label, and optional right-hand controls.
+/// double-click-to-zoom, left brand label, optional left controls, and optional
+/// right-hand controls.
 pub fn title_bar(
     id: &'static str,
     theme: &KumuTheme,
     right: Option<AnyElement>,
 ) -> impl IntoElement {
+    title_bar_with_controls(id, theme, None, right)
+}
+
+/// Variant of [`title_bar`] that also places compact controls beside the left
+/// brand label (e.g. sidebar collapse/expand toggle).
+pub fn title_bar_with_controls(
+    id: &'static str,
+    theme: &KumuTheme,
+    left: Option<AnyElement>,
+    right: Option<AnyElement>,
+) -> impl IntoElement {
+    let mut left_group = div().flex().flex_row().items_center().gap_2().child(
+        div()
+            .text_sm()
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme.colors.foreground)
+            .child("kumu"),
+    );
+    if let Some(left) = left {
+        left_group = left_group.child(left);
+    }
+
     let mut bar = div()
         .id(id)
         .flex()
@@ -56,13 +79,7 @@ pub fn title_bar(
                 window.zoom_window();
             }
         })
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.colors.foreground)
-                .child("kumu"),
-        );
+        .child(left_group);
 
     if let Some(right) = right {
         bar = bar.child(right);

@@ -49,6 +49,7 @@ pub(super) enum SidebarAction {
     PromptOpenWorktree(i64),
     PromptRenameProject(i64),
     ConfirmDeleteProject(i64),
+    ConfirmRemoveWorktree(i64),
     RevealInFinder(String),
     CopyText(String),
     ToggleAgentsCollapsed,
@@ -262,15 +263,28 @@ pub(super) mod view {
             }));
         }
         items.push(MenuItem::separator());
-        {
+        if worktree {
+            {
+                let tx = tx.clone();
+                items.push(MenuItem::new("从列表移除").on_select(move || {
+                    send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
+                }));
+            }
+            {
+                let tx = tx.clone();
+                items.push(
+                    MenuItem::new("删除 worktree（清理目录）")
+                        .destructive(true)
+                        .on_select(move || {
+                            send(&tx, SidebarAction::ConfirmRemoveWorktree(project_id));
+                        }),
+                );
+            }
+        } else {
             let tx = tx.clone();
-            items.push(
-                MenuItem::new(if worktree { "移除" } else { "删除" })
-                    .destructive(true)
-                    .on_select(move || {
-                        send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
-                    }),
-            );
+            items.push(MenuItem::new("删除").destructive(true).on_select(move || {
+                send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
+            }));
         }
         items
     }

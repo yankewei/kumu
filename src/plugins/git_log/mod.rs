@@ -27,7 +27,7 @@ use nsh_platform_gpui::{AppOptions, AppView, Root};
 use self::patch_view::PatchView;
 use self::review::{PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewStore};
 use super::{Plugin, PluginHost, PluginProject};
-use crate::git::{Change, Changes, Commit, History};
+use crate::git::{BranchDiffSummary, Change, Changes, Commit, History};
 use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::theme::KumuTheme;
@@ -62,6 +62,7 @@ struct GitPanelSnapshot {
     project_id: Option<i64>,
     tab: PanelTab,
     branch: Option<String>,
+    branch_diff: Option<BranchDiffSummary>,
     loaded: bool,
     error: Option<String>,
     change_count: usize,
@@ -82,6 +83,7 @@ enum GitPanelAction {
     SetQuery(String),
     OpenChange(Change),
     OpenCommit(Commit),
+    OpenBranchDiff,
 }
 
 struct GitPanelMount {
@@ -104,12 +106,14 @@ struct RepoRead {
     fingerprint: String,
     changes: Changes,
     history: Option<History>,
+    branch_diff: Option<Option<BranchDiffSummary>>,
 }
 
 pub struct GitLogPanel {
     mount_id: u64,
     project: Option<PluginProject>,
     history: Option<History>,
+    branch_diff: Option<BranchDiffSummary>,
     commits: Arc<Vec<Commit>>,
     changes: Changes,
     tab: PanelTab,
@@ -210,6 +214,9 @@ impl Plugin for GitLogPanel {
                     GitPanelAction::OpenCommit(commit) => {
                         panel.open_commit(commit, window, cx);
                     }
+                    GitPanelAction::OpenBranchDiff => {
+                        panel.open_branch_diff(window, cx);
+                    }
                 });
                 if res.is_err() {
                     break;
@@ -221,6 +228,7 @@ impl Plugin for GitLogPanel {
             mount_id,
             project,
             history: None,
+            branch_diff: None,
             commits: Arc::default(),
             changes: Changes::default(),
             tab: PanelTab::Changes,
@@ -296,6 +304,7 @@ impl GitLogPanel {
             project_id: self.project.as_ref().map(|p| p.id),
             tab: self.tab,
             branch: self.history.as_ref().map(|h| h.branch.clone()),
+            branch_diff: self.branch_diff.clone(),
             loaded: self.history.is_some(),
             error: self.error.clone(),
             change_count: self.changes.len(),
@@ -314,6 +323,7 @@ impl GitLogPanel {
 
     fn clear_rows(&mut self) {
         self.history = None;
+        self.branch_diff = None;
         self.commits = Arc::default();
         self.changes = Changes::default();
         self.fingerprint = None;
@@ -336,16 +346,20 @@ impl GitLogPanel {
             let read = cx
                 .background_spawn(async move {
                     let fingerprint = crate::git::fingerprint(&project.path)?;
-                    let history = if known.as_deref() == Some(fingerprint.as_str()) {
-                        None
+                    let (history, branch_diff) = if known.as_deref() == Some(fingerprint.as_str()) {
+                        (None, None)
                     } else {
-                        Some(crate::git::history(&project.path)?)
+                        (
+                            Some(crate::git::history(&project.path)?),
+                            Some(crate::git::branch_diff_summary(&project.path)),
+                        )
                     };
                     let changes = crate::git::changes(&project.path)?;
                     Ok::<_, String>(RepoRead {
                         fingerprint,
                         changes,
                         history,
+                        branch_diff,
                     })
                 })
                 .await;
@@ -380,6 +394,12 @@ impl GitLogPanel {
                         self.rebuild_filter(cx);
                         changed = true;
                     }
+                }
+                if let Some(branch_diff) = read.branch_diff
+                    && self.branch_diff != branch_diff
+                {
+                    self.branch_diff = branch_diff;
+                    changed = true;
                 }
                 if self.changes != read.changes {
                     self.changes = read.changes;
@@ -501,6 +521,33 @@ impl GitLogPanel {
                 },
                 message: String::new(),
                 context: status.to_string(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn open_branch_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(project), Some(summary)) = (self.project.clone(), self.branch_diff.clone())
+        else {
+            return;
+        };
+        let meta = format!(
+            "{} 个提交 · {} 个改动文件（{}...{}）",
+            summary.commits, summary.files, summary.base, summary.head
+        );
+        self.open_patch(
+            PatchRequest {
+                project: project.id,
+                title: format!("分支改动：{} vs {}", summary.head, summary.base),
+                meta,
+                source: PatchSource::BranchDiff {
+                    root: project.path,
+                    base: summary.base.clone(),
+                    head: summary.head.clone(),
+                },
+                message: String::new(),
+                context: format!("分支 {} 相对 {}", summary.head, summary.base),
             },
             window,
             cx,

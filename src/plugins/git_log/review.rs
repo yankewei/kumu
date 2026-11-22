@@ -311,6 +311,12 @@ pub(super) enum PatchSource {
     Commit { root: PathBuf, hash: String },
     /// One uncommitted change in the repository at `root`.
     Change { root: PathBuf, change: Change },
+    /// Cumulative diff of the current branch relative to `base` (`base...HEAD`).
+    BranchDiff {
+        root: PathBuf,
+        base: String,
+        head: String,
+    },
 }
 
 impl PatchSource {
@@ -320,6 +326,7 @@ impl PatchSource {
         match self {
             Self::Commit { hash, .. } => PatchKey::commit(project, hash),
             Self::Change { change, .. } => PatchKey::change(project, change),
+            Self::BranchDiff { base, head, .. } => PatchKey::branch_diff(project, base, head),
         }
     }
 
@@ -328,6 +335,7 @@ impl PatchSource {
         match self {
             Self::Commit { root, hash } => crate::git::commit_diff(root, hash),
             Self::Change { root, change } => crate::git::change_diff(root, change),
+            Self::BranchDiff { root, base, .. } => crate::git::branch_diff(root, base),
         }
     }
 }
@@ -356,6 +364,13 @@ impl PatchKey {
                 if change.staged { "index" } else { "worktree" },
                 change.path
             ),
+        }
+    }
+
+    pub(super) fn branch_diff(project: i64, base: &str, head: &str) -> Self {
+        Self {
+            project,
+            target: format!("branch:{base}...{head}"),
         }
     }
 }

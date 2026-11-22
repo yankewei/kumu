@@ -598,6 +598,167 @@ pub fn list_worktrees(dir: &Path) -> Result<Vec<WorktreeEntry>, String> {
     Ok(entries)
 }
 
+/// Summary of how the current feature branch diverges from its base branch
+/// (e.g. `main` or `master`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchDiffSummary {
+    pub base: String,
+    pub head: String,
+    pub commits: usize,
+    pub files: usize,
+}
+
+/// Detect the repository's base branch (`origin/HEAD` → `main` → `master`),
+/// returning `None` when already checked out on that base branch or detached.
+pub fn branch_diff_summary(dir: &Path) -> Option<BranchDiffSummary> {
+    let root = repo_root(dir).ok()?;
+    let head = git(
+        &root,
+        &["--no-optional-locks", "symbolic-ref", "--short", "HEAD"],
+    )
+    .ok()?;
+    let head = head.trim().to_string();
+    if head.is_empty() {
+        return None;
+    }
+
+    let base = detect_base_branch(&root, &head)?;
+    let rev_range = format!("{base}..HEAD");
+    let commits = git(
+        &root,
+        &["--no-optional-locks", "rev-list", "--count", &rev_range],
+    )
+    .ok()
+    .and_then(|s| s.parse::<usize>().ok())
+    .unwrap_or(0);
+    let diff_range = format!("{base}...HEAD");
+    let files = git(
+        &root,
+        &["--no-optional-locks", "diff", "--name-only", &diff_range],
+    )
+    .ok()
+    .map(|out| out.lines().filter(|line| !line.trim().is_empty()).count())
+    .unwrap_or(0);
+
+    if commits == 0 && files == 0 {
+        return None;
+    }
+    Some(BranchDiffSummary {
+        base,
+        head,
+        commits,
+        files,
+    })
+}
+
+fn detect_base_branch(root: &Path, current_branch: &str) -> Option<String> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Ok(origin_head) = git(
+        root,
+        &[
+            "--no-optional-locks",
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) {
+        let short = origin_head
+            .strip_prefix("origin/")
+            .unwrap_or(&origin_head)
+            .to_string();
+        if !short.is_empty() {
+            candidates.push((short.clone(), short));
+            candidates.push((origin_head.clone(), origin_head));
+        }
+    }
+    for name in ["main", "master"] {
+        candidates.push((name.to_string(), name.to_string()));
+        candidates.push((format!("origin/{name}"), name.to_string()));
+    }
+
+    for (git_ref, short_name) in candidates {
+        if short_name == current_branch {
+            return None;
+        }
+        if git(
+            root,
+            &[
+                "--no-optional-locks",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &git_ref,
+            ],
+        )
+        .is_ok()
+        {
+            return Some(git_ref);
+        }
+    }
+    None
+}
+
+/// Cumulative diff of the current branch relative to `base` (`base...HEAD`),
+/// cut at [`MAX_PATCH_BYTES`].
+pub fn branch_diff(dir: &Path, base: &str) -> Result<Patch, String> {
+    let base = base.trim();
+    if base.is_empty() || base.starts_with('-') {
+        return Err("无效的基线分支名".to_string());
+    }
+    let root = repo_root(dir)?;
+    let range = format!("{base}...HEAD");
+    let args: Vec<std::ffi::OsString> = [
+        "--no-optional-locks",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        &range,
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    read_patch(&root, &args, false)
+}
+
+/// Remove a linked git worktree at `dir` (deleting its working directory).
+///
+/// Refuses to remove the main checkout. When `force` is false, git refuses if
+/// the worktree has uncommitted or untracked files.
+pub fn remove_worktree(dir: &Path, force: bool) -> Result<(), String> {
+    let wt_root = repo_root(dir)?;
+    let common_raw = git(
+        &wt_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|_| git(&wt_root, &["rev-parse", "--git-common-dir"]))?;
+    let common_path = {
+        let p = PathBuf::from(&common_raw);
+        if p.is_absolute() { p } else { wt_root.join(p) }
+    };
+    let main_root = common_path
+        .parent()
+        .ok_or_else(|| "无法确定主仓库目录".to_string())?
+        .to_path_buf();
+    let normalize = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if normalize(&wt_root) == normalize(&main_root) {
+        return Err("不能删除主仓库目录，仅支持删除 linked worktree".to_string());
+    }
+
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        std::ffi::OsStr::new("worktree"),
+        std::ffi::OsStr::new("remove"),
+    ];
+    if force {
+        args.push(std::ffi::OsStr::new("--force"));
+    }
+    args.push(std::ffi::OsStr::new("--"));
+    args.push(wt_root.as_os_str());
+    git_raw_os(&main_root, &args)?;
+    Ok(())
+}
+
 /// The repository working tree that contains `dir`, which may be a
 /// subdirectory of it.
 fn repo_root(dir: &Path) -> Result<PathBuf, String> {
@@ -932,6 +1093,39 @@ mod tests {
 
         git(&repo, &["tag", "v1"]).unwrap();
         assert_ne!(committed, fingerprint(&repo).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn branch_diff_and_remove_worktree_handle_feature_branches_safely() {
+        let (dir, repo) = fixture();
+        // Rename initial branch to `main` so base-branch detection is deterministic.
+        git(&repo, &["branch", "-M", "main"]).unwrap();
+        assert_eq!(branch_diff_summary(&repo), None);
+
+        // Main checkout must never be removable via remove_worktree.
+        assert!(remove_worktree(&repo, false).is_err());
+
+        let wt = create_worktree(&repo, "feat/branch-review").unwrap();
+        std::fs::write(wt.path.join("a"), "hello\nfeature\n").unwrap();
+        git(&wt.path, &["add", "a"]).unwrap();
+        git(&wt.path, &["commit", "-qm", "feature change"]).unwrap();
+
+        let summary = branch_diff_summary(&wt.path).expect("branch diff summary");
+        assert_eq!(summary.base, "main");
+        assert_eq!(summary.head, "feat/branch-review");
+        assert_eq!(summary.commits, 1);
+        assert_eq!(summary.files, 1);
+
+        let patch = branch_diff(&wt.path, &summary.base).unwrap();
+        assert!(patch.patch.contains("+feature"));
+
+        // Dirty worktree refuses non-force removal, succeeds with force.
+        std::fs::write(wt.path.join("dirty.txt"), "uncommitted").unwrap();
+        assert!(remove_worktree(&wt.path, false).is_err());
+        remove_worktree(&wt.path, true).unwrap();
+        assert!(!wt.path.exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

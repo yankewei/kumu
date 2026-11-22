@@ -111,6 +111,38 @@ impl KumuApp {
                     submitted: enter,
                 }));
             }
+            Command::Close {
+                target,
+                from,
+                allow_self,
+                reply,
+            } => {
+                let answer = self.control_resolve(&target, from, cx).and_then(|pane| {
+                    if !allow_self && from == Some(pane.0) {
+                        return Err(ControlError::new(
+                            "refuseSelf",
+                            format!(
+                                "refusing to close caller pane {}; pass --self to confirm",
+                                pane.0
+                            ),
+                        ));
+                    }
+                    self.close_pane(pane, cx);
+                    Ok(crate::control::CloseResult {
+                        pane: pane.0,
+                        closed: true,
+                    })
+                });
+                let _ = reply.send(answer);
+            }
+            Command::Wait {
+                target,
+                from,
+                timeout_secs,
+                next,
+                cancelled,
+                reply,
+            } => self.control_wait(target, from, timeout_secs, next, cancelled, reply, cx),
             Command::TodoList {
                 from,
                 status,
@@ -429,6 +461,154 @@ impl KumuApp {
                 Err(_) => Err(ControlError::new("unavailable", "kumu is not running")),
             };
             let _ = reply.send(answer);
+        })
+        .detach();
+    }
+
+    /// Block a `kumu pane wait` caller until the target agent pane reaches a
+    /// terminal/attention state (`waiting`, `completed`, `failed`) or exits.
+    #[allow(clippy::too_many_arguments)]
+    fn control_wait(
+        &mut self,
+        target: crate::control::PaneTarget,
+        from: Option<u64>,
+        timeout_secs: u64,
+        next: bool,
+        cancelled: Arc<AtomicBool>,
+        reply: std::sync::mpsc::Sender<
+            Result<crate::control::WaitResult, crate::control::ControlError>,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::agent::AgentState;
+        use crate::control::{ControlError, WaitResult};
+
+        let pane = match self.control_resolve(&target, from, cx) {
+            Ok(pane) => pane,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let is_agent = self.agent_status.contains_key(&pane)
+            || matches!(self.launches.get(&pane), Some(PaneLaunch::Agent { .. }));
+        if !is_agent {
+            let _ = reply.send(Err(ControlError::new(
+                "notAgent",
+                format!("pane {} is not an agent pane", pane.0),
+            )));
+            return;
+        }
+
+        let is_settled = |state: Option<AgentState>| {
+            matches!(
+                state,
+                Some(AgentState::Waiting | AgentState::Completed | AgentState::Failed)
+            )
+        };
+        let state_label = |state: Option<AgentState>| -> String {
+            match state {
+                Some(AgentState::Running) => "running".into(),
+                Some(AgentState::Waiting) => "waiting".into(),
+                Some(AgentState::Completed) => "completed".into(),
+                Some(AgentState::Failed) => "failed".into(),
+                None => "idle".into(),
+            }
+        };
+
+        let initial_state = self.agent_status.get(&pane).and_then(|e| e.state);
+        let initial_summary = self.control_summary(pane, cx);
+        if !next
+            && is_settled(initial_state)
+            && let Some(summary) = initial_summary
+        {
+            let _ = reply.send(Ok(WaitResult {
+                pane: summary,
+                state: state_label(initial_state),
+                elapsed_ms: 0,
+            }));
+            return;
+        }
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(timeout_secs);
+        let mut saw_transition = !next || !is_settled(initial_state);
+        let mut last_summary = initial_summary;
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+
+                let poll = this.update(cx, |app, cx| {
+                    let summary = app.control_summary(pane, cx);
+                    let agent_present = app.agent_status.contains_key(&pane)
+                        || matches!(app.launches.get(&pane), Some(PaneLaunch::Agent { .. }));
+                    let state = app.agent_status.get(&pane).and_then(|e| e.state);
+                    (summary, agent_present, state)
+                });
+
+                match poll {
+                    Ok((Some(summary), agent_present, state)) => {
+                        let exited = summary.exited || !agent_present;
+                        last_summary = Some(summary.clone());
+                        if exited {
+                            let _ = reply.send(Ok(WaitResult {
+                                pane: summary,
+                                state: "exited".into(),
+                                elapsed_ms: started.elapsed().as_millis() as u64,
+                            }));
+                            return;
+                        }
+                        if !saw_transition && !is_settled(state) {
+                            saw_transition = true;
+                        }
+                        if saw_transition && is_settled(state) {
+                            let _ = reply.send(Ok(WaitResult {
+                                pane: summary,
+                                state: state_label(state),
+                                elapsed_ms: started.elapsed().as_millis() as u64,
+                            }));
+                            return;
+                        }
+                    }
+                    Ok((None, _, _)) => {
+                        if let Some(summary) = last_summary {
+                            let _ = reply.send(Ok(WaitResult {
+                                pane: summary,
+                                state: "exited".into(),
+                                elapsed_ms: started.elapsed().as_millis() as u64,
+                            }));
+                        } else {
+                            let _ = reply.send(Err(ControlError::new(
+                                "paneGone",
+                                format!("pane {} closed while waiting", pane.0),
+                            )));
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = reply
+                            .send(Err(ControlError::new("unavailable", "kumu is not running")));
+                        return;
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    let _ = reply.send(Err(ControlError::new(
+                        "waitTimeout",
+                        format!("pane {} did not finish within {}s", pane.0, timeout_secs),
+                    )));
+                    return;
+                }
+            }
         })
         .detach();
     }

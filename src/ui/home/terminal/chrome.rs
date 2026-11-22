@@ -25,6 +25,8 @@ pub(crate) struct PaneChromeSnapshot {
     pub(crate) agent_status: Option<AgentState>,
     pub(crate) active: bool,
     pub(crate) can_close: bool,
+    pub(crate) can_zoom: bool,
+    pub(crate) zoomed: bool,
     pub(crate) find: Option<FindBarSnapshot>,
 }
 

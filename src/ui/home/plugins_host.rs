@@ -208,6 +208,28 @@ impl KumuApp {
             DispatchMode::NewTab { tab_name } => {
                 self.open_agent_tab(project_id, tab_name, launch, cx)
             }
+            DispatchMode::NewWorktree { branch, tab_name } => {
+                let (root_id, root_path) = {
+                    let ws = self.workspace.read(cx);
+                    let board_id = ws.board_project_id(project_id);
+                    let path = ws
+                        .project(board_id)
+                        .or_else(|| ws.project(project_id))
+                        .map(|p| std::path::PathBuf::from(&p.path))
+                        .ok_or_else(|| "无法定位根仓库目录".to_string())?;
+                    (board_id, path)
+                };
+                let worktree = crate::git::create_worktree(&root_path, &branch)
+                    .map_err(|err| format!("创建 worktree 失败：{err}"))?;
+                let wt_path = worktree.path.to_string_lossy().into_owned();
+                let wt_project_id = self
+                    .workspace
+                    .update(cx, |ws, cx| {
+                        ws.add_worktree(root_id, &worktree.name, &wt_path, cx)
+                    })
+                    .ok_or_else(|| "将 worktree 添加到工作区失败".to_string())?;
+                self.open_agent_tab(wt_project_id, tab_name, launch, cx)
+            }
         };
 
         if !prompt.trim().is_empty() {

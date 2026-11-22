@@ -322,6 +322,12 @@ fn the_panel_draws_changes_switches_tabs_and_opens_commits() {
         project_id: Some(1),
         tab: PanelTab::Changes,
         branch: Some(history.branch.clone()),
+        branch_diff: Some(crate::git::BranchDiffSummary {
+            base: "main".into(),
+            head: "feat/demo".into(),
+            commits: 2,
+            files: 3,
+        }),
         loaded: true,
         error: None,
         change_count: changes.len(),

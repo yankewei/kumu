@@ -161,6 +161,9 @@ impl KumuApp {
             SidebarAction::ConfirmDeleteProject(project_id) => {
                 self.confirm_delete_project(project_id, window, cx);
             }
+            SidebarAction::ConfirmRemoveWorktree(project_id) => {
+                self.confirm_remove_worktree(project_id, window, cx);
+            }
             SidebarAction::RevealInFinder(path) => reveal_in_finder(path, cx),
             SidebarAction::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));

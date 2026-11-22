@@ -113,6 +113,25 @@ pub enum Request {
         #[serde(default = "submit_by_default")]
         enter: bool,
     },
+    /// Close a pane. Refuses to close the caller's own pane unless `allow_self`.
+    Close {
+        pane: PaneTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default)]
+        allow_self: bool,
+    },
+    /// Wait until an agent pane enters a terminal/attention state (`waiting`,
+    /// `completed`, `failed`) or exits.
+    Wait {
+        pane: PaneTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_secs: u64,
+        #[serde(default)]
+        next: bool,
+    },
     /// List TODO items on the caller's repository board.
     TodoList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +187,13 @@ pub enum Request {
 
 fn submit_by_default() -> bool {
     true
+}
+
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
+const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
+
+fn default_wait_timeout() -> u64 {
+    DEFAULT_WAIT_TIMEOUT_SECS
 }
 
 fn todo_status_default() -> TodoStatus {
@@ -240,6 +266,22 @@ pub struct SendResult {
     pub submitted: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseResult {
+    pub pane: u64,
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitResult {
+    pub pane: PaneSummary,
+    /// Resulting agent state (`waiting`, `completed`, `failed`, or `exited`).
+    pub state: String,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ControlError {
     pub kind: &'static str,
@@ -282,6 +324,20 @@ pub enum Command {
         text: String,
         enter: bool,
         reply: Sender<Result<SendResult, ControlError>>,
+    },
+    Close {
+        target: PaneTarget,
+        from: Option<u64>,
+        allow_self: bool,
+        reply: Sender<Result<CloseResult, ControlError>>,
+    },
+    Wait {
+        target: PaneTarget,
+        from: Option<u64>,
+        timeout_secs: u64,
+        next: bool,
+        cancelled: Arc<AtomicBool>,
+        reply: Sender<Result<WaitResult, ControlError>>,
     },
     TodoList {
         from: Option<u64>,
@@ -653,6 +709,41 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
             enter,
             reply,
         }),
+        Request::Close {
+            pane,
+            from,
+            allow_self,
+        } => exchange(commands, |reply| Command::Close {
+            target: pane,
+            from,
+            allow_self,
+            reply,
+        }),
+        Request::Wait {
+            pane,
+            from,
+            timeout_secs,
+            next,
+        } => {
+            let clamped = timeout_secs.clamp(1, MAX_WAIT_TIMEOUT_SECS);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancel_flag = Arc::clone(&cancelled);
+            let result =
+                exchange_with_timeout(commands, Duration::from_secs(clamped + 5), |reply| {
+                    Command::Wait {
+                        target: pane,
+                        from,
+                        timeout_secs: clamped,
+                        next,
+                        cancelled: cancel_flag,
+                        reply,
+                    }
+                });
+            if result.is_err() {
+                cancelled.store(true, Ordering::Release);
+            }
+            result
+        }
         Request::TodoList { from, status, mine } => {
             let (reply, answer) = mpsc::channel();
             commands
@@ -726,11 +817,19 @@ fn exchange<T: Serialize>(
     commands: &UnboundedSender<Command>,
     command: impl FnOnce(Sender<Result<T, ControlError>>) -> Command,
 ) -> Result<Value, ControlError> {
+    exchange_with_timeout(commands, REPLY_TIMEOUT, command)
+}
+
+fn exchange_with_timeout<T: Serialize>(
+    commands: &UnboundedSender<Command>,
+    timeout: Duration,
+    command: impl FnOnce(Sender<Result<T, ControlError>>) -> Command,
+) -> Result<Value, ControlError> {
     let (reply, answer) = mpsc::channel();
     commands
         .unbounded_send(command(reply))
         .map_err(|_| unavailable())?;
-    match answer.recv_timeout(REPLY_TIMEOUT) {
+    match answer.recv_timeout(timeout) {
         Ok(Ok(value)) => serde_json::to_value(value)
             .map_err(|error| ControlError::new("internal", error.to_string())),
         Ok(Err(error)) => Err(error),
@@ -773,6 +872,8 @@ usage:
   kumu pane read [TARGET] [--history N] [--tail N] [--json]
   kumu pane split right|down --agent <id> [--prompt TEXT] [--json]
   kumu pane send <TARGET> <TEXT...> [--no-enter] [--json]
+  kumu pane wait <TARGET> [--timeout SECS] [--next] [--json]
+  kumu pane close <TARGET> [--self] [--json]
   kumu todo list [--status todo|in_progress|done] [--mine] [--json]
   kumu todo show <ID> [--json]
   kumu todo add <TITLE...> [--desc TEXT] [--status todo|in_progress|done] [--bind] [--json]
@@ -785,7 +886,8 @@ TARGET is a pane id, left/right/up/down (relative to $KUMU_PANE), or focused
 (the default). --history N reads N scrollback rows; --tail N keeps the last N
 lines of the answer. A split starts an agent in the new pane; its --prompt is
 sent once that agent has drawn its own prompt. In send, -- makes everything
-after it text, so it may start with a dash.";
+after it text, so it may start with a dash. wait blocks until the target agent
+enters waiting/completed/failed or exits (--next waits for the next transition).";
 
 fn panes_cli(args: &[String]) -> i32 {
     let (json, rest) = match flags(args) {
@@ -833,6 +935,8 @@ fn pane_cli(args: &[String]) -> i32 {
         Some("read") => pane_read(&args[1..]),
         Some("split") => pane_split(&args[1..]),
         Some("send") => pane_send(&args[1..]),
+        Some("wait") => pane_wait(&args[1..]),
+        Some("close") => pane_close(&args[1..]),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             0
@@ -842,6 +946,104 @@ fn pane_cli(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+fn pane_wait(args: &[String]) -> i32 {
+    let mut target = None;
+    let mut timeout_secs = DEFAULT_WAIT_TIMEOUT_SECS;
+    let mut next = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--next" => next = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            "--timeout" | "-t" => match iter.next().and_then(|n| n.parse::<u64>().ok()) {
+                Some(secs) if (1..=MAX_WAIT_TIMEOUT_SECS).contains(&secs) => timeout_secs = secs,
+                _ => {
+                    return usage_error(&format!(
+                        "--timeout needs seconds between 1 and {MAX_WAIT_TIMEOUT_SECS}"
+                    ));
+                }
+            },
+            other if other.starts_with('-') => {
+                return usage_error(&format!("unknown option {other}"));
+            }
+            other if target.is_none() => target = Some(other.to_string()),
+            _ => return usage_error("one target at a time"),
+        }
+    }
+    let Some(target) = target else {
+        return usage_error("name the target pane");
+    };
+    let value = match call(&Request::Wait {
+        pane: pane_target(Some(target)),
+        from: caller_pane(),
+        timeout_secs,
+        next,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let result: WaitResult = match serde_json::from_value(value) {
+        Ok(result) => result,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&result);
+    }
+    println!(
+        "{} · state {} · {:.1}s",
+        summary_line(&result.pane),
+        result.state,
+        result.elapsed_ms as f64 / 1000.0
+    );
+    0
+}
+
+fn pane_close(args: &[String]) -> i32 {
+    let mut target = None;
+    let mut allow_self = false;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--self" => allow_self = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other if other.starts_with('-') => {
+                return usage_error(&format!("unknown option {other}"));
+            }
+            other if target.is_none() => target = Some(other.to_string()),
+            _ => return usage_error("one target at a time"),
+        }
+    }
+    let Some(target) = target else {
+        return usage_error("name the target pane");
+    };
+    let value = match call(&Request::Close {
+        pane: pane_target(Some(target)),
+        from: caller_pane(),
+        allow_self,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let result: CloseResult = match serde_json::from_value(value) {
+        Ok(result) => result,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if json {
+        return print_json(&result);
+    }
+    println!("closed pane {}", result.pane);
+    0
 }
 
 fn pane_read(args: &[String]) -> i32 {
@@ -1475,9 +1677,16 @@ fn call_at_instance(
         .write_all(format!("{body}\n").as_bytes())
         .and_then(|()| stream.flush())
         .map_err(|error| format!("cannot send the request: {error}"))?;
-    // The server gives up on a busy app after REPLY_TIMEOUT; wait a little past
-    // that so its error reaches the user instead of a silent hang.
-    let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + Duration::from_secs(2)));
+    // The server gives up on a busy app after REPLY_TIMEOUT (or wait timeout
+    // for `pane wait`); wait a little past that so its error reaches the user
+    // instead of a silent hang.
+    let read_timeout = match request {
+        Request::Wait { timeout_secs, .. } => {
+            Duration::from_secs((*timeout_secs).clamp(1, MAX_WAIT_TIMEOUT_SECS) + 10)
+        }
+        _ => REPLY_TIMEOUT + Duration::from_secs(2),
+    };
+    let _ = stream.set_read_timeout(Some(read_timeout));
     let mut line = String::new();
     let n = BufReader::new(stream.take(MAX_RESPONSE_BYTES))
         .read_line(&mut line)
@@ -1736,6 +1945,52 @@ mod tests {
                             }]))
                             .expect("todo list reply");
                     }
+                    Command::Close {
+                        target,
+                        allow_self,
+                        reply,
+                        ..
+                    } => {
+                        assert!(matches!(target, PaneTarget::Id(5)));
+                        assert!(!allow_self);
+                        reply
+                            .send(Ok(CloseResult {
+                                pane: 5,
+                                closed: true,
+                            }))
+                            .expect("close reply");
+                    }
+                    Command::Wait {
+                        target,
+                        timeout_secs,
+                        next,
+                        reply,
+                        ..
+                    } => {
+                        assert!(matches!(target, PaneTarget::Id(5)));
+                        assert_eq!(timeout_secs, 30);
+                        assert!(next);
+                        reply
+                            .send(Ok(WaitResult {
+                                pane: PaneSummary {
+                                    id: 5,
+                                    project: 1,
+                                    project_name: "kumu".into(),
+                                    title: "codex".into(),
+                                    command: "codex".into(),
+                                    cwd: "/tmp/kumu".into(),
+                                    agent: Some("codex".into()),
+                                    focused: false,
+                                    selected: true,
+                                    cols: 80,
+                                    rows: 24,
+                                    exited: false,
+                                },
+                                state: "completed".into(),
+                                elapsed_ms: 420,
+                            }))
+                            .expect("wait reply");
+                    }
                     Command::TodoShow { .. }
                     | Command::TodoAdd { .. }
                     | Command::TodoUpdate { .. }
@@ -1795,6 +2050,31 @@ mod tests {
         .expect("todo list");
         assert_eq!(todos["todos"][0]["id"], 9);
         assert_eq!(todos["todos"][0]["awaitingReview"], true);
+
+        let waited = call_here(
+            &path,
+            &Request::Wait {
+                pane: PaneTarget::Id(5),
+                from: Some(3),
+                timeout_secs: 30,
+                next: true,
+            },
+        )
+        .expect("wait");
+        assert_eq!(waited["state"], "completed");
+        assert_eq!(waited["elapsedMs"], 420);
+
+        let closed = call_here(
+            &path,
+            &Request::Close {
+                pane: PaneTarget::Id(5),
+                from: Some(3),
+                allow_self: false,
+            },
+        )
+        .expect("close");
+        assert_eq!(closed["pane"], 5);
+        assert_eq!(closed["closed"], true);
 
         // A pane of another Kumu must not read this one's panes: the reply
         // carries the serving pid, so the client can refuse the answer.

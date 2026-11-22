@@ -334,13 +334,78 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
         let marks: Arc<ReviewMarks> = Arc::new(snap.marks);
 
         if snap.tab == PanelTab::Changes {
+            let branch_banner = snap.branch_diff.clone().map(|summary| {
+                let mark = marks.mark(&PatchKey::branch_diff(
+                    project_id,
+                    &summary.base,
+                    &summary.head,
+                ));
+                let tx_branch = tx_body.clone();
+                let title = format!("分支改动 vs {}", summary.base);
+                let subtitle = format!("{} 提交 · {} 文件", summary.commits, summary.files);
+                let mut card = view()
+                    .role(AccessibilityRole::Button)
+                    .flex_row()
+                    .w_full()
+                    .px_2p5()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(move || active_theme().radius)
+                    .border_1()
+                    .border_color(move || active_theme().sidebar_border)
+                    .bg(move || active_theme().background)
+                    .app_class("cursor-pointer")
+                    .hover(|s| s.bg(move || active_theme().accent.opacity(0.45)))
+                    .on_press(move || send_action(&tx_branch, GitPanelAction::OpenBranchDiff))
+                    .child(icon_svg("icons/git-branch.svg", 13.0).text_color(link_color))
+                    .child(
+                        view()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                text(title)
+                                    .app_class("truncate")
+                                    .text_size(text_xs_size)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(move || active_theme().foreground),
+                            )
+                            .child(meta_text(subtitle).app_class("truncate")),
+                    );
+                if let Some(mark_el) = render_mark(mark) {
+                    card = card.child(mark_el);
+                }
+                card = card.child(
+                    icon_svg("icons/chevron-right.svg", 12.0)
+                        .text_color(move || active_theme().muted_foreground),
+                );
+                view()
+                    .flex_shrink_0()
+                    .w_full()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .child(card)
+            });
+
             if snap.change_rows.is_empty() {
+                if let Some(banner) = branch_banner {
+                    return view()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(banner)
+                        .child(empty_view("工作区没有未提交的改动", false))
+                        .into_element();
+                }
                 return empty_view("工作区没有未提交的改动", false);
             }
             let rows = Arc::new(snap.change_rows);
             let rows_len = rows.len();
             let tx = tx_body.clone();
-            return virtual_list(rows_len, move |pos| {
+            let list = virtual_list(rows_len, move |pos| {
                 let Some(row) = rows.get(pos.index()) else {
                     return view().h(px(CHANGE_ROW_HEIGHT)).into_element();
                 };
@@ -420,6 +485,17 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
             .estimated_item_size(px(CHANGE_ROW_HEIGHT))
             .flex_1()
             .into_element();
+            if let Some(banner) = branch_banner {
+                return view()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(banner)
+                    .child(list)
+                    .into_element();
+            }
+            return list;
         }
 
         // History tab
