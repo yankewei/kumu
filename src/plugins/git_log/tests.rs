@@ -3,18 +3,21 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui_kit::{
-    AppContext, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    TestAppContext, Window, div,
+use futures::channel::mpsc::unbounded;
+use gpui::{AppContext, Entity, TestAppContext};
+use nsh_engine::EngineConfig;
+
+use super::patch_view::PatchView;
+use super::review::{
+    PatchSheet, PatchSource, ReviewComment, ReviewRange, ReviewSide, ReviewStore, compose_comments,
+    normalize_and_index_patch,
 };
-
-use super::patch_view::{PatchFooter, PatchView};
-use super::review::{PatchSheet, PatchSource, ReviewComment, ReviewStore, compose_comments};
-use super::{GitLogPanel, Plugin, PluginHost, PluginProject};
+use super::{
+    GitHostEvent, GitPanelAction, GitPanelMount, GitPanelSnapshot, PanelTab, PluginHost,
+    change_rows_from, register_panel_mount, view,
+};
 use crate::plugins::{PaneTarget, SendOutcome};
-use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 
-/// A host whose terminal is never asked for text in these tests.
 fn test_host() -> PluginHost {
     PluginHost::with_panes(|_, _, _, _| Ok(SendOutcome::Pasted), |_, _| Vec::new())
 }
@@ -23,8 +26,6 @@ fn empty_store() -> Rc<RefCell<ReviewStore>> {
     Rc::new(RefCell::new(ReviewStore::default()))
 }
 
-/// Build a sheet over `source`, sharing `store` with the panel that would
-/// have opened it.
 fn patch_view(
     cx: &mut TestAppContext,
     project: i64,
@@ -41,6 +42,8 @@ fn patch_view(
         PatchView::new(
             PatchSheet {
                 project,
+                title: "test patch".into(),
+                meta: "test meta".into(),
                 key,
                 source,
                 message,
@@ -54,7 +57,6 @@ fn patch_view(
     })
 }
 
-/// Run git in `repo`, failing the test with git's own message.
 fn git(repo: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -69,11 +71,8 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-/// Parallel tests can read the clock in the same tick, so a counter keeps
-/// their fixture directories apart.
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
-/// A repository with one commit, plus the directory that owns it.
 fn fixture() -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "kumu-panel-{}-{}-{}",
@@ -97,21 +96,8 @@ fn fixture() -> (PathBuf, PathBuf) {
     (dir, repo)
 }
 
-struct Host {
-    view: Entity<PatchView>,
-}
-
-impl Render for Host {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.view.clone())
-    }
-}
-
-/// The view reads the commit on the background executor and hands git's
-/// own patch to the diff parser, which is what the sheet draws.
 #[gpui::test]
 fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let (dir, path) = fixture();
     let history = crate::git::history(&path).unwrap();
     let commit = history.commits[0].clone();
@@ -131,46 +117,22 @@ fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
     );
     cx.run_until_parked();
 
-    let (files, error) = view.read_with(cx, |view, cx| {
+    let (files, error, has_patch) = view.read_with(cx, |view, _| {
         (
-            view.state
-                .as_ref()
-                .map(|state| state.read(cx).files().len()),
+            view.index.file_count,
             view.error.clone(),
+            view.patch_text.is_some(),
         )
     });
     assert_eq!(error, None);
-    assert_eq!(files, Some(1));
-
-    // The sheet only adds chrome around this view, so drawing the view is
-    // what proves the parsed patch reaches the diff component. A comment
-    // is an annotation inside a row, so drawing with one also proves the
-    // editor gets laid out with the code.
-    let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.add_comment(
-                DiffLineRange::new("a", DiffSide::Modified, 1, 1),
-                window,
-                cx,
-            );
-        });
-    });
-    cx.run_until_parked();
-    for _ in 0..3 {
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-    }
+    assert_eq!(files, 1);
+    assert!(has_patch);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A working tree change reads without a commit to name it: the sheet for
-/// an untracked file gets its patch from `--no-index`.
 #[gpui::test]
 fn the_diff_view_parses_an_uncommitted_change(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let (dir, path) = fixture();
     std::fs::write(path.join("new"), "new\n").unwrap();
     let changes = crate::git::changes(&path).unwrap();
@@ -180,25 +142,16 @@ fn the_diff_view_parses_an_uncommitted_change(cx: &mut TestAppContext) {
     let view = patch_view(cx, 1, source, "", "未暂存改动", test_host(), empty_store());
     cx.run_until_parked();
 
-    let (files, error) = view.read_with(cx, |view, cx| {
-        (
-            view.state
-                .as_ref()
-                .map(|state| state.read(cx).files().len()),
-            view.error.clone(),
-        )
-    });
+    let (files, error) = view.read_with(cx, |view, _| (view.index.file_count, view.error.clone()));
     assert_eq!(error, None);
-    assert_eq!(files, Some(1));
+    assert_eq!(files, 1);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A comment points at the line the user marked, so the agent can open the
-/// patch at the same place. Comments keep the order they were written in.
 #[test]
 fn comments_compose_as_one_instruction_with_their_locations() {
-    let comment = |start, end| DiffLineRange::new("src/git.rs", DiffSide::Modified, start, end);
+    let comment = |start, end| ReviewRange::new("src/git.rs", ReviewSide::Modified, start, end);
     let message = compose_comments(
         "提交 abc1234",
         &[
@@ -214,12 +167,10 @@ fn comments_compose_as_one_instruction_with_their_locations() {
     );
 }
 
-/// A unified selection can run from a deleted line to an added one, and
-/// the two line numbers mean different things.
 #[test]
 fn a_range_across_sides_names_both_sides() {
-    let range = DiffLineRange::new("src/git.rs", DiffSide::Original, 12, 14)
-        .with_end_side(DiffSide::Modified);
+    let range = ReviewRange::new("src/git.rs", ReviewSide::Original, 12, 14)
+        .with_end_side(ReviewSide::Modified);
     let message = compose_comments("未暂存改动", &[(range, "这一段要一起看".into())]);
     assert_eq!(
         message,
@@ -228,11 +179,42 @@ fn a_range_across_sides_names_both_sides() {
     );
 }
 
-/// The sheet hands the host one instruction naming each commented range,
-/// clears the editors once the terminal took it, and records where it went.
+#[test]
+fn truncated_patch_normalizes_and_maps_joined_lines_back_to_files() {
+    let raw = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,2 +10,3 @@ fn a()
+ line10
++added11
+ line11
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -20,5 +20,5 @@ fn b()
+ keep20
++added21
+";
+    let (normalized, index) = normalize_and_index_patch(raw, true);
+    assert_eq!(index.file_count, 2);
+    assert!(normalized.contains("@@ -20,1 +20,2 @@ fn b()"));
+    // Joined new line 4 (0-based) is `added21` at `src/b.rs:21`.
+    let mut range = nsh_base::DiffLineRange::default();
+    range.side = nsh_base::DiffSide::New;
+    range.start = 4;
+    range.end = 4;
+    let resolved = index.resolve_range(range).expect("maps back to src/b.rs");
+    assert_eq!(resolved.path(), "src/b.rs");
+    assert_eq!(resolved.start(), 21);
+    assert_eq!(
+        index.anchor_for(&resolved),
+        Some((nsh_base::DiffSide::New, 4))
+    );
+}
+
 #[gpui::test]
 fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let sent = Rc::new(RefCell::new(None::<(i64, Option<u64>, String)>));
     let host = PluginHost::with_panes(
         {
@@ -261,34 +243,21 @@ fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppCo
             ]
         },
     );
-    // The patch itself is irrelevant here: the comment is added and sent
-    // before any read could fail or finish.
     let source = PatchSource::Commit {
         root: PathBuf::from("/nonexistent"),
         hash: "HEAD".to_string(),
     };
     let store = empty_store();
     let view = patch_view(cx, 3, source, "", "提交 abc1234", host, store.clone());
-    let (_, cx) = cx.add_window_view(|_, _| Host { view: view.clone() });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.add_comment(
-                DiffLineRange::new("src/git.rs", DiffSide::Modified, 12, 14),
-                window,
-                cx,
-            );
-            let input = view.comments[0]
-                .input
-                .clone()
-                .expect("a new comment has an editor");
-            input.update(cx, |input, cx| {
-                input.set_value("这里应该先检查状态".to_string(), window, cx)
-            });
-            // Sending goes where the user pointed, not where focus is.
-            view.set_target(8, cx);
-            view.send_comments(cx);
-            assert!(view.comments.is_empty());
-        });
+    view.update(cx, |view, cx| {
+        view.add_comment(
+            ReviewRange::new("src/git.rs", ReviewSide::Modified, 12, 14),
+            cx,
+        );
+        view.update_comment(0, "这里应该先检查状态".to_string(), cx);
+        view.set_target(8, cx);
+        view.send_comments(cx);
+        assert!(view.comments.is_empty());
     });
     assert_eq!(
         sent.borrow().as_ref(),
@@ -306,11 +275,8 @@ fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppCo
     assert_eq!(record.target, "窗格 2 · claude");
 }
 
-/// Closing a sheet keeps its unsent comment, and the next sheet over the
-/// same patch puts the text back in an editor.
 #[gpui::test]
 fn a_closed_sheet_restores_its_draft(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
     let store = empty_store();
     let commit = PatchSource::Commit {
         root: PathBuf::from("/nonexistent"),
@@ -328,9 +294,8 @@ fn a_closed_sheet_restores_its_draft(cx: &mut TestAppContext) {
     first.update(cx, |view, cx| {
         view.comments.push(ReviewComment {
             index: 0,
-            range: DiffLineRange::new("src/git.rs", DiffSide::Modified, 12, 14),
+            range: ReviewRange::new("src/git.rs", ReviewSide::Modified, 12, 14),
             text: "这里应该先检查状态".to_string(),
-            input: None,
         });
         view.next_comment = 1;
         view.save_drafts(cx);
@@ -338,143 +303,62 @@ fn a_closed_sheet_restores_its_draft(cx: &mut TestAppContext) {
     drop(first);
 
     let second = patch_view(cx, 1, commit, "", "提交 abc1234", test_host(), store);
-    let (_, cx) = cx.add_window_view(|_, _| Host {
-        view: second.clone(),
-    });
-    cx.run_until_parked();
-    for _ in 0..3 {
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-    }
-    let (text, value) = second.read_with(cx, |view, cx| {
-        let comment = &view.comments[0];
-        (
-            comment.text.clone(),
-            comment
-                .input
-                .as_ref()
-                .map(|input| input.read(cx).value().to_string()),
-        )
-    });
+    let text = second.read_with(cx, |view, _| view.comments[0].text.clone());
     assert_eq!(text, "这里应该先检查状态");
-    assert_eq!(value.as_deref(), Some("这里应该先检查状态"));
 }
 
-struct PanelHost {
-    panel: Entity<GitLogPanel>,
-}
-
-impl Render for PanelHost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(gpui_kit::px(320.))
-            .h(gpui_kit::px(600.))
-            .child(self.panel.clone())
-    }
-}
-
-struct FooterHost {
-    footer: Entity<PatchFooter>,
-}
-
-impl Render for FooterHost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.footer.clone())
-    }
-}
-
-/// The footer names the pane the comments go to and offers the others in a
-/// menu; drawing it is what proves the buttons and the dropdown build.
-#[gpui::test]
-fn the_footer_offers_the_projects_panes(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let host = PluginHost::with_panes(
-        |_, _, _, _| Ok(SendOutcome::Submitted),
-        |_, _| {
-            vec![
-                PaneTarget {
-                    pane: 1,
-                    ordinal: 1,
-                    title: "codex".to_string(),
-                    agent: Some("codex".to_string()),
-                    focused: true,
-                },
-                PaneTarget {
-                    pane: 2,
-                    ordinal: 2,
-                    title: "终端".to_string(),
-                    agent: None,
-                    focused: false,
-                },
-            ]
-        },
-    );
-    let source = PatchSource::Commit {
-        root: PathBuf::from("/nonexistent"),
-        hash: "HEAD".to_string(),
-    };
-    let view = patch_view(cx, 1, source, "", "提交 abc1234", host, empty_store());
-    let footer = cx.new(|cx| PatchFooter::new(view.clone(), cx));
-    let (_, cx) = cx.add_window_view(|_, _| FooterHost { footer });
-    cx.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.add_comment(
-                DiffLineRange::new("a", DiffSide::Modified, 1, 1),
-                window,
-                cx,
-            );
-        });
-    });
-    cx.run_until_parked();
-    for _ in 0..3 {
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-    }
-}
-
-/// Drawing is what would catch a broken row or list: the panel shows the
-/// changes it read, then the history on the other tab.
-#[gpui::test]
-fn the_panel_draws_changes_and_history(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+#[test]
+fn the_panel_draws_changes_switches_tabs_and_opens_commits() {
     let (dir, path) = fixture();
     std::fs::write(path.join("b"), "b\n").unwrap();
-    let project = PluginProject {
-        id: 1,
-        path: path.clone(),
+    let history = crate::git::history(&path).unwrap();
+    let changes = crate::git::changes(&path).unwrap();
+    let rows = change_rows_from(&changes);
+    assert_eq!(rows.len(), 2);
+
+    let (events_tx, events_rx) = unbounded::<GitHostEvent>();
+    let (actions_tx, mut actions_rx) = unbounded::<GitPanelAction>();
+    let initial = GitPanelSnapshot {
+        project_id: Some(1),
+        tab: PanelTab::Changes,
+        branch: Some(history.branch.clone()),
+        loaded: true,
+        error: None,
+        change_count: changes.len(),
+        change_rows: rows,
+        commits: history.commits.clone(),
+        filter: None,
+        marks: Default::default(),
     };
+    let mount_id = register_panel_mount(GitPanelMount {
+        initial: initial.clone(),
+        events_rx,
+        actions_tx,
+    });
+    let root = nsh_core::element::Root::new::<view::GitLogRoot>(move || view::GitLogRootProps {
+        mount_id: mount_id.into(),
+    });
+    let mut app = nsh_testing::Headless::start(EngineConfig::new(root)).expect("start git NSH");
+    app.wait_for("未暂存").expect("shows unstaged section");
+    app.wait_for("b").expect("shows untracked file");
 
-    let (host, cx) = cx.add_window_view(|window, cx| {
-        let panel = cx.new(|cx| GitLogPanel::new(Some(project.clone()), test_host(), window, cx));
-        PanelHost { panel }
-    });
-    cx.run_until_parked();
-    for _ in 0..3 {
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-    }
-    // One heading and one file, which is what the changes tab drew.
-    host.update(cx, |host, cx| {
-        assert_eq!(host.panel.read(cx).change_rows().len(), 2);
-    });
+    app.press("历史 1").expect("switch to history tab");
+    assert!(matches!(
+        actions_rx.try_recv().ok(),
+        Some(GitPanelAction::SelectTab(PanelTab::History))
+    ));
 
-    cx.update(|_, cx| {
-        host.update(cx, |host, cx| {
-            host.panel.update(cx, |panel, cx| {
-                panel.tab = super::PanelTab::History;
-                cx.notify();
-            });
-        });
-    });
-    cx.run_until_parked();
-    for _ in 0..3 {
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-    }
+    let mut history_snap = initial;
+    history_snap.tab = PanelTab::History;
+    events_tx
+        .unbounded_send(GitHostEvent::Snapshot(history_snap))
+        .expect("switch to history");
+    app.wait_for("init").expect("shows initial commit");
+    app.press("init").expect("click commit row");
+    assert!(matches!(
+        actions_rx.try_recv().ok(),
+        Some(GitPanelAction::OpenCommit(_))
+    ));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

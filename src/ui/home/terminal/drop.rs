@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use gpui_kit::{ClipboardEntry, ClipboardItem, Image, ImageFormat};
+use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat};
 
 /// Subdirectory under `$TMPDIR` holding screenshots pasted from the clipboard.
 const CLIPBOARD_DIR_NAME: &str = "kumu-clipboard";
@@ -252,7 +252,7 @@ fn image_ext(format: ImageFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::{ClipboardString, ExternalPaths};
+    use gpui::{ClipboardString, ExternalPaths};
 
     #[test]
     fn escapes_spaces_shell_metachars_and_preserves_utf8() {

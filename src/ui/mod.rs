@@ -1,19 +1,12 @@
-//! Frontend UI: one module per window, shared widgets in `widgets`.
+//! Frontend UI: Home window, native macOS title bar, and Pure Rust NSH Settings window.
 
-mod home;
-mod settings;
-mod tooltip;
-pub mod widgets;
+pub(crate) mod home;
+pub(crate) mod titlebar;
 
+pub use crate::nsh_ui::settings::SettingsWindow;
 pub use home::KumuApp;
-pub use settings::SettingsWindow;
 
-pub fn init(cx: &mut gpui_kit::App) {
-    // Every window's Root mounts one tooltip overlay; elements find it
-    // through `Root::read(window, cx).plugin::<Tooltips>()`.
-    gpui_kit::base::Root::register_plugin::<tooltip::Tooltips>(cx, |_, cx| {
-        tooltip::Tooltips::new(cx)
-    });
+pub fn init(cx: &mut gpui::App) {
     if !cx.has_global::<crate::app::NotificationSettings>() {
         cx.set_global(crate::app::NotificationSettings {
             enabled: crate::db::get_setting(crate::db::SETTING_NOTIFICATIONS).as_deref()
@@ -22,22 +15,29 @@ pub fn init(cx: &mut gpui_kit::App) {
                 != Some("0"),
         });
     }
-    // Root's focus-navigation actions run before on_key_down. Let the
-    // focused terminal receive completion keys through its normal encoder.
+    // Let the focused terminal receive completion keys through its normal encoder
+    // instead of any outer focus-navigation binding.
     cx.bind_keys([
-        gpui_kit::KeyBinding::new("tab", gpui_kit::NoAction, Some("Terminal")),
-        gpui_kit::KeyBinding::new("shift-tab", gpui_kit::NoAction, Some("Terminal")),
+        gpui::KeyBinding::new("tab", gpui::NoAction, Some("Terminal")),
+        gpui::KeyBinding::new("shift-tab", gpui::NoAction, Some("Terminal")),
     ]);
 }
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::{KeyContext, Keystroke, TestAppContext};
+    use gpui::{KeyBinding, KeyContext, Keystroke, TestAppContext};
+
+    gpui::actions!(test_nav, [FocusNext, FocusPrev]);
 
     #[gpui::test]
     fn terminal_completion_keys_bypass_root_focus_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            gpui_kit::init(cx);
+            // Simulate an outer focus-navigation binding on `Root` so the test
+            // verifies `super::init` actually masks it inside `Terminal`.
+            cx.bind_keys([
+                KeyBinding::new("tab", FocusNext, Some("Root")),
+                KeyBinding::new("shift-tab", FocusPrev, Some("Root")),
+            ]);
             super::init(cx);
             let keymap = cx.key_bindings();
             let keymap = keymap.borrow();
@@ -50,8 +50,13 @@ mod tests {
                 assert!(bindings.is_empty(), "{key} must reach on_key_down");
                 assert!(!pending, "{key} must not wait for another keystroke");
 
-                let (bindings, _) = keymap.bindings_for_input(&input, std::slice::from_ref(&root));
-                assert_eq!(bindings.len(), 1, "{key} still navigates outside terminals");
+                let (outer_bindings, _) =
+                    keymap.bindings_for_input(&input, std::slice::from_ref(&root));
+                assert_eq!(
+                    outer_bindings.len(),
+                    1,
+                    "{key} still navigates outside terminals"
+                );
             }
         });
     }

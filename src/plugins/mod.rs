@@ -15,8 +15,7 @@ mod todo;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::*;
 
 use crate::agent::AgentState;
 use crate::app::Workspace;
@@ -89,6 +88,8 @@ type AgentPanesFn = dyn Fn(i64, &App) -> Vec<AgentPaneInfo>;
 type DispatchFn = dyn Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String>;
 type SendAnyPaneFn = dyn Fn(u64, &str, &mut App) -> Result<SendOutcome, String>;
 type RevealPaneFn = dyn Fn(u64, &mut Window, &mut App);
+type OpenSheetFn = dyn Fn(AnyView, &mut Window, &mut App);
+type CloseSheetFn = dyn Fn(&mut Window, &mut App);
 
 /// The panes a panel may hand text to, as the host sees them.
 ///
@@ -105,6 +106,8 @@ pub struct PluginHost {
     dispatch: Option<Rc<DispatchFn>>,
     send_any: Option<Rc<SendAnyPaneFn>>,
     reveal: Option<Rc<RevealPaneFn>>,
+    open_sheet: Option<Rc<OpenSheetFn>>,
+    close_sheet: Option<Rc<CloseSheetFn>>,
 }
 
 impl PluginHost {
@@ -121,7 +124,20 @@ impl PluginHost {
             dispatch: None,
             send_any: None,
             reveal: None,
+            open_sheet: None,
+            close_sheet: None,
         }
+    }
+
+    /// Attach full-window Pure Rust NSH sheet open/close handlers.
+    pub fn with_sheet_tools(
+        mut self,
+        open_sheet: impl Fn(AnyView, &mut Window, &mut App) + 'static,
+        close_sheet: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.open_sheet = Some(Rc::new(open_sheet));
+        self.close_sheet = Some(Rc::new(close_sheet));
+        self
     }
 
     /// Attach workspace access and cross-tab agent dispatch/reveal capabilities
@@ -213,6 +229,20 @@ impl PluginHost {
     pub fn reveal_pane(&self, pane: u64, window: &mut Window, cx: &mut App) {
         if let Some(reveal) = &self.reveal {
             (reveal)(pane, window, cx);
+        }
+    }
+
+    /// Present a full-window Pure Rust NSH sheet overlay (e.g. Diff Review).
+    pub fn open_sheet(&self, view: AnyView, window: &mut Window, cx: &mut App) {
+        if let Some(open_sheet) = &self.open_sheet {
+            (open_sheet)(view, window, cx);
+        }
+    }
+
+    /// Dismiss the active full-window sheet overlay and restore terminal focus.
+    pub fn close_sheet(&self, window: &mut Window, cx: &mut App) {
+        if let Some(close_sheet) = &self.close_sheet {
+            (close_sheet)(window, cx);
         }
     }
 }

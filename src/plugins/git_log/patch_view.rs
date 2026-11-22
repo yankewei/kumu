@@ -1,73 +1,592 @@
+//! Diff review sheet rendered with Pure Rust NSH (`nsh_base::diff_view`) +
+//! inline review annotations (`render_annotation` / `render_add_annotation`).
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::diff::{
-    Diff, DiffAnnotation, DiffFile, DiffLinePosition, DiffLineRange, DiffParseOptions, DiffState,
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use gpui::{
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
+    Task, Window, div,
 };
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use nsh_platform_gpui::{AppOptions, AppView, Root};
 
+use super::REFRESH_INTERVAL;
 use super::review::{
-    DraftComment, PatchKey, PatchSheet, PatchSource, ReviewComment, ReviewStore, SendNotice,
-    SentReview, comment_location, compose_comments, patch_digest,
+    DraftComment, PatchIndex, PatchKey, PatchSheet, PatchSource, ReviewComment, ReviewRange,
+    ReviewStore, SendNotice, SentReview, compose_comments, normalize_and_index_patch, patch_digest,
 };
-use super::{REFRESH_INTERVAL, empty};
+use crate::nsh_ui::mount::MountRegistry;
+use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::plugins::{PaneTarget, PluginHost, SendOutcome};
+use crate::theme::KumuTheme;
 
-/// The sheet body: one patch. The read and the patch parse run on the
-/// background executor; the diff state is built on the UI thread once the files
-/// are in hand, because it prepares syntax off-thread itself.
-pub(super) struct PatchView {
-    /// The project whose pane receives the review comments.
-    project: i64,
-    /// How this sheet reaches that pane.
-    host: PluginHost,
-    /// What this patch is, for finding its drafts again.
-    key: PatchKey,
-    /// The panel's shared review memory.
-    reviews: Rc<RefCell<ReviewStore>>,
-    /// Tells the panel a row marker changed while the sheet was open.
-    notify_panel: Rc<dyn Fn(&mut App)>,
-    /// Where the patch came from, so a stale sheet can be read again.
-    source: PatchSource,
-    /// Review comments, each anchored to the patch lines it discusses.
-    pub(super) comments: Vec<ReviewComment>,
-    /// Distinguishes comment element ids after a removal and a new comment.
-    pub(super) next_comment: u64,
-    /// The pane the user chose, or `None` for the project's focused pane.
-    pub(super) target: Option<u64>,
-    /// A digest of what the sheet read, compared by the watcher to notice the
-    /// repository moving under the review.
-    digest: Option<String>,
-    /// The patch changed since it was read; the sheet keeps showing the old
-    /// text until the user asks for the new one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PatchSnapshot {
+    pub(super) title: String,
+    pub(super) meta: String,
+    pub(super) message: String,
+    pub(super) patch_text: Option<String>,
+    pub(super) index: PatchIndex,
+    pub(super) truncated: bool,
     pub(super) stale: bool,
-    /// A read is running; a watcher tick does not start a second one.
+    pub(super) error: Option<String>,
+    pub(super) comments: Vec<ReviewComment>,
+    pub(super) targets: Vec<PaneTarget>,
+    pub(super) active_target: Option<u64>,
+    pub(super) sent: Option<SentReview>,
+    pub(super) notice: Option<SendNotice>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum PatchHostEvent {
+    Snapshot(PatchSnapshot),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PatchAction {
+    Reload,
+    AddComment(ReviewRange),
+    UpdateComment { index: u64, text: String },
+    RemoveComment(u64),
+    SetTarget(u64),
+    SendComments,
+    Close,
+}
+
+struct PatchMount {
+    initial: PatchSnapshot,
+    events_rx: UnboundedReceiver<PatchHostEvent>,
+    actions_tx: UnboundedSender<PatchAction>,
+}
+
+static MOUNTS: MountRegistry<PatchMount> = MountRegistry::new();
+
+fn register_mount(mount: PatchMount) -> u64 {
+    MOUNTS.register(mount)
+}
+
+fn take_mount(id: u64) -> Option<PatchMount> {
+    MOUNTS.take(id)
+}
+
+mod nsh_view {
+    use futures::StreamExt;
+    use futures::channel::mpsc::UnboundedSender;
+    use nsh_base::{
+        DiffAnnotation, DiffLayout, DiffLineRange, diff_view, input, sheet, theme as active_theme,
+    };
+    use nsh_core::element::desktop::{MenuItem, popup_menu};
+    use nsh_core::element::{AccessibilityRole, SignalEquals, scroll, signal_with};
+    use nsh_core::prelude::*;
+
+    use super::{PatchAction, PatchHostEvent, PatchSnapshot, take_mount};
+    use crate::nsh_ui::assets::icon_svg;
+    use crate::nsh_ui::components::{
+        ButtonVariant, kumu_button, kumu_tooltip, meta_text, section_title,
+    };
+    use crate::nsh_ui::theme::{TOKEN_LINK, TOKEN_WARNING, kumu_color, text_sm_size, text_xs_size};
+    use crate::plugins::git_log::review::{SendNotice, comment_location};
+
+    #[derive(Clone, Debug, PartialEq, Props)]
+    pub(super) struct PatchRootProps {
+        pub(super) mount_id: Prop<u64>,
+    }
+
+    fn send(tx: &Option<UnboundedSender<PatchAction>>, action: PatchAction) {
+        if let Some(tx) = tx {
+            let _ = tx.unbounded_send(action);
+        }
+    }
+
+    fn warning_color() -> AdaptiveColor {
+        kumu_color(TOKEN_WARNING, |t| t.destructive)
+    }
+
+    fn link_color() -> AdaptiveColor {
+        kumu_color(TOKEN_LINK, |t| t.primary)
+    }
+
+    #[component]
+    pub(super) fn PatchRoot(props: PatchRootProps) -> impl IntoElement {
+        let mount = take_mount(props.mount_id.get_untracked());
+        let (initial, events_rx, actions_tx) = match mount {
+            Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
+            None => (PatchSnapshot::default(), None, None),
+        };
+
+        let state = signal_with(initial, SignalEquals::Never);
+        let layout = signal(DiffLayout::Unified);
+
+        if let Some(mut rx) = events_rx {
+            spawn(async move {
+                while let Some(event) = rx.next().await {
+                    match event {
+                        PatchHostEvent::Snapshot(next) => state.set(next),
+                    }
+                }
+            });
+        }
+
+        let tx_banners = actions_tx.clone();
+        let banners = dynamic(move || {
+            let snap = state.get();
+            let message = snap.message.trim_end().to_string();
+            let mut col = view().flex_col().flex_shrink_0();
+            if !message.is_empty() {
+                col = col.child(
+                    scroll().w_full().max_h(px(192.0)).child(
+                        view().pb_2().child(
+                            text(message)
+                                .text_size(text_sm_size)
+                                .text_color(move || active_theme().muted_foreground),
+                        ),
+                    ),
+                );
+            }
+            if snap.truncated {
+                col = col.child(
+                    view().pb_2().child(
+                        text("补丁过大，只显示了前面的一部分")
+                            .text_size(text_xs_size)
+                            .text_color(warning_color),
+                    ),
+                );
+            }
+            if snap.stale {
+                let tx_reload = tx_banners.clone();
+                col = col.child(
+                    view()
+                        .flex_row()
+                        .w_full()
+                        .pb_2()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            text("补丁已经变化，当前显示的是旧内容")
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(text_xs_size)
+                                .text_color(warning_color),
+                        )
+                        .child(
+                            kumu_button("重新读取", ButtonVariant::Ghost)
+                                .on_press(move || send(&tx_reload, PatchAction::Reload)),
+                        ),
+                );
+            }
+            col
+        });
+
+        let tx_diff = actions_tx.clone();
+        let diff_body = dynamic(move || {
+            let snap = state.get();
+            if let Some(error) = snap.error {
+                return view()
+                    .flex_1()
+                    .px_3()
+                    .py_4()
+                    .child(
+                        text(error)
+                            .text_size(text_xs_size)
+                            .text_color(move || active_theme().destructive),
+                    )
+                    .into_element();
+            }
+            let Some(patch_text) = snap.patch_text else {
+                return view()
+                    .flex_1()
+                    .px_3()
+                    .py_4()
+                    .child(meta_text("正在读取补丁…"))
+                    .into_element();
+            };
+            if snap.index.file_count == 0 {
+                return view()
+                    .flex_1()
+                    .px_3()
+                    .py_4()
+                    .child(meta_text("没有内容变更"))
+                    .into_element();
+            }
+
+            let index_for_add = snap.index.clone();
+            let tx_add = tx_diff.clone();
+            let tx_edit = tx_diff.clone();
+            let comments_for_render = snap.comments.clone();
+            let annotations: Vec<DiffAnnotation> = snap
+                .comments
+                .iter()
+                .filter_map(|comment| {
+                    let (side, line) = snap.index.anchor_for(&comment.range)?;
+                    let mut ann = DiffAnnotation::default();
+                    ann.id = comment.annotation_id().into();
+                    ann.side = side;
+                    ann.line = line;
+                    Some(ann)
+                })
+                .collect();
+
+            diff_view()
+                .flex_1()
+                .layout(move || layout.get())
+                .patch(patch_text)
+                .annotations(annotations)
+                .render_add_annotation(move |range: &DiffLineRange| {
+                    let resolved = index_for_add.resolve_range(*range);
+                    let tx = tx_add.clone();
+                    view()
+                        .role(AccessibilityRole::Button)
+                        .label("添加评论")
+                        .w(px(18.0))
+                        .h(px(18.0))
+                        .rounded(px(4.0))
+                        .bg(link_color)
+                        .items_center()
+                        .justify_center()
+                        .on_press(move || {
+                            if let Some(r) = resolved.clone() {
+                                send(&tx, PatchAction::AddComment(r));
+                            }
+                        })
+                        .child(
+                            icon_svg("icons/plus.svg", 11.0)
+                                .text_color(move || active_theme().primary_foreground),
+                        )
+                })
+                .render_annotation(move |ann: &DiffAnnotation| {
+                    let Some(comment) = comments_for_render
+                        .iter()
+                        .find(|c| c.annotation_id() == ann.id.as_ref())
+                        .cloned()
+                    else {
+                        return view().into_element();
+                    };
+                    let idx = comment.index;
+                    let loc = comment_location(&comment.range);
+                    let draft = signal(comment.text);
+                    let tx_change = tx_edit.clone();
+                    let tx_remove = tx_edit.clone();
+
+                    view()
+                        .flex_col()
+                        .w_full()
+                        .gap_1()
+                        .p_2()
+                        .rounded(move || active_theme().radius)
+                        .border_1()
+                        .border_color(move || active_theme().border)
+                        .bg(move || active_theme().background)
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    text(loc)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .font_family(move || {
+                                            active_theme().font_mono.clone().unwrap_or_else(|| {
+                                                SharedString::from(crate::fonts::TERM_FONT)
+                                            })
+                                        })
+                                        .text_size(text_xs_size)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(move || active_theme().muted_foreground),
+                                )
+                                .child(
+                                    view()
+                                        .role(AccessibilityRole::Button)
+                                        .label("删除评论")
+                                        .p_0p5()
+                                        .rounded(move || active_theme().radius)
+                                        .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
+                                        .on_press(move || {
+                                            send(&tx_remove, PatchAction::RemoveComment(idx));
+                                        })
+                                        .child(
+                                            icon_svg("icons/x.svg", 11.0).text_color(move || {
+                                                active_theme().muted_foreground
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            input()
+                                .w_full()
+                                .min_h(px(44.0))
+                                .max_h(px(140.0))
+                                .multiline(true)
+                                .placeholder("写下对这个改动片段的意见")
+                                .placeholder_color(move || active_theme().muted_foreground.light)
+                                .text_size(text_xs_size)
+                                .text_color(move || active_theme().foreground)
+                                .value(move || draft.get())
+                                .on_change(move |v: &str| {
+                                    draft.set(v.to_owned());
+                                    send(
+                                        &tx_change,
+                                        PatchAction::UpdateComment {
+                                            index: idx,
+                                            text: v.to_owned(),
+                                        },
+                                    );
+                                }),
+                        )
+                        .into_element()
+                })
+                .into_element()
+        });
+
+        let tx_footer = actions_tx.clone();
+        let footer = dynamic(move || {
+            let snap = state.get();
+            let count = snap.comments.len();
+            let (hint_text, hint_kind) = match &snap.notice {
+                Some(SendNotice::Pasted(pane)) => (format!("已粘贴到 {pane}，按 Enter 提交"), 1u8),
+                Some(SendNotice::Hint(problem)) => (problem.clone(), 2u8),
+                None if count == 0 => match &snap.sent {
+                    Some(sent) => (
+                        format!("上次已发送 {} 条评论到 {}", sent.count, sent.target),
+                        0u8,
+                    ),
+                    None => ("悬停 diff 行，点 + 添加评论".to_string(), 0u8),
+                },
+                None => (format!("{count} 条评论"), 0u8),
+            };
+            let hint_color = move || match hint_kind {
+                1 => warning_color(),
+                2 => active_theme().destructive,
+                _ => active_theme().muted_foreground,
+            };
+
+            let active_pane = snap
+                .active_target
+                .and_then(|pane| snap.targets.iter().find(|t| t.pane == pane))
+                .or_else(|| snap.targets.iter().find(|t| t.focused))
+                .or_else(|| snap.targets.first())
+                .cloned();
+
+            let layout_btn = kumu_button(
+                move || match layout.get() {
+                    DiffLayout::Unified => "分栏视图",
+                    DiffLayout::Split => "合并视图",
+                },
+                ButtonVariant::Ghost,
+            )
+            .on_press(move || {
+                layout.update(|cur| {
+                    *cur = match *cur {
+                        DiffLayout::Unified => DiffLayout::Split,
+                        DiffLayout::Split => DiffLayout::Unified,
+                    };
+                });
+            });
+
+            let mut bar = view()
+                .flex_row()
+                .flex_shrink_0()
+                .w_full()
+                .pt_2()
+                .mt_2()
+                .gap_2()
+                .items_center()
+                .border_t_1()
+                .border_t_color(move || active_theme().border)
+                .child(
+                    text(hint_text)
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(text_xs_size)
+                        .text_color(hint_color),
+                )
+                .child(layout_btn);
+
+            if count > 0 {
+                if let Some(active) = active_pane {
+                    let targets = snap.targets.clone();
+                    let active_id = active.pane;
+                    let label = active.label();
+                    let tx_target = tx_footer.clone();
+                    bar = bar.child(
+                        view()
+                            .role(AccessibilityRole::Button)
+                            .label("选择接收审查意见的窗格")
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(move || active_theme().radius)
+                            .hover(|s| s.bg(move || active_theme().accent))
+                            .on_press(move || {
+                                let menu_items: Vec<MenuItem> = targets
+                                    .iter()
+                                    .map(|target| {
+                                        let pane = target.pane;
+                                        let tx = tx_target.clone();
+                                        MenuItem::new(target.label())
+                                            .checked(pane == active_id)
+                                            .on_select(move || {
+                                                send(&tx, PatchAction::SetTarget(pane));
+                                            })
+                                    })
+                                    .collect();
+                                drop(popup_menu(menu_items));
+                            })
+                            .child(
+                                text(label)
+                                    .text_size(text_xs_size)
+                                    .text_color(move || active_theme().foreground),
+                            )
+                            .child(
+                                icon_svg("icons/chevron-down.svg", 11.0)
+                                    .text_color(move || active_theme().muted_foreground),
+                            ),
+                    );
+                }
+
+                let tx_send = tx_footer.clone();
+                bar = bar.child(
+                    kumu_button("发送", ButtonVariant::Primary)
+                        .on_press(move || send(&tx_send, PatchAction::SendComments)),
+                );
+            }
+
+            bar
+        });
+
+        let tx_close = actions_tx.clone();
+        let tx_sheet = actions_tx.clone();
+        let open = signal(true);
+
+        let header = dynamic(move || {
+            let snap = state.get();
+            let tx_x = tx_close.clone();
+            view()
+                .flex_row()
+                .flex_shrink_0()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_b_color(move || active_theme().border)
+                .child(
+                    view()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(section_title(snap.title))
+                        .child(meta_text(snap.meta)),
+                )
+                .child(
+                    view()
+                        .role(AccessibilityRole::Button)
+                        .label("关闭 Diff 面板")
+                        .tooltip(kumu_tooltip("关闭 (Esc)"))
+                        .flex_shrink_0()
+                        .p_1()
+                        .rounded(move || active_theme().radius)
+                        .app_class("cursor-pointer")
+                        .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
+                        .on_press(move || {
+                            open.set(false);
+                            send(&tx_x, PatchAction::Close);
+                        })
+                        .child(
+                            icon_svg("icons/x.svg", 14.0)
+                                .text_color(move || active_theme().muted_foreground),
+                        ),
+                )
+        });
+
+        let panel = view()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .h_full()
+            .bg(move || active_theme().background)
+            .border_l_1()
+            .border_l_color(move || active_theme().border)
+            .font_family(move || {
+                active_theme()
+                    .font_sans
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
+            })
+            .child(header)
+            .child(banners)
+            .child(diff_body)
+            .child(footer);
+
+        sheet()
+            .open(move || Some(open.get()))
+            .side(Placement::Right)
+            .close_on_escape(true)
+            .close_on_backdrop_press(true)
+            .backdrop_class("bg-black/35")
+            .popup_class("w-[760px] max-w-[90%] h-full shadow-xl")
+            .on_open_change(move |ev: &nsh_base::SheetEvent| {
+                if matches!(ev, nsh_base::SheetEvent::OpenChange(false, _)) {
+                    open.set(false);
+                    send(&tx_sheet, PatchAction::Close);
+                }
+            })
+            .child(panel)
+    }
+}
+
+/// The sheet body: one patch rendered via Pure Rust NSH `DiffView`, with
+/// background git reading, staleness polling, and review draft persistence.
+pub(super) struct PatchView {
+    mount_id: u64,
+    project: i64,
+    title: String,
+    meta: String,
+    host: PluginHost,
+    key: PatchKey,
+    reviews: Rc<RefCell<ReviewStore>>,
+    notify_panel: Rc<dyn Fn(&mut App)>,
+    source: PatchSource,
+    pub(super) comments: Vec<ReviewComment>,
+    pub(super) next_comment: u64,
+    pub(super) target: Option<u64>,
+    digest: Option<String>,
+    pub(super) stale: bool,
     reading: bool,
-    /// Drops a read that was replaced by a later one.
     read_generation: u64,
-    /// What the patch belongs to, so the agent knows which line numbers the
-    /// comments refer to.
     context: String,
-    /// The last review this patch sent, shown until a new comment is written.
     sent: Option<SentReview>,
-    /// Why the last send did not go through, shown beside the send button.
     notice: Option<SendNotice>,
-    /// The commit message, shown above the patch; empty for a change.
     message: String,
-    pub(super) state: Option<Entity<DiffState>>,
+    pub(super) patch_text: Option<String>,
+    pub(super) index: PatchIndex,
     pub(super) truncated: bool,
     pub(super) error: Option<String>,
+    app_view: Option<Entity<AppView>>,
+    events_tx: UnboundedSender<PatchHostEvent>,
+    actions_rx: Option<UnboundedReceiver<PatchAction>>,
+    _theme_sub: Option<Subscription>,
+    _actions_task: Option<Task<()>>,
+}
+
+impl Drop for PatchView {
+    fn drop(&mut self) {
+        let _ = take_mount(self.mount_id);
+    }
 }
 
 impl PatchView {
     pub(super) fn new(sheet: PatchSheet, cx: &mut Context<Self>) -> Self {
         let PatchSheet {
             project,
+            title,
+            meta,
             key,
             source,
             message,
@@ -95,12 +614,38 @@ impl PatchView {
                 index: index as u64,
                 range: draft.range,
                 text: draft.text,
-                input: None,
             });
         }
         let next_comment = comments.len() as u64;
+        let (events_tx, events_rx) = unbounded::<PatchHostEvent>();
+        let (actions_tx, actions_rx) = unbounded::<PatchAction>();
+
+        let initial = PatchSnapshot {
+            title: title.clone(),
+            meta: meta.clone(),
+            message: message.clone(),
+            patch_text: None,
+            index: PatchIndex::default(),
+            truncated: false,
+            stale: false,
+            error: None,
+            comments: comments.clone(),
+            targets,
+            active_target: target,
+            sent: sent.clone(),
+            notice: None,
+        };
+        let mount_id = register_mount(PatchMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+
         let mut view = Self {
+            mount_id,
             project,
+            title,
+            meta,
             host,
             key,
             reviews,
@@ -117,21 +662,119 @@ impl PatchView {
             sent,
             notice: None,
             message,
-            state: None,
+            patch_text: None,
+            index: PatchIndex::default(),
             truncated: false,
             error: None,
+            app_view: None,
+            events_tx,
+            actions_rx: Some(actions_rx),
+            _theme_sub: None,
+            _actions_task: None,
         };
         view.reload(cx);
-        // Commits addressed by full hash are immutable; only working-tree
-        // changes need background staleness polling.
         if matches!(view.source, PatchSource::Change { .. }) {
             view.watch(cx);
         }
         view
     }
 
-    /// Read the patch again, replacing what the sheet shows. Drafts stay in
-    /// their editors; a line that moved keeps the comment where it was written.
+    /// Mount the Pure Rust NSH `AppView` on the first window paint (or when opened
+    /// in a sheet).
+    pub(super) fn ensure_nsh_mounted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.app_view.is_some() {
+            return;
+        }
+        let kumu_theme = KumuTheme::global(cx);
+        let initial_theme = nsh_theme(kumu_theme);
+        let initial_appearance = appearance(kumu_theme.mode);
+        let mount_id = self.mount_id;
+
+        let app_view = cx.new(|cx| {
+            let options = AppOptions {
+                title: "Kumu Diff Review".to_owned(),
+                // Keep the overlay surface transparent so the underlying Kumu
+                // workspace shows through the sheet's dimmed backdrop.
+                transparent: true,
+                ..Default::default()
+            };
+            let view = AppView::new(options, window, cx);
+            view.set_theme(Some(initial_theme), cx);
+            view.set_appearance(initial_appearance, cx);
+            view.load(nsh_platform_gpui::App::Rust(
+                Root::new::<nsh_view::PatchRoot>(move || nsh_view::PatchRootProps {
+                    mount_id: mount_id.into(),
+                }),
+            ));
+            view
+        });
+
+        self._theme_sub = Some(cx.observe_global::<KumuTheme>(|this: &mut Self, cx| {
+            let kumu_theme = KumuTheme::global(cx);
+            let (mapped, mode) = (nsh_theme(kumu_theme), appearance(kumu_theme.mode));
+            if let Some(app_view) = &this.app_view {
+                app_view.update(cx, |view, cx| {
+                    view.set_theme(Some(mapped), cx);
+                    view.set_appearance(mode, cx);
+                });
+            }
+        }));
+
+        if let Some(mut actions_rx) = self.actions_rx.take() {
+            self._actions_task = Some(cx.spawn_in(window, async move |this, cx| {
+                while let Some(action) = actions_rx.next().await {
+                    let res = this.update_in(cx, |view, window, cx| match action {
+                        PatchAction::Reload => view.reload(cx),
+                        PatchAction::AddComment(range) => view.add_comment(range, cx),
+                        PatchAction::UpdateComment { index, text } => {
+                            view.update_comment(index, text, cx);
+                        }
+                        PatchAction::RemoveComment(index) => view.remove_comment(index, cx),
+                        PatchAction::SetTarget(pane) => view.set_target(pane, cx),
+                        PatchAction::SendComments => {
+                            if view.send_comments(cx) {
+                                view.host.close_sheet(window, cx);
+                            }
+                        }
+                        PatchAction::Close => {
+                            view.host.close_sheet(window, cx);
+                        }
+                    });
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        self.app_view = Some(app_view);
+        self.push_snapshot(cx);
+    }
+
+    fn snapshot(&self, cx: &App) -> PatchSnapshot {
+        PatchSnapshot {
+            title: self.title.clone(),
+            meta: self.meta.clone(),
+            message: self.message.clone(),
+            patch_text: self.patch_text.clone(),
+            index: self.index.clone(),
+            truncated: self.truncated,
+            stale: self.stale,
+            error: self.error.clone(),
+            comments: self.comments.clone(),
+            targets: self.host.panes(self.project, cx),
+            active_target: self.target,
+            sent: self.sent.clone(),
+            notice: self.notice.clone(),
+        }
+    }
+
+    fn push_snapshot(&self, cx: &App) {
+        let _ = self
+            .events_tx
+            .unbounded_send(PatchHostEvent::Snapshot(self.snapshot(cx)));
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         if self.reading {
             return;
@@ -144,14 +787,9 @@ impl PatchView {
             let read = cx
                 .background_spawn(async move {
                     let patch = source.read()?;
-                    // A cut patch ends in the middle of a hunk, which the
-                    // parser takes when it is told to count the lines present.
-                    let files = DiffFile::parse_with(
-                        &patch.patch,
-                        DiffParseOptions::new().truncated_hunks(patch.truncated),
-                    )
-                    .map_err(|error| format!("无法解析补丁：{error}"))?;
-                    Ok::<_, String>((patch, files))
+                    let (normalized, index) =
+                        normalize_and_index_patch(&patch.patch, patch.truncated);
+                    Ok::<_, String>((patch, normalized, index))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -160,35 +798,28 @@ impl PatchView {
                 }
                 view.reading = false;
                 match read {
-                    Ok((patch, files)) => {
-                        let state = cx.new(|cx| DiffState::new(files, cx));
-                        // Scrolling and selection notify the state; this view
-                        // rebuilds the element so the new frame is painted.
-                        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+                    Ok((patch, normalized, index)) => {
                         view.truncated = patch.truncated;
                         view.digest = Some(patch_digest(&patch));
                         view.stale = false;
                         view.error = None;
-                        view.state = Some(state);
+                        view.patch_text = Some(normalized);
+                        view.index = index;
                     }
                     Err(error) => view.error = Some(error),
                 }
+                view.push_snapshot(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Notice a patch that changed since the sheet read it. The watcher never
-    /// replaces the diff by itself: yanking the text while someone writes a
-    /// comment is worse than an outdated frame with a refresh button.
     fn watch(&self, cx: &mut Context<Self>) {
         let source = self.source.clone();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
-                // Skip polling while a read is running or once the sheet is
-                // already marked stale.
                 let generation = match this.update(cx, |view, _| {
                     (!view.reading && !view.stale).then_some(view.read_generation)
                 }) {
@@ -212,6 +843,7 @@ impl PatchView {
                         && view.digest.as_ref() != Some(&digest)
                     {
                         view.stale = true;
+                        view.push_snapshot(cx);
                         cx.notify();
                     }
                 });
@@ -223,78 +855,6 @@ impl PatchView {
         .detach();
     }
 
-    /// Give every restored comment its editor. Restored text cannot be put in
-    /// a textarea before the sheet has a window, so the first paint is when
-    /// they come back.
-    pub(super) fn ensure_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let missing: Vec<(usize, u64, String)> = self
-            .comments
-            .iter()
-            .enumerate()
-            .filter(|(_, comment)| comment.input.is_none())
-            .map(|(position, comment)| (position, comment.index, comment.text.clone()))
-            .collect();
-        for (position, index, text) in missing {
-            let input = self.create_editor(&text, window, cx);
-            self.listen(index, &input, cx);
-            self.comments[position].input = Some(input);
-        }
-    }
-
-    fn create_editor(
-        &self,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextareaState> {
-        let input = cx.new(|cx| {
-            TextareaState::new(&mut *window, cx)
-                .placeholder("写下对这个改动片段的意见")
-                .auto_grow(1, 6)
-        });
-        if !text.is_empty() {
-            input.update(cx, |state, cx| {
-                state.set_value(text.to_string(), window, cx)
-            });
-        }
-        input
-    }
-
-    /// Follow one editor's changes into the comment and the panel's drafts.
-    fn listen(&self, index: u64, input: &Entity<TextareaState>, cx: &mut Context<Self>) {
-        cx.subscribe(input, move |view, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                view.sync_comment(index, cx);
-            }
-        })
-        .detach();
-    }
-
-    fn sync_comment(&mut self, index: u64, cx: &mut Context<Self>) {
-        let text = {
-            let Some(comment) = self.comments.iter().find(|comment| comment.index == index) else {
-                return;
-            };
-            let Some(input) = comment.input.as_ref() else {
-                return;
-            };
-            input.read(cx).value().to_string()
-        };
-        if let Some(comment) = self
-            .comments
-            .iter_mut()
-            .find(|comment| comment.index == index)
-        {
-            comment.text = text;
-        }
-        // A notice describes the previous text, so editing makes it stale.
-        self.notice = None;
-        self.save_drafts(cx);
-        cx.notify();
-    }
-
-    /// Write what the sheet holds into the panel's memory. A comment the user
-    /// emptied stops being a draft; the editor stays until the sheet closes.
     pub(super) fn save_drafts(&self, cx: &mut Context<Self>) {
         let drafts = self
             .comments
@@ -322,38 +882,28 @@ impl PatchView {
         }
     }
 
-    /// Anchor a comment beneath `range`, or focus the comment already there.
-    pub(super) fn add_comment(
-        &mut self,
-        range: DiffLineRange,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(position) = self
-            .comments
-            .iter()
-            .position(|comment| comment.range == range)
-        {
-            self.ensure_editors(window, cx);
-            if let Some(input) = self.comments[position].input.clone() {
-                let focus = input.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
+    pub(super) fn add_comment(&mut self, range: ReviewRange, cx: &mut Context<Self>) {
+        if self.comments.iter().any(|c| c.range == range) {
             return;
         }
         let index = self.next_comment;
         self.next_comment += 1;
-        let input = self.create_editor("", window, cx);
-        self.listen(index, &input, cx);
         self.notice = None;
-        window.focus(&input.read(cx).focus_handle(cx), cx);
         self.comments.push(ReviewComment {
             index,
             range,
             text: String::new(),
-            input: Some(input),
         });
+        self.push_snapshot(cx);
         cx.notify();
+    }
+
+    pub(super) fn update_comment(&mut self, index: u64, text: String, cx: &mut Context<Self>) {
+        if let Some(comment) = self.comments.iter_mut().find(|c| c.index == index) {
+            comment.text = text;
+        }
+        self.notice = None;
+        self.save_drafts(cx);
     }
 
     fn remove_comment(&mut self, index: u64, cx: &mut Context<Self>) {
@@ -362,12 +912,11 @@ impl PatchView {
         if self.comments.len() != before {
             self.notice = None;
             self.save_drafts(cx);
+            self.push_snapshot(cx);
             cx.notify();
         }
     }
 
-    /// The pane this sheet would send to: the chosen one when it still exists,
-    /// otherwise the project's focused pane.
     fn active_target<'a>(&self, targets: &'a [PaneTarget]) -> Option<&'a PaneTarget> {
         self.target
             .and_then(|pane| targets.iter().find(|target| target.pane == pane))
@@ -378,30 +927,23 @@ impl PatchView {
     pub(super) fn set_target(&mut self, pane: u64, cx: &mut Context<Self>) {
         if self.target != Some(pane) {
             self.target = Some(pane);
+            self.push_snapshot(cx);
             cx.notify();
         }
     }
 
-    /// Hand every non-empty comment to the chosen terminal as one instruction.
-    /// Returns whether the terminal took it, which is when the sheet can close.
     pub(super) fn send_comments(&mut self, cx: &mut Context<Self>) -> bool {
         let comments = self
             .comments
             .iter()
             .filter_map(|comment| {
-                // The editor is the source of truth; its Change event is what
-                // usually lands in `text`, but a programmatic value may not
-                // emit one.
-                let text = match comment.input.as_ref() {
-                    Some(input) => input.read(cx).value().to_string(),
-                    None => comment.text.clone(),
-                };
-                let text = text.trim().to_string();
+                let text = comment.text.trim().to_string();
                 (!text.is_empty()).then(|| (comment.range.clone(), text))
             })
             .collect::<Vec<_>>();
         if comments.is_empty() {
             self.notice = Some(SendNotice::Hint("先写下评论再发送".to_string()));
+            self.push_snapshot(cx);
             cx.notify();
             return false;
         }
@@ -432,326 +974,92 @@ impl PatchView {
                 (self.notify_panel)(cx);
                 self.comments.clear();
                 self.notice = None;
+                self.push_snapshot(cx);
                 cx.notify();
                 true
             }
-            // The notes sit on a shell's command line. Keeping the editors
-            // lets the user resend them after focusing an agent pane.
             Ok(SendOutcome::Pasted) => {
                 let pane = target
                     .map(|target| target.label())
                     .unwrap_or_else(|| "当前窗格".to_string());
                 self.notice = Some(SendNotice::Pasted(pane));
+                self.push_snapshot(cx);
                 cx.notify();
                 false
             }
             Err(problem) => {
                 self.notice = Some(SendNotice::Hint(problem));
+                self.push_snapshot(cx);
                 cx.notify();
                 false
             }
-        }
-    }
-
-    /// The footer's one line: what to do next, or why the last send stopped.
-    fn footer_hint(&self, theme: &Theme) -> (String, Hsla) {
-        match &self.notice {
-            Some(SendNotice::Pasted(pane)) => {
-                (format!("已粘贴到 {pane}，按 Enter 提交"), theme.warning)
-            }
-            Some(SendNotice::Hint(problem)) => (problem.clone(), theme.danger),
-            None if self.comments.is_empty() => match &self.sent {
-                Some(sent) => (
-                    format!("上次已发送 {} 条评论到 {}", sent.count, sent.target),
-                    theme.muted_foreground,
-                ),
-                None => (
-                    "悬停 diff 行，点 + 添加评论".to_string(),
-                    theme.muted_foreground,
-                ),
-            },
-            None => (
-                format!("{} 条评论", self.comments.len()),
-                theme.muted_foreground,
-            ),
         }
     }
 }
 
 impl Render for PatchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_editors(window, cx);
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let message = self.message.trim_end();
-        let body: AnyElement = match (&self.error, &self.state) {
-            (Some(error), _) => empty(error, theme.danger),
-            (None, Some(state)) if state.read(cx).files().is_empty() => {
-                empty("没有内容变更", muted)
-            }
-            (None, Some(state)) => {
-                let comments = Rc::new(
-                    self.comments
-                        .iter()
-                        .filter_map(|comment| {
-                            Some((
-                                comment.annotation_id(),
-                                comment.index,
-                                comment.range.clone(),
-                                comment.input.clone()?,
-                            ))
-                        })
-                        .collect::<Vec<_>>(),
-                );
-                let view = cx.entity().downgrade();
-                let annotations = comments.iter().map(|(id, _, range, _)| {
-                    DiffAnnotation::line(
-                        id.clone(),
-                        DiffLinePosition::new(range.path().clone(), range.side(), range.start()),
-                    )
-                });
-                let annotation_content = {
-                    let comments = comments.clone();
-                    let view = view.clone();
-                    move |annotation: &DiffAnnotation, _window: &mut Window, cx: &mut App| {
-                        let Some((_, index, range, input)) =
-                            comments.iter().find(|(id, _, _, _)| id == annotation.id())
-                        else {
-                            return div().into_any_element();
-                        };
-                        render_comment(*index, range.clone(), input.clone(), view.clone(), cx)
-                    }
-                };
-                let add_annotation = {
-                    let view = view.clone();
-                    move |range: &DiffLineRange, window: &mut Window, cx: &mut App| {
-                        let range = range.clone();
-                        if let Some(view) = view.upgrade() {
-                            view.update(cx, |this, cx| this.add_comment(range, window, cx));
-                        }
-                    }
-                };
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(
-                        Diff::new(state)
-                            .annotations(annotations)
-                            .render_annotation(annotation_content)
-                            .on_add_annotation(add_annotation)
-                            .size_full(),
-                    )
-                    .into_any_element()
-            }
-            (None, None) => empty("正在读取补丁…", muted),
-        };
-
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .min_w_0()
-            .text_color(theme.sidebar_foreground)
-            // The commit message lives here now that rows no longer open a
-            // hover card, which would have been drawn over this sheet.
-            .when(!message.is_empty(), |this| {
-                this.child(
-                    div()
-                        .id("commit-diff-message")
-                        .w_full()
-                        .max_h(rems(12.))
-                        .overflow_y_scroll()
-                        .pb_2()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(message.to_string()),
-                )
-            })
-            .when(self.truncated, |this| {
-                this.child(
-                    div()
-                        .pb_2()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child("补丁过大，只显示了前面的一部分"),
-                )
-            })
-            .when(self.stale, |this| {
-                let view = cx.entity().downgrade();
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .pb_2()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(theme.warning)
-                                .child("补丁已经变化，当前显示的是旧内容"),
-                        )
-                        .child(
-                            Button::new("git-diff-refresh")
-                                .small()
-                                .ghost()
-                                .label("重新读取")
-                                .on_click(move |_, _, cx| {
-                                    if let Some(view) = view.upgrade() {
-                                        view.update(cx, |view, cx| view.reload(cx));
-                                    }
-                                }),
-                        ),
-                )
-            })
-            .child(body)
-    }
-}
-
-/// The sheet footer. It lives outside the body's padding, so it is its own
-/// view and follows the patch it belongs to.
-pub(super) struct PatchFooter {
-    patch: Entity<PatchView>,
-}
-
-impl PatchFooter {
-    pub(super) fn new(patch: Entity<PatchView>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&patch, |_, _, cx| cx.notify()).detach();
-        Self { patch }
-    }
-}
-
-impl Render for PatchFooter {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let patch = self.patch.clone();
-        let (count, (hint, color), project, host, target) = {
-            let view = patch.read(cx);
-            (
-                view.comments.len(),
-                view.footer_hint(theme),
-                view.project,
-                view.host.clone(),
-                view.target,
-            )
-        };
-        let targets = host.panes(project, cx);
-        let active = target
-            .and_then(|pane| targets.iter().find(|target| target.pane == pane))
-            .or_else(|| targets.iter().find(|target| target.focused))
-            .or_else(|| targets.first())
-            .map(|target| (target.pane, target.label()));
-        let target_button = active.as_ref().map(|(active_pane, label)| {
-            let active_pane = *active_pane;
-            let label = label.clone();
-            let targets = targets.clone();
-            let patch = patch.downgrade();
-            Button::new("git-diff-target")
-                .small()
-                .ghost()
-                .icon(Icon::new(IconName::ChevronDown).xsmall())
-                .label(label)
-                .tooltip("选择接收审查意见的窗格")
-                .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                    let mut menu = menu;
-                    for target in &targets {
-                        let patch = patch.clone();
-                        let pane = target.pane;
-                        menu = menu.item(
-                            PopupMenuItem::new(target.label())
-                                .checked(pane == active_pane)
-                                .on_click(move |_, _, cx| {
-                                    let _ = patch.update(cx, |view, cx| view.set_target(pane, cx));
-                                }),
-                        );
-                    }
-                    menu
-                })
-        });
-        h_flex()
-            .w_full()
-            .gap_2()
-            .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(color)
-                    .child(hint),
-            )
-            .when(count > 0, |this| this.children(target_button))
-            .when(count > 0, |this| {
-                this.child(
-                    Button::new("git-diff-send")
-                        .small()
-                        .primary()
-                        .label("发送")
-                        .on_click({
-                            let patch = patch.clone();
-                            move |_, window, cx| {
-                                if patch.update(cx, |patch, cx| patch.send_comments(cx)) {
-                                    window.close_sheet(cx);
-                                }
-                            }
-                        }),
-                )
-            })
-    }
-}
-
-/// One comment's editor, drawn beneath the line it targets.
-fn render_comment(
-    index: u64,
-    range: DiffLineRange,
-    input: Entity<TextareaState>,
-    view: WeakEntity<PatchView>,
-    cx: &mut App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let muted = theme.muted_foreground;
-    let delete = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-        if let Some(view) = view.upgrade() {
-            view.update(cx, |this, cx| this.remove_comment(index, cx));
+        self.ensure_nsh_mounted(window, cx);
+        match &self.app_view {
+            Some(app_view) => div().size_full().child(app_view.clone()),
+            None => div().size_full(),
         }
-    };
-    v_flex()
-        .w_full()
-        .gap_1()
-        .p_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.background)
-        .child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_xs()
-                        .font_medium()
-                        .text_color(muted)
-                        .child(comment_location(&range)),
-                )
-                .child(
-                    Button::new(ElementId::named_usize(
-                        "git-diff-comment-delete",
-                        index as usize,
-                    ))
-                    .compact()
-                    .ghost()
-                    .icon(Icon::new(IconName::Close).xsmall())
-                    .tooltip("删除评论")
-                    .on_click(delete),
-                ),
-        )
-        .child(Textarea::new(&input).appearance(false).bordered(false))
-        .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsh_engine::EngineConfig;
+
+    #[test]
+    fn patch_sheet_nsh_renders_diff_and_closes() {
+        let (_events_tx, events_rx) = unbounded::<PatchHostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<PatchAction>();
+
+        let raw = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-let old = 1;
++let new = 2;
+";
+        let (normalized, index) = normalize_and_index_patch(raw, false);
+        let initial = PatchSnapshot {
+            title: "refactor: use nsh".into(),
+            meta: "abc1234 · 1 个文件".into(),
+            patch_text: Some(normalized),
+            index,
+            ..Default::default()
+        };
+
+        let mount_id = register_mount(PatchMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+        let root =
+            nsh_core::element::Root::new::<nsh_view::PatchRoot>(move || nsh_view::PatchRootProps {
+                mount_id: mount_id.into(),
+            });
+        let mut app = nsh_testing::Headless::start(EngineConfig::new(root))
+            .expect("start headless diff sheet");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_core::Points(1200.0),
+            nsh_core::Points(800.0),
+        ))
+        .expect("set viewport");
+
+        app.wait_for("text:refactor: use nsh")
+            .expect("diff sheet header renders");
+        app.wait_for("abc1234 · 1 个文件")
+            .expect("diff sheet meta renders");
+        app.press("label:关闭 Diff 面板")
+            .expect("press close diff sheet button");
+        assert!(matches!(
+            actions_rx.try_recv().ok(),
+            Some(PatchAction::Close)
+        ));
+    }
 }

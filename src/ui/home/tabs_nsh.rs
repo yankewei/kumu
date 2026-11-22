@@ -1,0 +1,398 @@
+//! Pure Rust NSH UI for the project-level Tab Bar above the terminal pane grid.
+
+use crate::app::layout::TabId;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TabAttention {
+    Waiting(usize),
+    Failed(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TabItemSnapshot {
+    pub(super) id: TabId,
+    pub(super) name: String,
+    pub(super) active: bool,
+    pub(super) attention: Option<TabAttention>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum TabBarSnapshot {
+    #[default]
+    Hidden,
+    ConfirmClose {
+        project_id: i64,
+        tab_id: TabId,
+        name: String,
+        pane_count: usize,
+    },
+    Tabs {
+        project_id: i64,
+        selected_tab_id: Option<TabId>,
+        tabs: Vec<TabItemSnapshot>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TabBarAction {
+    Select { project_id: i64, tab_id: TabId },
+    RequestClose { project_id: i64, tab_id: TabId },
+    CancelClose,
+    ConfirmClose { project_id: i64, tab_id: TabId },
+    Add,
+    PromptRename { project_id: i64, tab_id: TabId },
+}
+
+pub(super) mod view {
+    use futures::channel::mpsc::UnboundedSender;
+    use nsh_base::theme as active_theme;
+    use nsh_core::element::desktop::{MenuItem, popup_menu};
+    use nsh_core::element::{AccessibilityRole, scroll};
+    use nsh_core::prelude::*;
+
+    use super::{TabAttention, TabBarAction, TabBarSnapshot};
+    use crate::nsh_ui::assets::icon_svg;
+    use crate::nsh_ui::components::{ButtonVariant, kumu_button, kumu_tooltip};
+    use crate::nsh_ui::theme::{TOKEN_WARNING, kumu_color, text_xs_size};
+
+    fn send(tx: &Option<UnboundedSender<TabBarAction>>, action: TabBarAction) {
+        if let Some(tx) = tx {
+            let _ = tx.unbounded_send(action);
+        }
+    }
+
+    fn warning_color() -> AdaptiveColor {
+        kumu_color(TOKEN_WARNING, |t| t.destructive)
+    }
+
+    pub(in crate::ui::home) fn render_tab_bar(
+        state: Signal<TabBarSnapshot>,
+        actions_tx: Option<UnboundedSender<TabBarAction>>,
+    ) -> impl IntoElement {
+        let tx_root = actions_tx;
+        dynamic(move || match state.get() {
+            TabBarSnapshot::Hidden => view().w_full().h_full().into_element(),
+            TabBarSnapshot::ConfirmClose {
+                project_id,
+                tab_id,
+                name,
+                pane_count,
+            } => {
+                let tx_cancel = tx_root.clone();
+                let tx_confirm = tx_root.clone();
+                view()
+                    .flex_row()
+                    .w_full()
+                    .h_full()
+                    .px_3()
+                    .gap_2()
+                    .items_center()
+                    .bg(move || warning_color().opacity(0.12))
+                    .border_b_1()
+                    .border_b_color(move || active_theme().border)
+                    .font_family(move || {
+                        active_theme()
+                            .font_sans
+                            .clone()
+                            .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
+                    })
+                    .child(
+                        text(format!("关闭「{name}」会结束 {pane_count} 个终端。"))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(text_xs_size)
+                            .text_color(warning_color),
+                    )
+                    .child(
+                        kumu_button("取消", ButtonVariant::Ghost)
+                            .on_press(move || send(&tx_cancel, TabBarAction::CancelClose)),
+                    )
+                    .child(
+                        kumu_button("关闭页签", ButtonVariant::Default).on_press(move || {
+                            send(
+                                &tx_confirm,
+                                TabBarAction::ConfirmClose { project_id, tab_id },
+                            );
+                        }),
+                    )
+                    .into_element()
+            }
+            TabBarSnapshot::Tabs {
+                project_id,
+                selected_tab_id,
+                tabs,
+            } => {
+                let mut strip = view().flex_row().gap_1().items_center();
+                for tab in tabs {
+                    let tab_id = tab.id;
+                    let active = tab.active;
+                    let tx_sel = tx_root.clone();
+                    let tx_close = tx_root.clone();
+
+                    let mut tab_el = view()
+                        .role(AccessibilityRole::Button)
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1()
+                        .h(px(26.0))
+                        .px_2()
+                        .rounded(move || active_theme().radius)
+                        .app_class("cursor-pointer")
+                        .on_press(move || {
+                            send(&tx_sel, TabBarAction::Select { project_id, tab_id });
+                        })
+                        .child(
+                            icon_svg("icons/layout-dashboard.svg", 14.0)
+                                .text_color(move || active_theme().muted_foreground),
+                        )
+                        .child(
+                            text(tab.name)
+                                .max_w(px(160.0))
+                                .min_w_0()
+                                .app_class("truncate")
+                                .text_size(text_xs_size)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || {
+                                    if active {
+                                        active_theme().foreground
+                                    } else {
+                                        active_theme().muted_foreground
+                                    }
+                                }),
+                        );
+
+                    if active {
+                        tab_el = tab_el
+                            .bg(move || active_theme().background)
+                            .border_1()
+                            .border_color(move || active_theme().border);
+                    } else {
+                        tab_el = tab_el.hover(|s| s.bg(move || active_theme().accent.opacity(0.5)));
+                    }
+
+                    if let Some(att) = tab.attention {
+                        tab_el = tab_el.child(match att {
+                            TabAttention::Waiting(count) => view()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .flex_shrink_0()
+                                .rounded(px(3.5))
+                                .bg(warning_color)
+                                .tooltip(kumu_tooltip(format!("{count} 个等待输入")))
+                                .into_element(),
+                            TabAttention::Failed(count) => view()
+                                .flex_shrink_0()
+                                .tooltip(kumu_tooltip(format!("{count} 个执行失败")))
+                                .child(
+                                    icon_svg("icons/triangle-alert.svg", 12.0)
+                                        .text_color(move || active_theme().destructive),
+                                )
+                                .into_element(),
+                        });
+                    }
+
+                    tab_el = tab_el.child(
+                        view()
+                            .role(AccessibilityRole::Button)
+                            .label("关闭页签")
+                            .tooltip(kumu_tooltip("关闭页签 ⌘W"))
+                            .flex_shrink_0()
+                            .rounded(move || active_theme().radius)
+                            .p_0p5()
+                            .app_class("cursor-pointer")
+                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
+                            .on_press(move || {
+                                send(&tx_close, TabBarAction::RequestClose { project_id, tab_id });
+                            })
+                            .child(
+                                icon_svg("icons/x.svg", 12.0)
+                                    .opacity(if active { 1.0 } else { 0.55 })
+                                    .text_color(move || active_theme().muted_foreground),
+                            ),
+                    );
+
+                    strip = strip.child(tab_el);
+                }
+
+                let tx_add = tx_root.clone();
+                let tx_menu = tx_root.clone();
+
+                view()
+                    .flex_row()
+                    .w_full()
+                    .h_full()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .bg(move || active_theme().secondary.opacity(0.45))
+                    .border_b_1()
+                    .border_b_color(move || active_theme().border)
+                    .font_family(move || {
+                        active_theme()
+                            .font_sans
+                            .clone()
+                            .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
+                    })
+                    .child(scroll().horizontal().flex_1().min_w_0().child(strip))
+                    .child(
+                        view()
+                            .role(AccessibilityRole::Button)
+                            .label("新建页签")
+                            .tooltip(kumu_tooltip("新建页签 ⌘T"))
+                            .flex_shrink_0()
+                            .rounded(move || active_theme().radius)
+                            .p_0p5()
+                            .app_class("cursor-pointer")
+                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
+                            .on_press(move || send(&tx_add, TabBarAction::Add))
+                            .child(
+                                icon_svg("icons/plus.svg", 14.0)
+                                    .text_color(move || active_theme().muted_foreground),
+                            ),
+                    )
+                    .child(
+                        view()
+                            .role(AccessibilityRole::Button)
+                            .label("页签操作")
+                            .tooltip(kumu_tooltip("页签操作"))
+                            .flex_shrink_0()
+                            .rounded(move || active_theme().radius)
+                            .p_0p5()
+                            .app_class("cursor-pointer")
+                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
+                            .on_press(move || {
+                                let Some(tab_id) = selected_tab_id else {
+                                    return;
+                                };
+                                let tx_r = tx_menu.clone();
+                                let tx_c = tx_menu.clone();
+                                drop(popup_menu(vec![
+                                    MenuItem::new("重命名页签").on_select(move || {
+                                        send(
+                                            &tx_r,
+                                            TabBarAction::PromptRename { project_id, tab_id },
+                                        );
+                                    }),
+                                    MenuItem::new("关闭页签").on_select(move || {
+                                        send(
+                                            &tx_c,
+                                            TabBarAction::RequestClose { project_id, tab_id },
+                                        );
+                                    }),
+                                ]));
+                            })
+                            .child(
+                                icon_svg("icons/ellipsis.svg", 14.0)
+                                    .text_color(move || active_theme().muted_foreground),
+                            ),
+                    )
+                    .into_element()
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+    use nsh_core::prelude::*;
+    use nsh_engine::EngineConfig;
+
+    use super::*;
+    use crate::nsh_ui::mount::MountRegistry;
+
+    struct TabBarMount {
+        initial: TabBarSnapshot,
+        events_rx: UnboundedReceiver<TabBarSnapshot>,
+        actions_tx: UnboundedSender<TabBarAction>,
+    }
+
+    static MOUNTS: MountRegistry<TabBarMount> = MountRegistry::new();
+
+    #[derive(Clone, Debug, PartialEq, Props)]
+    struct TabBarRootProps {
+        mount_id: Prop<u64>,
+    }
+
+    #[component]
+    fn TabBarRoot(props: TabBarRootProps) -> impl IntoElement {
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
+        let (initial, events_rx, actions_tx) = match mount {
+            Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
+            None => (TabBarSnapshot::Hidden, None, None),
+        };
+        let state = signal(initial);
+        if let Some(mut rx) = events_rx {
+            spawn(async move {
+                while let Some(next) = rx.next().await {
+                    state.set(next);
+                }
+            });
+        }
+        view::render_tab_bar(state, actions_tx)
+    }
+
+    #[test]
+    fn tab_bar_nsh_selects_tabs_and_confirms_multi_pane_close() {
+        let (events_tx, events_rx) = unbounded::<TabBarSnapshot>();
+        let (actions_tx, mut actions_rx) = unbounded::<TabBarAction>();
+        let initial = TabBarSnapshot::Tabs {
+            project_id: 1,
+            selected_tab_id: Some(TabId(1)),
+            tabs: vec![
+                TabItemSnapshot {
+                    id: TabId(1),
+                    name: "工作区 1".into(),
+                    active: true,
+                    attention: None,
+                },
+                TabItemSnapshot {
+                    id: TabId(2),
+                    name: "工作区 2".into(),
+                    active: false,
+                    attention: Some(TabAttention::Waiting(1)),
+                },
+            ],
+        };
+        let mount_id = MOUNTS.register(TabBarMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+        let root = nsh_core::element::Root::new::<TabBarRoot>(move || TabBarRootProps {
+            mount_id: mount_id.into(),
+        });
+        let mut app =
+            nsh_testing::Headless::start(EngineConfig::new(root)).expect("start tabs NSH");
+        app.wait_for("工作区 2").expect("tab 2 renders");
+        app.press("工作区 2").expect("click tab 2");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(TabBarAction::Select {
+                project_id: 1,
+                tab_id: TabId(2),
+            })
+        );
+
+        events_tx
+            .unbounded_send(TabBarSnapshot::ConfirmClose {
+                project_id: 1,
+                tab_id: TabId(2),
+                name: "工作区 2".into(),
+                pane_count: 3,
+            })
+            .expect("push confirm banner");
+        app.wait_for("关闭「工作区 2」会结束 3 个终端。")
+            .expect("confirm banner renders");
+        app.press("关闭页签").expect("confirm close");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(TabBarAction::ConfirmClose {
+                project_id: 1,
+                tab_id: TabId(2),
+            })
+        );
+    }
+}

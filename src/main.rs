@@ -1,19 +1,24 @@
 //! kumu — local multi-agent desktop shell.
 //!
-//! Follows GPUI Kit's design guides:
-//!   - layout uses rem helpers (w_64/p_4/gap_3/text_sm…), px only for physical
-//!     boundaries (hairlines via h_px/w_px, window chrome);
-//!   - colors/surfaces read from cx.theme() by semantic role (sidebar uses
-//!     sidebar_* tokens; no raw hex/hsla in app code);
-//!   - density/spacing/typography stay on the semantic scale;
-//!   - primary reserved for the decision commit, internal nav = ghost/default.
+//! Architecture & design rules:
+//!   - all business UI (sidebar, tabs, splitable workspace shell, pane headers,
+//!     find bar, dialogs, settings, toast stack, tooltips, plugin panels & diff
+//!     sheet) is built with Pure Rust NSH (`nsh-core` + `nsh-base`) hosted on
+//!     `nsh-platform-gpui`;
+//!   - bare `gpui` (`gpui-fast`) is reserved exclusively for the macOS window &
+//!     transparent titlebar shell, native `SystemNotification`, and the
+//!     GPU-accelerated Ghostty VT `TerminalView` mounted as an NSH `NativeView`;
+//!   - colors/surfaces come from `KumuTheme` (`themes/*.json`) by semantic role
+//!     with zero `gpui-kit` dependency;
+//!   - typography stays on the two-step scale (`text_sm` 14px / `text_xs` 12px);
+//!   - primary is reserved for the decision commit, internal nav = ghost/default.
 //!
 //! Module layout:
-//!   - `ui/`      GPUI views: `home` (Home window), `settings` (Settings
-//!     window), `widgets` (theme-token helpers shared across windows);
-//!   - `theme.rs` themes/*.json loading into the ThemeRegistry;
-//!   - `app/`     projects and live terminals;
-//!   - `plugins/` right-hand plugin panels opened from the title bar;
+//!   - `nsh_ui/`  Pure Rust NSH foundation (theme, components, assets, dialogs, settings, toast);
+//!   - `ui/`      GPUI window shell, macOS titlebar, GPU Ghostty VT `TerminalView`, and unified `NshHomeShell`;
+//!   - `theme.rs` standalone `themes/*.json` loader driving both NSH and Ghostty `TermColors`;
+//!   - `app/`     framework-agnostic `WorkspaceCore` + `layout` tree and thin GPUI adapter;
+//!   - `plugins/` Pure Rust NSH right-hand plugin panels (TODO board, Git Log & Diff Review sheet);
 //!   - `git.rs`   worktree creation and commit history;
 //!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
 //!   - `term/`    PTY + VT for shells and the agent TUIs they launch;
@@ -28,6 +33,7 @@ mod db;
 mod dock_icon;
 mod fonts;
 mod git;
+mod nsh_ui;
 mod plugins;
 mod term;
 mod theme;
@@ -35,8 +41,7 @@ mod ui;
 mod updates;
 mod window_state;
 
-use gpui_kit::component::*;
-use gpui_kit::*;
+use gpui::*;
 use ui::KumuApp;
 
 fn main() {
@@ -50,14 +55,13 @@ fn main() {
     // pane runs its binary directly and would otherwise miss what `~/.zshrc`
     // exports (PATH, API keys) when Kumu was opened from Finder.
     term::shell_env::prewarm();
-    let app = gpui_kit::application().with_assets(assets::KumuAssetSource);
+    let app = gpui_platform::application().with_assets(assets::KumuAssetSource);
 
     // Closing the last window on macOS leaves the app running. A Dock click
     // must create a window again instead of only activating the empty app.
     app.on_reopen(open_main_window);
 
     app.run(move |cx| {
-        gpui_kit::init(cx);
         ui::init(cx);
         cx.set_app_identity("com.yankewei.kumu", "Kumu");
         fonts::install(cx);
@@ -82,21 +86,21 @@ fn open_main_window(cx: &mut App) {
         return;
     }
 
-    let mut window_options = TitleBar::window_options();
+    let mut window_options = ui::titlebar::window_options();
     window_options.window_bounds = Some(
         window_state::load(cx)
-            .unwrap_or_else(|| WindowBounds::centered(size(px(1360.), px(900.)), cx)),
+            .unwrap_or_else(|| WindowBounds::centered(None, size(px(1360.), px(900.)), cx)),
     );
     window_options.window_min_size = Some(size(
         px(window_state::MIN_WIDTH),
         px(window_state::MIN_HEIGHT),
     ));
 
-    match gpui_kit::open_window(window_options, cx, |window, cx| {
+    match cx.open_window(window_options, |window, cx| {
         cx.new(|cx| KumuApp::new(window, cx))
     }) {
-        Ok((handle, _)) => {
-            cx.set_global(MainWindow(Some(handle)));
+        Ok(handle) => {
+            cx.set_global(MainWindow(Some(handle.into())));
             eprintln!("[ui] window opened");
         }
         Err(e) => eprintln!("[ui] window open FAILED: {e:?}"),

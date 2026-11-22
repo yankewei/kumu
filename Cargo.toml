@@ -7,20 +7,25 @@ edition = "2024"
 anyhow = "1"
 futures = "0.3"
 ghostty-sys = { path = "crates/ghostty-sys" }
-gpui-kit = "0.9.1"
-# gpui-kit and its updater must share this compatible GPUI backend.
-gpui = { package = "gpui-pre", version = "=0.3.12" }
-gpui-updater = { package = "gpui-updater-pre", version = "0.4.4" }
+# Shared GPUI backend for nsh-platform-gpui and Kumu's Ghostty VT TerminalView.
+gpui = { package = "gpui-fast", version = "0.1.17", default-features = false, features = ["font-kit"] }
+gpui-platform = { package = "gpui-fast-platform", version = "0.1.17" }
+gpui-updater-core = "0.4.4"
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", features = ["svg"] }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false, features = ["editor", "highlight"] }
+nsh-platform-gpui = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false, features = ["editor", "highlight", "svg", "runtime-shaders"] }
 portable-pty = "=0.9.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151" }
 sha2 = "0.10"
 jsonc-parser = { version = "0.34.0", features = ["cst", "serde_json"] }
 
 [dev-dependencies]
-gpui-kit = { version = "0.9.1", features = ["test-support"] }
+gpui = { package = "gpui-fast", version = "0.1.17", default-features = false, features = ["font-kit", "test-support"] }
+nsh-engine = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false }
+nsh-testing = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false }
 
 # `cargo run` launches a bare binary, not a `.app` bundle, so macOS shows the
 # generic executable icon in the Dock. src/dock_icon.rs sets kumu's own icon on

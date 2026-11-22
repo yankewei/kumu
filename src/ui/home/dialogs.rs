@@ -1,22 +1,40 @@
 use std::path::PathBuf;
 
-use gpui_kit::component::button::ButtonVariant;
-use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::{AnyView, App, AppContext, Context, PathPromptOptions, Window, WindowBounds, px, size};
 
 use super::KumuApp;
-use super::panes::PaneId;
+use crate::app::layout::PaneId;
 use crate::git::WorktreeEntry;
+use crate::nsh_ui::dialogs::{ActiveDialog, DialogOutcome, DialogSpec, WorktreeChoice};
+use crate::theme::KumuTheme;
 use crate::ui::SettingsWindow;
 
 impl KumuApp {
+    /// Open a full-window Pure Rust NSH modal dialog and clear it automatically
+    /// when dismissed or submitted.
+    pub(super) fn open_nsh_dialog(
+        &mut self,
+        spec: DialogSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_outcome: impl FnOnce(&mut Self, DialogOutcome, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let theme = KumuTheme::global(cx).clone();
+        self.active_dialog = Some(ActiveDialog::open(
+            spec,
+            &theme,
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                app.active_dialog = None;
+                on_outcome(app, outcome, window, cx);
+            },
+        ));
+        cx.notify();
+    }
+
     /// Add a project from a native folder picker; the picked folder's own
-    /// name becomes the project name, matching how Zed/waku open a project
-    /// (no separate naming step). Picking a folder that's already a project
-    /// selects it instead of inserting a duplicate row.
+    /// name becomes the project name.
     pub(super) fn add_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -50,7 +68,7 @@ impl KumuApp {
 
     /// Ask for a branch name and create a worktree next to the repository.
     pub(super) fn prompt_create_worktree(
-        &self,
+        &mut self,
         project_id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -58,49 +76,32 @@ impl KumuApp {
         let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("分支名，例如 feat/login"));
-        let weak = cx.weak_entity();
-        let dialog_input = input.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            dialog
-                .title("新建 worktree")
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "将在「{}」的同级目录创建 worktree，并检出同名分支。",
-                            project.path
-                        )),
-                )
-                .child(Input::new(&dialog_input).small())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("创建")
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok({
-                    let weak = weak.clone();
-                    let input = dialog_input.clone();
-                    move |_, _, cx| {
-                        let value = input.read(cx).value().to_string();
-                        let branch = value.trim().to_string();
-                        if branch.is_empty() {
-                            return false;
-                        }
-                        let _ = weak.update(cx, move |app, cx| {
-                            app.create_worktree(project_id, branch, cx)
-                        });
-                        true
-                    }
-                })
-                .centered()
-        });
-        input.update(cx, |state, cx| {
-            state.focus(window, cx);
-            cx.notify();
-        });
+        self.open_nsh_dialog(
+            DialogSpec::TextInput {
+                title: "新建 worktree".into(),
+                description: Some(format!(
+                    "将在「{}」的同级目录创建 worktree，并检出同名分支。",
+                    project.path
+                )),
+                placeholder: "分支名，例如 feat/login".into(),
+                initial_value: String::new(),
+                ok_label: "创建".into(),
+                cancel_label: "取消".into(),
+                require_non_empty: true,
+                select_all: false,
+            },
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                if let DialogOutcome::SubmittedText(branch) = outcome
+                    && !branch.is_empty()
+                {
+                    app.create_worktree(project_id, branch, cx);
+                }
+                app.focus_terminal(window, cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Create the worktree off the UI thread, then add it as a project under
@@ -145,8 +146,7 @@ impl KumuApp {
     }
 
     /// List the repository's existing worktrees and let the user attach one
-    /// to this project. Listing runs off the UI thread because worktree
-    /// metadata can live on a slow volume.
+    /// to this project.
     pub(super) fn prompt_open_worktree(
         &self,
         project_id: i64,
@@ -180,8 +180,7 @@ impl KumuApp {
         .detach();
     }
 
-    /// Offer the worktrees git already knows about. A worktree Kumu shows
-    /// already is labelled and selected instead of being added twice.
+    /// Offer the worktrees git already knows about.
     pub(super) fn show_worktree_picker(
         &mut self,
         project_id: i64,
@@ -192,128 +191,65 @@ impl KumuApp {
         let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
             return;
         };
-        let items: Vec<(String, PathBuf, Option<i64>)> = entries
+        let items: Vec<WorktreeChoice> = entries
             .into_iter()
             .filter(|entry| !entry.main)
             .map(|entry| {
-                let open = self.workspace.read(cx).project_by_path(&entry.path);
-                (entry.name, entry.path, open)
+                let open_project_id = self.workspace.read(cx).project_by_path(&entry.path);
+                WorktreeChoice {
+                    name: entry.name,
+                    path: entry.path,
+                    open_project_id,
+                }
             })
             .collect();
         if items.is_empty() {
-            window.open_dialog(cx, move |dialog, _, cx| {
-                dialog
-                    .title("打开已有 worktree")
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "「{}」没有其他 worktree。可在项目右键菜单中新建一个。",
-                                project.name
-                            )),
-                    )
-                    .button_props(
-                        DialogButtonProps::default()
-                            .ok_text("关闭")
-                            .show_cancel(false),
-                    )
-                    .centered()
-            });
+            self.open_nsh_dialog(
+                DialogSpec::Message {
+                    title: "打开已有 worktree".into(),
+                    description: format!(
+                        "「{}」没有其他 worktree。可在项目右键菜单中新建一个。",
+                        project.name
+                    ),
+                    ok_label: "关闭".into(),
+                },
+                window,
+                cx,
+                |app, _, window, cx| {
+                    app.focus_terminal(window, cx);
+                    cx.notify();
+                },
+            );
             return;
         }
 
-        let weak = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let theme = cx.theme();
-            let (muted, hover, radius) = (theme.muted_foreground, theme.accent, theme.radius);
-            let rows = items.iter().enumerate().map(|(index, (name, path, open))| {
-                let shown = path.to_string_lossy().into_owned();
-                let row_name = name.clone();
-                let row_path = path.clone();
-                let open = *open;
-                let weak = weak.clone();
-                v_flex()
-                    .id(("open-worktree", index))
-                    .w_full()
-                    .px_2()
-                    .py_1p5()
-                    .gap_0p5()
-                    .rounded(radius)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover.opacity(0.5)))
-                    .on_click(move |_, window, cx| {
-                        let _ = weak.update(cx, |app, cx| match open {
-                            Some(id) => {
-                                app.ensure_project_layout(id, cx);
-                                app.select_project(id, cx);
-                            }
-                            None => app.attach_worktree(
-                                project_id,
-                                row_name.clone(),
-                                row_path.clone(),
-                                cx,
-                            ),
-                        });
-                        window.close_dialog(cx);
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_medium()
-                                    .child(name.clone()),
-                            )
-                            .when_some(open, |row, _| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("已打开"),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(shown),
-                    )
-            });
-            dialog
-                .title("打开已有 worktree")
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "选择要加入「{}」的 worktree，它会作为子项目出现在侧栏。",
-                            project.name
-                        )),
-                )
-                .child(
-                    div()
-                        .id("open-worktree-list")
-                        .w_full()
-                        .max_h(px(320.))
-                        .overflow_y_scroll()
-                        .child(v_flex().w_full().children(rows)),
-                )
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("关闭")
-                        .show_cancel(false),
-                )
-                .centered()
-        });
+        self.open_nsh_dialog(
+            DialogSpec::WorktreePicker {
+                title: "打开已有 worktree".into(),
+                description: format!(
+                    "选择要加入「{}」的 worktree，它会作为子项目出现在侧栏。",
+                    project.name
+                ),
+                items,
+            },
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                if let DialogOutcome::PickedWorktree(choice) = outcome {
+                    match choice.open_project_id {
+                        Some(id) => {
+                            app.ensure_project_layout(id, cx);
+                            app.select_project(id, cx);
+                        }
+                        None => {
+                            app.attach_worktree(project_id, choice.name, choice.path, cx);
+                        }
+                    }
+                }
+                app.focus_terminal(window, cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Attach an existing worktree below its repository and show it.
@@ -335,9 +271,9 @@ impl KumuApp {
         self.select_project(id, cx);
     }
 
-    /// Rename a project: the dialog starts on the current name.
+    /// Rename a project via Pure Rust NSH modal dialog.
     pub(super) fn prompt_rename_project(
-        &self,
+        &mut self,
         project_id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -350,45 +286,36 @@ impl KumuApp {
             .find(|project| project.id == project_id)
             .map(|project| project.name.clone())
             .unwrap_or_default();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
-        let weak = cx.weak_entity();
-        let dialog_input = input.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("重命名项目")
-                .child(Input::new(&dialog_input).small())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("保存")
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok({
-                    let weak = weak.clone();
-                    let input = dialog_input.clone();
-                    move |_, _, cx| {
-                        let name = input.read(cx).value().trim().to_string();
-                        if !name.is_empty() {
-                            let _ = weak.update(cx, move |app, cx| {
-                                app.workspace.update(cx, |workspace, cx| {
-                                    workspace.rename_project(project_id, name, cx)
-                                })
-                            });
-                        }
-                        true
-                    }
-                })
-                .centered()
-        });
-        input.update(cx, |state, cx| {
-            state.focus(window, cx);
-            state.select_all(window, cx);
-        });
+        self.open_nsh_dialog(
+            DialogSpec::TextInput {
+                title: "重命名项目".into(),
+                description: None,
+                placeholder: "项目名称".into(),
+                initial_value: name,
+                ok_label: "保存".into(),
+                cancel_label: "取消".into(),
+                require_non_empty: true,
+                select_all: true,
+            },
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                if let DialogOutcome::SubmittedText(next_name) = outcome
+                    && !next_name.is_empty()
+                {
+                    app.workspace.update(cx, |workspace, cx| {
+                        workspace.rename_project(project_id, next_name, cx)
+                    });
+                }
+                app.focus_terminal(window, cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Ask before deleting a project and closing its terminals.
     pub(super) fn confirm_delete_project(
-        &self,
+        &mut self,
         project_id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -397,9 +324,7 @@ impl KumuApp {
             return;
         };
         let name = project.name;
-        // A worktree row is only a view of a directory; removing it must not
-        // pretend the checkout on disk goes away.
-        let (title, description, ok_text) = if project.parent_id.is_some() {
+        let (title, description, ok_label) = if project.parent_id.is_some() {
             (
                 "移除 worktree",
                 format!("「{name}」将从侧边栏移除，磁盘上的 worktree 不会被删除。"),
@@ -412,26 +337,24 @@ impl KumuApp {
                 "删除",
             )
         };
-        // The dialog outlives this call, so it reaches the view weakly.
-        let weak = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let weak = weak.clone();
-            alert
-                .title(title)
-                .description(description.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(ok_text)
-                        .ok_variant(ButtonVariant::Danger)
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = weak.update(cx, move |app, cx| app.delete_project(project_id, cx));
-                    true
-                })
-                .centered()
-        });
+        self.open_nsh_dialog(
+            DialogSpec::Confirm {
+                title: title.into(),
+                description,
+                ok_label: ok_label.into(),
+                cancel_label: "取消".into(),
+                destructive: true,
+            },
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                if outcome == DialogOutcome::Confirmed {
+                    app.delete_project(project_id, cx);
+                }
+                app.focus_terminal(window, cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Delete a project and its worktrees, then show another project when
@@ -443,8 +366,6 @@ impl KumuApp {
             .update(cx, |workspace, cx| workspace.delete_project(project_id, cx))
             .is_err()
         {
-            // The failure is already on its way to the banner; leave the
-            // project and its panes exactly where they are.
             return;
         }
         let selected_removed = self.selected.is_some_and(|id| removed.contains(&id));
@@ -481,14 +402,10 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// Focus the settings window if it's open, else open a new one (resizable,
-    /// opens at its minimum size).
+    /// Focus the settings window if it's open, else open a new one.
     pub(super) fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
         let activate = |view: AnyView, window: &mut Window, cx: &mut App| {
-            if show_updates
-                && let Ok(root) = view.downcast::<Root>()
-                && let Ok(settings) = root.read(cx).view().clone().downcast::<SettingsWindow>()
-            {
+            if show_updates && let Ok(settings) = view.downcast::<SettingsWindow>() {
                 settings.update(cx, |settings, cx| settings.show_updates(window, cx));
             }
             window.activate_window();
@@ -498,13 +415,14 @@ impl KumuApp {
         {
             return;
         }
-        let mut options = TitleBar::window_options();
-        options.window_bounds = Some(WindowBounds::centered(size(px(680.), px(640.)), cx));
+        let mut options = crate::ui::titlebar::window_options();
+        options.window_bounds = Some(WindowBounds::centered(None, size(px(680.), px(640.)), cx));
         options.window_min_size = Some(size(px(680.), px(640.)));
         let updater = self.updater.clone();
-        if let Ok((handle, _)) = gpui_kit::open_window(options, cx, |window, cx| {
+        if let Ok(handle) = cx.open_window(options, |window, cx| {
             cx.new(|cx| SettingsWindow::new(updater, window, cx))
         }) {
+            let handle: gpui::AnyWindowHandle = handle.into();
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
         }

@@ -8,7 +8,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui_kit::Axis;
+/// Direction along which a pane group divides its space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
 
 use crate::agent::launch::PaneLaunch;
 
@@ -519,9 +524,9 @@ impl SavedNode {
                         Some(PaneNode::Group {
                             id,
                             axis: if *horizontal {
-                                Axis::Horizontal
+                                SplitAxis::Horizontal
                             } else {
-                                Axis::Vertical
+                                SplitAxis::Vertical
                             },
                             children: restored,
                         })
@@ -539,7 +544,7 @@ pub enum PaneNode {
     Group {
         /// Keyed id for the resizable group, stable across re-renders.
         id: u64,
-        axis: Axis,
+        axis: SplitAxis,
         children: Vec<PaneNode>,
     },
 }
@@ -651,13 +656,13 @@ impl PaneNode {
                 for (i, child) in children.iter().enumerate() {
                     let offset = i as f32 / count;
                     let child_region = match axis {
-                        Axis::Horizontal => Region {
+                        SplitAxis::Horizontal => Region {
                             x: region.x + region.w * offset,
                             y: region.y,
                             w: region.w / count,
                             h: region.h,
                         },
-                        Axis::Vertical => Region {
+                        SplitAxis::Vertical => Region {
                             x: region.x,
                             y: region.y + region.h * offset,
                             w: region.w,
@@ -684,7 +689,7 @@ impl PaneNode {
 
     /// Put `new` beside `target` along `axis` (after it). Reuses a same-axis
     /// parent; otherwise wraps the target. `group_id` is used only when wrapping.
-    pub fn split(&mut self, target: PaneId, axis: Axis, new: PaneId, group_id: u64) -> bool {
+    pub fn split(&mut self, target: PaneId, axis: SplitAxis, new: PaneId, group_id: u64) -> bool {
         if let Some(parent_id) = self.parent_group_id(target)
             && let Some(Self::Group {
                 axis: group_axis,
@@ -729,7 +734,7 @@ impl PaneNode {
         match self {
             Self::Leaf(id) => SavedNode::Leaf { pane: id.0 },
             Self::Group { id, axis, children } => SavedNode::Group {
-                horizontal: *axis == Axis::Horizontal,
+                horizontal: *axis == SplitAxis::Horizontal,
                 sizes: ratios
                     .get(id)
                     .filter(|sizes| sizes.len() == children.len())
@@ -847,20 +852,20 @@ mod tests {
     #[test]
     fn splits_reuse_a_same_axis_parent_and_wrap_otherwise() {
         let mut n = leaf(1);
-        assert!(n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10));
+        assert!(n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10));
         assert!(matches!(
             &n,
             PaneNode::Group {
-                axis: Axis::Horizontal,
+                axis: SplitAxis::Horizontal,
                 children,
                 ..
             } if children.len() == 2
         ));
-        assert!(n.split(PaneId(2), Axis::Horizontal, PaneId(3), 99));
+        assert!(n.split(PaneId(2), SplitAxis::Horizontal, PaneId(3), 99));
         assert_eq!(n.panes(), vec![PaneId(1), PaneId(2), PaneId(3)]);
-        assert!(n.split(PaneId(3), Axis::Vertical, PaneId(4), 11));
+        assert!(n.split(PaneId(3), SplitAxis::Vertical, PaneId(4), 11));
         let PaneNode::Group {
-            axis: Axis::Horizontal,
+            axis: SplitAxis::Horizontal,
             children,
             ..
         } = &n
@@ -870,7 +875,7 @@ mod tests {
         assert!(matches!(
             &children[2],
             PaneNode::Group {
-                axis: Axis::Vertical,
+                axis: SplitAxis::Vertical,
                 ..
             }
         ));
@@ -880,9 +885,9 @@ mod tests {
     #[test]
     fn splitting_reuses_the_direct_same_axis_parent() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
-        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
-        assert!(n.split(PaneId(3), Axis::Vertical, PaneId(4), 12));
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), SplitAxis::Vertical, PaneId(3), 11);
+        assert!(n.split(PaneId(3), SplitAxis::Vertical, PaneId(4), 12));
         // H[1, V[2, 3, 4]]: the second vertical split joins V, it does not
         // wrap pane 3 in another vertical group.
         let PaneNode::Group { children, .. } = &n else {
@@ -890,7 +895,7 @@ mod tests {
         };
         assert_eq!(children.len(), 2);
         let PaneNode::Group {
-            axis: Axis::Vertical,
+            axis: SplitAxis::Vertical,
             children: inner,
             ..
         } = &children[1]
@@ -904,8 +909,8 @@ mod tests {
     #[test]
     fn closing_collapses_single_child_groups() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
-        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), SplitAxis::Vertical, PaneId(3), 11);
         assert!(n.remove(PaneId(3)));
         assert_eq!(n.panes(), vec![PaneId(1), PaneId(2)]);
         assert!(n.remove(PaneId(2)));
@@ -916,8 +921,8 @@ mod tests {
     #[test]
     fn neighbor_prefers_the_previous_leaf() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
-        n.split(PaneId(2), Axis::Horizontal, PaneId(3), 10);
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), SplitAxis::Horizontal, PaneId(3), 10);
         assert_eq!(n.neighbor(PaneId(2)), Some(PaneId(1)));
         assert_eq!(n.neighbor(PaneId(1)), Some(PaneId(2)));
     }
@@ -927,8 +932,8 @@ mod tests {
     #[test]
     fn directional_focus_crosses_split_boundaries() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
-        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), SplitAxis::Vertical, PaneId(3), 11);
 
         assert_eq!(
             n.neighbor_in(PaneId(1), PaneDirection::Right),
@@ -951,9 +956,9 @@ mod tests {
     #[test]
     fn directional_focus_prefers_the_aligned_pane() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Vertical, PaneId(2), 10);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(3), 11);
-        n.split(PaneId(2), Axis::Horizontal, PaneId(4), 12);
+        n.split(PaneId(1), SplitAxis::Vertical, PaneId(2), 10);
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(3), 11);
+        n.split(PaneId(2), SplitAxis::Horizontal, PaneId(4), 12);
 
         assert_eq!(
             n.neighbor_in(PaneId(1), PaneDirection::Right),
@@ -1014,8 +1019,8 @@ mod tests {
     #[test]
     fn a_saved_layout_round_trips_its_structure() {
         let mut n = leaf(1);
-        n.split(PaneId(1), Axis::Horizontal, PaneId(2), 10);
-        n.split(PaneId(2), Axis::Vertical, PaneId(3), 11);
+        n.split(PaneId(1), SplitAxis::Horizontal, PaneId(2), 10);
+        n.split(PaneId(2), SplitAxis::Vertical, PaneId(3), 11);
 
         let ratios = HashMap::from([(10, vec![0.4, 0.6]), (11, vec![0.5, 0.5])]);
         let mut next_group = 1;
@@ -1032,7 +1037,7 @@ mod tests {
         );
         assert_eq!(group_sizes.get(&2), Some(&vec![0.4, 0.6]));
         let PaneNode::Group {
-            axis: Axis::Horizontal,
+            axis: SplitAxis::Horizontal,
             children,
             ..
         } = &restored
@@ -1042,7 +1047,7 @@ mod tests {
         assert!(matches!(
             &children[1],
             PaneNode::Group {
-                axis: Axis::Vertical,
+                axis: SplitAxis::Vertical,
                 ..
             }
         ));
@@ -1133,7 +1138,7 @@ mod tests {
                                 "agents",
                                 {
                                     let mut n = leaf(2);
-                                    n.split(PaneId(2), Axis::Horizontal, PaneId(3), 10);
+                                    n.split(PaneId(2), SplitAxis::Horizontal, PaneId(3), 10);
                                     n
                                 },
                                 3,

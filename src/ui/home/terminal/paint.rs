@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
-use gpui_kit::*;
+use gpui::*;
 
 use super::{CursorAt, PAD_X, PAD_Y, PaintCache};
 use crate::term::link;

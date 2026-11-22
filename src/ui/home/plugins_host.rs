@@ -1,19 +1,17 @@
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::*;
 
-use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs};
 use super::{AgentEntry, KumuApp, agent_display_name, shell_prompt, submits_after_paste};
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
+use crate::app::layout::{PaneId, PaneNode, ProjectTab, ProjectTabs, SplitAxis};
 use crate::db::TodoStatus;
 use crate::plugins::{
     AgentPaneInfo, DispatchMode, PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome,
 };
 use crate::term::KeyInput;
+use crate::theme::KumuTheme;
 
 /// The plugin panel's opening width and the range its divider allows.
 pub(super) const PLUGIN_WIDTH: f32 = 300.;
@@ -43,6 +41,8 @@ impl KumuApp {
         let dispatcher = home.clone();
         let any_sender = home.clone();
         let revealer = home.clone();
+        let sheet_opener = home.clone();
+        let sheet_closer = home.clone();
         PluginHost::with_panes(
             move |project, pane, text, cx| {
                 let Some(home) = home.upgrade() else {
@@ -82,6 +82,25 @@ impl KumuApp {
             move |pane, window, cx| {
                 if let Some(home) = revealer.upgrade() {
                     home.update(cx, |app, cx| app.reveal_agent(PaneId(pane), window, cx));
+                }
+            },
+        )
+        .with_sheet_tools(
+            move |view, _window, cx| {
+                if let Some(home) = sheet_opener.upgrade() {
+                    home.update(cx, |app, cx| {
+                        app.active_sheet = Some(view);
+                        cx.notify();
+                    });
+                }
+            },
+            move |window, cx| {
+                if let Some(home) = sheet_closer.upgrade() {
+                    home.update(cx, |app, cx| {
+                        app.active_sheet = None;
+                        app.focus_terminal(window, cx);
+                        cx.notify();
+                    });
                 }
             },
         )
@@ -180,7 +199,7 @@ impl KumuApp {
                     .map(|tab| tab.focused)
                     .unwrap_or(self.focused);
                 let before = self.focused;
-                self.split_pane_with(anchor, Axis::Horizontal, launch, cx);
+                self.split_pane_with(anchor, SplitAxis::Horizontal, launch, cx);
                 if self.focused == before {
                     return Err("无法在当前页签分屏启动 Agent".to_string());
                 }
@@ -312,7 +331,7 @@ impl KumuApp {
     fn todo_attention_color(&self, cx: &Context<Self>) -> Option<Hsla> {
         let project = self.selected?;
         let todos = self.workspace.read(cx).todos_for_project(project);
-        let theme = cx.theme();
+        let colors = &KumuTheme::global(cx).colors;
         let mut has_review = false;
         for todo in todos {
             if todo.status != TodoStatus::InProgress {
@@ -325,13 +344,13 @@ impl KumuApp {
                     .and_then(|entry| entry.state)
                     == Some(AgentState::Waiting)
             {
-                return Some(theme.warning);
+                return Some(colors.warning);
             }
             if todo.awaiting_review {
                 has_review = true;
             }
         }
-        has_review.then_some(theme.success)
+        has_review.then_some(colors.success)
     }
 
     /// The panes a plugin may hand text to, in layout order. The header's label
@@ -447,6 +466,7 @@ impl KumuApp {
         if self.open_plugin == Some(spec.id) {
             self.open_plugin = None;
             self.plugin_views.clear();
+            self.native_registry.clear_plugins();
         } else {
             self.open_plugin = Some(spec.id);
             self.plugin_views
@@ -455,6 +475,7 @@ impl KumuApp {
                 let project = self.plugin_project(cx);
                 let host = self.plugin_host(cx);
                 let view = spec.create(project, host, window, cx);
+                self.native_registry.set_plugin(spec.id, view.clone());
                 self.plugin_views.insert(spec.id, view);
             }
         }
@@ -493,41 +514,61 @@ impl KumuApp {
     /// One title-bar entry per registered plugin; the open panel's entry stays
     /// highlighted.
     pub(super) fn render_plugin_button(&self, spec: PluginSpec, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
+        let theme = KumuTheme::global(cx);
+        let colors = &theme.colors;
         let active = self.open_plugin == Some(spec.id);
+        let hovered = self.hovered_plugin_tooltip == Some(spec.id);
         let background = if active {
-            theme.accent
+            colors.accent
         } else {
-            theme.transparent
+            colors.transparent
         };
+        let hover_bg = colors.accent.opacity(0.5);
         let foreground = if active {
-            theme.link
+            colors.link
         } else {
-            theme.muted_foreground
+            colors.muted_foreground
         };
         let attention = (spec.id == "todo")
             .then(|| self.todo_attention_color(cx))
             .flatten();
-        let button = Button::new(format!("plugin-toggle-{}", spec.id))
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .color(background)
-                    .foreground(foreground)
-                    .hover(theme.accent.opacity(0.5)),
-            )
-            .compact()
-            .icon(Icon::empty().path(spec.icon))
-            .tooltip(spec.title)
+        let icon = spec.icon;
+        let plugin_id = spec.id;
+        let plugin_title = spec.title;
+        let button = div()
+            .id(SharedString::from(format!("plugin-toggle-{}", spec.id)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.))
+            .h(px(24.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .bg(background)
+            .hover(move |style| style.bg(hover_bg))
+            .on_hover(cx.listener(move |this, is_hovered: &bool, _, cx| {
+                let next = if *is_hovered {
+                    Some(plugin_id)
+                } else if this.hovered_plugin_tooltip == Some(plugin_id) {
+                    None
+                } else {
+                    this.hovered_plugin_tooltip
+                };
+                if this.hovered_plugin_tooltip != next {
+                    this.hovered_plugin_tooltip = next;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.hovered_plugin_tooltip = None;
                 this.toggle_plugin(spec.clone(), window, cx);
-            }));
-        let Some(dot_color) = attention else {
-            return button.into_any_element();
-        };
-        div()
-            .relative()
-            .child(button)
-            .child(
+            }))
+            .child(svg().path(icon).size(px(14.)).text_color(foreground));
+
+        let mut wrapper = div().relative().child(button);
+        if let Some(dot_color) = attention {
+            wrapper = wrapper.child(
                 div()
                     .absolute()
                     .top(px(2.))
@@ -536,61 +577,30 @@ impl KumuApp {
                     .h(px(6.))
                     .rounded_full()
                     .bg(dot_color),
-            )
-            .into_any_element()
-    }
-
-    /// The open plugin panel: host chrome (title and close) above the plugin's
-    /// own content.
-    pub(super) fn render_plugin_panel(&self, cx: &Context<Self>) -> AnyElement {
-        let Some(id) = self.open_plugin else {
-            return div().into_any_element();
-        };
-        let Some(spec) = crate::plugins::spec(id) else {
-            return div().into_any_element();
-        };
-        let theme = cx.theme();
-        let (muted, border) = (theme.muted_foreground, theme.sidebar_border);
-        v_flex()
-            .size_full()
-            .bg(theme.sidebar)
-            .text_color(theme.sidebar_foreground)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(Icon::empty().path(spec.icon).small().text_color(muted))
-                    .child(div().text_xs().font_medium().child(spec.title))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new(format!("plugin-close-{}", spec.id))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(theme.transparent)
-                                    .foreground(muted)
-                                    .hover(theme.accent.opacity(0.5)),
-                            )
-                            .compact()
-                            .icon(IconName::Close)
-                            .tooltip("收起面板")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_plugin = None;
-                                this.plugin_views.clear();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(self.plugin_views.get(id).cloned().map(|view| {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(view.cached(StyleRefinement::default().size_full().min_h_0().min_w_0()))
-            }))
-            .into_any_element()
+            );
+        }
+        if hovered {
+            wrapper = wrapper.child(
+                deferred(
+                    div()
+                        .absolute()
+                        .top(px(28.))
+                        .right_0()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(theme.radius))
+                        .bg(colors.popover)
+                        .border_1()
+                        .border_color(colors.border)
+                        .shadow_md()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(colors.popover_foreground)
+                        .child(plugin_title),
+                )
+                .with_priority(1),
+            );
+        }
+        wrapper.into_any_element()
     }
 }

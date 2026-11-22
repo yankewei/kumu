@@ -2,7 +2,7 @@
 //! exactly, as Ghostty does. Font glyphs for these rarely span the whole
 //! cell, so tables get gaps between rows and block art gets seams.
 
-use gpui_kit::{Bounds, Hsla, PathBuilder, Pixels, Window, fill, point, px, size};
+use gpui::{Bounds, Hsla, PathBuilder, Pixels, Window, fill, point, px, size};
 
 /// Per direction (up, right, down, left): 0 none, 1 light, 2 heavy, 3 double.
 fn lines(c: char) -> Option<[u8; 4]> {

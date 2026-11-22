@@ -1,15 +1,10 @@
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
-use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::*;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
+use gpui::{Context, Window};
 
 use super::KumuApp;
-use super::panes::{PaneId, PaneNode, ProjectTab, ProjectTabs, TabId};
+use super::tabs_nsh::{TabAttention, TabBarAction, TabBarSnapshot, TabItemSnapshot};
 use crate::agent::AgentState;
-use crate::ui::tooltip::HoverLabel as _;
+use crate::app::layout::{PaneId, PaneNode, ProjectTab, ProjectTabs, TabId};
+use crate::nsh_ui::dialogs::{DialogOutcome, DialogSpec};
 
 impl KumuApp {
     /// The project and tab that own `pane`.
@@ -135,8 +130,6 @@ impl KumuApp {
         self.focused = pane;
         self.pending_focus = Some(pane);
         self.pending_close_tab = None;
-        // Installs the view; show_selected_tab attaches it and hides the
-        // tab that was on screen.
         self.show_selected_tab(project_id, cx);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
@@ -236,8 +229,6 @@ impl KumuApp {
     }
 
     pub(super) fn close_selected_tab(&mut self, cx: &mut Context<Self>) {
-        // While a close confirmation is on screen, ⌘W answers it instead of
-        // closing whichever tab happens to be selected.
         if let Some((project, tab_id)) = self.pending_close_tab {
             self.finish_close_tab_by_id(project, tab_id, cx);
             return;
@@ -256,9 +247,9 @@ impl KumuApp {
         self.request_close_tab(project, tab_id, cx);
     }
 
-    /// Rename a tab; the dialog starts on the name the strip shows.
+    /// Rename a tab via Pure Rust NSH modal dialog.
     pub(super) fn prompt_rename_tab(
-        &self,
+        &mut self,
         project: i64,
         tab_id: TabId,
         window: &mut Window,
@@ -274,45 +265,34 @@ impl KumuApp {
         else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        let weak = cx.weak_entity();
-        let dialog_input = input.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("重命名页签")
-                .child(Input::new(&dialog_input).small())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("保存")
-                        .cancel_text("取消")
-                        .show_cancel(true),
-                )
-                .on_ok({
-                    let weak = weak.clone();
-                    let input = dialog_input.clone();
-                    move |_, _, cx| {
-                        let name = input.read(cx).value().trim().to_string();
-                        if !name.is_empty() {
-                            let _ = weak.update(cx, move |app, cx| {
-                                if let Some(tabs) = app.tabs_by_project.get_mut(&project)
-                                    && let Some(tab) =
-                                        tabs.tabs.iter_mut().find(|tab| tab.id == tab_id)
-                                {
-                                    tab.name = name;
-                                }
-                                app.persist_workspace(cx);
-                                cx.notify();
-                            });
-                        }
-                        true
+        self.open_nsh_dialog(
+            DialogSpec::TextInput {
+                title: "重命名页签".into(),
+                description: None,
+                placeholder: "页签名称".into(),
+                initial_value: current,
+                ok_label: "保存".into(),
+                cancel_label: "取消".into(),
+                require_non_empty: true,
+                select_all: true,
+            },
+            window,
+            cx,
+            move |app, outcome, window, cx| {
+                if let DialogOutcome::SubmittedText(name) = outcome
+                    && !name.is_empty()
+                {
+                    if let Some(tabs) = app.tabs_by_project.get_mut(&project)
+                        && let Some(tab) = tabs.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                    {
+                        tab.name = name;
                     }
-                })
-                .centered()
-        });
-        input.update(cx, |state, cx| {
-            state.focus(window, cx);
-            state.select_all(window, cx);
-        });
+                    app.persist_workspace(cx);
+                }
+                app.focus_terminal(window, cx);
+                cx.notify();
+            },
+        );
     }
 
     /// Remove a tab and end every terminal in it.
@@ -350,6 +330,7 @@ impl KumuApp {
                 workspace.unbind_pane_todos(pane.0, cx);
             });
             self.panes.remove(&pane);
+            self.native_registry.unregister_pane(pane.0);
             self.launches.remove(&pane);
             self.agent_status.remove(&pane);
         }
@@ -370,241 +351,94 @@ impl KumuApp {
         cx.notify();
     }
 
-    /// The project-level tab strip above the panes. Each tab is one whole
-    /// layout; the `+` opens another, `…` renames or closes the visible one.
-    pub(super) fn render_tab_bar(&self, cx: &Context<Self>) -> AnyElement {
+    /// Build the current snapshot for the Pure Rust NSH tab strip.
+    pub(super) fn build_tab_bar_snapshot(&self) -> TabBarSnapshot {
         let Some(project) = self.selected else {
-            return div().into_any_element();
+            return TabBarSnapshot::Hidden;
         };
         let Some(tabs) = self.tabs_by_project.get(&project) else {
-            return div().into_any_element();
+            return TabBarSnapshot::Hidden;
         };
-        let theme = cx.theme();
-        let (muted, fg, hover) = (
-            theme.muted_foreground,
-            theme.foreground,
-            theme.accent.opacity(0.5),
-        );
+
         if let Some((pending_project, tab_id)) = self
             .pending_close_tab
             .filter(|(pending_project, _)| *pending_project == project)
             && let Some(index) = tabs.tabs.iter().position(|tab| tab.id == tab_id)
             && let Some(tab) = tabs.tabs.get(index)
         {
-            let name = Self::tab_name(tabs, index);
-            let count = tab.layout.panes().len();
-            return h_flex()
-                .id("project-tab-close-confirm")
-                .flex_none()
-                .h(px(36.))
-                .px_3()
-                .gap_2()
-                .items_center()
-                .bg(theme.warning.opacity(0.12))
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child(format!("关闭「{name}」会结束 {count} 个终端。")),
-                )
-                .child(
-                    Button::new("tab-close-cancel")
-                        .ghost()
-                        .label("取消")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.pending_close_tab = None;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("tab-close-confirm")
-                        .label("关闭页签")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.finish_close_tab_by_id(pending_project, tab_id, cx);
-                        })),
-                )
-                .into_any_element();
-        }
-
-        let mut strip = h_flex()
-            .id("project-tabs-strip")
-            .flex_1()
-            .min_w_0()
-            .gap_1()
-            .overflow_x_scroll();
-        for index in 0..tabs.tabs.len() {
-            let active = index == tabs.selected;
-            let name = Self::tab_name(tabs, index);
-            let tab = &tabs.tabs[index];
-            let tab_id = tab.id;
-            // Only waiting and failed need a glance from a hidden tab; the
-            // running/completed detail is in the pane header and sidebar.
-            let mut waiting = 0;
-            let mut failed = 0;
-            for pane in tab.layout.panes() {
-                match self.agent_status.get(&pane).and_then(|entry| entry.state) {
-                    Some(AgentState::Waiting) => waiting += 1,
-                    Some(AgentState::Failed) => failed += 1,
-                    _ => {}
-                }
-            }
-            let attention = if waiting > 0 {
-                Some((true, theme.warning, format!("{waiting} 个等待输入")))
-            } else if failed > 0 {
-                Some((false, theme.danger, format!("{failed} 个执行失败")))
-            } else {
-                None
+            return TabBarSnapshot::ConfirmClose {
+                project_id: pending_project,
+                tab_id,
+                name: Self::tab_name(tabs, index),
+                pane_count: tab.layout.panes().len(),
             };
-            strip = strip.child(
-                h_flex()
-                    .id(format!("project-tab-{project}-{}", tab_id.0))
-                    .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .h(px(26.))
-                    .px_2()
-                    .rounded(theme.radius)
-                    .cursor_pointer()
-                    .when(active, |this| {
-                        this.bg(theme.background)
-                            .border_1()
-                            .border_color(theme.border)
-                    })
-                    .when(!active, |this| this.hover(move |style| style.bg(hover)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(idx) = this.tab_index_by_id(project, tab_id) {
-                            this.select_tab(idx, cx);
-                        }
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        Icon::new(IconName::LayoutDashboard)
-                            .with_size(px(14.))
-                            .text_color(muted),
-                    )
-                    .child(
-                        div()
-                            .max_w(px(160.))
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(if active { fg } else { muted })
-                            .child(name),
-                    )
-                    .when_some(attention, |row, (is_waiting, color, detail)| {
-                        row.child(if is_waiting {
-                            div()
-                                .id(format!("project-tab-attention-{project}-{}", tab_id.0))
-                                .flex_none()
-                                .size(px(7.))
-                                .rounded_full()
-                                .bg(color)
-                                .hover_label(detail)
-                                .into_any_element()
-                        } else {
-                            div()
-                                .id(format!("project-tab-attention-{project}-{}", tab_id.0))
-                                .flex_none()
-                                .hover_label(detail)
-                                .child(
-                                    Icon::new(IconName::TriangleAlert)
-                                        .with_size(px(12.))
-                                        .text_color(color),
-                                )
-                                .into_any_element()
-                        })
-                    })
-                    .child(
-                        div()
-                            .id(format!("project-tab-close-{project}-{}", tab_id.0))
-                            .flex_none()
-                            .rounded(theme.radius)
-                            .p_0p5()
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(hover))
-                            .hover_label("关闭页签 ⌘W")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.request_close_tab(project, tab_id, cx);
-                            }))
-                            .child(
-                                Icon::new(IconName::Close)
-                                    .with_size(px(12.))
-                                    .text_color(muted)
-                                    .opacity(if active { 1. } else { 0.55 }),
-                            ),
-                    ),
-            );
         }
 
-        let selected_tab_id = tabs.active().map(|tab| tab.id);
-        let menu_view = cx.entity().downgrade();
-        h_flex()
-            .id("project-tabs")
-            .flex_none()
-            .h(px(36.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(theme.secondary.opacity(0.45))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(strip)
-            .child(
-                div()
-                    .id("project-tab-add")
-                    .flex_none()
-                    .rounded(theme.radius)
-                    .p_0p5()
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .hover_label("新建页签 ⌘T")
-                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .with_size(px(14.))
-                            .text_color(muted),
-                    ),
-            )
-            .child(
-                Button::new("project-tab-menu")
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(theme.transparent)
-                            .foreground(muted)
-                            .hover(hover),
-                    )
-                    .compact()
-                    .icon(IconName::Ellipsis)
-                    .text_color(muted)
-                    .tooltip("页签操作")
-                    .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                        let rename = menu_view.clone();
-                        let close = menu_view.clone();
-                        menu.item(PopupMenuItem::new("重命名页签").on_click(
-                            move |_, window, cx| {
-                                if let Some(tab_id) = selected_tab_id {
-                                    let _ = rename.update(cx, |this, cx| {
-                                        this.prompt_rename_tab(project, tab_id, window, cx)
-                                    });
-                                }
-                            },
-                        ))
-                        .item(PopupMenuItem::new("关闭页签").on_click(move |_, _, cx| {
-                            if let Some(tab_id) = selected_tab_id {
-                                let _ = close.update(cx, |this, cx| {
-                                    this.request_close_tab(project, tab_id, cx)
-                                });
-                            }
-                        }))
-                    }),
-            )
-            .into_any_element()
+        let items = (0..tabs.tabs.len())
+            .map(|index| {
+                let tab = &tabs.tabs[index];
+                let mut waiting = 0usize;
+                let mut failed = 0usize;
+                for pane in tab.layout.panes() {
+                    match self.agent_status.get(&pane).and_then(|entry| entry.state) {
+                        Some(AgentState::Waiting) => waiting += 1,
+                        Some(AgentState::Failed) => failed += 1,
+                        _ => {}
+                    }
+                }
+                let attention = if waiting > 0 {
+                    Some(TabAttention::Waiting(waiting))
+                } else if failed > 0 {
+                    Some(TabAttention::Failed(failed))
+                } else {
+                    None
+                };
+                TabItemSnapshot {
+                    id: tab.id,
+                    name: Self::tab_name(tabs, index),
+                    active: index == tabs.selected,
+                    attention,
+                }
+            })
+            .collect();
+
+        TabBarSnapshot::Tabs {
+            project_id: project,
+            selected_tab_id: tabs.active().map(|tab| tab.id),
+            tabs: items,
+        }
+    }
+
+    pub(super) fn handle_tab_bar_action(
+        &mut self,
+        action: TabBarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            TabBarAction::Select { project_id, tab_id } => {
+                if let Some(idx) = self.tab_index_by_id(project_id, tab_id) {
+                    self.select_tab(idx, cx);
+                }
+                self.focus_terminal(window, cx);
+            }
+            TabBarAction::RequestClose { project_id, tab_id } => {
+                self.request_close_tab(project_id, tab_id, cx);
+            }
+            TabBarAction::CancelClose => {
+                self.pending_close_tab = None;
+                self.focus_terminal(window, cx);
+                cx.notify();
+            }
+            TabBarAction::ConfirmClose { project_id, tab_id } => {
+                self.finish_close_tab_by_id(project_id, tab_id, cx);
+            }
+            TabBarAction::Add => {
+                self.new_tab(cx);
+            }
+            TabBarAction::PromptRename { project_id, tab_id } => {
+                self.prompt_rename_tab(project_id, tab_id, window, cx);
+            }
+        }
     }
 }
