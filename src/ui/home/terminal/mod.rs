@@ -9,6 +9,7 @@
 //! cursor cell and the system candidate window anchors there too.
 
 mod chrome;
+mod drop;
 mod input;
 mod paint;
 
@@ -392,7 +393,15 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_theme(cx);
-        let colors = &KumuTheme::global(cx).colors;
+        let theme = KumuTheme::global(cx);
+        let colors = &theme.colors;
+        let radius = px(theme.radius);
+        let fg = colors.foreground;
+        let search_hit = colors.selection.opacity(0.55);
+        let search_active = colors.warning.opacity(0.55);
+        let drop_accent = colors.blue;
+        let drop_tint = colors.blue.opacity(0.08);
+        let drop_pill_bg = colors.popover;
         let (font_family, font_px) = theme::term_font(cx);
         let snapshot = self.snapshot.clone();
         let marked = self.marked.clone();
@@ -409,10 +418,8 @@ impl Render for TerminalView {
         let input_view = cx.entity();
         let mouse_view = cx.entity().downgrade();
         let pane = self.pane;
-        // Find-bar highlights; copied out of the theme before the grid's
-        // paint closure (which must be 'static) captures them.
-        let search_hit = colors.selection.opacity(0.55);
-        let search_active = colors.warning.opacity(0.55);
+        let drop_group: SharedString = format!("pane-drop-{}", pane.0).into();
+        let show_drop_overlay = has_project && cx.has_active_drag();
         // The link under a ⌘-hovered cell: its runs are underlined and each is
         // a hitbox, so the pointer turns into a hand over it.
         let link_spans: Vec<link::Span> = self
@@ -432,8 +439,10 @@ impl Render for TerminalView {
         let typeface_paint = typeface;
         let term_bg = paint_color(snapshot.bg);
         let term_id = format!("kumu-term-{}", pane.0);
-        div()
+        let mut container = div()
             .id(term_id)
+            .group(drop_group.clone())
+            .relative()
             .size_full()
             .min_h_0()
             .min_w_0()
@@ -441,6 +450,10 @@ impl Render for TerminalView {
             .bg(term_bg)
             .track_focus(&self.focus)
             .key_context("Terminal")
+            .can_drop(move |drag, _, _| has_project && drag.is::<ExternalPaths>())
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_paths(paths, window, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -637,6 +650,52 @@ impl Render for TerminalView {
                     },
                 )
                 .size_full(),
-            )
+            );
+
+        if show_drop_overlay {
+            container = container.child(
+                div()
+                    .id(format!("pane-drop-overlay-{}", pane.0))
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.)
+                    .group_drag_over::<ExternalPaths>(drop_group, move |style| {
+                        style
+                            .opacity(1.)
+                            .bg(drop_tint)
+                            .border_2()
+                            .border_color(drop_accent)
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .px_3()
+                            .py(px(6.))
+                            .rounded(radius)
+                            .bg(drop_pill_bg)
+                            .border_1()
+                            .border_color(drop_accent)
+                            .shadow_sm()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(
+                                svg()
+                                    .path("icons/file.svg")
+                                    .size(px(14.))
+                                    .text_color(drop_accent),
+                            )
+                            .child("松开以插入路径"),
+                    ),
+            );
+        }
+
+        container
     }
 }
