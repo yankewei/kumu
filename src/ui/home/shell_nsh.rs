@@ -371,9 +371,7 @@ mod view {
                                     let tx = tx_agent.clone();
                                     let id = agent.id.to_string();
                                     let icon = asset_src(agent.logo.unwrap_or("icons/bot.svg"));
-                                    MenuItem::new(agent.name)
-                                        .icon(icon)
-                                        .on_select(move || {
+                                    MenuItem::new(agent.name).icon(icon).on_select(move || {
                                         send(
                                             &tx,
                                             HomeShellAction::AgentPane {
