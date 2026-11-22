@@ -1,21 +1,11 @@
 //! Pure Rust NSH UI for the project-level Tab Bar above the terminal pane grid.
 
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
-
-#[cfg(test)]
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-
 use crate::app::layout::TabId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TabAttention {
-    Waiting,
-    Failed,
+    Waiting(usize),
+    Failed(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,12 +33,6 @@ pub(super) enum TabBarSnapshot {
     },
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(super) enum TabBarHostEvent {
-    Snapshot(TabBarSnapshot),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TabBarAction {
     Select { project_id: i64, tab_id: TabId },
@@ -59,40 +43,7 @@ pub(super) enum TabBarAction {
     PromptRename { project_id: i64, tab_id: TabId },
 }
 
-#[cfg(test)]
-struct TabBarMount {
-    initial: TabBarSnapshot,
-    events_rx: UnboundedReceiver<TabBarHostEvent>,
-    actions_tx: UnboundedSender<TabBarAction>,
-}
-
-#[cfg(test)]
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(test)]
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, TabBarMount>>> = OnceLock::new();
-
-#[cfg(test)]
-fn pending_mounts() -> &'static Mutex<HashMap<u64, TabBarMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-fn register_mount(mount: TabBarMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
-}
-
-#[cfg(test)]
-fn take_mount(id: u64) -> Option<TabBarMount> {
-    pending_mounts().lock().ok()?.remove(&id)
-}
-
 pub(super) mod view {
-    #[cfg(test)]
-    use futures::StreamExt;
     use futures::channel::mpsc::UnboundedSender;
     use nsh_base::theme as active_theme;
     use nsh_core::element::desktop::{MenuItem, popup_menu};
@@ -100,17 +51,9 @@ pub(super) mod view {
     use nsh_core::prelude::*;
 
     use super::{TabAttention, TabBarAction, TabBarSnapshot};
-    #[cfg(test)]
-    use super::{TabBarHostEvent, take_mount};
     use crate::nsh_ui::assets::icon_svg;
     use crate::nsh_ui::components::{ButtonVariant, kumu_button, kumu_tooltip};
     use crate::nsh_ui::theme::{TOKEN_WARNING, kumu_color, text_xs_size};
-
-    #[cfg(test)]
-    #[derive(Clone, Debug, PartialEq, Props)]
-    pub(super) struct TabBarRootProps {
-        pub(super) mount_id: Prop<u64>,
-    }
 
     fn send(tx: &Option<UnboundedSender<TabBarAction>>, action: TabBarAction) {
         if let Some(tx) = tx {
@@ -120,30 +63,6 @@ pub(super) mod view {
 
     fn warning_color() -> AdaptiveColor {
         kumu_color(TOKEN_WARNING, |t| t.destructive)
-    }
-
-    #[cfg(test)]
-    #[component]
-    pub(super) fn TabBarRoot(props: TabBarRootProps) -> impl IntoElement {
-        let mount = take_mount(props.mount_id.get_untracked());
-        let (initial, events_rx, actions_tx) = match mount {
-            Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
-            None => (TabBarSnapshot::Hidden, None, None),
-        };
-
-        let state = signal(initial);
-
-        if let Some(mut rx) = events_rx {
-            spawn(async move {
-                while let Some(event) = rx.next().await {
-                    match event {
-                        TabBarHostEvent::Snapshot(next) => state.set(next),
-                    }
-                }
-            });
-        }
-
-        render_tab_bar(state, actions_tx)
     }
 
     pub(in crate::ui::home) fn render_tab_bar(
@@ -219,6 +138,7 @@ pub(super) mod view {
                         .h(px(26.0))
                         .px_2()
                         .rounded(move || active_theme().radius)
+                        .app_class("cursor-pointer")
                         .on_press(move || {
                             send(&tx_sel, TabBarAction::Select { project_id, tab_id });
                         })
@@ -229,6 +149,8 @@ pub(super) mod view {
                         .child(
                             text(tab.name)
                                 .max_w(px(160.0))
+                                .min_w_0()
+                                .app_class("truncate")
                                 .text_size(text_xs_size)
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(move || {
@@ -251,15 +173,21 @@ pub(super) mod view {
 
                     if let Some(att) = tab.attention {
                         tab_el = tab_el.child(match att {
-                            TabAttention::Waiting => view()
+                            TabAttention::Waiting(count) => view()
                                 .w(px(7.0))
                                 .h(px(7.0))
                                 .flex_shrink_0()
                                 .rounded(px(3.5))
                                 .bg(warning_color)
+                                .tooltip(kumu_tooltip(format!("{count} 个等待输入")))
                                 .into_element(),
-                            TabAttention::Failed => icon_svg("icons/triangle-alert.svg", 12.0)
-                                .text_color(move || active_theme().destructive)
+                            TabAttention::Failed(count) => view()
+                                .flex_shrink_0()
+                                .tooltip(kumu_tooltip(format!("{count} 个执行失败")))
+                                .child(
+                                    icon_svg("icons/triangle-alert.svg", 12.0)
+                                        .text_color(move || active_theme().destructive),
+                                )
                                 .into_element(),
                         });
                     }
@@ -268,9 +196,11 @@ pub(super) mod view {
                         view()
                             .role(AccessibilityRole::Button)
                             .label("关闭页签")
+                            .tooltip(kumu_tooltip("关闭页签 ⌘W"))
                             .flex_shrink_0()
                             .rounded(move || active_theme().radius)
                             .p_0p5()
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
                             .on_press(move || {
                                 send(&tx_close, TabBarAction::RequestClose { project_id, tab_id });
@@ -313,6 +243,7 @@ pub(super) mod view {
                             .flex_shrink_0()
                             .rounded(move || active_theme().radius)
                             .p_0p5()
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
                             .on_press(move || send(&tx_add, TabBarAction::Add))
                             .child(
@@ -328,6 +259,7 @@ pub(super) mod view {
                             .flex_shrink_0()
                             .rounded(move || active_theme().radius)
                             .p_0p5()
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
                             .on_press(move || {
                                 let Some(tab_id) = selected_tab_id else {
@@ -363,12 +295,48 @@ pub(super) mod view {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use futures::StreamExt;
+    use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+    use nsh_core::prelude::*;
     use nsh_engine::EngineConfig;
+
+    use super::*;
+    use crate::nsh_ui::mount::MountRegistry;
+
+    struct TabBarMount {
+        initial: TabBarSnapshot,
+        events_rx: UnboundedReceiver<TabBarSnapshot>,
+        actions_tx: UnboundedSender<TabBarAction>,
+    }
+
+    static MOUNTS: MountRegistry<TabBarMount> = MountRegistry::new();
+
+    #[derive(Clone, Debug, PartialEq, Props)]
+    struct TabBarRootProps {
+        mount_id: Prop<u64>,
+    }
+
+    #[component]
+    fn TabBarRoot(props: TabBarRootProps) -> impl IntoElement {
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
+        let (initial, events_rx, actions_tx) = match mount {
+            Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
+            None => (TabBarSnapshot::Hidden, None, None),
+        };
+        let state = signal(initial);
+        if let Some(mut rx) = events_rx {
+            spawn(async move {
+                while let Some(next) = rx.next().await {
+                    state.set(next);
+                }
+            });
+        }
+        view::render_tab_bar(state, actions_tx)
+    }
 
     #[test]
     fn tab_bar_nsh_selects_tabs_and_confirms_multi_pane_close() {
-        let (events_tx, events_rx) = unbounded::<TabBarHostEvent>();
+        let (events_tx, events_rx) = unbounded::<TabBarSnapshot>();
         let (actions_tx, mut actions_rx) = unbounded::<TabBarAction>();
         let initial = TabBarSnapshot::Tabs {
             project_id: 1,
@@ -384,19 +352,18 @@ mod tests {
                     id: TabId(2),
                     name: "工作区 2".into(),
                     active: false,
-                    attention: Some(TabAttention::Waiting),
+                    attention: Some(TabAttention::Waiting(1)),
                 },
             ],
         };
-        let mount_id = register_mount(TabBarMount {
+        let mount_id = MOUNTS.register(TabBarMount {
             initial,
             events_rx,
             actions_tx,
         });
-        let root =
-            nsh_core::element::Root::new::<view::TabBarRoot>(move || view::TabBarRootProps {
-                mount_id: mount_id.into(),
-            });
+        let root = nsh_core::element::Root::new::<TabBarRoot>(move || TabBarRootProps {
+            mount_id: mount_id.into(),
+        });
         let mut app =
             nsh_testing::Headless::start(EngineConfig::new(root)).expect("start tabs NSH");
         app.wait_for("工作区 2").expect("tab 2 renders");
@@ -410,12 +377,12 @@ mod tests {
         );
 
         events_tx
-            .unbounded_send(TabBarHostEvent::Snapshot(TabBarSnapshot::ConfirmClose {
+            .unbounded_send(TabBarSnapshot::ConfirmClose {
                 project_id: 1,
                 tab_id: TabId(2),
                 name: "工作区 2".into(),
                 pane_count: 3,
-            }))
+            })
             .expect("push confirm banner");
         app.wait_for("关闭「工作区 2」会结束 3 个终端。")
             .expect("confirm banner renders");

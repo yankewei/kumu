@@ -4,16 +4,14 @@
 //! `KumuApp`), so closed dialogs have zero rendering or input overhead and
 //! never interfere with live terminals.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{AppContext, Context, Entity, Task, Window};
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
+use super::mount::MountRegistry;
 use super::theme::{appearance, nsh_theme};
 use crate::theme::KumuTheme;
 
@@ -36,6 +34,7 @@ pub enum DialogSpec {
         ok_label: String,
         cancel_label: String,
         require_non_empty: bool,
+        select_all: bool,
     },
     Confirm {
         title: String,
@@ -70,24 +69,7 @@ struct DialogMount {
     outcome_tx: UnboundedSender<DialogOutcome>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, DialogMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, DialogMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_mount(mount: DialogMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
-}
-
-fn take_mount(id: u64) -> Option<DialogMount> {
-    pending_mounts().lock().ok()?.remove(&id)
-}
+static MOUNTS: MountRegistry<DialogMount> = MountRegistry::new();
 
 mod view {
     use futures::channel::mpsc::UnboundedSender;
@@ -95,7 +77,7 @@ mod view {
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{DialogOutcome, DialogSpec, take_mount};
+    use super::{DialogOutcome, DialogSpec, MOUNTS};
     use crate::nsh_ui::components::{
         ButtonVariant, kumu_button, kumu_input, meta_text, row_title, section_title,
     };
@@ -113,7 +95,7 @@ mod view {
 
     #[component]
     pub(super) fn DialogRoot(props: DialogRootProps) -> impl IntoElement {
-        let mount = take_mount(props.mount_id.get_untracked());
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
         let (spec, tx) = match mount {
             Some(m) => (m.spec, Some(m.outcome_tx)),
             None => (
@@ -137,6 +119,7 @@ mod view {
                 ok_label,
                 cancel_label,
                 require_non_empty,
+                select_all,
             } => {
                 let draft = signal(initial_value);
                 let tx_ok = tx.clone();
@@ -168,6 +151,7 @@ mod view {
                     .child(
                         kumu_input(placeholder)
                             .auto_focus(true)
+                            .select_text_on_focus(select_all)
                             .w_full()
                             .value(move || draft.get())
                             .on_change(move |v: &str| draft.set(v.to_owned()))
@@ -291,6 +275,7 @@ mod view {
                             .py_1p5()
                             .gap_0p5()
                             .rounded(move || active_theme().radius)
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
                             .on_press(move || {
                                 send(&tx_pick, DialogOutcome::PickedWorktree(picked.clone()));
@@ -346,7 +331,7 @@ mod view {
                 view()
                     .absolute()
                     .inset(px(0.0))
-                    .bg(move || active_theme().foreground.opacity(0.28))
+                    .app_class("bg-black/35")
                     .on_press(move || send(&tx_backdrop, DialogOutcome::Dismissed)),
             )
             .child(card)
@@ -362,7 +347,7 @@ pub struct ActiveDialog {
 
 impl Drop for ActiveDialog {
     fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
+        let _ = MOUNTS.take(self.mount_id);
     }
 }
 
@@ -375,13 +360,16 @@ impl ActiveDialog {
         on_outcome: impl FnOnce(&mut V, DialogOutcome, &mut Window, &mut Context<V>) + 'static,
     ) -> Self {
         let (outcome_tx, mut outcome_rx) = unbounded::<DialogOutcome>();
-        let mount_id = register_mount(DialogMount { spec, outcome_tx });
+        let mount_id = MOUNTS.register(DialogMount { spec, outcome_tx });
 
         let mapped = nsh_theme(theme);
         let mode = appearance(theme.mode);
         let app_view = cx.new(|cx| {
             let options = AppOptions {
                 title: "Kumu Dialog".to_owned(),
+                // Keep the overlay surface transparent so the underlying Kumu
+                // workspace stays visible behind the dimmed modal backdrop.
+                transparent: true,
                 ..Default::default()
             };
             let view = AppView::new(options, window, cx);
@@ -426,7 +414,7 @@ mod tests {
     #[test]
     fn confirm_dialog_emits_confirmed_or_dismissed() {
         let (tx, mut rx) = unbounded::<DialogOutcome>();
-        let mount_id = register_mount(DialogMount {
+        let mount_id = MOUNTS.register(DialogMount {
             spec: DialogSpec::Confirm {
                 title: "删除项目".into(),
                 description: "此操作无法撤销。".into(),

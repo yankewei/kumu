@@ -12,10 +12,6 @@
 
 mod view;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gpui::{
@@ -28,6 +24,7 @@ use super::{AgentPaneInfo, DispatchMode, Plugin, PluginHost, PluginProject};
 use crate::agent::{AGENTS, AgentState};
 use crate::app::WorkspaceEvent;
 use crate::db::{SETTING_TODO_DEFAULT_AGENT, TodoItem, TodoPatch, TodoStatus};
+use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::theme::KumuTheme;
 
@@ -154,23 +151,10 @@ pub(super) struct TodoMount {
     pub(super) actions_tx: UnboundedSender<TodoAction>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, TodoMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, TodoMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_mount(mount: TodoMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
-}
+static MOUNTS: MountRegistry<TodoMount> = MountRegistry::new();
 
 pub(super) fn take_mount(id: u64) -> Option<TodoMount> {
-    pending_mounts().lock().ok()?.remove(&id)
+    MOUNTS.take(id)
 }
 
 pub struct TodoPanel {
@@ -205,9 +189,20 @@ impl Plugin for TodoPanel {
         let (actions_tx, mut actions_rx) = unbounded::<TodoAction>();
 
         let default_agent = resolve_default_agent();
-        let initial = Self::build_snapshot(project.as_ref(), &host, default_agent.as_deref(), cx);
+        // `TodoPanel::new` runs synchronously inside `KumuApp::toggle_plugin`
+        // while `KumuApp` is mutably leased, so reading `host.agent_panes(...)`
+        // here would re-enter `KumuApp` and panic. Build the initial snapshot
+        // from `Workspace` alone and defer the live-pane refresh until the
+        // outer `KumuApp` update finishes.
+        let initial = Self::build_snapshot_inner(
+            project.as_ref(),
+            &host,
+            default_agent.as_deref(),
+            false,
+            cx,
+        );
 
-        let mount_id = register_mount(TodoMount {
+        let mount_id = MOUNTS.register(TodoMount {
             initial,
             events_rx,
             actions_tx,
@@ -247,7 +242,7 @@ impl Plugin for TodoPanel {
             subscriptions.push(cx.subscribe(&workspace, |panel, _, event, cx| match event {
                 WorkspaceEvent::TodosChanged(board_id) => {
                     if panel.board_id(cx) == Some(*board_id) {
-                        panel.push_snapshot(cx);
+                        panel.schedule_snapshot(cx);
                     }
                 }
                 WorkspaceEvent::Changed
@@ -256,7 +251,7 @@ impl Plugin for TodoPanel {
                 | WorkspaceEvent::AgentExited { .. }
                 | WorkspaceEvent::PaneExited { .. }
                 | WorkspaceEvent::Session { .. } => {
-                    panel.push_snapshot(cx);
+                    panel.schedule_snapshot(cx);
                 }
                 _ => {}
             }));
@@ -273,7 +268,7 @@ impl Plugin for TodoPanel {
             }
         });
 
-        Self {
+        let panel = Self {
             mount_id,
             project,
             host,
@@ -282,7 +277,9 @@ impl Plugin for TodoPanel {
             default_agent,
             _subscriptions: subscriptions,
             _actions_task: actions_task,
-        }
+        };
+        panel.schedule_snapshot(cx);
+        panel
     }
 
     fn set_project(&mut self, project: Option<PluginProject>, cx: &mut Context<Self>) {
@@ -290,7 +287,7 @@ impl Plugin for TodoPanel {
             return;
         }
         self.project = project;
-        self.push_snapshot(cx);
+        self.schedule_snapshot(cx);
     }
 }
 
@@ -305,6 +302,16 @@ impl TodoPanel {
         project: Option<&PluginProject>,
         host: &PluginHost,
         default_agent: Option<&str>,
+        cx: &App,
+    ) -> TodoBoardSnapshot {
+        Self::build_snapshot_inner(project, host, default_agent, true, cx)
+    }
+
+    fn build_snapshot_inner(
+        project: Option<&PluginProject>,
+        host: &PluginHost,
+        default_agent: Option<&str>,
+        include_live_panes: bool,
         cx: &App,
     ) -> TodoBoardSnapshot {
         let Some(project) = project else {
@@ -325,9 +332,13 @@ impl TodoPanel {
             }
             None => (None, None, Vec::new()),
         };
-        let live_panes = board_id
-            .map(|bid| host.agent_panes(bid, cx))
-            .unwrap_or_default();
+        let live_panes = if include_live_panes {
+            board_id
+                .map(|bid| host.agent_panes(bid, cx))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         TodoBoardSnapshot {
             has_project: true,
@@ -338,6 +349,15 @@ impl TodoPanel {
             installed_agents: installed_agents_list(),
             default_agent: Self::active_default_agent_from(default_agent),
         }
+    }
+
+    /// Defer snapshot pushes until the current GPUI update finishes so callers
+    /// holding a mutable lease on `KumuApp` never re-enter `KumuApp::read(cx)`.
+    fn schedule_snapshot(&self, cx: &mut Context<Self>) {
+        let panel = cx.weak_entity();
+        (**cx).defer(move |cx| {
+            let _ = panel.read_with(cx, |panel, cx| panel.push_snapshot(cx));
+        });
     }
 
     fn push_snapshot(&self, cx: &App) {
@@ -745,7 +765,7 @@ mod tests {
             default_agent: Some("claude".into()),
         };
 
-        let mount_id = register_mount(TodoMount {
+        let mount_id = MOUNTS.register(TodoMount {
             initial,
             events_rx,
             actions_tx,
@@ -791,5 +811,70 @@ mod tests {
             })
             .expect("send notice");
         app.wait_for("测试提示").expect("notice renders");
+    }
+
+    #[gpui::test]
+    fn opening_todo_panel_during_host_update_does_not_reenter_host(cx: &mut gpui::TestAppContext) {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeHost {
+            panel: Option<Entity<TodoPanel>>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl Render for FakeHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().children(self.panel.clone())
+            }
+        }
+
+        cx.update(|cx| {
+            cx.set_global(KumuTheme::load_bundled());
+        });
+        let workspace = cx.new(crate::app::Workspace::new);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_for_host = Arc::clone(&reads);
+        let window = cx.add_window(|_, _| FakeHost {
+            panel: None,
+            reads: reads_for_host,
+        });
+
+        // Simulate `KumuApp::toggle_plugin`: create `TodoPanel` while `FakeHost`
+        // is mutably leased, with `PluginHost::agent_panes` reading `FakeHost`.
+        window
+            .update(cx, |host_view, window, cx| {
+                let weak_host = cx.entity().downgrade();
+                let plugin_host = PluginHost::with_panes(
+                    |_, _, _, _| Ok(crate::plugins::SendOutcome::Pasted),
+                    |_, _| Vec::new(),
+                )
+                .with_agent_tools(
+                    workspace.clone(),
+                    move |_, cx| {
+                        if let Some(home) = weak_host.upgrade() {
+                            home.read(cx).reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Vec::new()
+                    },
+                    |_, _, _, _, _| Err("unused".into()),
+                    |_, _, _| Err("unused".into()),
+                    |_, _, _| {},
+                );
+                let project = Some(PluginProject {
+                    id: 1,
+                    path: PathBuf::from("/tmp/kumu"),
+                });
+                let panel = cx.new(|cx| TodoPanel::new(project, plugin_host, window, cx));
+                host_view.panel = Some(panel);
+            })
+            .expect("toggle TODO panel inside host update without re-entrant panic");
+
+        // Deferred snapshot runs after the outer host update finishes and can
+        // safely read the host entity.
+        assert!(
+            reads.load(Ordering::SeqCst) >= 1,
+            "deferred live-pane snapshot should run once host update completes"
+        );
     }
 }

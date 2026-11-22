@@ -45,12 +45,6 @@ impl Workspace {
         }
     }
 
-    /// Access the framework-free shared core (for NSH / non-GPUI bridges).
-    #[allow(dead_code)]
-    pub fn shared_core(&self) -> Arc<Mutex<WorkspaceCore>> {
-        Arc::clone(&self.core)
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, WorkspaceCore> {
         self.core.lock().unwrap_or_else(|e| e.into_inner())
     }

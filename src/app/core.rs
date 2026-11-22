@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::UnboundedReceiver;
 
 use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX, authenticated_session};
 use crate::agent::status::{
@@ -155,8 +155,6 @@ pub struct WorkspaceCore {
     pub(crate) startup_error: Option<String>,
     /// The home window's last layout JSON, handed to the view once at startup.
     pub(crate) saved_workspace: Option<String>,
-    /// Pure-Rust subscribers (e.g. NSH reactive bridges) notified on every event.
-    subscribers: Vec<UnboundedSender<WorkspaceEvent>>,
 }
 
 impl WorkspaceCore {
@@ -189,7 +187,6 @@ impl WorkspaceCore {
             next_term: 1,
             startup_error,
             saved_workspace,
-            subscribers: Vec::new(),
         };
         core.bootstrap();
         core
@@ -207,26 +204,10 @@ impl WorkspaceCore {
             next_term: 1,
             startup_error: None,
             saved_workspace: None,
-            subscribers: Vec::new(),
         }
     }
 
-    /// Subscribe to all future [`WorkspaceEvent`]s from any non-GPUI consumer
-    /// (such as an NSH engine thread). Dropped receivers are pruned on emit.
-    #[allow(dead_code)]
-    pub fn subscribe(&mut self) -> UnboundedReceiver<WorkspaceEvent> {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        self.subscribers.push(tx);
-        rx
-    }
-
-    /// Forward emitted events to pure-Rust subscribers as well as collecting
-    /// them for the immediate caller (e.g. the GPUI `Workspace` entity).
     fn emit(&mut self, events: &mut Vec<WorkspaceEvent>, event: WorkspaceEvent) {
-        if !self.subscribers.is_empty() {
-            self.subscribers
-                .retain(|tx| tx.unbounded_send(event.clone()).is_ok());
-        }
         events.push(event);
     }
 
@@ -1370,11 +1351,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        LiveTerm, ProjectPick, WorkspaceCore, WorkspaceEvent, first_run_dir_from, project_name,
+        LiveTerm, ProjectPick, WorkspaceCore, first_run_dir_from, project_name,
         resolve_project_pick, terminal_evictions,
     };
     use crate::agent::launch::PaneLaunch;
-    use crate::db::{Project, TodoStatus};
+    use crate::db::Project;
 
     #[test]
     fn only_an_immediately_failed_resume_gets_a_fresh_retry() {
@@ -1473,34 +1454,6 @@ mod tests {
             None,
             "stale notification cannot restart a process"
         );
-    }
-
-    #[test]
-    fn subscribers_receive_core_events_without_gpui() {
-        let mut core = WorkspaceCore::in_memory();
-        let mut rx = core.subscribe();
-        let mut events = Vec::new();
-        let project_id = core
-            .add_project("/tmp/kumu-core-test", &mut events)
-            .expect("insert project");
-        let _todo = core
-            .add_todo(
-                project_id,
-                "verify core",
-                "",
-                TodoStatus::Todo,
-                None,
-                None,
-                None,
-                &mut events,
-            )
-            .expect("insert todo");
-        assert_eq!(events.len(), 2);
-        assert!(matches!(rx.try_recv(), Ok(WorkspaceEvent::Changed)));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(WorkspaceEvent::TodosChanged(id)) if id == project_id
-        ));
     }
 
     /// A shell pane's adopted launch survives only while the agent is still a

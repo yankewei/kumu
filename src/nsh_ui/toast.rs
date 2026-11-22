@@ -1,22 +1,14 @@
 //! Pure Rust NSH foreground toast stack built over `nsh_base::toast_stack` +
 //! `nsh_base::ToastManager`.
 //!
-//! Can be mounted directly inside any NSH root component (e.g. Settings window
-//! or the unified Home NSH root), and also provides [`NshToastHost`] for GPUI
-//! windows hosting foreground notifications with click-to-action and dismissal.
+//! Mounted directly inside NSH root components (Settings window and the unified
+//! Home NSH shell) to host foreground notifications with click-to-action and
+//! dismissal.
 
-#[cfg(test)]
-use std::collections::HashMap;
 use std::rc::Rc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
-#[cfg(test)]
-use futures::channel::mpsc::unbounded;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use nsh_base::{
     Anchor, ToastManager, ToastMotion, ToastOptions, ToastStackState, ToastTransitionStatus,
@@ -27,14 +19,12 @@ use nsh_core::prelude::*;
 use nsh_core::time::now;
 
 use super::assets::icon_svg;
-use super::theme::{TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size};
+use super::theme::{TOKEN_LINK, TOKEN_SUCCESS, kumu_color, text_xs_size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ToastTone {
     Info,
     Success,
-    Warning,
     Error,
 }
 
@@ -86,7 +76,6 @@ impl ToastItem {
     fn timeout(&self) -> Duration {
         match self.tone {
             ToastTone::Error => Duration::from_secs(7),
-            ToastTone::Warning => Duration::from_secs(6),
             ToastTone::Info | ToastTone::Success => Duration::from_secs(5),
         }
     }
@@ -101,14 +90,12 @@ pub enum ToastCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastHostEvent {
     Clicked(String),
-    CountChanged(usize),
 }
 
 fn tone_color(tone: ToastTone) -> AdaptiveColor {
     match tone {
         ToastTone::Info => kumu_color(TOKEN_LINK, |t| t.primary),
         ToastTone::Success => kumu_color(TOKEN_SUCCESS, |t| t.primary),
-        ToastTone::Warning => kumu_color(TOKEN_WARNING, |t| t.destructive),
         ToastTone::Error => active_theme().destructive,
     }
 }
@@ -117,7 +104,7 @@ fn tone_icon(tone: ToastTone) -> &'static str {
     match tone {
         ToastTone::Info => "icons/info.svg",
         ToastTone::Success => "icons/check.svg",
-        ToastTone::Warning | ToastTone::Error => "icons/triangle-alert.svg",
+        ToastTone::Error => "icons/triangle-alert.svg",
     }
 }
 
@@ -131,29 +118,62 @@ pub fn render_toast_stack(
     let shown = signal(Vec::<(String, ToastItem, ToastTransitionStatus)>::new());
     let state = ToastStackState::new();
 
-    let on_event_sync = on_event.clone();
     let sync: Rc<dyn Fn()> = Rc::new(move || {
         let next: Vec<(String, ToastItem, ToastTransitionStatus)> = manager.with(|m| {
             m.visible(3)
                 .map(|(id, item, status)| (id.clone(), item.clone(), status))
                 .collect()
         });
-        let total = manager.with(|m| m.len());
         shown.set(next);
-        if let Some(tx) = &on_event_sync {
-            let _ = tx.unbounded_send(ToastHostEvent::CountChanged(total));
-        }
     });
 
-    let sync_tick = sync.clone();
-    set_interval(Duration::from_millis(80), move || {
-        if manager.with(|m| m.advance(now(), state.is_expanded()).changed) {
-            sync_tick();
-        }
-    });
+    type TickCallback = Rc<dyn Fn()>;
+    let ticking = stored(false);
+    let schedule_tick: Rc<std::cell::RefCell<Option<TickCallback>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    {
+        let sync_tick = sync.clone();
+        let schedule_slot = schedule_tick.clone();
+        let tick_fn: TickCallback = Rc::new(move || {
+            let sync_inner = sync_tick.clone();
+            let slot_inner = schedule_slot.clone();
+            drop(set_timeout(Duration::from_millis(80), move || {
+                if manager.with(|m| m.advance(now(), state.is_expanded()).changed) {
+                    sync_inner();
+                }
+                if manager.with(|m| !m.is_empty()) {
+                    if let Some(next_tick) = slot_inner.borrow().as_ref().cloned() {
+                        next_tick();
+                    }
+                } else {
+                    ticking.with(|t| *t = false);
+                }
+            }));
+        });
+        *schedule_tick.borrow_mut() = Some(tick_fn);
+    }
+
+    let ensure_ticking: Rc<dyn Fn()> = {
+        let schedule_slot = schedule_tick.clone();
+        Rc::new(move || {
+            let should_start = manager.with(|m| !m.is_empty())
+                && ticking.with(|t| {
+                    if *t {
+                        false
+                    } else {
+                        *t = true;
+                        true
+                    }
+                });
+            if should_start && let Some(tick) = schedule_slot.borrow().as_ref().cloned() {
+                tick();
+            }
+        })
+    };
 
     if let Some(mut rx) = cmd_rx {
         let sync_cmd = sync.clone();
+        let ensure_cmd = ensure_ticking.clone();
         spawn(async move {
             while let Some(cmd) = rx.next().await {
                 let ts = now();
@@ -173,6 +193,7 @@ pub fn render_toast_stack(
                     }
                 }
                 sync_cmd();
+                ensure_cmd();
             }
         });
     }
@@ -245,6 +266,7 @@ pub fn render_toast_stack(
                                 .flex_shrink_0()
                                 .p_0p5()
                                 .rounded(move || active_theme().radius)
+                                .app_class("cursor-pointer")
                                 .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                                 .on_press(move || {
                                     manager.with(|m| {
@@ -261,6 +283,7 @@ pub fn render_toast_stack(
                     if clickable {
                         card = card
                             .role(AccessibilityRole::Button)
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.35)))
                             .on_press(move || {
                                 if let Some(tx) = &on_click_tx {
@@ -295,50 +318,28 @@ pub fn render_toast_stack(
 }
 
 #[cfg(test)]
-struct ToastOverlayMount {
-    cmd_rx: UnboundedReceiver<ToastCommand>,
-    event_tx: UnboundedSender<ToastHostEvent>,
-}
+mod tests {
+    use futures::channel::mpsc::unbounded;
+    use nsh_engine::EngineConfig;
 
-#[cfg(test)]
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(test)]
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, ToastOverlayMount>>> = OnceLock::new();
+    use super::*;
+    use crate::nsh_ui::mount::MountRegistry;
 
-#[cfg(test)]
-fn pending_mounts() -> &'static Mutex<HashMap<u64, ToastOverlayMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-fn register_mount(mount: ToastOverlayMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
+    struct ToastOverlayMount {
+        cmd_rx: UnboundedReceiver<ToastCommand>,
+        event_tx: UnboundedSender<ToastHostEvent>,
     }
-    id
-}
 
-#[cfg(test)]
-fn take_mount(id: u64) -> Option<ToastOverlayMount> {
-    pending_mounts().lock().ok()?.remove(&id)
-}
-
-#[cfg(test)]
-mod overlay_view {
-    use nsh_base::Anchor;
-    use nsh_core::prelude::*;
-
-    use super::{render_toast_stack, take_mount};
+    static MOUNTS: MountRegistry<ToastOverlayMount> = MountRegistry::new();
 
     #[derive(Clone, Debug, PartialEq, Props)]
-    pub(super) struct ToastOverlayRootProps {
-        pub(super) mount_id: Prop<u64>,
+    struct ToastOverlayRootProps {
+        mount_id: Prop<u64>,
     }
 
     #[component]
-    pub(super) fn ToastOverlayRoot(props: ToastOverlayRootProps) -> impl IntoElement {
-        let mount = take_mount(props.mount_id.get_untracked());
+    fn ToastOverlayRoot(props: ToastOverlayRootProps) -> impl IntoElement {
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
         let (cmd_rx, event_tx) = match mount {
             Some(m) => (Some(m.cmd_rx), Some(m.event_tx)),
             None => (None, None),
@@ -349,23 +350,16 @@ mod overlay_view {
             .h_full()
             .child(render_toast_stack(cmd_rx, Anchor::TopRight, event_tx))
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nsh_engine::EngineConfig;
 
     #[test]
     fn toast_stack_renders_clicks_and_dismisses_headlessly() {
         let (cmd_tx, cmd_rx) = unbounded::<ToastCommand>();
         let (event_tx, mut event_rx) = unbounded::<ToastHostEvent>();
-        let mount_id = register_mount(ToastOverlayMount { cmd_rx, event_tx });
-        let root = nsh_core::element::Root::new::<overlay_view::ToastOverlayRoot>(move || {
-            overlay_view::ToastOverlayRootProps {
+        let mount_id = MOUNTS.register(ToastOverlayMount { cmd_rx, event_tx });
+        let root =
+            nsh_core::element::Root::new::<ToastOverlayRoot>(move || ToastOverlayRootProps {
                 mount_id: mount_id.into(),
-            }
-        });
+            });
         let mut app = nsh_testing::Headless::start(EngineConfig::new(root))
             .expect("start headless toast stack");
 

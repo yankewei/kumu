@@ -12,10 +12,8 @@ mod tests;
 mod view;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -30,6 +28,7 @@ use self::patch_view::PatchView;
 use self::review::{PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewStore};
 use super::{Plugin, PluginHost, PluginProject};
 use crate::git::{Change, Changes, Commit, History};
+use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::theme::KumuTheme;
 
@@ -91,23 +90,14 @@ struct GitPanelMount {
     actions_tx: UnboundedSender<GitPanelAction>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, GitPanelMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, GitPanelMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static PANEL_MOUNTS: MountRegistry<GitPanelMount> = MountRegistry::new();
 
 fn register_panel_mount(mount: GitPanelMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
+    PANEL_MOUNTS.register(mount)
 }
 
 fn take_panel_mount(id: u64) -> Option<GitPanelMount> {
-    pending_mounts().lock().ok()?.remove(&id)
+    PANEL_MOUNTS.take(id)
 }
 
 struct RepoRead {

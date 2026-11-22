@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::mpsc::unbounded;
@@ -14,10 +13,9 @@ use super::review::{
     normalize_and_index_patch,
 };
 use super::{
-    ChangeRow, GitHostEvent, GitPanelAction, GitPanelMount, GitPanelSnapshot, PanelTab, PluginHost,
+    GitHostEvent, GitPanelAction, GitPanelMount, GitPanelSnapshot, PanelTab, PluginHost,
     change_rows_from, register_panel_mount, view,
 };
-use crate::git::{Change, Commit};
 use crate::plugins::{PaneTarget, SendOutcome};
 
 fn test_host() -> PluginHost {
@@ -310,7 +308,7 @@ fn a_closed_sheet_restores_its_draft(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn the_panel_draws_changes_and_history() {
+fn the_panel_draws_changes_switches_tabs_and_opens_commits() {
     let (dir, path) = fixture();
     std::fs::write(path.join("b"), "b\n").unwrap();
     let history = crate::git::history(&path).unwrap();
@@ -344,6 +342,12 @@ fn the_panel_draws_changes_and_history() {
     app.wait_for("未暂存").expect("shows unstaged section");
     app.wait_for("b").expect("shows untracked file");
 
+    app.press("历史 1").expect("switch to history tab");
+    assert!(matches!(
+        actions_rx.try_recv().ok(),
+        Some(GitPanelAction::SelectTab(PanelTab::History))
+    ));
+
     let mut history_snap = initial;
     history_snap.tab = PanelTab::History;
     events_tx
@@ -357,70 +361,4 @@ fn the_panel_draws_changes_and_history() {
     ));
 
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn git_log_nsh_panel_switches_tabs_and_opens_rows() {
-    let (events_tx, events_rx) = unbounded::<GitHostEvent>();
-    let (actions_tx, mut actions_rx) = unbounded::<GitPanelAction>();
-
-    let change = Change {
-        path: "src/main.rs".into(),
-        original: None,
-        status: 'M',
-        staged: false,
-    };
-    let commit = Commit {
-        hash: "abcdef1234567890".into(),
-        short: "abcdef1".into(),
-        subject: "migrate git log to nsh".into(),
-        body: String::new(),
-        author: "Dev".into(),
-        email: String::new(),
-        date: "2026-11-21".into(),
-        refs: vec!["HEAD -> master".into()],
-        parents: 1,
-    };
-
-    let initial = GitPanelSnapshot {
-        project_id: Some(1),
-        tab: PanelTab::Changes,
-        branch: Some("master".into()),
-        loaded: true,
-        error: None,
-        change_count: 1,
-        change_rows: vec![ChangeRow::Header("未暂存"), ChangeRow::File(change.clone())],
-        commits: Arc::new(vec![commit.clone()]),
-        filter: None,
-        marks: Default::default(),
-    };
-    let mount_id = register_panel_mount(GitPanelMount {
-        initial: initial.clone(),
-        events_rx,
-        actions_tx,
-    });
-    let root = nsh_core::element::Root::new::<view::GitLogRoot>(move || view::GitLogRootProps {
-        mount_id: mount_id.into(),
-    });
-    let mut app = nsh_testing::Headless::start(EngineConfig::new(root)).expect("start git NSH");
-
-    app.wait_for("main.rs").expect("shows uncommitted change");
-    app.press("历史 1").expect("switch to history tab");
-    assert!(matches!(
-        actions_rx.try_recv().ok(),
-        Some(GitPanelAction::SelectTab(PanelTab::History))
-    ));
-
-    let mut history_snap = initial;
-    history_snap.tab = PanelTab::History;
-    events_tx
-        .unbounded_send(GitHostEvent::Snapshot(history_snap))
-        .expect("push history snapshot");
-    app.wait_for("migrate git log to nsh")
-        .expect("shows commit subject");
-    app.press("migrate git log to nsh").expect("click commit");
-    assert!(matches!(
-        actions_rx.try_recv().ok(),
-        Some(GitPanelAction::OpenCommit(_))
-    ));
 }

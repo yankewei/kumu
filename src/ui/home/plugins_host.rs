@@ -514,8 +514,10 @@ impl KumuApp {
     /// One title-bar entry per registered plugin; the open panel's entry stays
     /// highlighted.
     pub(super) fn render_plugin_button(&self, spec: PluginSpec, cx: &Context<Self>) -> AnyElement {
-        let colors = &KumuTheme::global(cx).colors;
+        let theme = KumuTheme::global(cx);
+        let colors = &theme.colors;
         let active = self.open_plugin == Some(spec.id);
+        let hovered = self.hovered_plugin_tooltip == Some(spec.id);
         let background = if active {
             colors.accent
         } else {
@@ -531,6 +533,8 @@ impl KumuApp {
             .then(|| self.todo_attention_color(cx))
             .flatten();
         let icon = spec.icon;
+        let plugin_id = spec.id;
+        let plugin_title = spec.title;
         let button = div()
             .id(SharedString::from(format!("plugin-toggle-{}", spec.id)))
             .flex()
@@ -542,18 +546,29 @@ impl KumuApp {
             .cursor_pointer()
             .bg(background)
             .hover(move |style| style.bg(hover_bg))
+            .on_hover(cx.listener(move |this, is_hovered: &bool, _, cx| {
+                let next = if *is_hovered {
+                    Some(plugin_id)
+                } else if this.hovered_plugin_tooltip == Some(plugin_id) {
+                    None
+                } else {
+                    this.hovered_plugin_tooltip
+                };
+                if this.hovered_plugin_tooltip != next {
+                    this.hovered_plugin_tooltip = next;
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.hovered_plugin_tooltip = None;
                 this.toggle_plugin(spec.clone(), window, cx);
             }))
             .child(svg().path(icon).size(px(14.)).text_color(foreground));
-        let Some(dot_color) = attention else {
-            return button.into_any_element();
-        };
-        div()
-            .relative()
-            .child(button)
-            .child(
+
+        let mut wrapper = div().relative().child(button);
+        if let Some(dot_color) = attention {
+            wrapper = wrapper.child(
                 div()
                     .absolute()
                     .top(px(2.))
@@ -562,7 +577,30 @@ impl KumuApp {
                     .h(px(6.))
                     .rounded_full()
                     .bg(dot_color),
-            )
-            .into_any_element()
+            );
+        }
+        if hovered {
+            wrapper = wrapper.child(
+                deferred(
+                    div()
+                        .absolute()
+                        .top(px(28.))
+                        .right_0()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(theme.radius))
+                        .bg(colors.popover)
+                        .border_1()
+                        .border_color(colors.border)
+                        .shadow_md()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(colors.popover_foreground)
+                        .child(plugin_title),
+                )
+                .with_priority(1),
+            );
+        }
+        wrapper.into_any_element()
     }
 }

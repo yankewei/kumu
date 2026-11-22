@@ -102,7 +102,8 @@ impl KumuApp {
             let Some(tabs) = self.tabs_by_project.get(&project.id) else {
                 continue;
             };
-            for tab in &tabs.tabs {
+            for (tab_index, tab) in tabs.tabs.iter().enumerate() {
+                let tab_name = Self::tab_name(tabs, tab_index);
                 for pane in tab.layout.panes() {
                     let Some(entry) = self.agent_status.get(&pane) else {
                         continue;
@@ -110,6 +111,8 @@ impl KumuApp {
                     agent_rows.push(AgentRowSnapshot {
                         pane,
                         project_name: project.name.clone(),
+                        project_path: project.path.clone(),
+                        tab_name: tab_name.clone(),
                         agent: entry.agent.clone(),
                         title: entry.display_title(),
                         state: entry.state,

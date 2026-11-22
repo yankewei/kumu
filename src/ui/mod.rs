@@ -25,11 +25,19 @@ pub fn init(cx: &mut gpui::App) {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{KeyContext, Keystroke, TestAppContext};
+    use gpui::{KeyBinding, KeyContext, Keystroke, TestAppContext};
+
+    gpui::actions!(test_nav, [FocusNext, FocusPrev]);
 
     #[gpui::test]
     fn terminal_completion_keys_bypass_root_focus_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            // Simulate an outer focus-navigation binding on `Root` so the test
+            // verifies `super::init` actually masks it inside `Terminal`.
+            cx.bind_keys([
+                KeyBinding::new("tab", FocusNext, Some("Root")),
+                KeyBinding::new("shift-tab", FocusPrev, Some("Root")),
+            ]);
             super::init(cx);
             let keymap = cx.key_bindings();
             let keymap = keymap.borrow();
@@ -41,6 +49,14 @@ mod tests {
                     keymap.bindings_for_input(&input, &[root.clone(), terminal.clone()]);
                 assert!(bindings.is_empty(), "{key} must reach on_key_down");
                 assert!(!pending, "{key} must not wait for another keystroke");
+
+                let (outer_bindings, _) =
+                    keymap.bindings_for_input(&input, std::slice::from_ref(&root));
+                assert_eq!(
+                    outer_bindings.len(),
+                    1,
+                    "{key} still navigates outside terminals"
+                );
             }
         });
     }

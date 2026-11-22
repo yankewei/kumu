@@ -9,13 +9,12 @@ use nsh_platform_gpui::{AdaptiveColor, Appearance};
 use crate::theme::{DEFAULT_FONT_SIZE, KumuTheme, ThemeMode};
 
 /// Base body text size (14px at 16px root): section titles, main empty states, primary content.
-pub const TEXT_SM: Points = Points(14.0);
+const TEXT_SM: Points = Points(14.0);
 
 /// Base secondary/meta text size (12px at 16px root): sidebar rows, labels, pills, captions.
-pub const TEXT_XS: Points = Points(12.0);
+const TEXT_XS: Points = Points(12.0);
 
 /// Custom token names layered on top of shadcn's standard NSH theme tokens.
-pub const TOKEN_CARD_SURFACE: &str = "kumu-card";
 pub const TOKEN_ICON_TILE: &str = "kumu-tile";
 pub const TOKEN_LINK: &str = "kumu-link";
 pub const TOKEN_WARNING: &str = "kumu-warning";
@@ -107,7 +106,6 @@ pub fn nsh_theme(theme: &KumuTheme) -> nsh_platform_gpui::Theme {
         ),
         ("sidebar-border", colors.sidebar_border),
         ("sidebar-ring", colors.ring),
-        (TOKEN_CARD_SURFACE, card_surface),
         (TOKEN_ICON_TILE, icon_tile),
         (TOKEN_LINK, colors.link),
         (TOKEN_WARNING, colors.warning),

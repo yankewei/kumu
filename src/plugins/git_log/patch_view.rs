@@ -2,10 +2,7 @@
 //! inline review annotations (`render_annotation` / `render_add_annotation`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -20,6 +17,7 @@ use super::review::{
     DraftComment, PatchIndex, PatchKey, PatchSheet, PatchSource, ReviewComment, ReviewRange,
     ReviewStore, SendNotice, SentReview, compose_comments, normalize_and_index_patch, patch_digest,
 };
+use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::plugins::{PaneTarget, PluginHost, SendOutcome};
 use crate::theme::KumuTheme;
@@ -63,23 +61,14 @@ struct PatchMount {
     actions_tx: UnboundedSender<PatchAction>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, PatchMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, PatchMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static MOUNTS: MountRegistry<PatchMount> = MountRegistry::new();
 
 fn register_mount(mount: PatchMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
+    MOUNTS.register(mount)
 }
 
 fn take_mount(id: u64) -> Option<PatchMount> {
-    pending_mounts().lock().ok()?.remove(&id)
+    MOUNTS.take(id)
 }
 
 mod nsh_view {
@@ -503,6 +492,7 @@ mod nsh_view {
                         .flex_shrink_0()
                         .p_1()
                         .rounded(move || active_theme().radius)
+                        .app_class("cursor-pointer")
                         .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                         .on_press(move || {
                             open.set(false);
@@ -539,7 +529,7 @@ mod nsh_view {
             .side(Placement::Right)
             .close_on_escape(true)
             .close_on_backdrop_press(true)
-            .backdrop_class("bg-foreground/25")
+            .backdrop_class("bg-black/35")
             .popup_class("w-[760px] max-w-[90%] h-full shadow-xl")
             .on_open_change(move |ev: &nsh_base::SheetEvent| {
                 if matches!(ev, nsh_base::SheetEvent::OpenChange(false, _)) {
@@ -703,6 +693,9 @@ impl PatchView {
         let app_view = cx.new(|cx| {
             let options = AppOptions {
                 title: "Kumu Diff Review".to_owned(),
+                // Keep the overlay surface transparent so the underlying Kumu
+                // workspace shows through the sheet's dimmed backdrop.
+                transparent: true,
                 ..Default::default()
             };
             let view = AppView::new(options, window, cx);
@@ -1011,5 +1004,62 @@ impl Render for PatchView {
             Some(app_view) => div().size_full().child(app_view.clone()),
             None => div().size_full(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsh_engine::EngineConfig;
+
+    #[test]
+    fn patch_sheet_nsh_renders_diff_and_closes() {
+        let (_events_tx, events_rx) = unbounded::<PatchHostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<PatchAction>();
+
+        let raw = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-let old = 1;
++let new = 2;
+";
+        let (normalized, index) = normalize_and_index_patch(raw, false);
+        let initial = PatchSnapshot {
+            title: "refactor: use nsh".into(),
+            meta: "abc1234 · 1 个文件".into(),
+            patch_text: Some(normalized),
+            index,
+            ..Default::default()
+        };
+
+        let mount_id = register_mount(PatchMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+        let root =
+            nsh_core::element::Root::new::<nsh_view::PatchRoot>(move || nsh_view::PatchRootProps {
+                mount_id: mount_id.into(),
+            });
+        let mut app = nsh_testing::Headless::start(EngineConfig::new(root))
+            .expect("start headless diff sheet");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_core::Points(1200.0),
+            nsh_core::Points(800.0),
+        ))
+        .expect("set viewport");
+
+        app.wait_for("text:refactor: use nsh")
+            .expect("diff sheet header renders");
+        app.wait_for("abc1234 · 1 个文件")
+            .expect("diff sheet meta renders");
+        app.press("label:关闭 Diff 面板")
+            .expect("press close diff sheet button");
+        assert!(matches!(
+            actions_rx.try_recv().ok(),
+            Some(PatchAction::Close)
+        ));
     }
 }

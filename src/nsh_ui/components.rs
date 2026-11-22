@@ -14,7 +14,6 @@ use nsh_core::prelude::*;
 use super::theme::{TOKEN_ACCENT_PILL_BG, TOKEN_LINK, kumu_color, text_sm_size, text_xs_size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ButtonVariant {
     Primary,
     Default,
@@ -24,11 +23,9 @@ pub enum ButtonVariant {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum PillTone {
     Neutral,
     Accent,
-    Danger,
 }
 
 /// 14px body text (`text_sm`).
@@ -70,6 +67,7 @@ pub fn kumu_button(
         .px_2p5()
         .py_1()
         .rounded(move || theme().radius)
+        .app_class("cursor-pointer")
         .active(|s| s.opacity(0.75))
         .disabled_style(|s| s.opacity(0.45));
 
@@ -137,17 +135,12 @@ pub fn kumu_switch_bare<M>(checked: impl IntoProp<bool, M>) -> SwitchElement {
         .checked(checked)
         .flex_row()
         .items_center()
+        .app_class("cursor-pointer")
         .track_class("w-8 h-4 rounded-full bg-input checked:bg-primary p-0.5")
         .thumb_class("w-3 h-3 rounded-full bg-background checked:translate-x-4")
 }
 
-/// Styled Kumu toggle switch over `nsh_base::switch()`.
-#[allow(dead_code)]
-pub fn kumu_switch<M>(checked: impl IntoProp<bool, M>, label: &'static str) -> SwitchElement {
-    kumu_switch_bare(checked).gap_2().child(body_text(label))
-}
-
-/// Borderless status pill matching `AGENTS.md` / `src/ui/widgets.rs`.
+/// Borderless status pill matching `AGENTS.md`.
 pub fn pill(label: impl IntoReactive<SharedString>, tone: PillTone) -> View {
     type ColorFn = fn() -> AdaptiveColor;
     let (bg, fg): (ColorFn, ColorFn) = match tone {
@@ -156,7 +149,6 @@ pub fn pill(label: impl IntoReactive<SharedString>, tone: PillTone) -> View {
             || kumu_color(TOKEN_ACCENT_PILL_BG, |t| t.accent),
             || kumu_color(TOKEN_LINK, |t| t.accent_foreground),
         ),
-        PillTone::Danger => (|| theme().destructive, || theme().primary_foreground),
     };
     view()
         .px_2()
@@ -223,7 +215,9 @@ mod tests {
                             .on_press(move || count.update(|n| *n += 1)),
                     )
                     .child(
-                        kumu_switch(move || enabled.get(), "Auto Resume")
+                        kumu_switch_bare(move || enabled.get())
+                            .gap_2()
+                            .child(body_text("Auto Resume"))
                             .on_change(move |next: &bool| enabled.set(*next)),
                     )
                     .child(pill(

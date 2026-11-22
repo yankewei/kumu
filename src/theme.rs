@@ -15,10 +15,10 @@ pub(crate) struct ThemeRevision(pub u64);
 
 impl Global for ThemeRevision {}
 
-pub const THEME_LIGHT: &str = include_str!("../themes/light.json");
-pub const THEME_DARK: &str = include_str!("../themes/dark.json");
-pub const THEME_LIGHT_NAME: &str = "Kumu Light";
-pub const THEME_DARK_NAME: &str = "Zed Dark";
+const THEME_LIGHT: &str = include_str!("../themes/light.json");
+const THEME_DARK: &str = include_str!("../themes/dark.json");
+const THEME_LIGHT_NAME: &str = "Kumu Light";
+const THEME_DARK_NAME: &str = "Zed Dark";
 
 /// The app's default UI font family: the platform system font.
 pub const SYSTEM_FONT_FAMILY: &str = ".SystemUIFont";
@@ -45,7 +45,6 @@ impl ThemeMode {
 
 /// Semantic color palette loaded from `themes/*.json`.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ThemeColors {
     pub background: Hsla,
     pub foreground: Hsla,
@@ -73,15 +72,10 @@ pub struct ThemeColors {
     pub popover_foreground: Hsla,
     pub title_bar: Hsla,
     pub title_bar_border: Hsla,
-    pub tab_bar: Hsla,
-    pub tab_active: Hsla,
-    pub tab_active_foreground: Hsla,
-    pub tab_foreground: Hsla,
     pub caret: Hsla,
     pub danger: Hsla,
     pub warning: Hsla,
     pub success: Hsla,
-    pub info: Hsla,
     pub red: Hsla,
     pub green: Hsla,
     pub yellow: Hsla,
@@ -307,22 +301,6 @@ fn parse_theme_json(json: &str, name: &str, fallback_mode: ThemeMode) -> ThemePr
         &["title_bar.border"],
         if dark { 0x30343dff } else { 0xe3e3e0ff },
     );
-    let tab_bar = pick(
-        &["tab_bar.background"],
-        if dark { 0x22252bff } else { 0xf0f0eeff },
-    );
-    let tab_active = pick(
-        &["tab.active.background"],
-        if dark { 0x2f333dff } else { 0xf9f9f8ff },
-    );
-    let tab_active_foreground = pick(
-        &["tab.active.foreground"],
-        if dark { 0xd7dadfff } else { 0x403f44ff },
-    );
-    let tab_foreground = pick(
-        &["tab.foreground"],
-        if dark { 0xd4d4d4ff } else { 0x8a8b90ff },
-    );
     let caret = pick(&["caret"], if dark { 0xd7dadfff } else { 0x403f44ff });
     let danger = pick(
         &["danger.background", "base.red"],
@@ -335,10 +313,6 @@ fn parse_theme_json(json: &str, name: &str, fallback_mode: ThemeMode) -> ThemePr
     let success = pick(
         &["success.background", "base.green"],
         if dark { 0x98c379ff } else { 0x7fae6aff },
-    );
-    let info = pick(
-        &["info.background", "base.blue"],
-        if dark { 0x56b6c2ff } else { 0x94a4f5ff },
     );
     let red = pick(&["base.red"], if dark { 0xe06c75ff } else { 0xd1686fff });
     let green = pick(&["base.green"], if dark { 0x98c379ff } else { 0x7fae6aff });
@@ -394,15 +368,10 @@ fn parse_theme_json(json: &str, name: &str, fallback_mode: ThemeMode) -> ThemePr
             popover_foreground,
             title_bar,
             title_bar_border,
-            tab_bar,
-            tab_active,
-            tab_active_foreground,
-            tab_foreground,
             caret,
             danger,
             warning,
             success,
-            info,
             red,
             green,
             yellow,

@@ -163,6 +163,8 @@ pub struct KumuApp {
     plugin_views: HashMap<&'static str, AnyView>,
     /// Width of the open plugin panel in px, chosen by dragging its divider.
     plugin_width: f32,
+    /// Title-bar plugin button currently hovered (for pure-GPUI hover tooltip).
+    pub(super) hovered_plugin_tooltip: Option<&'static str>,
     /// Registry backing `"kumu.terminal"` and `"kumu.plugin"` native NSH slots.
     native_registry: NativeViewRegistry,
     /// Unified Pure Rust NSH home shell (sidebar + tabs + split pane grid + plugin slot + toast stack).
@@ -497,6 +499,7 @@ impl KumuApp {
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
+            hovered_plugin_tooltip: None,
             native_registry,
             shell_nsh,
             active_dialog: None,

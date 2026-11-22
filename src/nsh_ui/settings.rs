@@ -2,10 +2,6 @@
 //! Waku-style: sidebar (back row + search + icon nav) on the left; a centered
 //! scrollable column with card-grouped rows on the right.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gpui::{
@@ -14,6 +10,7 @@ use gpui::{
 };
 use nsh_platform_gpui::{AppOptions, AppView, Root};
 
+use super::mount::MountRegistry;
 use super::theme::{appearance, nsh_theme};
 use super::toast::ToastItem;
 use crate::agent::{AGENTS, integration};
@@ -149,24 +146,7 @@ struct SettingsMount {
     actions_tx: UnboundedSender<SettingsAction>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, SettingsMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, SettingsMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_mount(mount: SettingsMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
-}
-
-fn take_mount(id: u64) -> Option<SettingsMount> {
-    pending_mounts().lock().ok()?.remove(&id)
-}
+static MOUNTS: MountRegistry<SettingsMount> = MountRegistry::new();
 
 mod view {
     use std::collections::HashMap;
@@ -179,9 +159,7 @@ mod view {
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{
-        AgentStatusRow, HostEvent, SettingsAction, SettingsPage, UpdateSnapshot, take_mount,
-    };
+    use super::{AgentStatusRow, HostEvent, MOUNTS, SettingsAction, SettingsPage, UpdateSnapshot};
     use crate::agent::{AGENTS, integration};
     use crate::nsh_ui::assets::{agent_logo, icon_svg};
     use crate::nsh_ui::components::{
@@ -203,7 +181,7 @@ mod view {
 
     #[component]
     pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
-        let mount = take_mount(props.mount_id.get_untracked());
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
 
         let (initial, events_rx, actions_tx) = match mount {
             Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
@@ -985,7 +963,7 @@ pub struct SettingsWindow {
 
 impl Drop for SettingsWindow {
     fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
+        let _ = MOUNTS.take(self.mount_id);
     }
 }
 
@@ -1014,7 +992,7 @@ impl SettingsWindow {
             updater: UpdateSnapshot::from_status(updater.read(cx).status()),
         };
 
-        let mount_id = register_mount(SettingsMount {
+        let mount_id = MOUNTS.register(SettingsMount {
             initial: initial_state,
             events_rx,
             actions_tx,
@@ -1327,7 +1305,7 @@ mod tests {
     fn settings_nsh_navigation_toggles_and_restart_dialog() {
         let (events_tx, events_rx) = unbounded::<HostEvent>();
         let (actions_tx, mut actions_rx) = unbounded::<SettingsAction>();
-        let mount_id = register_mount(SettingsMount {
+        let mount_id = MOUNTS.register(SettingsMount {
             initial: InitialSettingsState {
                 dark: false,
                 font_family: crate::theme::SYSTEM_FONT_FAMILY.to_string(),

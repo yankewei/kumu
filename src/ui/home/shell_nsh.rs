@@ -15,8 +15,6 @@
 //! and `⌘F` find-bar updates never unmount or recreate live `TerminalView` nodes.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -29,6 +27,7 @@ use super::tabs_nsh::{TabBarAction, TabBarSnapshot};
 use super::terminal::PaneChromeSnapshot;
 use super::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use crate::app::layout::{PaneId, SplitAxis};
+use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::nsh_ui::toast::{ToastCommand, ToastItem};
 use crate::theme::KumuTheme;
@@ -38,8 +37,9 @@ const PLUGIN_MAX_W: f32 = 520.0;
 
 /// Split tree structure (topology + initial group ratios only).
 /// Separating this from per-pane chrome guarantees header/status/find updates
-/// never remount live `native("kumu.terminal")` leaves.
-#[derive(Clone, Debug, PartialEq)]
+/// never remount live `native("kumu.terminal")` leaves, and topology-only
+/// [`PartialEq`] ensures dragging a split divider never rebuilds the tree.
+#[derive(Clone, Debug)]
 pub(super) enum LayoutNodeSnapshot {
     Leaf(PaneId),
     Group {
@@ -48,6 +48,29 @@ pub(super) enum LayoutNodeSnapshot {
         ratios: Vec<f32>,
         children: Vec<LayoutNodeSnapshot>,
     },
+}
+
+impl PartialEq for LayoutNodeSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Leaf(a), Self::Leaf(b)) => a == b,
+            (
+                Self::Group {
+                    id: id_a,
+                    axis: axis_a,
+                    children: children_a,
+                    ..
+                },
+                Self::Group {
+                    id: id_b,
+                    axis: axis_b,
+                    children: children_b,
+                    ..
+                },
+            ) => id_a == id_b && axis_a == axis_b && children_a == children_b,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -130,27 +153,12 @@ struct ShellMount {
     actions_tx: UnboundedSender<HomeShellAction>,
 }
 
-static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
-static PENDING_MOUNTS: OnceLock<Mutex<HashMap<u64, ShellMount>>> = OnceLock::new();
-
-fn pending_mounts() -> &'static Mutex<HashMap<u64, ShellMount>> {
-    PENDING_MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn register_mount(mount: ShellMount) -> u64 {
-    let id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = pending_mounts().lock() {
-        map.insert(id, mount);
-    }
-    id
-}
-
-fn take_mount(id: u64) -> Option<ShellMount> {
-    pending_mounts().lock().ok()?.remove(&id)
-}
+static MOUNTS: MountRegistry<ShellMount> = MountRegistry::new();
 
 mod view {
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     use futures::StreamExt;
     use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -160,9 +168,9 @@ mod view {
     use nsh_core::prelude::*;
 
     use super::{
-        CenterModeSnapshot, HomeShellAction, HomeShellSnapshot, LayoutNodeSnapshot,
+        CenterModeSnapshot, HomeShellAction, HomeShellSnapshot, LayoutNodeSnapshot, MOUNTS,
         PLUGIN_COMPONENT, PLUGIN_MAX_W, PLUGIN_MIN_W, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-        ShellHostEvent, TERMINAL_COMPONENT, take_mount,
+        ShellHostEvent, TERMINAL_COMPONENT,
     };
     use crate::agent::{AGENTS, AgentState, installed};
     use crate::app::layout::{PaneId, SplitAxis};
@@ -215,6 +223,7 @@ mod view {
         };
         let glyph: AnyElement = match state {
             AgentState::Running => icon_svg("icons/loader-circle.svg", 12.0)
+                .app_class("animate-spin")
                 .text_color(color)
                 .into_element(),
             AgentState::Waiting => view()
@@ -261,22 +270,31 @@ mod view {
             .flex_shrink_0()
             .p_0p5()
             .rounded(move || active_theme().radius)
+            .app_class("cursor-pointer")
             .hover(|s| s.bg(move || active_theme().accent.opacity(0.5)))
             .on_press(on_press)
             .child(icon_svg(icon, 14.0).text_color(move || active_theme().muted_foreground))
     }
 
+    type PaneSignalMap = Rc<RefCell<HashMap<PaneId, Signal<Option<PaneChromeSnapshot>>>>>;
+
+    fn pane_signal(signals: &PaneSignalMap, pane_id: PaneId) -> Signal<Option<PaneChromeSnapshot>> {
+        *signals
+            .borrow_mut()
+            .entry(pane_id)
+            .or_insert_with(|| signal(None))
+    }
+
     fn render_pane_leaf(
         pane_id: PaneId,
-        pane_chrome: Signal<HashMap<PaneId, PaneChromeSnapshot>>,
+        pane_sig: Signal<Option<PaneChromeSnapshot>>,
         tx: Option<UnboundedSender<HomeShellAction>>,
     ) -> AnyElement {
         let tx_hdr = tx.clone();
         let tx_find = tx.clone();
 
         let header = dynamic(move || {
-            let snap = pane_chrome.with(|map| map.get(&pane_id).cloned());
-            let Some(snap) = snap else {
+            let Some(snap) = pane_sig.get() else {
                 return view().h(px(34.0)).w_full().into_element();
             };
             let active = snap.active;
@@ -311,6 +329,8 @@ mod view {
                     text(snap.name)
                         .flex_shrink_0()
                         .max_w(px(180.0))
+                        .min_w_0()
+                        .app_class("truncate")
                         .text_size(text_xs_size)
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || active_theme().foreground),
@@ -319,6 +339,7 @@ mod view {
                     text(snap.cwd)
                         .flex_1()
                         .min_w_0()
+                        .app_class("truncate")
                         .text_size(text_xs_size)
                         .text_color(move || active_theme().muted_foreground),
                 );
@@ -386,21 +407,62 @@ mod view {
             row.into_element()
         });
 
-        let find_bar = dynamic(move || {
-            let find = pane_chrome.with(|map| map.get(&pane_id).and_then(|p| p.find.clone()));
-            let Some(find) = find else {
-                return view().into_element();
+        let find_open = move || pane_sig.with(|p| p.as_ref().is_some_and(|c| c.find.is_some()));
+        let find_bar = when(find_open, move || {
+            let initial_find = pane_sig.get_untracked().and_then(|c| c.find);
+            let initial_needle = initial_find
+                .as_ref()
+                .map(|f| f.needle.clone())
+                .unwrap_or_default();
+            let initial_nonce = initial_find.as_ref().map_or(0, |f| f.focus_nonce);
+
+            let draft = signal(initial_needle);
+            let input_ref = element_ref();
+            let last_nonce = stored(initial_nonce);
+
+            // Re-focus (and select-all) whenever ⌘F is pressed again while open.
+            effect(move || {
+                let nonce = pane_sig.with(|p| {
+                    p.as_ref()
+                        .and_then(|c| c.find.as_ref())
+                        .map_or(0, |f| f.focus_nonce)
+                });
+                let changed = last_nonce.with(|prev| {
+                    if nonce > *prev {
+                        *prev = nonce;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    input_ref.focus();
+                }
+            });
+
+            let count_label = move || {
+                pane_sig.with(|p| {
+                    p.as_ref()
+                        .and_then(|c| c.find.as_ref())
+                        .map(|f| f.count_label.clone())
+                        .unwrap_or_default()
+                })
             };
-            let draft = signal(find.needle.clone());
+            let has_matches = move || {
+                pane_sig.with(|p| {
+                    p.as_ref()
+                        .and_then(|c| c.find.as_ref())
+                        .is_some_and(|f| f.has_matches)
+                })
+            };
+
             let tx_change = tx_find.clone();
             let tx_key = tx_find.clone();
             let tx_older = tx_find.clone();
             let tx_newer = tx_find.clone();
             let tx_close = tx_find.clone();
-            let has_matches = find.has_matches;
-            let dim = if has_matches { 1.0 } else { 0.4 };
 
-            let mut bar = view()
+            view()
                 .absolute()
                 .top_2()
                 .right_3()
@@ -431,7 +493,9 @@ mod view {
                 })
                 .child(
                     kumu_input("在当前终端中查找")
+                        .element_ref(&input_ref)
                         .auto_focus(true)
+                        .select_text_on_focus(true)
                         .flex_1()
                         .min_w_0()
                         .py_0p5()
@@ -447,60 +511,58 @@ mod view {
                                 },
                             );
                         }),
-                );
-
-            if !find.count_label.is_empty() {
-                bar = bar.child(
-                    text(find.count_label)
+                )
+                .child(
+                    text(count_label)
+                        .style_when(move || count_label().is_empty(), |s| s.hidden())
                         .flex_shrink_0()
                         .text_size(text_xs_size)
                         .text_color(move || active_theme().muted_foreground),
-                );
-            }
-
-            bar.child(
-                header_icon_button(
-                    "icons/chevron-up.svg",
-                    "查找更早的内容（Enter）",
-                    move || {
-                        send(
-                            &tx_older,
-                            HomeShellAction::FindStep {
-                                pane: pane_id,
-                                older: true,
-                            },
-                        );
-                    },
                 )
-                .opacity(dim),
-            )
-            .child(
-                header_icon_button(
-                    "icons/chevron-down.svg",
-                    "查找更新的内容（⇧Enter）",
-                    move || {
-                        send(
-                            &tx_newer,
-                            HomeShellAction::FindStep {
-                                pane: pane_id,
-                                older: false,
-                            },
-                        );
-                    },
+                .child(
+                    header_icon_button(
+                        "icons/chevron-up.svg",
+                        "查找更早的内容（Enter）",
+                        move || {
+                            send(
+                                &tx_older,
+                                HomeShellAction::FindStep {
+                                    pane: pane_id,
+                                    older: true,
+                                },
+                            );
+                            input_ref.focus();
+                        },
+                    )
+                    .opacity(move || if has_matches() { 1.0_f32 } else { 0.4_f32 }),
                 )
-                .opacity(dim),
-            )
-            .child(header_icon_button(
-                "icons/x.svg",
-                "关闭查找",
-                move || {
-                    send(&tx_close, HomeShellAction::FindClose(pane_id));
-                },
-            ))
-            .into_element()
+                .child(
+                    header_icon_button(
+                        "icons/chevron-down.svg",
+                        "查找更新的内容（⇧Enter）",
+                        move || {
+                            send(
+                                &tx_newer,
+                                HomeShellAction::FindStep {
+                                    pane: pane_id,
+                                    older: false,
+                                },
+                            );
+                            input_ref.focus();
+                        },
+                    )
+                    .opacity(move || if has_matches() { 1.0_f32 } else { 0.4_f32 }),
+                )
+                .child(header_icon_button(
+                    "icons/x.svg",
+                    "关闭查找",
+                    move || {
+                        send(&tx_close, HomeShellAction::FindClose(pane_id));
+                    },
+                ))
         });
 
-        let is_active = move || pane_chrome.with(|map| map.get(&pane_id).is_some_and(|p| p.active));
+        let is_active = move || pane_sig.with(|p| p.as_ref().is_some_and(|c| c.active));
 
         view()
             .flex_col()
@@ -536,11 +598,13 @@ mod view {
 
     fn render_pane_tree(
         node: &LayoutNodeSnapshot,
-        pane_chrome: Signal<HashMap<PaneId, PaneChromeSnapshot>>,
+        pane_signals: &PaneSignalMap,
         tx: Option<UnboundedSender<HomeShellAction>>,
     ) -> AnyElement {
         match node {
-            LayoutNodeSnapshot::Leaf(pane_id) => render_pane_leaf(*pane_id, pane_chrome, tx),
+            LayoutNodeSnapshot::Leaf(pane_id) => {
+                render_pane_leaf(*pane_id, pane_signal(pane_signals, *pane_id), tx)
+            }
             LayoutNodeSnapshot::Group {
                 id,
                 axis,
@@ -575,7 +639,7 @@ mod view {
 
                 let count = children.len().max(1);
                 for (index, child) in children.iter().enumerate() {
-                    let child_el = render_pane_tree(child, pane_chrome, tx.clone());
+                    let child_el = render_pane_tree(child, pane_signals, tx.clone());
                     let mut panel = resizable_panel().min_size(px(120.0));
                     if ratios.len() == count {
                         panel = panel.size(Some(px(ratios[index] * 1000.0)));
@@ -607,7 +671,7 @@ mod view {
 
     #[component]
     pub(super) fn HomeShellRoot(props: HomeShellRootProps) -> impl IntoElement {
-        let mount = take_mount(props.mount_id.get_untracked());
+        let mount = MOUNTS.take(props.mount_id.get_untracked());
         let (initial, events_rx, actions_tx) = match mount {
             Some(m) => (m.initial, Some(m.events_rx), Some(m.actions_tx)),
             None => (HomeShellSnapshot::default(), None, None),
@@ -623,7 +687,13 @@ mod view {
         let sidebar_sig = signal(initial.sidebar);
         let tab_bar_sig = signal(initial.tab_bar);
         let center_sig = signal(initial.center);
-        let pane_chrome = signal(initial.pane_chrome);
+        let pane_signals: PaneSignalMap = Rc::new(RefCell::new(
+            initial
+                .pane_chrome
+                .into_iter()
+                .map(|(id, snap)| (id, signal(Some(snap))))
+                .collect(),
+        ));
         let open_plugin = signal(initial.open_plugin);
 
         let (sidebar_tx, mut sidebar_rx) = unbounded();
@@ -646,13 +716,12 @@ mod view {
         });
         let tx_toast = actions_tx.clone();
         spawn(async move {
-            while let Some(ev) = toast_ev_rx.next().await {
-                if let ToastHostEvent::Clicked(id) = ev {
-                    send(&tx_toast, HomeShellAction::ToastClicked(id));
-                }
+            while let Some(ToastHostEvent::Clicked(id)) = toast_ev_rx.next().await {
+                send(&tx_toast, HomeShellAction::ToastClicked(id));
             }
         });
 
+        let pane_signals_ev = pane_signals.clone();
         if let Some(mut rx) = events_rx {
             spawn(async move {
                 while let Some(ev) = rx.next().await {
@@ -661,7 +730,21 @@ mod view {
                         ShellHostEvent::Sidebar(s) => sidebar_sig.set(s),
                         ShellHostEvent::TabBar(t) => tab_bar_sig.set(t),
                         ShellHostEvent::Center(c) => center_sig.set(c),
-                        ShellHostEvent::PaneChrome(m) => pane_chrome.set(m),
+                        ShellHostEvent::PaneChrome(mut next_map) => {
+                            let mut map = pane_signals_ev.borrow_mut();
+                            for (pane_id, sig) in map.iter() {
+                                if let Some(next) = next_map.remove(pane_id) {
+                                    if sig.get_untracked().as_ref() != Some(&next) {
+                                        sig.set(Some(next));
+                                    }
+                                } else if sig.get_untracked().is_some() {
+                                    sig.set(None);
+                                }
+                            }
+                            for (pane_id, next) in next_map {
+                                map.insert(pane_id, signal(Some(next)));
+                            }
+                        }
                         ShellHostEvent::OpenPlugin(p) => open_plugin.set(p),
                         ShellHostEvent::Toast(cmd) => {
                             let _ = toast_cmd_tx.unbounded_send(cmd);
@@ -700,6 +783,7 @@ mod view {
                         .flex_shrink_0()
                         .p_0p5()
                         .rounded(move || active_theme().radius)
+                        .app_class("cursor-pointer")
                         .hover(|s| s.bg(move || warning_color().opacity(0.25)))
                         .on_press(move || send(&tx_x, HomeShellAction::DismissStoreError))
                         .child(icon_svg("icons/close.svg", 12.0).text_color(warning_color)),
@@ -711,11 +795,12 @@ mod view {
         let tab_bar_el = render_tab_bar(tab_bar_sig, Some(tabs_tx));
 
         let tx_center = actions_tx.clone();
+        let pane_signals_center = pane_signals.clone();
         let center_body = dynamic(move || {
             let tx_c = tx_center.clone();
             match center_sig.get() {
                 CenterModeSnapshot::Panes(root_node) => {
-                    render_pane_tree(&root_node, pane_chrome, tx_c)
+                    render_pane_tree(&root_node, &pane_signals_center, tx_c)
                 }
                 CenterModeSnapshot::EmptyTerminals => view()
                     .flex_col()
@@ -890,7 +975,7 @@ pub(super) struct NshHomeShell {
 
 impl Drop for NshHomeShell {
     fn drop(&mut self) {
-        let _ = take_mount(self.mount_id);
+        let _ = MOUNTS.take(self.mount_id);
     }
 }
 
@@ -912,7 +997,7 @@ impl NshHomeShell {
         let last_pane_chrome = initial.pane_chrome.clone();
         let last_plugin = initial.open_plugin.clone();
 
-        let mount_id = register_mount(ShellMount {
+        let mount_id = MOUNTS.register(ShellMount {
             initial,
             events_rx,
             actions_tx,
@@ -982,17 +1067,17 @@ impl NshHomeShell {
                 .events_tx
                 .unbounded_send(ShellHostEvent::TabBar(next.tab_bar));
         }
-        if self.last_center != next.center {
-            self.last_center = next.center.clone();
-            let _ = self
-                .events_tx
-                .unbounded_send(ShellHostEvent::Center(next.center));
-        }
         if self.last_pane_chrome != next.pane_chrome {
             self.last_pane_chrome = next.pane_chrome.clone();
             let _ = self
                 .events_tx
                 .unbounded_send(ShellHostEvent::PaneChrome(next.pane_chrome));
+        }
+        if self.last_center != next.center {
+            self.last_center = next.center.clone();
+            let _ = self
+                .events_tx
+                .unbounded_send(ShellHostEvent::Center(next.center));
         }
         if self.last_plugin != next.open_plugin {
             self.last_plugin = next.open_plugin.clone();
@@ -1059,7 +1144,7 @@ mod tests {
             pane_chrome: chrome,
             ..Default::default()
         };
-        let mount_id = register_mount(ShellMount {
+        let mount_id = MOUNTS.register(ShellMount {
             initial,
             events_rx,
             actions_tx,
@@ -1078,6 +1163,32 @@ mod tests {
 
         app.wait_for("zsh").expect("pane header name renders");
         app.wait_for("1/3").expect("find bar match count renders");
+
+        // Updating match count updates badge reactively without tearing down the find bar.
+        let mut updated_chrome = HashMap::new();
+        updated_chrome.insert(
+            PaneId(1),
+            PaneChromeSnapshot {
+                id: PaneId(1),
+                name: "zsh".into(),
+                cwd: "~/kumu".into(),
+                note: None,
+                agent_status: None,
+                active: true,
+                can_close: true,
+                find: Some(FindBarSnapshot {
+                    needle: "hello".into(),
+                    count_label: "2/3".into(),
+                    has_matches: true,
+                    focus_nonce: 2,
+                }),
+            },
+        );
+        events_tx
+            .unbounded_send(ShellHostEvent::PaneChrome(updated_chrome))
+            .expect("update match count");
+        app.wait_for("2/3").expect("updated match count renders");
+
         app.press("label:关闭查找").expect("press close find");
         assert_eq!(
             actions_rx.try_recv().ok(),
@@ -1088,5 +1199,40 @@ mod tests {
             .unbounded_send(ShellHostEvent::Center(CenterModeSnapshot::EmptyProjects))
             .expect("switch to empty projects");
         app.wait_for("还没有项目").expect("empty projects renders");
+    }
+
+    #[test]
+    fn layout_topology_equality_ignores_dragged_split_ratios() {
+        let before = LayoutNodeSnapshot::Group {
+            id: 1,
+            axis: SplitAxis::Horizontal,
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                LayoutNodeSnapshot::Leaf(PaneId(1)),
+                LayoutNodeSnapshot::Leaf(PaneId(2)),
+            ],
+        };
+        let after_drag = LayoutNodeSnapshot::Group {
+            id: 1,
+            axis: SplitAxis::Horizontal,
+            ratios: vec![0.3, 0.7],
+            children: vec![
+                LayoutNodeSnapshot::Leaf(PaneId(1)),
+                LayoutNodeSnapshot::Leaf(PaneId(2)),
+            ],
+        };
+        let after_split = LayoutNodeSnapshot::Group {
+            id: 1,
+            axis: SplitAxis::Horizontal,
+            ratios: vec![0.3, 0.35, 0.35],
+            children: vec![
+                LayoutNodeSnapshot::Leaf(PaneId(1)),
+                LayoutNodeSnapshot::Leaf(PaneId(2)),
+                LayoutNodeSnapshot::Leaf(PaneId(3)),
+            ],
+        };
+
+        assert_eq!(before, after_drag);
+        assert_ne!(before, after_split);
     }
 }

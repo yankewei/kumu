@@ -274,6 +274,7 @@ impl KumuApp {
                 ok_label: "保存".into(),
                 cancel_label: "取消".into(),
                 require_non_empty: true,
+                select_all: true,
             },
             window,
             cx,
@@ -386,9 +387,9 @@ impl KumuApp {
                     }
                 }
                 let attention = if waiting > 0 {
-                    Some(TabAttention::Waiting)
+                    Some(TabAttention::Waiting(waiting))
                 } else if failed > 0 {
-                    Some(TabAttention::Failed)
+                    Some(TabAttention::Failed(failed))
                 } else {
                     None
                 };

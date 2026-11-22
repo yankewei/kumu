@@ -99,6 +99,7 @@ fn render_ref_badges(refs: &[String]) -> Vec<AnyElement> {
                 .bg(move || color().opacity(0.14))
                 .child(
                     text(label.to_string())
+                        .app_class("truncate")
                         .text_size(text_xs_size)
                         .text_color(color),
                 )
@@ -194,6 +195,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                     .rounded(px(4.0))
                     .items_center()
                     .justify_center()
+                    .app_class("cursor-pointer")
                     .on_press(move || send_action(&tx, GitPanelAction::SelectTab(target)));
                 if active {
                     btn = btn.bg(move || active_theme().background);
@@ -245,7 +247,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                         .min_w_0()
                         .flex_row()
                         .justify_end()
-                        .child(meta_text(branch)),
+                        .child(meta_text(branch).app_class("truncate")),
                 ),
         );
 
@@ -295,6 +297,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                                     view()
                                         .role(AccessibilityRole::Button)
                                         .label("清空搜索")
+                                        .app_class("cursor-pointer")
                                         .on_press(move || {
                                             search_draft.set(String::new());
                                             send_action(
@@ -373,6 +376,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                             .px_2()
                             .gap_1p5()
                             .items_center()
+                            .app_class("cursor-pointer")
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.35)))
                             .on_press(move || {
                                 send_action(&tx, GitPanelAction::OpenChange(clicked.clone()));
@@ -394,11 +398,17 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                                 text(file_name(&change.path).to_string())
                                     .flex_1()
                                     .min_w_0()
+                                    .app_class("truncate")
                                     .text_size(text_xs_size)
                                     .text_color(move || active_theme().sidebar_foreground),
                             );
                         if !trailing.is_empty() {
-                            row_el = row_el.child(meta_text(trailing));
+                            row_el = row_el.child(
+                                meta_text(trailing)
+                                    .max_w(px(120.0))
+                                    .min_w_0()
+                                    .app_class("truncate"),
+                            );
                         }
                         if let Some(mark_el) = render_mark(mark) {
                             row_el = row_el.child(mark_el);
@@ -477,6 +487,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                 .px_2()
                 .gap_1()
                 .items_center()
+                .app_class("cursor-pointer")
                 .hover(|s| s.bg(move || active_theme().accent.opacity(0.35)))
                 .on_press(move || {
                     send_action(&tx, GitPanelAction::OpenCommit(clicked.clone()));
@@ -504,6 +515,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                 text(commit.subject.clone())
                     .flex_1()
                     .min_w_0()
+                    .app_class("truncate")
                     .text_size(text_xs_size)
                     .text_color(move || active_theme().sidebar_foreground),
             );
