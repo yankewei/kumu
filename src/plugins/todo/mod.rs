@@ -104,6 +104,14 @@ pub(super) enum TodoHostEvent {
     ClearFollowup,
 }
 
+/// Where a newly dispatched TODO Agent should open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TodoDispatchTarget {
+    SplitRight,
+    NewTab,
+    NewWorktree,
+}
+
 /// User actions emitted by the Pure Rust NSH TODO board back to the GPUI host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TodoAction {
@@ -131,7 +139,7 @@ pub(super) enum TodoAction {
     DispatchNewAgent {
         id: i64,
         agent_id: String,
-        new_tab: bool,
+        target: TodoDispatchTarget,
     },
     BindExistingPane {
         id: i64,
@@ -486,10 +494,10 @@ impl TodoPanel {
             TodoAction::DispatchNewAgent {
                 id,
                 agent_id,
-                new_tab,
+                target,
             } => {
                 if let Some(item) = self.todo_by_id(id, cx) {
-                    self.dispatch_new_agent(&item, &agent_id, new_tab, cx);
+                    self.dispatch_new_agent(&item, &agent_id, target, cx);
                 }
                 self.push_snapshot(cx);
             }
@@ -556,26 +564,29 @@ impl TodoPanel {
             self.push_notice("未检测到已安装的编码 Agent", true);
             return;
         };
-        self.dispatch_new_agent(item, &agent_id, false, cx);
+        self.dispatch_new_agent(item, &agent_id, TodoDispatchTarget::SplitRight, cx);
     }
 
     fn dispatch_new_agent(
         &mut self,
         item: &TodoItem,
         agent_id: &str,
-        new_tab: bool,
+        target: TodoDispatchTarget,
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.project.as_ref() else {
             return;
         };
         let prompt = format_task_prompt(item);
-        let mode = if new_tab {
-            DispatchMode::NewTab {
+        let mode = match target {
+            TodoDispatchTarget::SplitRight => DispatchMode::SplitRight,
+            TodoDispatchTarget::NewTab => DispatchMode::NewTab {
                 tab_name: item.title.clone(),
-            }
-        } else {
-            DispatchMode::SplitRight
+            },
+            TodoDispatchTarget::NewWorktree => DispatchMode::NewWorktree {
+                branch: todo_branch_name(item),
+                tab_name: item.title.clone(),
+            },
         };
         match self
             .host
@@ -676,10 +687,60 @@ impl Render for TodoPanel {
     }
 }
 
+/// Build a safe, git-ref-valid branch name for dispatching `item` into a
+/// dedicated worktree (e.g. `todo-12-fix-osc` or `todo-12`).
+fn todo_branch_name(item: &TodoItem) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in item.title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !slug.is_empty() {
+            slug.push('-');
+            prev_dash = true;
+        }
+        if slug.len() >= 28 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("todo-{}", item.id)
+    } else {
+        format!("todo-{}-{slug}", item.id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nsh_engine::EngineConfig;
+
+    #[test]
+    fn todo_branch_name_produces_valid_slugs() {
+        let mk = |id, title: &str| TodoItem {
+            id,
+            project_id: 1,
+            title: title.into(),
+            description: String::new(),
+            status: TodoStatus::Todo,
+            position: 0,
+            pane_id: None,
+            agent_id: None,
+            agent_session_id: None,
+            awaiting_review: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+        };
+        assert_eq!(
+            todo_branch_name(&mk(12, "Fix OSC parser!")),
+            "todo-12-fix-osc-parser"
+        );
+        assert_eq!(todo_branch_name(&mk(7, "重构 TODO 看板")), "todo-7-todo");
+        assert_eq!(todo_branch_name(&mk(9, "修复所有中文问题")), "todo-9");
+    }
 
     #[test]
     fn task_prompt_omits_blank_description_and_keeps_multiline_body() {

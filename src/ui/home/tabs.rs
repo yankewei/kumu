@@ -130,6 +130,7 @@ impl KumuApp {
         self.focused = pane;
         self.pending_focus = Some(pane);
         self.pending_close_tab = None;
+        self.zoomed_pane = None;
         self.show_selected_tab(project_id, cx);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
@@ -165,6 +166,7 @@ impl KumuApp {
             return;
         }
         self.pending_close_tab = None;
+        self.zoomed_pane = None;
         if let Some(tabs) = self.tabs_by_project.get_mut(&project) {
             tabs.selected = index;
         }
@@ -298,6 +300,7 @@ impl KumuApp {
     /// Remove a tab and end every terminal in it.
     pub(super) fn finish_close_tab(&mut self, project: i64, index: usize, cx: &mut Context<Self>) {
         self.pending_close_tab = None;
+        self.zoomed_pane = None;
         let Some(tabs) = self.tabs_by_project.get(&project) else {
             return;
         };

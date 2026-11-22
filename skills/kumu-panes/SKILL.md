@@ -11,6 +11,8 @@ Kumu 的每个窗格是一个独立终端。你只能看到自己这一格，但
 - `kumu pane read <目标>` 返回一个窗格的纯文本：屏幕内容，加上可选的滚动历史。
 - `kumu pane split right|down --agent <id>` 在你旁边开一个 Agent 窗格。
 - `kumu pane send <目标> <文字>` 往一个 **Agent 窗格** 输入文字并回车。
+- `kumu pane wait <目标>` 阻塞等待目标 Agent 窗格进入 `waiting` / `completed` / `failed` 或退出。
+- `kumu pane close <目标>` 关闭指定窗格（关闭自身需显式传 `--self`）。
 
 ## 先确认入口
 
@@ -60,6 +62,23 @@ Kumu 的每个窗格是一个独立终端。你只能看到自己这一格，但
 - 文本以 `-` 开头，或者整段正好是 `--json`、`-h` 这类词时，先加 `--`：`pane send right -- "-x"`。
 - 只能发给 Agent 窗格（`panes` 里带 `agent` 的）；shell 窗格会报 `notAgent`，因为在那里输入等于执行命令。
 - 如果目标 Agent 还在启动中，先用 `pane read` 确认它已经画出输入框，或者一开始就用 `pane split --prompt`。
+
+## 等待完成与关闭窗格
+
+```sh
+# 派发任务后阻塞等待右侧 Agent 完成（或等待输入 / 失败 / 退出）
+"$KUMU_APP_BINARY" pane wait right --timeout 300 --json
+
+# 向已有 Agent 追加消息后，等待下一次进入终态（避免立即命中上一轮 completed）
+"$KUMU_APP_BINARY" pane send right "顺便把单测补上"
+"$KUMU_APP_BINARY" pane wait right --next --timeout 300
+
+# 读取结果后关闭临时子窗格
+"$KUMU_APP_BINARY" pane close right
+```
+
+- `pane wait` 在目标 Agent 处于 `waiting` / `completed` / `failed` 或退出时返回，避免反复轮询 `pane read`。
+- `pane close` 默认拒绝关闭调用方自身（返回 `refuseSelf`），确需关闭自身时传 `--self`。
 
 ## 读内容
 

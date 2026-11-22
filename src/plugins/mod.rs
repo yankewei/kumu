@@ -75,6 +75,9 @@ pub enum DispatchMode {
     SplitRight,
     /// Open a new tab named after the task and start the agent inside it.
     NewTab { tab_name: String },
+    /// Create a sibling git worktree for `branch`, attach it under the root
+    /// repository, and start the agent inside a fresh tab there.
+    NewWorktree { branch: String, tab_name: String },
 }
 
 /// The window's send function, erased so a panel holds no window type. `None`

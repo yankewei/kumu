@@ -8,23 +8,11 @@ use super::drop::{
     save_clipboard_image,
 };
 use super::{FindState, GridAt, TerminalEvent, TerminalView};
-use crate::app::layout::PaneDirection;
 use crate::term::link;
 use crate::term::{
     Cell as TermCell, KeyInput, MouseAction, MouseButton as TermMouseButton, MouseInput, MouseMods,
     SelectStep,
 };
-
-/// Direction for a ⌘⌥arrow focus move.
-fn pane_direction(key: &str) -> Option<PaneDirection> {
-    match key {
-        "left" => Some(PaneDirection::Left),
-        "right" => Some(PaneDirection::Right),
-        "up" => Some(PaneDirection::Up),
-        "down" => Some(PaneDirection::Down),
-        _ => None,
-    }
-}
 
 impl TerminalView {
     pub(super) fn write_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -57,75 +45,24 @@ impl TerminalView {
             return;
         }
         if mods.platform {
-            // ⌘⌥arrows move focus between panes; ⌘D / ⌘⇧D split the focused
-            // pane, matching the split buttons in the pane chrome. ⌘T / ⌘W
-            // open and close tabs, ⌘⇧[ / ⌘⇧] walk them and ⌘1…9 picks one.
-            if mods.alt && !mods.control && !mods.shift {
-                if let Some(direction) = pane_direction(key) {
-                    cx.emit(TerminalEvent::Focus(direction));
-                    cx.stop_propagation();
-                }
-                return;
-            }
-            if !mods.alt && !mods.control {
-                // Holding a mutating shortcut must not repeat: a held ⌘W
-                // would otherwise turn its own close confirmation into the
-                // confirming click.
-                if event.is_held && matches!(key, "t" | "w" | "d") {
-                    cx.stop_propagation();
-                    return;
-                }
+            // Window-level shortcuts (⌘K, ⌘B, ⌘,, ⌘T, ⌘W, ⌘⇧W, ⌘D, ⌘⇧D,
+            // ⌘⇧Enter, ⌘⌥arrows, ⌘1…9, ⌘+/⌘-/⌘0) are intercepted by `KumuApp`.
+            // Keep terminal-local clipboard & find bindings here and swallow
+            // other ⌘ chords so they never leak into the PTY.
+            if !mods.alt && !mods.control && !mods.shift {
                 match key {
-                    "t" if !mods.shift => {
-                        cx.emit(TerminalEvent::NewTab);
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "w" if !mods.shift => {
-                        cx.emit(TerminalEvent::CloseTab);
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "{" | "[" if mods.shift => {
-                        cx.emit(TerminalEvent::PrevTab);
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "}" | "]" if mods.shift => {
-                        cx.emit(TerminalEvent::NextTab);
-                        cx.stop_propagation();
-                        return;
-                    }
-                    digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-                        if !mods.shift =>
-                    {
-                        if let Ok(index) = digit.parse::<usize>() {
-                            cx.emit(TerminalEvent::SelectTab(index - 1));
-                            cx.stop_propagation();
-                        }
-                        return;
-                    }
-                    "d" => {
-                        cx.emit(if mods.shift {
-                            TerminalEvent::SplitDown
-                        } else {
-                            TerminalEvent::SplitRight
-                        });
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "f" if !mods.shift => {
+                    "f" => {
                         self.open_find(window, cx);
                         cx.stop_propagation();
                         return;
                     }
-                    "c" if !mods.shift => {
+                    "c" => {
                         if self.copy(cx) {
                             cx.stop_propagation();
                         }
                         return;
                     }
-                    "v" if !mods.shift => {
+                    "v" => {
                         self.paste(cx);
                         cx.stop_propagation();
                         return;
@@ -245,7 +182,7 @@ impl TerminalView {
 
     /// Open the find bar and request input focus. ⌘F on an open bar bumps the
     /// focus nonce so the NSH find input re-focuses.
-    pub(super) fn open_find(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_find(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.project.is_none() {
             return;
         }
@@ -499,20 +436,17 @@ impl TerminalView {
         }
     }
 
-    /// Resolve the link at one cell: plain URL text from the cells on this
-    /// side, then an OSC 8 hyperlink from the terminal thread when the cell
-    /// carries one. The probe id makes a late answer unable to replace the
-    /// link under a newer cell.
+    /// Resolve the link at one cell: plain URL or local `file:line` text from
+    /// the cells on this side, then an OSC 8 hyperlink from the terminal thread
+    /// when the cell carries one. The probe id makes a late answer unable to
+    /// replace the link under a newer cell.
     fn resolve_link(&mut self, col: u16, row: u16, cx: &mut Context<Self>) {
         self.hover = Some((col, row));
         self.hover_row = self.snapshot.cells.get(usize::from(row)).cloned();
         self.hover_osc8 = false;
         self.hover_probe = self.hover_probe.wrapping_add(1);
         let probe = self.hover_probe;
-        self.set_link(
-            link::at(&self.snapshot, row, col).filter(|l| link::openable(&l.url)),
-            cx,
-        );
+        self.set_link(link::resolve_at(&self.snapshot, row, col), cx);
         if !self.hyperlinked(row, col) {
             return;
         }
@@ -535,21 +469,20 @@ impl TerminalView {
                 else {
                     if this.hover_osc8 {
                         this.hover_osc8 = false;
-                        let fallback =
-                            link::at(&this.snapshot, row, col).filter(|l| link::openable(&l.url));
+                        let fallback = link::resolve_at(&this.snapshot, row, col);
                         this.set_link(fallback, cx);
                     }
                     return;
                 };
                 this.hover_osc8 = true;
                 this.set_link(
-                    Some(link::TextLink {
+                    Some(link::ResolvedLink {
                         spans: vec![link::Span {
                             row: hyperlink.row,
                             from: hyperlink.from,
                             to: hyperlink.to,
                         }],
-                        url: hyperlink.uri,
+                        target: link::LinkTarget::Url(hyperlink.uri),
                     }),
                     cx,
                 );
@@ -573,10 +506,7 @@ impl TerminalView {
         }
         self.hover_osc8 = false;
         self.hover_probe = self.hover_probe.wrapping_add(1);
-        self.set_link(
-            link::at(&self.snapshot, row, col).filter(|l| link::openable(&l.url)),
-            cx,
-        );
+        self.set_link(link::resolve_at(&self.snapshot, row, col), cx);
     }
 
     /// Whether this cell is the visible text of an OSC 8 hyperlink.
@@ -588,7 +518,7 @@ impl TerminalView {
             .is_some_and(|cell| cell.hyperlink)
     }
 
-    fn set_link(&mut self, target: Option<link::TextLink>, cx: &mut Context<Self>) {
+    fn set_link(&mut self, target: Option<link::ResolvedLink>, cx: &mut Context<Self>) {
         if self.link == target {
             return;
         }
@@ -596,11 +526,22 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn launch_link_target(target: link::LinkTarget, cx: &mut App) {
+        match target {
+            link::LinkTarget::Url(url) => cx.open_url(&url),
+            link::LinkTarget::File(file) => {
+                cx.background_executor()
+                    .spawn(async move { link::open_file_in_editor(&file) })
+                    .detach();
+            }
+        }
+    }
+
     /// Open the link under the pointer. Called for a ⌘-click; `true` means the
     /// press was the link gesture and must not become a selection.
     ///
     /// Matches hover priority: an openable OSC 8 hyperlink takes precedence
-    /// over plain-text URL scanning on the same cell.
+    /// over plain-text URL / file:line scanning on the same cell.
     pub(super) fn open_link(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
         if self.project.is_none() {
             return false;
@@ -608,7 +549,7 @@ impl TerminalView {
         let Some((col, row)) = self.cell_at(pos) else {
             return false;
         };
-        let text_fallback = link::at(&self.snapshot, row, col).filter(|l| link::openable(&l.url));
+        let text_fallback = link::resolve_at(&self.snapshot, row, col);
         if self.hyperlinked(row, col)
             && let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0)
         {
@@ -628,7 +569,7 @@ impl TerminalView {
                     {
                         cx.open_url(&hyperlink.uri);
                     } else if let Some(link) = text_fallback {
-                        cx.open_url(&link.url);
+                        Self::launch_link_target(link.target, cx);
                     }
                 });
             })
@@ -636,7 +577,7 @@ impl TerminalView {
             return true;
         }
         if let Some(link) = text_fallback {
-            cx.open_url(&link.url);
+            Self::launch_link_target(link.target, cx);
             return true;
         }
         false

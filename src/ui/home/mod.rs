@@ -9,6 +9,7 @@ mod dialogs;
 mod native_host;
 mod plugins_host;
 mod shell_nsh;
+mod shortcuts;
 mod sidebar;
 mod sidebar_nsh;
 mod sprites;
@@ -26,6 +27,7 @@ use crate::app::layout::{
     SavedProjectTabs, SavedWorkspace, SplitAxis, TabId, WORKSPACE_STATE_VERSION,
 };
 use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
+use crate::nsh_ui::command_palette::ActiveCommandPalette;
 use crate::nsh_ui::dialogs::ActiveDialog;
 use crate::nsh_ui::toast::ToastItem;
 use crate::theme::KumuTheme;
@@ -156,6 +158,14 @@ pub struct KumuApp {
     last_saved_layout: Option<String>,
     /// Sidebar width in px, restored from the last drag of the divider.
     sidebar_width: f32,
+    /// Whether the left sidebar is expanded (`⌘B`).
+    sidebar_visible: bool,
+    /// Title-bar sidebar toggle button currently hovered.
+    hovered_sidebar_tooltip: bool,
+    /// Pane temporarily maximized over its split siblings (`⌘⇧Enter`).
+    zoomed_pane: Option<PaneId>,
+    /// Root focus handle so window-level shortcuts work even on empty states.
+    window_focus: FocusHandle,
     /// Open right-hand plugin panel, by registry id.
     open_plugin: Option<&'static str>,
     /// Live plugin panels. A panel is created when it opens and dropped when
@@ -169,6 +179,8 @@ pub struct KumuApp {
     native_registry: NativeViewRegistry,
     /// Unified Pure Rust NSH home shell (sidebar + tabs + split pane grid + plugin slot + toast stack).
     shell_nsh: NshHomeShell,
+    /// Full-window Pure Rust NSH `⌘K` command palette overlay (mounted only while open).
+    active_palette: Option<ActiveCommandPalette>,
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
     active_dialog: Option<ActiveDialog>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
@@ -411,6 +423,8 @@ impl KumuApp {
             .filter(|width| width.is_finite())
             .map(|width| width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
             .unwrap_or(SIDEBAR_WIDTH);
+        let sidebar_visible =
+            crate::db::get_setting(crate::db::SETTING_SIDEBAR_VISIBLE).as_deref() != Some("0");
 
         // Save the window's geometry when it closes. The app-quit path does not
         // hand the callback a window, so it reads the same bounds through the
@@ -457,6 +471,7 @@ impl KumuApp {
         let native_registry = NativeViewRegistry::new();
         let shell_nsh = NshHomeShell::new(
             HomeShellSnapshot {
+                sidebar_visible,
                 sidebar_width,
                 plugin_width: PLUGIN_WIDTH,
                 ..Default::default()
@@ -470,10 +485,14 @@ impl KumuApp {
         let nsh_theme_sub = cx.observe_global::<KumuTheme>(|app: &mut Self, cx| {
             let theme = KumuTheme::global(cx).clone();
             app.shell_nsh.sync_theme(&theme, cx);
+            if let Some(palette) = &app.active_palette {
+                palette.sync_theme(&theme, cx);
+            }
             if let Some(dialog) = &app.active_dialog {
                 dialog.sync_theme(&theme, cx);
             }
         });
+        let window_focus = cx.focus_handle();
 
         let mut app = Self {
             workspace,
@@ -496,12 +515,17 @@ impl KumuApp {
             auto_resume: auto_resume_enabled(),
             last_saved_layout,
             sidebar_width,
+            sidebar_visible,
+            hovered_sidebar_tooltip: false,
+            zoomed_pane: None,
+            window_focus,
             open_plugin: None,
             plugin_views: HashMap::new(),
             plugin_width: PLUGIN_WIDTH,
             hovered_plugin_tooltip: None,
             native_registry,
             shell_nsh,
+            active_palette: None,
             active_dialog: None,
             active_sheet: None,
             _nsh_theme_sub: nsh_theme_sub,
@@ -831,14 +855,6 @@ impl KumuApp {
     fn on_terminal_event(&mut self, pane: PaneId, ev: &TerminalEvent, cx: &mut Context<Self>) {
         match ev {
             TerminalEvent::Activated => self.focus_pane(pane, cx),
-            TerminalEvent::SplitRight => self.split_pane(pane, SplitAxis::Horizontal, cx),
-            TerminalEvent::SplitDown => self.split_pane(pane, SplitAxis::Vertical, cx),
-            TerminalEvent::NewTab => self.new_tab(cx),
-            TerminalEvent::NextTab => self.switch_tab(1, cx),
-            TerminalEvent::PrevTab => self.switch_tab(-1, cx),
-            TerminalEvent::SelectTab(index) => self.select_tab(*index, cx),
-            TerminalEvent::CloseTab => self.close_selected_tab(cx),
-            TerminalEvent::Focus(direction) => self.focus_neighbor(pane, *direction, cx),
             TerminalEvent::ChromeChanged => cx.notify(),
         }
     }
@@ -1016,6 +1032,9 @@ impl KumuApp {
         if project_changed || previous_tab != Some(tab_index) || needs_view {
             self.show_selected_tab(project, cx);
         }
+        if self.zoomed_pane != Some(pane) {
+            self.zoomed_pane = None;
+        }
         self.focused = pane;
         self.pending_focus = Some(pane);
         self.pending_close_tab = None;
@@ -1029,20 +1048,23 @@ impl KumuApp {
     }
 
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self
+        if self
             .selected
             .and_then(|project| self.active_tab(project))
             .is_some_and(|tab| tab.layout.contains(self.focused))
+            && let Some(terminal) = self.panes.get(&self.focused).cloned()
         {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
             return;
         }
-        if let Some(terminal) = self.panes.get(&self.focused).cloned() {
-            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-        }
+        // Empty workspace / empty project: keep focus on the home window root
+        // so global shortcuts (`⌘K`, `⌘B`, `⌘,`, `⌘T`) still fire.
+        self.window_focus.focus(window, cx);
     }
 
     fn select_project(&mut self, id: i64, cx: &mut Context<Self>) {
         self.pending_close_tab = None;
+        self.zoomed_pane = None;
         if self.selected != Some(id)
             && let Some(previous) = self.selected
         {
@@ -1147,6 +1169,7 @@ impl KumuApp {
         }
         let terminal = self.install_pane(new_id, cx);
         terminal.update(cx, |terminal, cx| terminal.show(project_id, &launch, cx));
+        self.zoomed_pane = None;
         self.focused = new_id;
         self.selected = Some(project_id);
         self.pending_focus = Some(new_id);
@@ -1207,6 +1230,14 @@ impl KumuApp {
         self.native_registry.unregister_pane(pane.0);
         self.launches.remove(&pane);
         self.agent_status.remove(&pane);
+        if self.zoomed_pane == Some(pane)
+            || self
+                .selected
+                .and_then(|project| self.active_tab(project))
+                .is_none_or(|tab| tab.layout.panes().len() <= 1)
+        {
+            self.zoomed_pane = None;
+        }
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
@@ -1221,11 +1252,16 @@ impl KumuApp {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let can_zoom_tab = visible.len() > 1;
+        let zoomed_pane = self.active_zoomed_pane();
         let focused = self.focused;
         for (id, terminal) in &self.panes {
-            let active = visible.contains(id) && *id == focused;
+            let shown = visible.contains(id);
+            let active = shown && *id == focused;
+            let can_zoom = shown && can_zoom_tab;
+            let zoomed = zoomed_pane == Some(*id);
             terminal.update(cx, |terminal, cx| {
-                terminal.set_chrome(active, visible.contains(id), cx);
+                terminal.set_chrome(active, shown, can_zoom, zoomed, cx);
             });
         }
     }
@@ -1271,6 +1307,7 @@ impl KumuApp {
     fn build_shell_snapshot(&self, cx: &Context<Self>) -> HomeShellSnapshot {
         let has_projects = !self.workspace.read(cx).projects().is_empty();
         let active_tab = self.selected.and_then(|project| self.active_tab(project));
+        let zoomed = self.active_zoomed_pane();
         let (center, pane_chrome) = match active_tab {
             Some(tab) if !tab.layout.panes().is_empty() => {
                 let mut chrome = HashMap::new();
@@ -1279,10 +1316,11 @@ impl KumuApp {
                         chrome.insert(pane_id, view.read(cx).chrome_snapshot());
                     }
                 }
-                (
-                    CenterModeSnapshot::Panes(self.build_layout_snapshot(&tab.layout)),
-                    chrome,
-                )
+                let layout = match zoomed {
+                    Some(pane_id) => LayoutNodeSnapshot::Leaf(pane_id),
+                    None => self.build_layout_snapshot(&tab.layout),
+                };
+                (CenterModeSnapshot::Panes(layout), chrome)
             }
             _ if has_projects => (CenterModeSnapshot::EmptyTerminals, HashMap::new()),
             _ => (CenterModeSnapshot::EmptyProjects, HashMap::new()),
@@ -1299,6 +1337,7 @@ impl KumuApp {
 
         HomeShellSnapshot {
             store_error: self.store_error.clone(),
+            sidebar_visible: self.sidebar_visible,
             sidebar_width: self.sidebar_width,
             plugin_width: self.plugin_width,
             sidebar: self.build_sidebar_snapshot(cx),
@@ -1336,19 +1375,16 @@ impl KumuApp {
                 self.native_registry.clear_plugins();
                 cx.notify();
             }
-            HomeShellAction::ResizeOuter {
-                sidebar_width,
-                plugin_width,
-            } => {
+            HomeShellAction::ResizeSidebar(sidebar_width) => {
                 let width = sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
                 if (width - self.sidebar_width).abs() >= 1.0 {
                     crate::db::set_setting(crate::db::SETTING_SIDEBAR_WIDTH, &format!("{width}"))
                         .ok();
                     self.sidebar_width = width;
                 }
-                if let Some(pw) = plugin_width {
-                    self.plugin_width = pw.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH);
-                }
+            }
+            HomeShellAction::ResizePlugin(plugin_width) => {
+                self.plugin_width = plugin_width.clamp(PLUGIN_MIN_WIDTH, PLUGIN_MAX_WIDTH);
             }
             HomeShellAction::ResizeGroup { group_id, ratios } => {
                 self.group_ratios.insert(group_id, ratios);
@@ -1358,6 +1394,9 @@ impl KumuApp {
                 self.focus_pane(pane, cx);
                 self.focus_terminal(window, cx);
                 cx.notify();
+            }
+            HomeShellAction::ToggleZoomPane(pane) => {
+                self.toggle_zoom_pane(pane, window, cx);
             }
             HomeShellAction::SplitRight(pane) => {
                 self.split_pane(pane, SplitAxis::Horizontal, cx);
@@ -1410,13 +1449,17 @@ impl KumuApp {
             .items_center()
             .gap_1()
             .children(crate::plugins::specs().map(|spec| self.render_plugin_button(spec, cx)));
-        let title_bar = crate::ui::titlebar::title_bar(
+        let title_bar = crate::ui::titlebar::title_bar_with_controls(
             "home-titlebar",
             theme,
+            Some(self.render_sidebar_toggle_button(cx)),
             Some(plugins.into_any_element()),
         );
 
         div()
+            .track_focus(&self.window_focus)
+            .capture_key_down(cx.listener(Self::on_window_key_down))
+            .on_key_down(cx.listener(Self::on_window_key_down_bubble))
             .flex()
             .flex_col()
             .relative()
@@ -1458,6 +1501,11 @@ impl KumuApp {
                     }))
                     .child(dialog.app_view.clone())
             }))
+            .children(
+                self.active_palette
+                    .as_ref()
+                    .map(|palette| div().absolute().inset_0().child(palette.app_view.clone())),
+            )
     }
 
     fn reveal_terminal_by_id(
@@ -1485,7 +1533,8 @@ impl KumuApp {
 
 impl Render for KumuApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.active_dialog.is_none()
+        if self.active_palette.is_none()
+            && self.active_dialog.is_none()
             && self.active_sheet.is_none()
             && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()

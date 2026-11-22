@@ -22,11 +22,12 @@ use gpui::*;
 #[cfg(test)]
 pub(crate) use self::chrome::FindBarSnapshot;
 pub(crate) use self::chrome::PaneChromeSnapshot;
+pub(crate) use self::chrome::short_cwd as short_cwd_display;
 use self::chrome::{find_bar_snapshot, header_name, header_note, short_cwd};
 use self::paint::{GridPaint, RowOp, Typeface, cell_size, grid_origin, paint_color, paint_grid};
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
-use crate::app::layout::{PaneDirection, PaneId};
+use crate::app::layout::PaneId;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::link;
 use crate::term::{Cell as TermCell, MouseAction, Rgb, SelectStep, Snapshot};
@@ -36,22 +37,6 @@ use crate::theme::{self, KumuTheme, ThemeRevision};
 pub enum TerminalEvent {
     /// The user clicked into this pane; the home window should focus it.
     Activated,
-    /// Split this pane to the right (another shell in the same project).
-    SplitRight,
-    /// Split this pane downward.
-    SplitDown,
-    /// Move keyboard focus to the pane in this direction.
-    Focus(PaneDirection),
-    /// Open a new tab with one shell.
-    NewTab,
-    /// Close the current tab (and every terminal in it).
-    CloseTab,
-    /// Show the next tab.
-    NextTab,
-    /// Show the previous tab.
-    PrevTab,
-    /// Show tab `n` (0-based).
-    SelectTab(usize),
     /// Pane header metadata or find-bar state changed; refresh the NSH shell.
     ChromeChanged,
 }
@@ -102,6 +87,10 @@ pub struct TerminalView {
     active: bool,
     /// Hidden panes do not expose close controls.
     can_close: bool,
+    /// Whether this pane belongs to a split layout and can be zoomed.
+    can_zoom: bool,
+    /// Whether this pane is currently maximized over its split siblings.
+    zoomed: bool,
     /// Theme revision last pushed into the live terminals.
     theme_rev: u64,
     /// IME composition preview ("nihao" before 你好).
@@ -113,7 +102,7 @@ pub struct TerminalView {
     /// Left-button selection drag in progress.
     selecting: bool,
     /// The link under a ⌘-hovered cell: where it sits and where a click goes.
-    link: Option<link::TextLink>,
+    link: Option<link::ResolvedLink>,
     /// The cell the pointer is over while ⌘ is held.
     hover: Option<(u16, u16)>,
     /// That cell's row as it looked when the link was resolved. A new frame
@@ -169,6 +158,8 @@ impl TerminalView {
             focus,
             active: true,
             can_close: false,
+            can_zoom: false,
+            zoomed: false,
             theme_rev: u64::MAX,
             marked: None,
             agent_status: None,
@@ -212,6 +203,8 @@ impl TerminalView {
             agent_status: self.agent_status,
             active: self.active,
             can_close: self.can_close,
+            can_zoom: self.can_zoom,
+            zoomed: self.zoomed,
             find: self
                 .find
                 .as_ref()
@@ -224,12 +217,25 @@ impl TerminalView {
     }
 
     /// Set the chrome state of a visible pane.
-    pub fn set_chrome(&mut self, active: bool, can_close: bool, cx: &mut Context<Self>) {
-        if self.active == active && self.can_close == can_close {
+    pub fn set_chrome(
+        &mut self,
+        active: bool,
+        can_close: bool,
+        can_zoom: bool,
+        zoomed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active == active
+            && self.can_close == can_close
+            && self.can_zoom == can_zoom
+            && self.zoomed == zoomed
+        {
             return;
         }
         self.active = active;
         self.can_close = can_close;
+        self.can_zoom = can_zoom;
+        self.zoomed = zoomed;
         cx.notify();
     }
 

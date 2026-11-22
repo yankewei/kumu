@@ -48,9 +48,10 @@ impl PaneLaunch {
         if !super::installed(agent) {
             return None;
         }
+        let extra = parse_extra_args(&crate::db::get_agent_args(agent));
         Some(AgentCommand {
             program: executable(agent)?,
-            args: resume_args(agent, session.as_deref()),
+            args: launch_args(agent, session.as_deref(), &extra),
         })
     }
 
@@ -69,6 +70,85 @@ impl PaneLaunch {
 pub struct AgentCommand {
     pub program: String,
     pub args: Vec<String>,
+}
+
+/// Split a user-configured CLI argument string into argv tokens, supporting
+/// single quotes, double quotes, and backslash escapes while ignoring control
+/// characters.
+pub fn parse_extra_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut has_token = false;
+
+    for ch in raw.chars() {
+        if ch.is_control() && !ch.is_whitespace() {
+            continue;
+        }
+        if escaped {
+            current.push(ch);
+            has_token = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+                has_token = true;
+            }
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '\\' => escaped = true,
+                _ => {
+                    current.push(ch);
+                    has_token = true;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                has_token = true;
+            }
+            '\'' => {
+                in_single = true;
+                has_token = true;
+            }
+            '"' => {
+                in_double = true;
+                has_token = true;
+            }
+            c if c.is_whitespace() => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            _ => {
+                current.push(ch);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+/// Combine user-configured extra flags with the CLI's session resume arguments.
+pub fn launch_args(agent: &str, session: Option<&str>, extra: &[String]) -> Vec<String> {
+    let mut args = extra.to_vec();
+    args.extend(resume_args(agent, session));
+    args
 }
 
 /// The arguments that start `agent`, resuming `session` when this CLI has a
@@ -296,5 +376,29 @@ mod tests {
             "the pane stays an agent pane"
         );
         assert_eq!(PaneLaunch::Shell.fresh(), PaneLaunch::Shell);
+    }
+
+    #[test]
+    fn parse_extra_args_handles_quotes_escapes_and_merges_with_resume() {
+        assert_eq!(
+            parse_extra_args(r#"--model "claude sonnet" --profile 'work dev' --flag\=1"#),
+            vec![
+                "--model",
+                "claude sonnet",
+                "--profile",
+                "work dev",
+                "--flag=1"
+            ]
+        );
+        assert!(parse_extra_args("   \t  ").is_empty());
+        let extra = parse_extra_args("--dangerously-skip-permissions");
+        assert_eq!(
+            launch_args("claude", Some("ses-1"), &extra),
+            vec!["--dangerously-skip-permissions", "--resume", "ses-1"]
+        );
+        assert_eq!(
+            launch_args("codex", Some("ses-2"), &parse_extra_args("--full-auto")),
+            vec!["--full-auto", "resume", "ses-2"]
+        );
     }
 }

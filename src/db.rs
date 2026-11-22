@@ -1094,8 +1094,30 @@ pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 /// divider beside it.
 pub const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
 
+/// Setting key holding whether the left sidebar is visible ("0" = collapsed).
+pub const SETTING_SIDEBAR_VISIBLE: &str = "sidebar_visible";
+
 /// Setting key holding the last agent id chosen for one-click TODO dispatch.
 pub const SETTING_TODO_DEFAULT_AGENT: &str = "todo_default_agent";
+
+/// Setting key prefix holding optional extra CLI flags per coding agent
+/// (keyed as `agent_args:<agent_id>`).
+pub const SETTING_AGENT_ARGS_PREFIX: &str = "agent_args:";
+
+/// Build the setting key storing extra CLI arguments for `agent_id`.
+pub fn agent_args_key(agent_id: &str) -> String {
+    format!("{SETTING_AGENT_ARGS_PREFIX}{agent_id}")
+}
+
+/// Read persisted extra CLI arguments for `agent_id`, or empty when unset.
+pub fn get_agent_args(agent_id: &str) -> String {
+    get_setting(&agent_args_key(agent_id)).unwrap_or_default()
+}
+
+/// Persist extra CLI arguments for `agent_id`.
+pub fn set_agent_args(agent_id: &str, args: &str) -> Result<(), rusqlite::Error> {
+    set_setting(&agent_args_key(agent_id), args.trim())
+}
 
 /// Settings use a short-lived connection instead of the UI-owned Store: they
 /// are read once at startup (before any window exists) and written rarely

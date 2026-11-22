@@ -357,6 +357,85 @@ impl KumuApp {
         );
     }
 
+    /// Inspect a linked worktree for uncommitted changes, ask for confirmation,
+    /// then remove its directory via `git worktree remove` and drop it from Kumu.
+    pub(super) fn confirm_remove_worktree(
+        &mut self,
+        project_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.read(cx).project(project_id).cloned() else {
+            return;
+        };
+        let path = PathBuf::from(&project.path);
+        let name = project.name.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let dirty_count = cx
+                .background_executor()
+                .spawn(async move { crate::git::changes(&path).map(|c| c.len()).unwrap_or(0) })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                let force = dirty_count > 0;
+                let description = if force {
+                    format!(
+                        "worktree「{name}」存在 {dirty_count} 处未提交改动！\n强制删除将永久清除磁盘目录「{}」及其未提交改动，并关闭关联终端。",
+                        project.path
+                    )
+                } else {
+                    format!(
+                        "将通过 git worktree remove 删除磁盘目录「{}」，并关闭「{name}」内的所有终端。",
+                        project.path
+                    )
+                };
+                let ok_label = if force { "强制删除" } else { "删除 worktree" };
+                let remove_path = PathBuf::from(&project.path);
+                app.open_nsh_dialog(
+                    DialogSpec::Confirm {
+                        title: format!("删除 worktree「{name}」"),
+                        description,
+                        ok_label: ok_label.into(),
+                        cancel_label: "取消".into(),
+                        destructive: true,
+                    },
+                    window,
+                    cx,
+                    move |app, outcome, window, cx| {
+                        if outcome == DialogOutcome::Confirmed {
+                            app.execute_remove_worktree(project_id, remove_path, force, cx);
+                        }
+                        app.focus_terminal(window, cx);
+                        cx.notify();
+                    },
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn execute_remove_worktree(
+        &mut self,
+        project_id: i64,
+        path: PathBuf,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::git::remove_worktree(&path, force) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |app, cx| match result {
+                Ok(()) => app.delete_project(project_id, cx),
+                Err(message) => {
+                    app.store_error = Some(format!("删除 worktree 失败：{message}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Delete a project and its worktrees, then show another project when
     /// one remains. Worktree directories stay on disk.
     pub(super) fn delete_project(&mut self, project_id: i64, cx: &mut Context<Self>) {
@@ -375,10 +454,14 @@ impl KumuApp {
                     self.workspace
                         .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
                     self.panes.remove(&pane);
+                    self.native_registry.unregister_pane(pane.0);
                     self.launches.remove(&pane);
                     self.agent_status.remove(&pane);
                 }
             }
+        }
+        if selected_removed {
+            self.zoomed_pane = None;
         }
         if self
             .pending_close_tab

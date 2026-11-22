@@ -13,7 +13,9 @@ use nsh_core::element::{AccessibilityRole, SignalEquals, scroll, signal_with};
 use nsh_core::prelude::*;
 use nsh_core::{ContextMenuEvent, MouseButton, MouseEvent};
 
-use super::{TodoAction, TodoBoardSnapshot, TodoHostEvent, short_agent_name, take_mount};
+use super::{
+    TodoAction, TodoBoardSnapshot, TodoDispatchTarget, TodoHostEvent, short_agent_name, take_mount,
+};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
 use crate::nsh_ui::assets::icon_svg;
@@ -86,7 +88,7 @@ fn build_dispatch_menu_items(
                     TodoAction::DispatchNewAgent {
                         id: todo_id,
                         agent_id: agent_id.clone(),
-                        new_tab: false,
+                        target: TodoDispatchTarget::SplitRight,
                     },
                 );
             }));
@@ -103,13 +105,33 @@ fn build_dispatch_menu_items(
                         TodoAction::DispatchNewAgent {
                             id: todo_id,
                             agent_id: agent_id.clone(),
-                            new_tab: true,
+                            target: TodoDispatchTarget::NewTab,
                         },
                     );
                 })
             })
             .collect();
         items.push(MenuItem::submenu("在新页签中启动", sub_items));
+
+        let wt_items: Vec<MenuItem> = installed_agents
+            .iter()
+            .map(|(agent_id, agent_name)| {
+                let tx = tx.clone();
+                let todo_id = item.id;
+                let agent_id = agent_id.clone();
+                MenuItem::new(agent_name.clone()).on_select(move || {
+                    send_action(
+                        &tx,
+                        TodoAction::DispatchNewAgent {
+                            id: todo_id,
+                            agent_id: agent_id.clone(),
+                            target: TodoDispatchTarget::NewWorktree,
+                        },
+                    );
+                })
+            })
+            .collect();
+        items.push(MenuItem::submenu("在新建 Worktree 中启动", wt_items));
     }
 
     if !live_panes.is_empty() {

@@ -85,11 +85,11 @@ Kumu 向每个窗格注入 <code>KUMU_APP_BINARY</code> 与 <code>KUMU_PANE</cod
 </tr>
 </table>
 
-- **Git 历史与 Diff 行级审查** — 右上角打开 Git 面板查看当前分支、提交历史（支持搜索与悬停看完整信息）及工作区改动 diff；在 diff 任意行点 `+` 写审查意见，指定目标窗格后连同文件、行号与上下文一键发给 Agent（未发出的草稿自动保留，补丁变更时提示重新读取；焦点在普通 shell 时仅粘贴不执行）。
-- **原生 Git Worktree 管理** — 在 Git 仓库右键按分支创建或导入同级 `<仓库>-<分支>` worktree，作为子项目挂在侧栏；从 Kumu 移除不会删除磁盘上的目录。
-- **自动接管与会话恢复** — 无论是通过窗格按钮新建，还是在普通 shell 里手动输入 `claude`、`codex`、`opencode`、`agy` 等命令启动，Kumu 都会自动识别并在下次打开应用时按原 CLI 语法接回同一段对话。
-- **高性能原生架构** — 使用 Rust + GPUI 构建原生界面，内嵌 Ghostty (`libghostty`) 终端渲染引擎，轻快流畅、无 Electron 开销。
-- **亮暗主题与字体定制** — 支持亮色 / 深色外观切换，以及自定义界面字体与基础字号；终端内支持 `⌘ + 点击` 直接打开链接。
+- **Git 历史、分支总览与 Diff 行级审查** — 右上角打开 Git 面板查看当前分支、相对默认分支（`main`/`master`）的整条分支 Diff 总览、提交历史（支持搜索与悬停看完整信息）及工作区改动 diff；在 diff 任意行点 `+` 写审查意见，指定目标窗格后连同文件、行号与上下文一键发给 Agent（未发出的草稿自动保留，补丁变更时提示重新读取；焦点在普通 shell 时仅粘贴不执行）。
+- **原生 Git Worktree 全生命周期管理** — 在 Git 仓库右键按分支创建或导入同级 `<仓库>-<分支>` worktree，支持从 TODO 卡片一键新建 Worktree 并派发 Agent；任务完成后可选择「从列表移除（保留目录）」或「删除 worktree（带未提交改动检查并清理磁盘目录）」。
+- **自动接管、会话恢复与自定义启动参数** — 无论是通过窗格按钮新建，还是在普通 shell 里手动输入 `claude`、`codex`、`opencode`、`agy` 等命令启动，Kumu 都会自动识别并在下次打开应用时按原 CLI 语法接回同一段对话；可在 **设置 → 服务商 → 编码 Agent** 为各已安装 Agent 配置默认启动参数。
+- **高性能原生架构** — 使用 Rust + Pure Rust NSH + GPUI 构建原生界面，内嵌 Ghostty (`libghostty`) 终端渲染引擎，轻快流畅、无 Electron 开销。
+- **亮暗主题、字体定制与源码跳转** — 支持亮色 / 深色外观切换与自定义字体字号；终端内支持 `⌘ + 点击` 直接打开网页链接及 `file:line:col` 本地源码路径（自动调用 Zed / Cursor / VS Code 等编辑器并定位到行列）。
 - **本地优先、隐私安全** — 所有项目、布局、TODO 与设置仅存放在本机 `~/.kumu/kumu.db`，不上传代码、不收集使用数据。
 
 ---
@@ -145,7 +145,9 @@ npx skills add yankewei/kumu
 "$KUMU_APP_BINARY" panes                                          # 列出所有窗格（id、项目、标题、cwd、尺寸）
 "$KUMU_APP_BINARY" pane read right --history 200 --tail 60        # 读取右侧窗格滚动历史与当前屏幕
 "$KUMU_APP_BINARY" pane split right --agent codex --prompt "review 所有改动"
+"$KUMU_APP_BINARY" pane wait right --timeout 300                  # 阻塞等待右侧 Agent 完成或等待输入
 "$KUMU_APP_BINARY" pane send right "继续，把测试也补上"
+"$KUMU_APP_BINARY" pane close right                               # 关闭临时子窗格
 
 # 操作当前仓库的 TODO 看板（Worktree 自动关联父仓库）
 "$KUMU_APP_BINARY" todo list --json
@@ -163,12 +165,18 @@ npx skills add yankewei/kumu
 
 | 操作 | 快捷键 |
 | --- | --- |
+| 打开/关闭快捷命令面板（跳 Agent / 项目 / 页签 / 命令） | `⌘K` |
+| 折叠/展开左侧边栏 | `⌘B` |
+| 打开设置 | `⌘,` |
 | 新建页签 | `⌘T` |
 | 关闭页签（结束该布局内所有终端） | `⌘W` |
+| 关闭当前聚焦窗格 | `⌘⇧W` |
 | 切换页签 | `⌘⇧[` / `⌘⇧]` 或 `⌘1`…`⌘9` |
 | 向右分屏 | `⌘D` |
 | 向下分屏 | `⌘⇧D` |
+| 最大化/还原当前分屏窗格 | `⌘⇧Enter` |
 | 在窗格间移动焦点 | `⌘⌥← / → / ↑ / ↓` |
+| 放大 / 缩小 / 重置字号 | `⌘+` / `⌘-` / `⌘0` |
 | 在当前窗格中查找（含滚动历史） | `⌘F` |
 | 在查找结果间跳转 / 关闭查找条 | `Enter` / `⇧Enter` / `Esc` |
 | 打开终端中的链接 | `⌘ + 点击` |

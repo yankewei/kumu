@@ -92,6 +92,7 @@ struct InitialSettingsState {
     notifications_enabled: bool,
     notification_sound: bool,
     auto_resume: bool,
+    agent_args: std::collections::HashMap<&'static str, String>,
     updater: UpdateSnapshot,
 }
 
@@ -131,6 +132,7 @@ enum SettingsAction {
     SetNotifications(bool),
     SetNotificationSound(bool),
     SetAutoResume(bool),
+    SetAgentArgs { agent: &'static str, args: String },
     ToggleIntegration { agent: &'static str, remove: bool },
     UpdatePrimaryAction,
     ConfirmRestartUpdate,
@@ -197,6 +199,7 @@ mod view {
                     notifications_enabled: true,
                     notification_sound: true,
                     auto_resume: true,
+                    agent_args: HashMap::new(),
                     updater: UpdateSnapshot::from_status(&crate::updates::UpdateStatus::Idle),
                 },
                 None,
@@ -214,6 +217,16 @@ mod view {
         let auto_resume = signal(initial.auto_resume);
         let updater = signal(initial.updater);
         let agents_state = signal(HashMap::<&'static str, AgentStatusRow>::new());
+        let agent_args_signals: std::rc::Rc<HashMap<&'static str, Signal<String>>> =
+            std::rc::Rc::new(
+                AGENTS
+                    .iter()
+                    .map(|a| {
+                        let initial_val = initial.agent_args.get(a.id).cloned().unwrap_or_default();
+                        (a.id, signal(initial_val))
+                    })
+                    .collect(),
+            );
         let integration_busy = signal(Option::<&'static str>::None);
         let confirm_restart_open = signal(false);
         let (toast_tx, toast_rx) = futures::channel::mpsc::unbounded();
@@ -420,6 +433,7 @@ mod view {
 
         let providers_card = move || {
             let tx_providers = tx_providers.clone();
+            let args_map = agent_args_signals.clone();
             section_card()
                 .child(
                     view()
@@ -427,7 +441,7 @@ mod view {
                         .gap_1()
                         .child(section_title("编码 Agent"))
                         .child(meta_text(
-                            "开启通知会注册到 Agent 的配置或扩展目录，之后可按原来的方式启动。",
+                            "开启通知会注册到 Agent 的配置或扩展目录；可为已安装的 Agent 配置默认启动参数（新建窗格生效）。",
                         )),
                 )
                 .child(dynamic(move || {
@@ -514,19 +528,12 @@ mod view {
                             info_col = info_col.child(view().mt_0p5().child(meta_text(hint_text)));
                         }
 
-                        let mut row_el = view()
+                        let mut top_row = view()
                             .flex_row()
                             .items_center()
                             .gap_3()
-                            .py_3()
                             .child(icon_tile)
                             .child(info_col);
-
-                        if idx + 1 < total {
-                            row_el = row_el
-                                .border_b_1()
-                                .border_b_color(move || active_theme().border);
-                        }
 
                         if installed {
                             let is_this_busy = busy_agent == Some(a.id);
@@ -543,7 +550,7 @@ mod view {
                             } else {
                                 ButtonVariant::Outline
                             };
-                            row_el = row_el.child(
+                            top_row = top_row.child(
                                 kumu_button(btn_text, variant).disabled(any_busy).on_press(
                                     move || {
                                         send_action(
@@ -556,6 +563,56 @@ mod view {
                                     },
                                 ),
                             );
+                        }
+
+                        let mut row_el = view().flex_col().py_3().gap_2().child(top_row);
+                        if installed
+                            && let Some(&arg_sig) = args_map.get(a.id)
+                        {
+                            let tx_args = tx_providers.clone();
+                            let agent_id = a.id;
+                            row_el = row_el.child(
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .pl(px(42.0))
+                                    .child(meta_text("启动参数").flex_shrink_0())
+                                    .child(
+                                        input()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(move || active_theme().radius)
+                                            .border_1()
+                                            .border_color(move || active_theme().input)
+                                            .bg(move || active_theme().background)
+                                            .text_size(text_xs_size)
+                                            .text_color(move || active_theme().foreground)
+                                            .placeholder("可选，如 --model ...（新建窗格生效）")
+                                            .placeholder_color(move || {
+                                                active_theme().muted_foreground.light
+                                            })
+                                            .value(move || arg_sig.get())
+                                            .on_change(move |val: &str| {
+                                                arg_sig.set(val.to_owned());
+                                                send_action(
+                                                    &tx_args,
+                                                    SettingsAction::SetAgentArgs {
+                                                        agent: agent_id,
+                                                        args: val.to_owned(),
+                                                    },
+                                                );
+                                            }),
+                                    ),
+                            );
+                        }
+
+                        if idx + 1 < total {
+                            row_el = row_el
+                                .border_b_1()
+                                .border_b_color(move || active_theme().border);
                         }
                         rows = rows.child(row_el);
                     }
@@ -989,6 +1046,10 @@ impl SettingsWindow {
             notifications_enabled: notif.enabled,
             notification_sound: notif.sound,
             auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
+            agent_args: AGENTS
+                .iter()
+                .map(|a| (a.id, db::get_agent_args(a.id)))
+                .collect(),
             updater: UpdateSnapshot::from_status(updater.read(cx).status()),
         };
 
@@ -1194,6 +1255,15 @@ impl SettingsWindow {
                         .unbounded_send(HostEvent::AutoResume(current));
                 }
             }
+            SettingsAction::SetAgentArgs { agent, args } => {
+                if let Err(error) = db::set_agent_args(agent, &args) {
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("保存 {agent} 启动参数失败：{error}"),
+                    ));
+                }
+            }
             SettingsAction::ToggleIntegration { agent, remove } => {
                 self.change_integration(agent, remove, window, cx);
             }
@@ -1317,6 +1387,7 @@ mod tests {
                 notifications_enabled: true,
                 notification_sound: true,
                 auto_resume: true,
+                agent_args: std::collections::HashMap::new(),
                 updater: UpdateSnapshot::from_status(&UpdateStatus::Idle),
             },
             events_rx,
