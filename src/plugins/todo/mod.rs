@@ -819,6 +819,10 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        // `TodoPanel` spawns a real `nsh-engine` OS thread whose initial frame
+        // submission wakes the GPUI foreground executor from that thread.
+        cx.executor().allow_parking();
+
         struct FakeHost {
             panel: Option<Entity<TodoPanel>>,
             reads: Arc<AtomicUsize>,
