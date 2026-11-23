@@ -41,6 +41,8 @@ const MAX_CONCURRENT_CLIENTS: usize = 32;
 /// The most scrollback rows one read may ask for. Reading history pages the
 /// viewport, so the bound is work, not storage.
 pub const MAX_HISTORY: usize = 2_000;
+/// Maximum lines / wheel ticks accepted in a single `pane scroll` request.
+pub const MAX_SCROLL_LINES: u16 = 500;
 /// The pid of the Kumu a pane's process belongs to. Kumu exports it to every
 /// pane, so a client can tell its own app apart from another instance that
 /// happens to serve the socket.
@@ -71,6 +73,22 @@ pub fn socket_path() -> PathBuf {
 
 // ---------------------------------------------------------------- protocol
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+}
+
+impl ScrollDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Request {
@@ -86,6 +104,22 @@ pub enum Request {
         /// Scrollback rows above the screen.
         #[serde(default)]
         history: usize,
+    },
+    /// Scroll a pane up (older content) or down (newer content).
+    Scroll {
+        pane: PaneTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        direction: ScrollDirection,
+        /// Number of lines / wheel ticks. Defaults to half the pane height.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<u16>,
+        /// Optional 0-based column for mouse-wheel TUIs (defaults to `cols / 3`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        col: Option<u16>,
+        /// Optional 0-based row for mouse-wheel TUIs (defaults to `rows / 2`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<u16>,
     },
     /// Split a pane and start an agent in the new one.
     Split {
@@ -282,6 +316,19 @@ pub struct WaitResult {
     pub elapsed_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrollResult {
+    pub pane: PaneSummary,
+    pub direction: ScrollDirection,
+    /// Requested (or default half-screen) lines / wheel ticks.
+    pub lines: u16,
+    /// Actual primary-screen viewport offset delta (`0` = already at limit),
+    /// or `None` when forwarded to a TUI (`mouse_tracking` / `alt_screen`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<i32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ControlError {
     pub kind: &'static str,
@@ -309,6 +356,15 @@ pub enum Command {
         from: Option<u64>,
         history: usize,
         reply: Sender<Result<PaneContent, ControlError>>,
+    },
+    Scroll {
+        target: PaneTarget,
+        from: Option<u64>,
+        direction: ScrollDirection,
+        lines: Option<u16>,
+        col: Option<u16>,
+        row: Option<u16>,
+        reply: Sender<Result<ScrollResult, ControlError>>,
     },
     Split {
         direction: String,
@@ -676,6 +732,32 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
             history: history.min(MAX_HISTORY),
             reply,
         }),
+        Request::Scroll {
+            pane,
+            from,
+            direction,
+            lines,
+            col,
+            row,
+        } => {
+            if let Some(n) = lines
+                && !(1..=MAX_SCROLL_LINES).contains(&n)
+            {
+                return Err(ControlError::new(
+                    "badRequest",
+                    format!("lines must be between 1 and {MAX_SCROLL_LINES}"),
+                ));
+            }
+            exchange(commands, |reply| Command::Scroll {
+                target: pane,
+                from,
+                direction,
+                lines,
+                col,
+                row,
+                reply,
+            })
+        }
         Request::Split {
             direction,
             agent,
@@ -870,6 +952,7 @@ const USAGE: &str = "\
 usage:
   kumu panes [--json]
   kumu pane read [TARGET] [--history N] [--tail N] [--json]
+  kumu pane scroll up|down [TARGET] [--lines N] [--col C] [--row R] [--json]
   kumu pane split right|down --agent <id> [--prompt TEXT] [--json]
   kumu pane send <TARGET> <TEXT...> [--no-enter] [--json]
   kumu pane wait <TARGET> [--timeout SECS] [--next] [--json]
@@ -933,6 +1016,7 @@ fn panes_cli(args: &[String]) -> i32 {
 fn pane_cli(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("read") => pane_read(&args[1..]),
+        Some("scroll") => pane_scroll(&args[1..]),
         Some("split") => pane_split(&args[1..]),
         Some("send") => pane_send(&args[1..]),
         Some("wait") => pane_wait(&args[1..]),
@@ -1100,6 +1184,123 @@ fn pane_read(args: &[String]) -> i32 {
     println!("{}", summary_line(&content.pane));
     println!("---");
     println!("{}", content.text.trim_end());
+    0
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScrollCliArgs {
+    direction: ScrollDirection,
+    target: Option<String>,
+    lines: Option<u16>,
+    col: Option<u16>,
+    row: Option<u16>,
+    json: bool,
+}
+
+enum ScrollParse {
+    Help,
+    Parsed(ScrollCliArgs),
+    Error(String),
+}
+
+fn parse_pane_scroll(args: &[String]) -> ScrollParse {
+    let mut direction = None;
+    let mut target = None;
+    let mut lines = None;
+    let mut col = None;
+    let mut row = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => return ScrollParse::Help,
+            "--lines" | "-n" => match iter.next().and_then(|n| n.parse::<u16>().ok()) {
+                Some(n) if (1..=MAX_SCROLL_LINES).contains(&n) => lines = Some(n),
+                _ => {
+                    return ScrollParse::Error(format!(
+                        "--lines needs a number between 1 and {MAX_SCROLL_LINES}"
+                    ));
+                }
+            },
+            "--col" => match iter.next().and_then(|n| n.parse::<u16>().ok()) {
+                Some(n) => col = Some(n),
+                None => return ScrollParse::Error("--col needs a number".into()),
+            },
+            "--row" => match iter.next().and_then(|n| n.parse::<u16>().ok()) {
+                Some(n) => row = Some(n),
+                None => return ScrollParse::Error("--row needs a number".into()),
+            },
+            other if other.starts_with('-') => {
+                return ScrollParse::Error(format!("unknown option {other}"));
+            }
+            other if direction.is_none() => match other {
+                "up" => direction = Some(ScrollDirection::Up),
+                "down" => direction = Some(ScrollDirection::Down),
+                _ => {
+                    return ScrollParse::Error(
+                        "declare the direction first: up or down".into(),
+                    );
+                }
+            },
+            other if target.is_none() => target = Some(other.to_string()),
+            _ => return ScrollParse::Error("one target at a time".into()),
+        }
+    }
+    let Some(direction) = direction else {
+        return ScrollParse::Error("declare the direction: up or down".into());
+    };
+    ScrollParse::Parsed(ScrollCliArgs {
+        direction,
+        target,
+        lines,
+        col,
+        row,
+        json,
+    })
+}
+
+fn pane_scroll(args: &[String]) -> i32 {
+    let parsed = match parse_pane_scroll(args) {
+        ScrollParse::Help => {
+            println!("{USAGE}");
+            return 0;
+        }
+        ScrollParse::Error(msg) => return usage_error(&msg),
+        ScrollParse::Parsed(parsed) => parsed,
+    };
+    let value = match call(&Request::Scroll {
+        pane: pane_target(parsed.target),
+        from: caller_pane(),
+        direction: parsed.direction,
+        lines: parsed.lines,
+        col: parsed.col,
+        row: parsed.row,
+    }) {
+        Ok(value) => value,
+        Err(error) => return runtime_error(&error),
+    };
+    let result: ScrollResult = match serde_json::from_value(value) {
+        Ok(result) => result,
+        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
+    };
+    if parsed.json {
+        return print_json(&result);
+    }
+    match result.moved {
+        Some(moved) => println!(
+            "scrolled pane {} {} {} lines (moved {moved})",
+            result.pane.id,
+            result.direction.as_str(),
+            result.lines
+        ),
+        None => println!(
+            "scrolled pane {} {} {} lines",
+            result.pane.id,
+            result.direction.as_str(),
+            result.lines
+        ),
+    }
     0
 }
 
@@ -1991,6 +2192,30 @@ mod tests {
                             }))
                             .expect("wait reply");
                     }
+                    Command::Scroll {
+                        target,
+                        from,
+                        direction,
+                        lines,
+                        col,
+                        row,
+                        reply,
+                    } => {
+                        assert!(matches!(target, PaneTarget::Name(ref s) if s == "right"));
+                        assert_eq!(from, Some(3));
+                        assert_eq!(direction, ScrollDirection::Up);
+                        assert_eq!(lines, Some(15));
+                        assert_eq!(col, Some(20));
+                        assert_eq!(row, Some(10));
+                        reply
+                            .send(Ok(ScrollResult {
+                                pane: summary(4),
+                                direction,
+                                lines: 15,
+                                moved: Some(-15),
+                            }))
+                            .expect("scroll reply");
+                    }
                     Command::TodoShow { .. }
                     | Command::TodoAdd { .. }
                     | Command::TodoUpdate { .. }
@@ -2014,6 +2239,37 @@ mod tests {
         .expect("read");
         assert_eq!(read["text"], "hello");
         assert_eq!(read["pane"]["id"], 4);
+
+        let scrolled = call_here(
+            &path,
+            &Request::Scroll {
+                pane: PaneTarget::Name("right".into()),
+                from: Some(3),
+                direction: ScrollDirection::Up,
+                lines: Some(15),
+                col: Some(20),
+                row: Some(10),
+            },
+        )
+        .expect("scroll");
+        assert_eq!(scrolled["pane"]["id"], 4);
+        assert_eq!(scrolled["direction"], "up");
+        assert_eq!(scrolled["lines"], 15);
+        assert_eq!(scrolled["moved"], -15);
+
+        let bad_scroll = call_here(
+            &path,
+            &Request::Scroll {
+                pane: PaneTarget::Name("right".into()),
+                from: Some(3),
+                direction: ScrollDirection::Down,
+                lines: Some(MAX_SCROLL_LINES + 1),
+                col: None,
+                row: None,
+            },
+        )
+        .expect_err("out-of-range scroll lines rejected");
+        assert!(bad_scroll.contains("between 1 and"), "{bad_scroll}");
 
         let split = call_here(
             &path,
@@ -2132,5 +2388,56 @@ mod tests {
             .join()
             .expect("the answering side ends with the socket");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_pane_scroll_handles_direction_target_and_bounds() {
+        let s = |xs: &[&str]| xs.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+
+        let ScrollParse::Parsed(parsed) = parse_pane_scroll(&s(&["up"])) else {
+            panic!("expected parsed up with default target");
+        };
+        assert_eq!(
+            parsed,
+            ScrollCliArgs {
+                direction: ScrollDirection::Up,
+                target: None,
+                lines: None,
+                col: None,
+                row: None,
+                json: false,
+            }
+        );
+
+        // `up` as direction and `up` as target must not be ambiguous.
+        let ScrollParse::Parsed(parsed) =
+            parse_pane_scroll(&s(&["down", "up", "--lines", "12", "--col", "8", "--row", "4", "--json"]))
+        else {
+            panic!("expected parsed down targeting pane above");
+        };
+        assert_eq!(
+            parsed,
+            ScrollCliArgs {
+                direction: ScrollDirection::Down,
+                target: Some("up".into()),
+                lines: Some(12),
+                col: Some(8),
+                row: Some(4),
+                json: true,
+            }
+        );
+
+        assert!(matches!(
+            parse_pane_scroll(&s(&["right"])),
+            ScrollParse::Error(_)
+        ));
+        assert!(matches!(
+            parse_pane_scroll(&s(&["up", "23", "--lines", "0"])),
+            ScrollParse::Error(_)
+        ));
+        assert!(matches!(
+            parse_pane_scroll(&s(&["up", "23", "--lines", "501"])),
+            ScrollParse::Error(_)
+        ));
     }
 }

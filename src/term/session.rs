@@ -78,10 +78,28 @@ fn terminate_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync
     let _ = child.wait();
 }
 
+/// Maximum arrow-key repeats sent in one control scroll on an alt-screen TUI
+/// without mouse tracking, so a single request cannot flood the PTY.
+const MAX_ALT_SCREEN_SCROLL_KEYS: usize = 50;
+
+/// Result of a control-socket scroll request executed on the session thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollOutcome {
+    /// Actual viewport offset delta on primary screen (`0` = already at edge),
+    /// or `None` when forwarded to a TUI (`mouse_tracking` / `alt_screen`).
+    pub moved: Option<i32>,
+    /// True when bytes were written to the PTY and callers should wait briefly
+    /// for the TUI to redraw.
+    pub wait_redraw: bool,
+}
+
 struct Live {
     screen: Mutex<Snapshot>,
     notifications: Mutex<VecDeque<TermNotification>>,
     queued: AtomicBool,
+    /// Monotonic counter bumped on every published snapshot, used by control
+    /// requests to observe TUI redraws even on hidden/parked panes.
+    frame_rev: AtomicU64,
     /// The PTY child (the shell), or 0 before it is spawned.
     pid: AtomicU64,
     /// Per-pane random token authenticating `kumu-session:` OSC reports.
@@ -92,6 +110,7 @@ struct Live {
 impl Live {
     fn publish(&self, snapshot: Snapshot, force_wake: bool) {
         *self.screen.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+        self.frame_rev.fetch_add(1, Ordering::Release);
         let was_queued = self.queued.swap(true, Ordering::SeqCst);
         if !was_queued || force_wake {
             let _ = self.wake.unbounded_send(());
@@ -318,6 +337,14 @@ enum Msg {
         cell_h: f32,
         mods: MouseMods,
     },
+    /// Scroll initiated by the local control socket (`kumu pane scroll`),
+    /// computing pixel coordinates from the VT's own cell size.
+    ScrollControl {
+        lines: isize,
+        col: Option<u16>,
+        row: Option<u16>,
+        reply: Sender<ScrollOutcome>,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -383,6 +410,7 @@ impl Term {
             )),
             notifications: Mutex::new(VecDeque::new()),
             queued: AtomicBool::new(false),
+            frame_rev: AtomicU64::new(0),
             pid: AtomicU64::new(0),
             session_token: session_token.clone(),
             wake,
@@ -614,6 +642,11 @@ impl Term {
         rx.recv_timeout(CONTENT_TIMEOUT).ok().flatten()
     }
 
+    /// Monotonic count of snapshots published by this terminal thread.
+    pub fn frame_rev(&self) -> u64 {
+        self.live.frame_rev.load(Ordering::Acquire)
+    }
+
     pub fn scroll(&self, lines: isize, x: f32, y: f32, cell_w: f32, cell_h: f32, mods: MouseMods) {
         if lines == 0 {
             return;
@@ -626,6 +659,30 @@ impl Term {
             cell_h,
             mods,
         });
+    }
+
+    /// Execute a control-socket scroll on the session thread, returning how far
+    /// the primary viewport moved (or whether a TUI redraw should be awaited).
+    pub fn scroll_control(
+        &self,
+        lines: isize,
+        col: Option<u16>,
+        row: Option<u16>,
+    ) -> Option<ScrollOutcome> {
+        if lines == 0 {
+            return Some(ScrollOutcome {
+                moved: Some(0),
+                wait_redraw: false,
+            });
+        }
+        let (tx, rx) = mpsc::channel();
+        self.inbox.send_control(Msg::ScrollControl {
+            lines,
+            col,
+            row,
+            reply: tx,
+        });
+        rx.recv_timeout(CONTENT_TIMEOUT).ok()
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
@@ -1057,6 +1114,66 @@ impl Running {
                         self.vt.scroll_viewport(lines);
                         self.publish(false);
                     }
+                }
+                NextWork::Control(Msg::ScrollControl {
+                    lines,
+                    col,
+                    row,
+                    reply,
+                }) => {
+                    let outcome = if self.vt.mouse_tracking() {
+                        let cols = self.vt.cols().max(1);
+                        let rows = self.vt.rows().max(1);
+                        let cell_col = col.unwrap_or(cols / 3).min(cols - 1);
+                        let cell_row = row.unwrap_or(rows / 2).min(rows - 1);
+                        let (cw, ch) = self.vt.cell_pixel_size();
+                        let x = f32::from(cell_col) * cw + cw * 0.5;
+                        let y = f32::from(cell_row) * ch + ch * 0.5;
+                        let button = if lines < 0 {
+                            super::vt::MouseButton::WheelUp
+                        } else {
+                            super::vt::MouseButton::WheelDown
+                        };
+                        let mut out = Vec::new();
+                        for _ in 0..lines.unsigned_abs() {
+                            out.extend(self.vt.encode_mouse(MouseInput {
+                                action: super::vt::MouseAction::Press,
+                                button: Some(button),
+                                x,
+                                y,
+                                cell_w: cw,
+                                cell_h: ch,
+                                any_pressed: false,
+                                mods: MouseMods::default(),
+                            }));
+                        }
+                        self.write_pty(out);
+                        ScrollOutcome {
+                            moved: None,
+                            wait_redraw: true,
+                        }
+                    } else if self.vt.alt_screen() {
+                        let count = lines.unsigned_abs().min(MAX_ALT_SCREEN_SCROLL_KEYS);
+                        let bytes = self.vt.encode_scroll_keys(lines < 0, count);
+                        self.write_pty(bytes);
+                        ScrollOutcome {
+                            moved: None,
+                            wait_redraw: true,
+                        }
+                    } else {
+                        let before = self.vt.scrollbar().map(|b| b.offset);
+                        self.vt.scroll_viewport(lines);
+                        let after = self.vt.scrollbar().map(|b| b.offset);
+                        self.publish(false);
+                        let moved = before
+                            .zip(after)
+                            .and_then(|(b, a)| i32::try_from(a as i64 - b as i64).ok());
+                        ScrollOutcome {
+                            moved,
+                            wait_redraw: false,
+                        }
+                    };
+                    let _ = reply.send(outcome);
                 }
                 NextWork::Control(Msg::Resize {
                     cols,

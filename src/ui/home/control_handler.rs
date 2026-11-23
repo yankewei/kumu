@@ -35,7 +35,10 @@ impl KumuApp {
     }
 
     fn handle_control_command(&mut self, command: crate::control::Command, cx: &mut Context<Self>) {
-        use crate::control::{Command, ControlError, PaneContent, SendResult};
+        use crate::control::{
+            Command, ControlError, MAX_SCROLL_LINES, PaneContent, ScrollDirection, ScrollResult,
+            SendResult,
+        };
 
         match command {
             Command::Panes { reply } => {
@@ -85,6 +88,98 @@ impl KumuApp {
                         None => Err(ControlError::new("timeout", "the terminal did not answer")),
                     };
                     let _ = reply.send(answer);
+                })
+                .detach();
+            }
+            Command::Scroll {
+                target,
+                from,
+                direction,
+                lines,
+                col,
+                row,
+                reply,
+            } => {
+                let pane = match self.control_resolve(&target, from, cx) {
+                    Ok(pane) => pane,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                };
+                let term = self.workspace.read(cx).terminal_for_pane(pane.0);
+                let (Some(term), Some(summary)) = (term, self.control_summary(pane, cx)) else {
+                    let _ = reply.send(Err(ControlError::new(
+                        "paneGone",
+                        format!("pane {} is not running", pane.0),
+                    )));
+                    return;
+                };
+                if summary.exited {
+                    let _ = reply.send(Err(ControlError::new(
+                        "paneGone",
+                        format!("pane {} is not running", pane.0),
+                    )));
+                    return;
+                }
+                let effective_lines = match lines {
+                    Some(n) if (1..=MAX_SCROLL_LINES).contains(&n) => n,
+                    Some(_) => {
+                        let _ = reply.send(Err(ControlError::new(
+                            "badRequest",
+                            format!("lines must be between 1 and {MAX_SCROLL_LINES}"),
+                        )));
+                        return;
+                    }
+                    None => (summary.rows / 2).max(1),
+                };
+                let signed = match direction {
+                    ScrollDirection::Up => -(effective_lines as isize),
+                    ScrollDirection::Down => effective_lines as isize,
+                };
+                let before_rev = term.frame_rev();
+                cx.spawn(async move |_, cx| {
+                    let term_for_scroll = term.clone();
+                    let outcome = cx
+                        .background_spawn(async move {
+                            term_for_scroll.scroll_control(signed, col, row)
+                        })
+                        .await;
+                    let Some(outcome) = outcome else {
+                        let _ = reply.send(Err(ControlError::new(
+                            "timeout",
+                            "the terminal did not answer",
+                        )));
+                        return;
+                    };
+                    if outcome.wait_redraw {
+                        // Wait briefly for the TUI to process the wheel/arrow
+                        // bytes and settle its redraw (bounded at 200ms).
+                        let deadline = Instant::now() + Duration::from_millis(200);
+                        let quiet = Duration::from_millis(40);
+                        let mut last_rev = before_rev;
+                        let mut changed_at: Option<Instant> = None;
+                        while Instant::now() < deadline {
+                            let rev = term.frame_rev();
+                            if rev != last_rev {
+                                last_rev = rev;
+                                changed_at = Some(Instant::now());
+                            } else if let Some(at) = changed_at
+                                && at.elapsed() >= quiet
+                            {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(10))
+                                .await;
+                        }
+                    }
+                    let _ = reply.send(Ok(ScrollResult {
+                        pane: summary,
+                        direction,
+                        lines: effective_lines,
+                        moved: outcome.moved,
+                    }));
                 })
                 .detach();
             }

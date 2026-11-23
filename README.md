@@ -144,6 +144,7 @@ npx skills add yankewei/kumu
 # 窗格查看、读取与跨窗格协作
 "$KUMU_APP_BINARY" panes                                          # 列出所有窗格（id、项目、标题、cwd、尺寸）
 "$KUMU_APP_BINARY" pane read right --history 200 --tail 60        # 读取右侧窗格滚动历史与当前屏幕
+"$KUMU_APP_BINARY" pane scroll up right                           # 向上滚动右侧窗格（支持主屏和全屏 TUI）
 "$KUMU_APP_BINARY" pane split right --agent codex --prompt "review 所有改动"
 "$KUMU_APP_BINARY" pane wait right --timeout 300                  # 阻塞等待右侧 Agent 完成或等待输入
 "$KUMU_APP_BINARY" pane send right "继续，把测试也补上"

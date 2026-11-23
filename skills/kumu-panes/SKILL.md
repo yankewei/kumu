@@ -9,6 +9,7 @@ Kumu 的每个窗格是一个独立终端。你只能看到自己这一格，但
 
 - `kumu panes` 列出所有窗格（id、项目、标题、cwd、尺寸、是否聚焦）。
 - `kumu pane read <目标>` 返回一个窗格的纯文本：屏幕内容，加上可选的滚动历史。
+- `kumu pane scroll up|down [目标]` 向上/向下滚动目标窗格（主屏滚视口，TUI 自动发滚轮/方向键并等待重绘）。
 - `kumu pane split right|down --agent <id>` 在你旁边开一个 Agent 窗格。
 - `kumu pane send <目标> <文字>` 往一个 **Agent 窗格** 输入文字并回车。
 - `kumu pane wait <目标>` 阻塞等待目标 Agent 窗格进入 `waiting` / `completed` / `failed` 或退出。
@@ -91,9 +92,14 @@ Kumu 的每个窗格是一个独立终端。你只能看到自己这一格，但
 
 # 指定窗格的完整输出，机器可读
 "$KUMU_APP_BINARY" pane read 3 --json
+
+# 全屏 TUI（如 OpenCode / Claude Code）超出当前屏幕时，先滚动再读取
+"$KUMU_APP_BINARY" pane scroll up right                  # 默认向上滚半屏
+"$KUMU_APP_BINARY" pane scroll down 3 --lines 20         # 向下滚 20 行（可选 --col/--row 指定格坐标）
+"$KUMU_APP_BINARY" pane read right
 ```
 
-输出第一行是窗格信息（id、项目、标题、agent、cwd、尺寸、focused/shown），`---` 之后是纯文本，没有颜色和控制符。需要“刚才发生了什么”时带 `--history N`（最多 2000 行）；只看结论时用 `--tail` 截断。全屏 TUI（多数 Agent 界面跑在备用屏幕上）没有滚动历史，`--history` 只会得到当前屏幕；要更早的内容，让那个 Agent 自己打印一段摘要。
+输出第一行是窗格信息（id、项目、标题、agent、cwd、尺寸、focused/shown），`---` 之后是纯文本，没有颜色和控制符。需要“刚才发生了什么”时带 `--history N`（最多 2000 行）；只看结论时用 `--tail` 截断。全屏 TUI（多数 Agent 界面跑在备用屏幕上）没有终端级滚动历史，`--history` 只会得到当前屏幕；要翻看更早的内容，先用 `pane scroll up <目标>` 向上滚动后再 `pane read`。
 
 `pane split --prompt ""` 会被当成用法错误；不带 prompt 就直接省略这个参数，只开窗格。
 

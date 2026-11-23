@@ -539,6 +539,11 @@ impl Vt {
         self.rows
     }
 
+    pub fn cell_pixel_size(&self) -> (f32, f32) {
+        let size = unsafe { (*self.shared.as_ptr()).size };
+        (size.cell_width.max(1) as f32, size.cell_height.max(1) as f32)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
         if cols == 0 || rows == 0 {
             return;
