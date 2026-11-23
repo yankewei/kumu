@@ -13,9 +13,11 @@
 //! here, then lay it under the PTY of every pane that starts a program
 //! directly. A login-shell pane reads those files itself and is left alone.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -26,6 +28,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 /// How long the login shell gets to print its environment.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the startup PATH probe gets before falling back to common directories.
+const PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long to wait before retrying after a failed or timed-out capture, so a
 /// broken rc file does not stall every subsequent agent pane for 5 seconds.
 const RETRY_BACKOFF: Duration = Duration::from_secs(60);
@@ -34,6 +39,11 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// managers, fetch tools) cannot be mistaken for a variable.
 const BEGIN: &str = "__kumu_env_begin__";
 const END: &str = "__kumu_env_end__";
+
+/// Markers bracketing the login-shell `PATH` probe output.
+const PATH_BEGIN: &[u8] = b"kumu-path[";
+const PATH_END: &[u8] = b"]kumu-path";
+const PATH_PROBE_SCRIPT: &str = "printf 'kumu-path['; /usr/bin/printenv PATH; printf ']kumu-path'";
 
 struct Cache {
     env: Option<HashMap<String, String>>,
@@ -73,6 +83,215 @@ fn kill_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
 #[cfg(not(unix))]
 fn kill_process_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     let _ = child.kill();
+}
+
+/// Populate this process's `PATH` once when launched from Finder/Dock
+/// (`parent_id() == 1` on Unix, i.e. launchd).
+///
+/// Must be called early in `main` before other threads start, because it calls
+/// `std::env::set_var`. Subprocesses spawned directly by Kumu (such as `git`
+/// running Git LFS smudge filters or hooks) then inherit the user's login
+/// `PATH` and common Homebrew/local bin directories.
+pub fn fill_process_path() {
+    #[cfg(unix)]
+    {
+        if std::os::unix::process::parent_id() != 1 {
+            return;
+        }
+        let (program, base_args) = crate::term::default_shell();
+        let login_path = probe_login_path_from(&program, &base_args, &[], PATH_PROBE_TIMEOUT);
+        let fallback_dirs = default_fallback_dirs(std::env::var_os("HOME").as_deref());
+        let current_path = std::env::var_os("PATH");
+        if let Some(merged) = merge_paths(
+            login_path.as_deref(),
+            &fallback_dirs,
+            current_path.as_deref(),
+        ) {
+            // SAFETY: Called once at startup in `main` before spawning threads;
+            // `probe_login_path_from` joins its reader thread before returning.
+            unsafe {
+                std::env::set_var("PATH", merged);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_std_process_group(child: &mut std::process::Child) {
+    const SIGKILL: i32 = 9;
+    if let Ok(pgid) = i32::try_from(child.id())
+        && pgid > 0
+    {
+        unsafe {
+            kill(-pgid, SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn probe_login_path_from(
+    program: &str,
+    base_args: &[String],
+    extra_env: &[(&str, String)],
+    timeout: Duration,
+) -> Option<OsString> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(program);
+    cmd.args(base_args)
+        .args(["-c", PATH_PROBE_SCRIPT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    let (tx, rx) = mpsc::channel();
+    let reader_handle = std::thread::Builder::new()
+        .name("kumu-path-probe".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if has_marker(&bytes, PATH_END) || bytes.len() >= 256 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(bytes);
+        })
+        .ok();
+    let Some(reader_handle) = reader_handle else {
+        kill_std_process_group(&mut child);
+        let _ = child.wait();
+        return None;
+    };
+
+    let bytes = match rx.recv_timeout(timeout) {
+        Ok(bytes) => {
+            let wait_deadline = Instant::now() + Duration::from_millis(50);
+            while Instant::now() < wait_deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                kill_std_process_group(&mut child);
+                let _ = child.wait();
+            }
+            Some(bytes)
+        }
+        Err(_) => {
+            kill_std_process_group(&mut child);
+            let _ = child.wait();
+            None
+        }
+    };
+    // Always join the reader thread before returning so the caller remains
+    // single-threaded when updating process `PATH`.
+    let _ = reader_handle.join();
+
+    bytes.as_deref().and_then(parse_path_probe)
+}
+
+fn has_marker(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+fn parse_path_probe(bytes: &[u8]) -> Option<OsString> {
+    let begin_pos = bytes
+        .windows(PATH_BEGIN.len())
+        .position(|w| w == PATH_BEGIN)?;
+    let after_begin = &bytes[begin_pos + PATH_BEGIN.len()..];
+    let end_rel = after_begin
+        .windows(PATH_END.len())
+        .position(|w| w == PATH_END)?;
+    let mut body = &after_begin[..end_rel];
+    while let Some(rest) = body
+        .strip_prefix(b"\r")
+        .or_else(|| body.strip_prefix(b"\n"))
+    {
+        body = rest;
+    }
+    while let Some(rest) = body
+        .strip_suffix(b"\r")
+        .or_else(|| body.strip_suffix(b"\n"))
+    {
+        body = rest;
+    }
+    if body.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(OsStr::from_bytes(body).to_os_string())
+    }
+    #[cfg(not(unix))]
+    {
+        Some(OsString::from(String::from_utf8_lossy(body).into_owned()))
+    }
+}
+
+fn default_fallback_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(3);
+    if let Some(home) = home
+        && !home.is_empty()
+    {
+        dirs.push(PathBuf::from(home).join(".local/bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+/// Merge `PATH` in priority order: login shell `PATH` → fallback directories →
+/// current process `PATH`, deduplicating while preserving first-seen order.
+fn merge_paths(
+    login_path: Option<&OsStr>,
+    fallback_dirs: &[PathBuf],
+    current_path: Option<&OsStr>,
+) -> Option<OsString> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if !dir.as_os_str().is_empty() && seen.insert(dir.clone()) {
+            merged.push(dir);
+        }
+    };
+
+    if let Some(path) = login_path {
+        for dir in std::env::split_paths(path) {
+            push(dir);
+        }
+    }
+    for dir in fallback_dirs {
+        push(dir.clone());
+    }
+    if let Some(path) = current_path {
+        for dir in std::env::split_paths(path) {
+            push(dir);
+        }
+    }
+
+    if merged.is_empty() {
+        return None;
+    }
+    std::env::join_paths(merged).ok()
 }
 
 /// Start the capture early so the first pane finds it ready. Panes themselves
@@ -443,5 +662,89 @@ mod tests {
             Some("from_profile")
         );
         assert_eq!(env.get("KUMU_RC_TEST").map(String::as_str), Some("from_rc"));
+    }
+
+    #[test]
+    fn parse_path_probe_extracts_marked_value_and_strips_noise() {
+        let output = b"login banner\nkumu-path[/opt/homebrew/bin:/usr/bin\n]kumu-path\ntrailing\n";
+        assert_eq!(
+            parse_path_probe(output),
+            Some(OsString::from("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(parse_path_probe(b"no markers here"), None);
+        assert_eq!(parse_path_probe(b"kumu-path[/usr/bin"), None);
+        assert_eq!(parse_path_probe(b"kumu-path[\n]kumu-path"), None);
+    }
+
+    #[test]
+    fn merge_paths_preserves_order_and_deduplicates() {
+        let fallback = default_fallback_dirs(Some(OsStr::new("/Users/test")));
+        let merged = merge_paths(
+            Some(OsStr::new(
+                "/custom/bin::/opt/homebrew/bin:/usr/bin:/custom/bin",
+            )),
+            &fallback,
+            Some(OsStr::new("/usr/bin:/bin:/usr/local/bin:/sbin")),
+        )
+        .expect("merged PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/custom/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/Users/test/.local/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/sbin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_paths_falls_back_when_login_probe_fails() {
+        let fallback = default_fallback_dirs(Some(OsStr::new("/Users/test")));
+        let merged =
+            merge_paths(None, &fallback, Some(OsStr::new("/usr/bin:/bin"))).expect("merged PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/Users/test/.local/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_login_path_reads_zprofile() {
+        let home = std::env::temp_dir().join(format!("kumu-path-probe-{}", std::process::id()));
+        std::fs::create_dir(&home).expect("create probe fixture");
+        std::fs::write(
+            home.join(".zprofile"),
+            "echo noisy banner\nexport PATH=\"/kumu/test/bin:$PATH\"\n",
+        )
+        .expect("write zprofile");
+
+        let probed = probe_login_path_from(
+            "/bin/zsh",
+            &["-l".to_string()],
+            &[
+                ("HOME", home.display().to_string()),
+                ("ZDOTDIR", home.display().to_string()),
+                ("PATH", "/usr/bin:/bin".to_string()),
+            ],
+            PATH_PROBE_TIMEOUT,
+        );
+        std::fs::remove_dir_all(&home).expect("remove probe fixture");
+
+        let probed = probed.expect("probed PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&probed).collect();
+        assert_eq!(entries.first(), Some(&PathBuf::from("/kumu/test/bin")));
     }
 }

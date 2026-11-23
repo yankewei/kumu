@@ -50,6 +50,10 @@ fn main() {
     if let Some(code) = agent::integration::run_cli().or_else(control::run_cli) {
         std::process::exit(code);
     }
+    // Enrich this process's PATH once when launched from Finder/Dock (launchd)
+    // before any threads start, so child processes like `git` (and its LFS
+    // filters/hooks) find Homebrew and user-local binaries.
+    term::shell_env::fill_process_path();
     // A Finder-launched app has no readable stderr. Send diagnostics to
     // ~/Library/Logs/Kumu/kumu.log so users can attach them to a report.
     logging::init();
