@@ -487,8 +487,8 @@ pub(super) mod view {
                 ));
 
             // Project tree
-            let mut proj_col = view().flex_col().w_full().pb_2();
-            for project in &snap.projects {
+            let mut proj_col = view().flex_col().w_full().px_1p5().py_1p5().gap_0p5();
+            for (idx, project) in snap.projects.iter().enumerate() {
                 let id = project.id;
                 let active = project.active;
                 let worktree = project.worktree;
@@ -498,11 +498,18 @@ pub(super) mod view {
                 let tx_ctx = tx_body.clone();
                 let ctx_proj = project.clone();
 
-                let fg = move || {
+                let text_fg = move || {
                     if active {
                         active_theme().sidebar_accent_foreground
                     } else {
                         active_theme().sidebar_foreground
+                    }
+                };
+                let icon_fg = move || {
+                    if active {
+                        active_theme().sidebar_accent_foreground
+                    } else {
+                        active_theme().muted_foreground
                     }
                 };
 
@@ -518,9 +525,21 @@ pub(super) mod view {
                 let mut row = view()
                     .flex_row()
                     .w_full()
-                    .pr_3()
-                    .mt(px(if worktree { 2.0 } else { 6.0 }))
+                    .h(px(30.0))
+                    .pr_1()
+                    .mt(px(if worktree || idx == 0 { 0.0 } else { 4.0 }))
                     .items_center()
+                    .rounded(move || active_theme().radius)
+                    .bg(move || {
+                        if active {
+                            active_theme().sidebar_accent
+                        } else if hovered_project.get() == Some(id) {
+                            active_theme().sidebar_accent.opacity(0.5)
+                        } else {
+                            AdaptiveColor::TRANSPARENT
+                        }
+                    })
+                    .when(!reduce_motion(), |s| s.transition_colors().duration(120.0))
                     .on_mouse_enter(move |_: &nsh_core::MouseEvent| hovered_project.set(Some(id)))
                     .on_mouse_leave(move |_: &nsh_core::MouseEvent| {
                         if hovered_project.get_untracked() == Some(id) {
@@ -528,29 +547,39 @@ pub(super) mod view {
                         }
                     });
 
-                let mut project_button =
-                    kumu_list_button(project.name.clone(), active, ControlTone::Sidebar)
-                        .flex_1()
-                        .py_1p5()
-                        .pl(px(if worktree { 28.0 } else { 12.0 }))
-                        .pr_1()
-                        .gap_1p5()
-                        .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
-                        .on_context_menu(move |ev: &ContextMenuEvent| {
-                            let items = project_context_menu(tx_ctx.clone(), &ctx_proj);
-                            drop(popup_menu_at(items, ev.page_position));
-                        })
-                        .child(icon_svg(icon_path, 14.0).text_color(fg))
-                        .child(
-                            text(project.name.clone())
-                                .flex_1()
-                                .min_w_0()
-                                .app_class("truncate")
-                                .tooltip(kumu_tooltip(project_path))
-                                .text_size(text_xs_size)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(fg),
-                        );
+                let mut project_button = nsh_base::button()
+                    .accessibility_label(project.name.clone())
+                    .selected(active)
+                    .flex_row()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .items_center()
+                    .rounded(move || active_theme().radius)
+                    .active(|s| s.opacity(0.75))
+                    .focus_visible(|s| {
+                        s.outline(px(2.0))
+                            .outline_color(move || active_theme().ring)
+                    })
+                    .pl(px(if worktree { 22.0 } else { 6.0 }))
+                    .pr_1()
+                    .gap_1p5()
+                    .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
+                    .on_context_menu(move |ev: &ContextMenuEvent| {
+                        let items = project_context_menu(tx_ctx.clone(), &ctx_proj);
+                        drop(popup_menu_at(items, ev.page_position));
+                    })
+                    .child(icon_svg(icon_path, 14.0).text_color(icon_fg))
+                    .child(
+                        text(project.name.clone())
+                            .flex_1()
+                            .min_w_0()
+                            .app_class("truncate")
+                            .tooltip(kumu_tooltip(project_path))
+                            .text_size(text_xs_size)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_fg),
+                    );
 
                 if project.unread {
                     project_button = project_button.child(
@@ -568,35 +597,37 @@ pub(super) mod view {
                 } else {
                     "移除项目"
                 };
-                let row_actions = view()
-                    .flex_row()
-                    .flex_shrink_0()
-                    .gap_0p5()
-                    .opacity(move || {
-                        if hovered_project.get() == Some(id) {
-                            1.0_f32
-                        } else {
-                            0.65_f32
-                        }
-                    })
-                    .child(kumu_icon_button(
-                        remove_label,
-                        icon_svg("icons/x.svg", 13.0)
-                            .text_color(move || active_theme().muted_foreground),
-                        ControlTone::Sidebar,
-                        move || {
-                            send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
-                        },
-                    ))
-                    .child(kumu_icon_button(
-                        "新建终端",
-                        icon_svg("icons/square-terminal.svg", 13.0)
-                            .text_color(move || active_theme().muted_foreground),
-                        ControlTone::Sidebar,
-                        move || {
-                            send(&tx_term, SidebarAction::NewTerminal(id));
-                        },
-                    ));
+                let row_actions = dynamic(move || {
+                    if hovered_project.get() != Some(id) {
+                        return view().into_element();
+                    }
+                    let tx_del = tx_del.clone();
+                    let tx_term = tx_term.clone();
+                    view()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_0p5()
+                        .child(kumu_icon_button(
+                            remove_label,
+                            icon_svg("icons/x.svg", 13.0)
+                                .text_color(move || active_theme().muted_foreground),
+                            ControlTone::Sidebar,
+                            move || {
+                                send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
+                            },
+                        ))
+                        .child(kumu_icon_button(
+                            "新建终端",
+                            icon_svg("icons/square-terminal.svg", 13.0)
+                                .text_color(move || active_theme().muted_foreground),
+                            ControlTone::Sidebar,
+                            move || {
+                                send(&tx_term, SidebarAction::NewTerminal(id));
+                            },
+                        ))
+                        .into_element()
+                });
                 row = row.child(project_button).child(row_actions);
                 proj_col = proj_col.child(row);
             }

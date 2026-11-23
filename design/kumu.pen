@@ -1403,7 +1403,7 @@
                           "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -1430,26 +1430,6 @@
                           "fill": "$warning",
                           "width": 7,
                           "height": 7
-                        },
-                        {
-                          "type": "icon",
-                          "id": "dXXIC",
-                          "name": "Action Close",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "N8jVKD",
-                          "name": "Action Terminal",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
                         }
                       ]
                     },
@@ -2362,7 +2342,7 @@
                   "id": "l24IXq",
                   "name": "Group Caption",
                   "fill": "$mutedFg",
-                  "content": "侧边栏 240 × 32，选中态带操作图标",
+                  "content": "侧边栏 240 × 32，整行共享圆角底色，仅悬停时显示右侧操作图标",
                   "lineHeight": 1.33,
                   "fontFamily": "Inter",
                   "fontSize": 12,
@@ -2387,7 +2367,7 @@
                       "width": "fill_container",
                       "height": 32,
                       "cornerRadius": 6,
-                      "gap": 4,
+                      "gap": 6,
                       "padding": [
                         0,
                         12
@@ -2398,8 +2378,8 @@
                           "type": "icon",
                           "id": "AUqC9",
                           "name": "Icon",
-                          "width": 16,
-                          "height": 16,
+                          "width": 14,
+                          "height": 14,
                           "icon": "folder",
                           "library": "lucide",
                           "fill": "$mutedFg"
@@ -2426,6 +2406,72 @@
                     },
                     {
                       "type": "frame",
+                      "id": "t4UIkM",
+                      "name": "Project Row / Hover",
+                      "reusable": true,
+                      "width": "fill_container",
+                      "height": 32,
+                      "fill": "#e4e4e180",
+                      "cornerRadius": 6,
+                      "gap": 6,
+                      "padding": [
+                        0,
+                        12
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "CRgVR",
+                          "name": "Icon",
+                          "width": 14,
+                          "height": 14,
+                          "icon": "folder",
+                          "library": "lucide",
+                          "fill": "$mutedFg"
+                        },
+                        {
+                          "type": "text",
+                          "id": "WXV32",
+                          "name": "Project Name",
+                          "fill": "$sidebarFg",
+                          "content": "zed",
+                          "lineHeight": 1.33,
+                          "fontFamily": "Inter",
+                          "fontSize": 12,
+                          "fontWeight": "500"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "t6bG4v",
+                          "name": "Spacer",
+                          "width": "fill_container",
+                          "height": 1
+                        },
+                        {
+                          "type": "icon",
+                          "id": "H7z43t",
+                          "name": "Action Close",
+                          "width": 14,
+                          "height": 14,
+                          "icon": "x",
+                          "library": "lucide",
+                          "fill": "$mutedFg"
+                        },
+                        {
+                          "type": "icon",
+                          "id": "rO2fd",
+                          "name": "Action Terminal",
+                          "width": 14,
+                          "height": 14,
+                          "icon": "square-terminal",
+                          "library": "lucide",
+                          "fill": "$mutedFg"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
                       "id": "D4nMG",
                       "name": "Project Row / Active",
                       "reusable": true,
@@ -2433,7 +2479,7 @@
                       "height": 32,
                       "fill": "$sidebarAccent",
                       "cornerRadius": 6,
-                      "gap": 4,
+                      "gap": 6,
                       "padding": [
                         0,
                         12
@@ -2444,11 +2490,11 @@
                           "type": "icon",
                           "id": "ndwmk",
                           "name": "Icon",
-                          "width": 16,
-                          "height": 16,
+                          "width": 14,
+                          "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -2467,26 +2513,72 @@
                           "name": "Spacer",
                           "width": "fill_container",
                           "height": 1
+                        }
+                      ]
+                    },
+                    {
+                      "type": "frame",
+                      "id": "i40s3",
+                      "name": "Project Row / Active Hover",
+                      "reusable": true,
+                      "width": "fill_container",
+                      "height": 32,
+                      "fill": "$sidebarAccent",
+                      "cornerRadius": 6,
+                      "gap": 6,
+                      "padding": [
+                        0,
+                        12
+                      ],
+                      "alignItems": "center",
+                      "children": [
+                        {
+                          "type": "icon",
+                          "id": "XLY77",
+                          "name": "Icon",
+                          "width": 14,
+                          "height": 14,
+                          "icon": "folder-open",
+                          "library": "lucide",
+                          "fill": "$sidebarAccentFg"
+                        },
+                        {
+                          "type": "text",
+                          "id": "tLQb2",
+                          "name": "Project Name",
+                          "fill": "$sidebarAccentFg",
+                          "content": "kumu",
+                          "lineHeight": 1.33,
+                          "fontFamily": "Inter",
+                          "fontSize": 12,
+                          "fontWeight": "500"
+                        },
+                        {
+                          "type": "frame",
+                          "id": "QMugl",
+                          "name": "Spacer",
+                          "width": "fill_container",
+                          "height": 1
                         },
                         {
                           "type": "icon",
-                          "id": "x4Ivz",
+                          "id": "waXrG",
                           "name": "Action Close",
-                          "width": 16,
-                          "height": 16,
+                          "width": 14,
+                          "height": 14,
                           "icon": "x",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$mutedFg"
                         },
                         {
                           "type": "icon",
-                          "id": "Z3i6J",
+                          "id": "wcKO2",
                           "name": "Action Terminal",
-                          "width": 16,
-                          "height": 16,
+                          "width": 14,
+                          "height": 14,
                           "icon": "square-terminal",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$mutedFg"
                         }
                       ]
                     },
@@ -2497,7 +2589,7 @@
                       "width": "fill_container",
                       "height": 32,
                       "cornerRadius": 6,
-                      "gap": 4,
+                      "gap": 6,
                       "padding": [
                         0,
                         12,
@@ -2510,8 +2602,8 @@
                           "type": "icon",
                           "id": "x8DEW",
                           "name": "Icon",
-                          "width": 16,
-                          "height": 16,
+                          "width": 14,
+                          "height": 14,
                           "icon": "git-branch",
                           "library": "lucide",
                           "fill": "$mutedFg"
@@ -4936,7 +5028,7 @@
                           "height": 16,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -4955,26 +5047,6 @@
                           "name": "Spacer",
                           "width": "fill_container",
                           "height": 1
-                        },
-                        {
-                          "type": "icon",
-                          "id": "egHmF",
-                          "name": "Action Close",
-                          "width": 16,
-                          "height": 16,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$fg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "w5Pft5",
-                          "name": "Action Terminal",
-                          "width": 16,
-                          "height": 16,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$fg"
                         }
                       ]
                     },
@@ -7365,7 +7437,7 @@
                           "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -7392,26 +7464,6 @@
                           "fill": "$warning",
                           "width": 7,
                           "height": 7
-                        },
-                        {
-                          "type": "icon",
-                          "id": "UPPml",
-                          "name": "Action Close",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "mwkEN",
-                          "name": "Action Terminal",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
                         }
                       ]
                     },
@@ -9446,7 +9498,7 @@
                           "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -9465,26 +9517,6 @@
                           "name": "Spacer",
                           "width": "fill_container",
                           "height": 1
-                        },
-                        {
-                          "type": "icon",
-                          "id": "VBIUV",
-                          "name": "Action Close",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "o8kwh",
-                          "name": "Action Terminal",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
                         }
                       ]
                     },
@@ -12028,7 +12060,7 @@
                           "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -12047,26 +12079,6 @@
                           "name": "Spacer",
                           "width": "fill_container",
                           "height": 1
-                        },
-                        {
-                          "type": "icon",
-                          "id": "UJ4LV",
-                          "name": "Action Close",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "uFB0G",
-                          "name": "Action Terminal",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
                         }
                       ]
                     },
@@ -15054,7 +15066,7 @@
                           "height": 14,
                           "icon": "folder-open",
                           "library": "lucide",
-                          "fill": "$fg"
+                          "fill": "$sidebarAccentFg"
                         },
                         {
                           "type": "text",
@@ -15073,26 +15085,6 @@
                           "name": "Spacer",
                           "width": "fill_container",
                           "height": 1
-                        },
-                        {
-                          "type": "icon",
-                          "id": "g28t8x",
-                          "name": "Action Close",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "x",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
-                        },
-                        {
-                          "type": "icon",
-                          "id": "OqVK8",
-                          "name": "Action Terminal",
-                          "width": 14,
-                          "height": 14,
-                          "icon": "square-terminal",
-                          "library": "lucide",
-                          "fill": "$mutedFg"
                         }
                       ]
                     },
