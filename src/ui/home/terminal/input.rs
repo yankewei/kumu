@@ -78,7 +78,8 @@ impl TerminalView {
             return;
         }
         if let Some(until) = self.suppress_ctrl_c_until {
-            let is_ctrl_c = mods.control && !mods.alt && !mods.platform && !mods.shift && key == "c";
+            let is_ctrl_c =
+                mods.control && !mods.alt && !mods.platform && !mods.shift && key == "c";
             if is_ctrl_c && Instant::now() < until {
                 cx.stop_propagation();
                 return;

@@ -1238,9 +1238,7 @@ fn parse_pane_scroll(args: &[String]) -> ScrollParse {
                 "up" => direction = Some(ScrollDirection::Up),
                 "down" => direction = Some(ScrollDirection::Down),
                 _ => {
-                    return ScrollParse::Error(
-                        "declare the direction first: up or down".into(),
-                    );
+                    return ScrollParse::Error("declare the direction first: up or down".into());
                 }
             },
             other if target.is_none() => target = Some(other.to_string()),
@@ -2410,9 +2408,9 @@ mod tests {
         );
 
         // `up` as direction and `up` as target must not be ambiguous.
-        let ScrollParse::Parsed(parsed) =
-            parse_pane_scroll(&s(&["down", "up", "--lines", "12", "--col", "8", "--row", "4", "--json"]))
-        else {
+        let ScrollParse::Parsed(parsed) = parse_pane_scroll(&s(&[
+            "down", "up", "--lines", "12", "--col", "8", "--row", "4", "--json",
+        ])) else {
             panic!("expected parsed down targeting pane above");
         };
         assert_eq!(

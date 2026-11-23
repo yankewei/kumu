@@ -848,7 +848,9 @@ fn autoscroll_interval(y: f32, height: f32) -> Duration {
         0.0
     };
     let t = (overshoot / AUTOSCROLL_MAX_DISTANCE).clamp(0.0, 1.0);
-    Duration::from_millis((AUTOSCROLL_MAX_MS - (AUTOSCROLL_MAX_MS - AUTOSCROLL_MIN_MS) * t).round() as u64)
+    Duration::from_millis(
+        (AUTOSCROLL_MAX_MS - (AUTOSCROLL_MAX_MS - AUTOSCROLL_MIN_MS) * t).round() as u64,
+    )
 }
 
 fn min_wait(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
