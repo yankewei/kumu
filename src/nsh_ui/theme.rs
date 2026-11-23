@@ -49,6 +49,21 @@ pub fn kumu_color(name: &str, fallback: fn(&nsh_base::Theme) -> AdaptiveColor) -
     t.color(name).unwrap_or_else(|| fallback(&t))
 }
 
+/// Reactive semantic link color token.
+pub fn link_color() -> AdaptiveColor {
+    kumu_color(TOKEN_LINK, |t| t.primary)
+}
+
+/// Reactive semantic warning color token.
+pub fn warning_color() -> AdaptiveColor {
+    kumu_color(TOKEN_WARNING, |t| t.primary)
+}
+
+/// Reactive semantic success color token.
+pub fn success_color() -> AdaptiveColor {
+    kumu_color(TOKEN_SUCCESS, |t| t.primary)
+}
+
 /// Convert Kumu's light/dark mode to NSH's [`Appearance`].
 pub fn appearance(mode: ThemeMode) -> Appearance {
     if mode.is_dark() {
