@@ -330,6 +330,9 @@ impl KumuApp {
                     terminal.update(cx, |terminal, cx| {
                         terminal.hide(cx);
                         terminal.show(*project, &next, cx);
+                        if next.is_shell() {
+                            terminal.guard_post_exit_ctrl_c();
+                        }
                     });
                 }
                 this.sync_pane_agent_status(pane, cx);

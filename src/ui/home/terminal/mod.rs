@@ -51,6 +51,11 @@ const PAD_Y: f32 = 10.;
 /// TUIs with 120Hz `SIGWINCH` bursts).
 const PANEL_RESIZE_PACE: Duration = Duration::from_millis(28);
 
+/// Grace window after an exited agent pane falls back to a fresh login shell,
+/// dropping trailing `Ctrl+C` taps meant for the exiting agent so they do not
+/// send `SIGINT` while the new shell is sourcing `~/.zshrc`.
+const POST_EXIT_CTRL_C_GUARD: Duration = Duration::from_millis(600);
+
 /// Cached drawing for one viewport, keyed by the snapshot's row Arcs.
 struct PaintCache {
     cell: (Pixels, Pixels),
@@ -117,6 +122,9 @@ pub struct TerminalView {
     /// Window deactivation listener so swallowed mouse-up events (⌘Tab, system
     /// modals) cannot leave a selection drag or autoscroll running.
     window_activation_sub: Option<Subscription>,
+    /// Deadline until which trailing `Ctrl+C` is dropped after an agent exits
+    /// back into a fresh shell, preventing `SIGINT` from aborting `~/.zshrc`.
+    suppress_ctrl_c_until: Option<Instant>,
     /// The link under a ⌘-hovered cell: where it sits and where a click goes.
     link: Option<link::ResolvedLink>,
     /// The cell the pointer is over while ⌘ is held.
@@ -199,6 +207,7 @@ impl TerminalView {
             drag_term: None,
             drag_pos: None,
             window_activation_sub: None,
+            suppress_ctrl_c_until: None,
             link: None,
             hover: None,
             hover_row: None,
@@ -321,6 +330,7 @@ impl TerminalView {
     /// Keep this pane's process while its project is hidden.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.reset_gesture();
+        self.suppress_ctrl_c_until = None;
         self.shown = false;
         self.find = None;
         let pane = self.pane.0;
@@ -330,10 +340,17 @@ impl TerminalView {
         });
     }
 
+    /// Briefly suppress trailing `Ctrl+C` after an exited agent pane falls back
+    /// to a fresh login shell so exit taps do not abort shell rc startup.
+    pub fn guard_post_exit_ctrl_c(&mut self) {
+        self.suppress_ctrl_c_until = Some(Instant::now() + POST_EXIT_CTRL_C_GUARD);
+    }
+
     /// Attach a terminal already assigned to this pane by the workspace.
     /// Notification navigation reattaches the process that sent the request.
     pub fn attach(&mut self, project_id: i64, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.reset_gesture();
+        self.suppress_ctrl_c_until = None;
         // A find bar belongs to the terminal it was opened on. Reattaching
         // the pane's own terminal (clicking the selected project, a
         // notification from the same pane) keeps it; a different terminal
