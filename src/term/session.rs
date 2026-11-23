@@ -278,6 +278,18 @@ enum Msg {
         reply: Option<Sender<Option<String>>>,
     },
     ClearSelection,
+    ResetSelectionGesture,
+    /// Scroll the primary viewport while dragging a selection, then re-apply
+    /// the drag endpoint in a single frame.
+    SelectScroll {
+        lines: isize,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+    },
     SelectionText(Sender<Option<String>>),
     /// The OSC 8 hyperlink on a viewport cell, with the cells it covers.
     HyperlinkAt {
@@ -525,6 +537,39 @@ impl Term {
         self.inbox.send_control(Msg::ClearSelection);
     }
 
+    /// Cancel an in-flight selection gesture and stop any active autoscroll.
+    pub fn reset_selection_gesture(&self) {
+        self.inbox.send_control(Msg::ResetSelectionGesture);
+    }
+
+    /// Scroll the primary viewport during an active selection drag and extend
+    /// the selection to the pointer in one step (never forwards wheel events to
+    /// mouse-tracking programs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_scroll(
+        &self,
+        lines: isize,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+    ) {
+        if lines == 0 {
+            return;
+        }
+        self.inbox.send_control(Msg::SelectScroll {
+            lines,
+            col,
+            row,
+            x,
+            y,
+            cell_w,
+            height,
+        });
+    }
+
     /// The OSC 8 hyperlink on a viewport cell, with the cells it covers.
     ///
     /// Blocks until the session thread answers, so callers run on a background
@@ -682,6 +727,7 @@ fn run(launch: Launch, inbox: Arc<Inbox>, live: Arc<Live>) {
         command,
         cwd: cwd_text,
         exited: false,
+        autoscroll: None,
         live,
     };
     session.vt.resize(80, 24, 8, 16);
@@ -715,6 +761,46 @@ fn read_pty(reader: &mut dyn Read, inbox: &Inbox) {
     }
 }
 
+/// Slowest and fastest intervals (ms) between single-row selection autoscroll ticks.
+const AUTOSCROLL_MAX_MS: f32 = 70.0;
+const AUTOSCROLL_MIN_MS: f32 = 14.0;
+/// Distance outside the grid (in logical pixels) where autoscroll reaches top speed.
+const AUTOSCROLL_MAX_DISTANCE: f32 = 200.0;
+/// Stop ticking after this many consecutive ticks without a viewport offset change
+/// (for example at the scrollback limit or if a release event was swallowed).
+const AUTOSCROLL_MAX_STALLED_TICKS: u8 = 30;
+
+#[derive(Clone, Copy)]
+struct Autoscroll {
+    col: u16,
+    row: u16,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    height: f32,
+    due: Instant,
+    stalled_ticks: u8,
+}
+
+fn autoscroll_interval(y: f32, height: f32) -> Duration {
+    let overshoot = if y < 0.0 {
+        -y
+    } else if y > height {
+        y - height
+    } else {
+        0.0
+    };
+    let t = (overshoot / AUTOSCROLL_MAX_DISTANCE).clamp(0.0, 1.0);
+    Duration::from_millis((AUTOSCROLL_MAX_MS - (AUTOSCROLL_MAX_MS - AUTOSCROLL_MIN_MS) * t).round() as u64)
+}
+
+fn min_wait(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 struct Running {
     pty: Pty,
     write_tx: SyncSender<Vec<u8>>,
@@ -722,6 +808,7 @@ struct Running {
     command: String,
     cwd: String,
     exited: bool,
+    autoscroll: Option<Autoscroll>,
     live: Arc<Live>,
 }
 
@@ -733,11 +820,76 @@ impl Running {
         }
     }
 
+    fn autoscroll_wait(&self) -> Option<Duration> {
+        self.autoscroll
+            .map(|state| state.due.saturating_duration_since(Instant::now()))
+    }
+
+    fn tick_autoscroll(&mut self) -> bool {
+        let Some(mut state) = self.autoscroll else {
+            return false;
+        };
+        if self.vt.is_held() {
+            // Defer autoscroll while a synchronized-output hold freezes the frame.
+            let defer = self
+                .vt
+                .hold_wait()
+                .unwrap_or_else(|| autoscroll_interval(state.y, state.height));
+            state.due = Instant::now() + defer;
+            self.autoscroll = Some(state);
+            return false;
+        }
+        let prev_offset = self.vt.scrollbar().map(|b| b.offset);
+        let _produced = self.vt.autoscroll_tick(
+            state.col,
+            state.row,
+            state.x,
+            state.y,
+            state.cell_w,
+            state.height,
+        );
+        let next_offset = self.vt.scrollbar().map(|b| b.offset);
+        let scrolled = prev_offset != next_offset;
+        if !self.vt.autoscroll_active() {
+            self.autoscroll = None;
+        } else if !scrolled {
+            state.stalled_ticks = state.stalled_ticks.saturating_add(1);
+            if state.stalled_ticks >= AUTOSCROLL_MAX_STALLED_TICKS {
+                self.autoscroll = None;
+            } else {
+                state.due = Instant::now() + autoscroll_interval(state.y, state.height);
+                self.autoscroll = Some(state);
+            }
+        } else {
+            state.stalled_ticks = 0;
+            state.due = Instant::now() + autoscroll_interval(state.y, state.height);
+            self.autoscroll = Some(state);
+        }
+        if scrolled {
+            self.publish(false);
+            true
+        } else {
+            false
+        }
+    }
+
     fn pump(&mut self, inbox: &Inbox) {
         loop {
-            let work = inbox.next(self.vt.hold_wait());
+            if self.autoscroll.is_some_and(|a| Instant::now() >= a.due) {
+                self.tick_autoscroll();
+            }
+            let wait = min_wait(self.vt.hold_wait(), self.autoscroll_wait());
+            let work = inbox.next(wait);
             match work {
-                NextWork::Timeout => self.publish(false),
+                NextWork::Timeout => {
+                    let mut published = false;
+                    if self.autoscroll.is_some_and(|a| Instant::now() >= a.due) {
+                        published = self.tick_autoscroll();
+                    }
+                    if !published && self.vt.hold_wait().is_some_and(|w| w.is_zero()) {
+                        self.publish(false);
+                    }
+                }
                 NextWork::PtyBatch(chunks) => {
                     let started = Instant::now();
                     for chunk in chunks {
@@ -758,6 +910,7 @@ impl Running {
                     }
                 }
                 NextWork::Control(Msg::Key(input)) => {
+                    self.autoscroll = None;
                     if self.vt.clear_selection() {
                         self.publish(false);
                     }
@@ -765,12 +918,14 @@ impl Running {
                     self.write_pty(bytes);
                 }
                 NextWork::Control(Msg::Write(bytes)) => {
+                    self.autoscroll = None;
                     if self.vt.clear_selection() {
                         self.publish(false);
                     }
                     self.write_pty(bytes);
                 }
                 NextWork::Control(Msg::Paste(text)) => {
+                    self.autoscroll = None;
                     if self.vt.clear_selection() {
                         self.publish(false);
                     }
@@ -792,13 +947,56 @@ impl Running {
                     reply,
                 }) => {
                     self.vt.select(step, col, row, x, y, cell_w, height);
+                    match step {
+                        SelectStep::Drag if self.vt.autoscroll_active() => {
+                            let next_due = Instant::now() + autoscroll_interval(y, height);
+                            let due = self
+                                .autoscroll
+                                .map_or(next_due, |prev| prev.due.min(next_due));
+                            self.autoscroll = Some(Autoscroll {
+                                col,
+                                row,
+                                x,
+                                y,
+                                cell_w,
+                                height,
+                                due,
+                                stalled_ticks: 0,
+                            });
+                        }
+                        // Press, Release, or an in-bounds Drag ends autoscroll.
+                        _ => {
+                            self.autoscroll = None;
+                        }
+                    }
                     self.publish(false);
                     if let Some(reply) = reply {
                         let _ = reply.send(self.vt.selection_text());
                     }
                 }
                 NextWork::Control(Msg::ClearSelection) => {
+                    self.autoscroll = None;
                     if self.vt.clear_selection() {
+                        self.publish(false);
+                    }
+                }
+                NextWork::Control(Msg::ResetSelectionGesture) => {
+                    self.autoscroll = None;
+                    self.vt.reset_selection_gesture();
+                }
+                NextWork::Control(Msg::SelectScroll {
+                    lines,
+                    col,
+                    row,
+                    x,
+                    y,
+                    cell_w,
+                    height,
+                }) => {
+                    if !self.vt.alt_screen() {
+                        self.vt.scroll_viewport(lines);
+                        self.vt
+                            .select(SelectStep::Drag, col, row, x, y, cell_w, height);
                         self.publish(false);
                     }
                 }
@@ -866,6 +1064,9 @@ impl Running {
                     cell_w,
                     cell_h,
                 }) => {
+                    if cols != self.vt.cols() || rows != self.vt.rows() {
+                        self.autoscroll = None;
+                    }
                     let _ = self.pty.master.resize(PtySize {
                         rows,
                         cols,

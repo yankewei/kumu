@@ -267,6 +267,7 @@ pub struct Vt {
     press: GhosttySelectionGestureEvent,
     drag: GhosttySelectionGestureEvent,
     release: GhosttySelectionGestureEvent,
+    autoscroll: GhosttySelectionGestureEvent,
     /// Created on the first search and kept until the terminal is freed.
     /// `needle` is empty when no search is running.
     search: Option<GhosttySearch>,
@@ -361,14 +362,16 @@ impl Vt {
                 );
                 event
             };
-            let (press, drag, release) = (
+            let (press, drag, release, autoscroll) = (
                 gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS),
                 gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG),
                 gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE),
+                gesture_event(GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_AUTOSCROLL_TICK),
             );
             require_handle(press, "gesture_event_new")?;
             require_handle(drag, "gesture_event_new")?;
             require_handle(release, "gesture_event_new")?;
+            require_handle(autoscroll, "gesture_event_new")?;
 
             let shared = NonNull::new(Box::into_raw(Box::new(Shared {
                 state,
@@ -443,6 +446,7 @@ impl Vt {
                 press,
                 drag,
                 release,
+                autoscroll,
                 search: None,
                 needle: String::new(),
                 cols,
@@ -525,6 +529,14 @@ impl Vt {
     pub fn hold_wait(&self) -> Option<Duration> {
         unsafe { (*self.shared.as_ptr()).held_since }
             .map(|since| MAX_HOLD.saturating_sub(since.elapsed()))
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.rows
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
@@ -682,6 +694,7 @@ impl Drop for Vt {
             ghostty_selection_gesture_event_free(self.press);
             ghostty_selection_gesture_event_free(self.drag);
             ghostty_selection_gesture_event_free(self.release);
+            ghostty_selection_gesture_event_free(self.autoscroll);
             ghostty_selection_gesture_free(self.gesture, self.term);
             ghostty_mouse_event_free(self.mouse_event);
             ghostty_mouse_encoder_free(self.mouse);

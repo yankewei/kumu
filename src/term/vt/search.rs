@@ -355,6 +355,15 @@ impl Vt {
         }
     }
 
+    fn gesture_geometry(&self, cell_w: f32, height: f32) -> GhosttySelectionGestureGeometry {
+        GhosttySelectionGestureGeometry {
+            columns: u32::from(self.cols),
+            cell_width: cell_w.max(1.0).round() as u32,
+            padding_left: 0,
+            screen_height: height.max(1.0).round() as u32,
+        }
+    }
+
     /// One mouse step of a selection gesture. Positions are in grid-local pixels.
     #[allow(clippy::too_many_arguments)]
     pub fn select(
@@ -423,12 +432,7 @@ impl Vt {
                     );
                 }
                 SelectStep::Drag => {
-                    let geometry = GhosttySelectionGestureGeometry {
-                        columns: u32::from(self.cols),
-                        cell_width: cell_w.max(1.0).round() as u32,
-                        padding_left: 0,
-                        screen_height: height.max(1.0).round() as u32,
-                    };
+                    let geometry = self.gesture_geometry(cell_w, height);
                     ghostty_selection_gesture_event_set(
                         event,
                         GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
@@ -455,6 +459,87 @@ impl Vt {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Whether the active selection gesture is requesting viewport autoscroll
+    /// (pointer dragged above or below the rendered grid).
+    pub fn autoscroll_active(&self) -> bool {
+        let mut dir: GhosttySelectionGestureAutoscroll = GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE;
+        let status = unsafe {
+            ghostty_selection_gesture_get(
+                self.gesture,
+                self.term,
+                GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL,
+                &mut dir as *mut _ as *mut c_void,
+            )
+        };
+        status == GHOSTTY_SUCCESS && dir != GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE
+    }
+
+    /// Advance an active selection autoscroll by one row and extend the
+    /// selection at the given viewport coordinate. Returns `true` when
+    /// libghostty produced an updated selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn autoscroll_tick(
+        &mut self,
+        col: u16,
+        row: u16,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        height: f32,
+    ) -> bool {
+        unsafe {
+            let viewport = GhosttyPointCoordinate {
+                x: col.min(self.cols.saturating_sub(1)),
+                y: u32::from(row.min(self.rows.saturating_sub(1))),
+            };
+            let pos = GhosttySurfacePosition {
+                x: f64::from(x),
+                y: f64::from(y),
+            };
+            let geometry = self.gesture_geometry(cell_w, height);
+            ghostty_selection_gesture_event_set(
+                self.autoscroll,
+                GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT,
+                &viewport as *const _ as *const c_void,
+            );
+            ghostty_selection_gesture_event_set(
+                self.autoscroll,
+                GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                &pos as *const _ as *const c_void,
+            );
+            ghostty_selection_gesture_event_set(
+                self.autoscroll,
+                GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
+                &geometry as *const _ as *const c_void,
+            );
+            let mut selection = GhosttySelection::default();
+            if ghostty_selection_gesture_event(
+                self.gesture,
+                self.term,
+                self.autoscroll,
+                &mut selection,
+            ) == GHOSTTY_SUCCESS
+            {
+                ghostty_terminal_set(
+                    self.term,
+                    GHOSTTY_TERMINAL_OPT_SELECTION,
+                    &selection as *const _ as *const c_void,
+                );
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Cancel any in-flight selection gesture (for example when a pane is
+    /// hidden or detached mid-drag).
+    pub fn reset_selection_gesture(&mut self) {
+        unsafe {
+            ghostty_selection_gesture_reset(self.gesture, self.term);
         }
     }
 }

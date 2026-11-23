@@ -189,6 +189,58 @@ fn a_drag_selects_plain_text() {
 }
 
 #[test]
+fn autoscroll_tick_scrolls_and_extends_selection_down_and_up() {
+    let mut vt = Vt::new(16, 4);
+    for i in 1..=8 {
+        vt.write(format!("line{i}\r\n").as_bytes());
+    }
+    // Scroll to the top of scrollback (lines 1..=4 visible) and drag below the grid.
+    vt.scroll_to_row(0);
+    let top_offset = vt.scrollbar().expect("scrollbar").offset;
+    vt.select(SelectStep::Press, 0, 0, 1.0, 5.0, 10.0, 40.0);
+    vt.select(SelectStep::Drag, 5, 3, 50.0, 55.0, 10.0, 40.0);
+    assert!(vt.autoscroll_active(), "dragging below grid requests autoscroll");
+    assert!(vt.autoscroll_tick(5, 3, 50.0, 55.0, 10.0, 40.0));
+    assert!(vt.autoscroll_tick(5, 3, 50.0, 55.0, 10.0, 40.0));
+    let after_down = vt.scrollbar().expect("scrollbar").offset;
+    assert_eq!(after_down, top_offset + 2, "two downward ticks scroll two rows");
+    let text = vt.selection_text().expect("selection across scrolled rows");
+    assert!(text.contains("line1"), "anchor row stays selected: {text:?}");
+    assert!(text.contains("line6"), "newly revealed row is selected: {text:?}");
+    vt.select(SelectStep::Release, 5, 3, 50.0, 55.0, 10.0, 40.0);
+    assert!(!vt.autoscroll_active(), "release clears autoscroll");
+
+    // Now start near the bottom and drag above the grid (y < 0).
+    let before_up = vt.scrollbar().expect("scrollbar").offset;
+    vt.select(SelectStep::Press, 5, 3, 50.0, 35.0, 10.0, 40.0);
+    vt.select(SelectStep::Drag, 0, 0, 1.0, -15.0, 10.0, 40.0);
+    assert!(vt.autoscroll_active(), "dragging above grid requests autoscroll");
+    assert!(vt.autoscroll_tick(0, 0, 1.0, -15.0, 10.0, 40.0));
+    let after_up = vt.scrollbar().expect("scrollbar").offset;
+    assert_eq!(after_up, before_up - 1, "upward tick scrolls one row up");
+    let up_text = vt.selection_text().expect("upward selection");
+    assert!(up_text.contains("line2"), "revealed upper row is selected: {up_text:?}");
+}
+
+#[test]
+fn autoscroll_tick_after_release_does_nothing() {
+    let mut vt = Vt::new(16, 4);
+    for i in 1..=8 {
+        vt.write(format!("line{i}\r\n").as_bytes());
+    }
+    vt.scroll_to_row(0);
+    vt.select(SelectStep::Press, 0, 0, 1.0, 5.0, 10.0, 40.0);
+    vt.select(SelectStep::Drag, 5, 3, 50.0, 55.0, 10.0, 40.0);
+    vt.select(SelectStep::Release, 5, 3, 50.0, 55.0, 10.0, 40.0);
+    let offset = vt.scrollbar().expect("scrollbar").offset;
+    let text = vt.selection_text();
+    assert!(!vt.autoscroll_active());
+    assert!(!vt.autoscroll_tick(5, 3, 50.0, 55.0, 10.0, 40.0));
+    assert_eq!(vt.scrollbar().expect("scrollbar").offset, offset);
+    assert_eq!(vt.selection_text(), text);
+}
+
+#[test]
 fn search_finds_matches_and_reports_their_viewport_rows() {
     let mut vt = Vt::new(20, 6);
     for line in [

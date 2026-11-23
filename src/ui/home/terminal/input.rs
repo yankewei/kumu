@@ -308,7 +308,12 @@ impl TerminalView {
     }
 
     pub(super) fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(prev) = self.drag_term.take() {
+            prev.reset_selection_gesture();
+        }
         self.selecting = true;
+        self.drag_pos = Some(pos);
+        self.drag_term = self.workspace.read(cx).terminal_handle(self.pane.0);
         self.apply_select(SelectStep::Press, pos, cx);
     }
 
@@ -316,13 +321,16 @@ impl TerminalView {
     /// and the text both live on the session thread, so it runs off-thread.
     pub(super) fn finish_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         self.selecting = false;
-        if self.project.is_none() {
-            return;
-        }
-        let Some(point) = self.select_point(pos) else {
+        self.drag_pos = None;
+        let Some(term) = self
+            .drag_term
+            .take()
+            .or_else(|| self.workspace.read(cx).terminal_handle(self.pane.0))
+        else {
             return;
         };
-        let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) else {
+        let Some(point) = self.select_point(pos) else {
+            term.reset_selection_gesture();
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -361,7 +369,11 @@ impl TerminalView {
         let Some(point) = self.select_point(pos) else {
             return;
         };
-        if let Some(term) = self.workspace.read(cx).terminal_handle(self.pane.0) {
+        let term = self
+            .drag_term
+            .clone()
+            .or_else(|| self.workspace.read(cx).terminal_handle(self.pane.0));
+        if let Some(term) = term {
             // Press and Drag never wait on the session thread.
             let _ = term.select(
                 step,
@@ -378,14 +390,17 @@ impl TerminalView {
 
     fn select_point(&self, pos: Point<Pixels>) -> Option<SelectPoint> {
         let grid = self.grid_at.get();
-        let (x, y) = local_pos(grid, pos);
         let (cw, ch) = (f32::from(grid.cell.0), f32::from(grid.cell.1));
         if cw <= 0. || ch <= 0. {
             return None;
         }
+        // Keep signed coordinates for libghostty's selection gesture: negative y
+        // and y > height are how Ghostty detects upward/downward autoscroll.
+        let x = f32::from(pos.x - grid.origin.x);
+        let y = f32::from(pos.y - grid.origin.y);
         Some(SelectPoint {
-            col: (x / cw) as u16,
-            row: (y / ch) as u16,
+            col: (x.max(0.) / cw) as u16,
+            row: (y.max(0.) / ch) as u16,
             x,
             y,
             cell_w: cw,
@@ -616,6 +631,23 @@ impl TerminalView {
         }
         // GPUI: positive y is content moving down = scroll up in terminal terms.
         let delta = -(lines as isize);
+        if self.selecting
+            && let Some(drag_pos) = self.drag_pos
+            && let Some(point) = self.select_point(drag_pos)
+            && let Some(term) = self.drag_term.as_ref()
+        {
+            term.select_scroll(
+                delta,
+                point.col,
+                point.row,
+                point.x,
+                point.y,
+                point.cell_w,
+                point.height,
+            );
+            cx.notify();
+            return;
+        }
         let (x, y) = local_pos(grid, event.position);
         let mods = mouse_mods(&event.modifiers);
         self.workspace.update(cx, |workspace, _| {

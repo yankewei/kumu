@@ -31,7 +31,7 @@ use crate::agent::launch::PaneLaunch;
 use crate::app::layout::PaneId;
 use crate::app::{Workspace, WorkspaceEvent};
 use crate::term::link;
-use crate::term::{Cell as TermCell, MouseAction, Rgb, SelectStep, Snapshot};
+use crate::term::{Cell as TermCell, MouseAction, Rgb, SelectStep, Snapshot, Term};
 use crate::theme::{self, KumuTheme, ThemeRevision};
 
 /// Chrome / focus messages from a pane up to the home window.
@@ -107,6 +107,16 @@ pub struct TerminalView {
     grid_at: Rc<Cell<GridAt>>,
     /// Left-button selection drag in progress.
     selecting: bool,
+    /// Terminal handle that owns the in-flight selection drag, captured on
+    /// press so switching projects or losing focus still resets the original
+    /// terminal's gesture and autoscroll timer.
+    drag_term: Option<Term>,
+    /// Latest pointer position while `selecting`, used to re-apply the drag
+    /// endpoint after manual wheel/trackpad scrolling.
+    drag_pos: Option<Point<Pixels>>,
+    /// Window deactivation listener so swallowed mouse-up events (⌘Tab, system
+    /// modals) cannot leave a selection drag or autoscroll running.
+    window_activation_sub: Option<Subscription>,
     /// The link under a ⌘-hovered cell: where it sits and where a click goes.
     link: Option<link::ResolvedLink>,
     /// The cell the pointer is over while ⌘ is held.
@@ -186,6 +196,9 @@ impl TerminalView {
                 bounds: Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
             })),
             selecting: false,
+            drag_term: None,
+            drag_pos: None,
+            window_activation_sub: None,
             link: None,
             hover: None,
             hover_row: None,
@@ -307,6 +320,7 @@ impl TerminalView {
 
     /// Keep this pane's process while its project is hidden.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.reset_gesture();
         self.shown = false;
         self.find = None;
         let pane = self.pane.0;
@@ -340,13 +354,17 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// A pane that changes project abandons whatever mouse gesture was in
-    /// flight. Left alone, `selecting` would make the next plain move end a
-    /// selection that belonged to the old screen, and a `reported` button
-    /// whose release never arrived (a drag that switched panes or lost focus)
-    /// would keep this pane from taking any click again.
+    /// Abandon any mouse gesture in flight (when switching projects, hiding a
+    /// pane, or losing window activation). Resets the original `drag_term`'s
+    /// selection gesture so its autoscroll timer stops even if this pane now
+    /// points at another terminal, and clears `reported` mouse buttons so a
+    /// swallowed release cannot lock out future clicks.
     fn reset_gesture(&mut self) {
+        if let Some(term) = self.drag_term.take() {
+            term.reset_selection_gesture();
+        }
         self.selecting = false;
+        self.drag_pos = None;
         self.reported.clear();
         self.scrolled = 0.;
         self.link = None;
@@ -423,6 +441,14 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.window_activation_sub.is_none() {
+            self.window_activation_sub =
+                Some(cx.observe_window_activation(window, |this, window, _| {
+                    if !window.is_window_active() {
+                        this.reset_gesture();
+                    }
+                }));
+        }
         self.sync_theme(cx);
         let theme = KumuTheme::global(cx);
         let colors = &theme.colors;
@@ -632,6 +658,7 @@ impl Render for TerminalView {
                             let _ = view.update(cx, |this, cx| {
                                 if this.selecting {
                                     if ev.pressed_button == Some(MouseButton::Left) {
+                                        this.drag_pos = Some(ev.position);
                                         this.apply_select(SelectStep::Drag, ev.position, cx);
                                     } else {
                                         this.finish_selection(ev.position, cx);
