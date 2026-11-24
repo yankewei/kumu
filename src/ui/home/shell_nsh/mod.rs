@@ -8,7 +8,6 @@
 //! - Native GPUI `TerminalView` leaves (`native("kumu.terminal")`, `focus_handle() -> None`)
 //! - Floating Pure Rust NSH `⌘F` Find Bar over each pane
 //! - Native right-hand plugin slot (`native("kumu.plugin")`)
-//! - Full-window NSH foreground `toast_stack`
 //!
 //! Layout topology (`LayoutStructure`) is separated from per-pane chrome
 //! (`HashMap<PaneId, PaneChromeSnapshot>`) so title, agent-status, active-border,
@@ -32,7 +31,6 @@ use super::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use crate::app::layout::{PaneId, SplitAxis};
 use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
-use crate::nsh_ui::toast::{ToastCommand, ToastItem};
 use crate::theme::KumuTheme;
 
 /// Soft-settle deceleration curve (`cubic-bezier(0.22, 1, 0.36, 1)`) for left
@@ -135,7 +133,6 @@ pub(super) enum ShellHostEvent {
     Center(CenterModeSnapshot),
     PaneChrome(HashMap<PaneId, PaneChromeSnapshot>),
     OpenPlugin(Option<PluginPanelSnapshot>),
-    Toast(ToastCommand),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,7 +174,6 @@ pub(super) enum HomeShellAction {
         older: bool,
     },
     FindClose(PaneId),
-    ToastClicked(String),
 }
 
 struct ShellMount {
@@ -201,7 +197,7 @@ mod view {
 
     use futures::StreamExt;
     use futures::channel::mpsc::unbounded;
-    use nsh_base::{Anchor, HandleEdge, resize_handle, theme as active_theme};
+    use nsh_base::{HandleEdge, resize_handle, theme as active_theme};
     use nsh_core::element::{LayoutCurve, LayoutTransition, native};
     use nsh_core::geometry::Axis;
     use nsh_core::prelude::*;
@@ -217,7 +213,6 @@ mod view {
         ButtonVariant, ControlTone, body_text, kumu_button, kumu_icon_button,
     };
     use crate::nsh_ui::theme::{text_xs_size, warning_color};
-    use crate::nsh_ui::toast::{ToastCommand, ToastHostEvent, render_toast_stack};
     use crate::ui::home::sidebar_nsh::view::render_sidebar;
     use crate::ui::home::tabs_nsh::view::render_tab_bar;
 
@@ -274,8 +269,6 @@ mod view {
 
         let (sidebar_tx, mut sidebar_rx) = unbounded();
         let (tabs_tx, mut tabs_rx) = unbounded();
-        let (toast_cmd_tx, toast_cmd_rx) = unbounded::<ToastCommand>();
-        let (toast_ev_tx, mut toast_ev_rx) = unbounded::<ToastHostEvent>();
 
         // Forward sub-view actions into unified HomeShellAction channel.
         let tx_sb = actions_tx.clone();
@@ -288,12 +281,6 @@ mod view {
         spawn(async move {
             while let Some(a) = tabs_rx.next().await {
                 send(&tx_tb, HomeShellAction::TabBar(a));
-            }
-        });
-        let tx_toast = actions_tx.clone();
-        spawn(async move {
-            while let Some(ToastHostEvent::Clicked(id)) = toast_ev_rx.next().await {
-                send(&tx_toast, HomeShellAction::ToastClicked(id));
             }
         });
 
@@ -438,9 +425,6 @@ mod view {
                                     (false, false) => {}
                                 }
                             }
-                        }
-                        ShellHostEvent::Toast(cmd) => {
-                            let _ = toast_cmd_tx.unbounded_send(cmd);
                         }
                     }
                 }
@@ -736,11 +720,6 @@ mod view {
             })
             .child(error_banner)
             .child(view().flex_1().min_h_0().min_w_0().child(main_split))
-            .child(render_toast_stack(
-                Some(toast_cmd_rx),
-                Anchor::TopRight,
-                Some(toast_ev_tx),
-            ))
     }
 }
 
@@ -879,18 +858,6 @@ impl NshHomeShell {
                 .events_tx
                 .unbounded_send(ShellHostEvent::OpenPlugin(next.open_plugin));
         }
-    }
-
-    pub(super) fn push_toast(&self, item: ToastItem) {
-        let _ = self
-            .events_tx
-            .unbounded_send(ShellHostEvent::Toast(ToastCommand::Push(item)));
-    }
-
-    pub(super) fn dismiss_toast(&self, id: String) {
-        let _ = self
-            .events_tx
-            .unbounded_send(ShellHostEvent::Toast(ToastCommand::Dismiss(id)));
     }
 
     pub(super) fn sync_theme(&self, theme: &KumuTheme, cx: &mut App) {
