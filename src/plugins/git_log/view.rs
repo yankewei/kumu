@@ -247,7 +247,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                         .min_w_0()
                         .flex_row()
                         .justify_end()
-                        .child(meta_text(branch).app_class("truncate")),
+                        .child(meta_text(branch).flex_shrink(1.0).app_class("truncate")),
                 ),
         );
 
