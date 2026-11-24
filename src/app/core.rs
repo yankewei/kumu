@@ -355,6 +355,38 @@ impl WorkspaceCore {
         }
     }
 
+    /// Import (or sync) an external task onto the board owning `project_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_imported_todo(
+        &mut self,
+        project_id: i64,
+        task: &crate::tracker::ImportedTask,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> Option<(TodoItem, bool)> {
+        let board_id = self.board_project_id(project_id);
+        match self.store.upsert_imported_todo(
+            board_id,
+            task,
+            status,
+            pane_id,
+            agent_id,
+            agent_session_id,
+        ) {
+            Ok((item, created)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                Some((item, created))
+            }
+            Err(error) => {
+                self.emit_failed(events, "导入 TODO 失败", error);
+                None
+            }
+        }
+    }
+
     /// Update one TODO item and notify subscribers.
     pub fn update_todo(
         &mut self,

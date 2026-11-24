@@ -10,7 +10,7 @@ use nsh_core::element::desktop::{popup_menu, popup_menu_at};
 use nsh_core::prelude::*;
 
 use super::menus::{CardContextMenuArgs, build_card_context_menu_items, build_dispatch_menu_items};
-use super::{DragCandidate, DragState, send_action};
+use super::{DragCandidate, DragState, render_source_badge, send_action};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
 use crate::nsh_ui::assets::icon_svg;
@@ -285,20 +285,25 @@ where
                                 .text_color(move || active_theme().muted_foreground),
                         ),
                 ),
-        )
-        .child({
-            let mut footer = view()
-                .flex_row()
-                .w_full()
-                .gap_1p5()
-                .items_center()
-                .child(pill_el)
-                .child(view().flex_1());
-            if let Some(cta) = right_cta {
-                footer = footer.child(cta);
-            }
-            footer
-        });
+        );
+
+    if let Some(badge) = render_source_badge(ctx.tx, item) {
+        body = body.child(view().flex_row().items_center().child(badge));
+    }
+
+    body = body.child({
+        let mut footer = view()
+            .flex_row()
+            .w_full()
+            .gap_1p5()
+            .items_center()
+            .child(pill_el)
+            .child(view().flex_1());
+        if let Some(cta) = right_cta {
+            footer = footer.child(cta);
+        }
+        footer
+    });
 
     if let Some(kind) = accent_kind {
         body = body.border_l(px(3.0)).border_l_color(move || match kind {
@@ -531,6 +536,10 @@ where
                 ),
         );
 
+    if let Some(badge) = render_source_badge(ctx.tx, item) {
+        card = card.child(view().flex_row().items_center().child(badge));
+    }
+
     if let Some(preview) = desc_preview {
         card = card.child(meta_text(preview));
     }
@@ -605,6 +614,9 @@ where
                 .text_color(move || active_theme().muted_foreground)
                 .line_through(),
         );
+    if let Some(badge) = render_source_badge(ctx.tx, item) {
+        row = row.child(badge);
+    }
     if let Some(agent) = item.agent_id.as_deref() {
         row = row.child(meta_text(short_agent_name(agent)));
     }

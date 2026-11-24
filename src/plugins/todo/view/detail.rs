@@ -9,7 +9,7 @@ use nsh_core::element::{AccessibilityRole, scroll};
 use nsh_core::prelude::*;
 
 use super::menus::build_dispatch_menu_items;
-use super::{render_notice_banner, send_action};
+use super::{render_notice_banner, render_source_badge, send_action};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
 use crate::nsh_ui::assets::icon_svg;
@@ -51,7 +51,7 @@ pub(super) fn render_detail_view(
     let needs_review = item.awaiting_review || live_state == Some(AgentState::Completed);
     let id = item.id;
 
-    let header = render_detail_header(tx.clone(), signals, id);
+    let header = render_detail_header(tx.clone(), signals, &item);
     let status_seg = render_status_segmented(tx.clone(), id, item.status);
     let agent_section = render_agent_section(
         tx.clone(),
@@ -180,9 +180,10 @@ pub(super) fn render_detail_view(
 fn render_detail_header(
     tx: Option<UnboundedSender<TodoAction>>,
     signals: DetailSignals,
-    id: i64,
+    item: &TodoItem,
 ) -> View {
-    view()
+    let id = item.id;
+    let mut header = view()
         .flex_row()
         .flex_shrink_0()
         .h(px(32.0))
@@ -212,7 +213,13 @@ fn render_detail_header(
                         .text_color(move || active_theme().foreground),
                 ),
         )
-        .child(view().flex_1())
+        .child(view().flex_1());
+
+    if let Some(badge) = render_source_badge(&tx, item) {
+        header = header.child(badge);
+    }
+
+    header
         .child(
             text(format!("#{id}"))
                 .font_family(move || {

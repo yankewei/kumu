@@ -22,7 +22,7 @@ use std::time::Duration;
 pub use cli::run_cli;
 pub use protocol::{
     CloseResult, Command, ControlError, PaneContent, PaneSummary, PaneTarget, ScrollDirection,
-    ScrollResult, SendResult, SplitResult, WaitResult,
+    ScrollResult, SendResult, SplitResult, TodoImportResult, WaitResult,
 };
 #[cfg(test)]
 use protocol::{Request, RequestLine};
@@ -266,6 +266,8 @@ mod tests {
                                 created_at: "2026-11-21 00:00:00".into(),
                                 updated_at: "2026-11-21 00:00:00".into(),
                                 completed_at: None,
+                                source_url: None,
+                                source_ref: None,
                             }]))
                             .expect("todo list reply");
                     }
@@ -342,7 +344,8 @@ mod tests {
                     Command::TodoShow { .. }
                     | Command::TodoAdd { .. }
                     | Command::TodoUpdate { .. }
-                    | Command::TodoRemove { .. } => {}
+                    | Command::TodoRemove { .. }
+                    | Command::TodoImport { .. } => {}
                 }
             }
         });

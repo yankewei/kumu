@@ -139,6 +139,34 @@ impl Workspace {
         item
     }
 
+    /// Import (or sync) an external task onto the board owning `project_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_imported_todo(
+        &self,
+        project_id: i64,
+        task: &crate::tracker::ImportedTask,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Option<(TodoItem, bool)> {
+        let mut events = Vec::new();
+        let result = self.lock().upsert_imported_todo(
+            project_id,
+            task,
+            status,
+            pane_id,
+            agent_id,
+            agent_session_id,
+            &mut events,
+        );
+        for event in events {
+            cx.emit(event);
+        }
+        result
+    }
+
     /// Update one TODO item and notify subscribers.
     pub fn update_todo(
         &self,

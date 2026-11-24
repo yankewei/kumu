@@ -150,6 +150,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<u64>,
     },
+    /// Import an external GitHub/GitLab/Jira issue onto the caller's repository board.
+    TodoImport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        input: String,
+        #[serde(default = "todo_status_default")]
+        status: TodoStatus,
+        #[serde(default)]
+        bind: bool,
+    },
 }
 
 fn submit_by_default() -> bool {
@@ -262,6 +272,13 @@ pub struct ScrollResult {
     pub moved: Option<i32>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoImportResult {
+    pub todo: TodoItem,
+    pub created: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ControlError {
     pub kind: &'static str,
@@ -362,5 +379,12 @@ pub enum Command {
         id: i64,
         from: Option<u64>,
         reply: Sender<Result<bool, ControlError>>,
+    },
+    TodoImport {
+        from: Option<u64>,
+        input: String,
+        status: TodoStatus,
+        bind: bool,
+        reply: Sender<Result<TodoImportResult, ControlError>>,
     },
 }

@@ -21,6 +21,8 @@ impl Store {
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
             completed_at: row.get(12)?,
+            source_url: row.get(13)?,
+            source_ref: row.get(14)?,
         })
     }
 
@@ -29,7 +31,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, title, description, status, position,
                     pane_id, agent_id, agent_session_id, awaiting_review,
-                    created_at, updated_at, completed_at
+                    created_at, updated_at, completed_at, source_url, source_ref
              FROM todos
              WHERE project_id = ?1
              ORDER BY position ASC, id DESC",
@@ -44,7 +46,7 @@ impl Store {
             .query_row(
                 "SELECT id, project_id, title, description, status, position,
                         pane_id, agent_id, agent_session_id, awaiting_review,
-                        created_at, updated_at, completed_at
+                        created_at, updated_at, completed_at, source_url, source_ref
                  FROM todos
                  WHERE id = ?1",
                 params![id],
@@ -95,6 +97,81 @@ impl Store {
         )?;
         let id = self.conn.last_insert_rowid();
         self.todo(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Insert an externally imported task or sync its title/description if a
+    /// row with the same `(project_id, source_url)` already exists.
+    ///
+    /// Returns `(item, created)`. When updating an existing row, local workflow
+    /// state (`status`, `position`, `pane_id`, `agent_id`, `agent_session_id`,
+    /// `awaiting_review`, `completed_at`) is preserved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_imported_todo(
+        &self,
+        project_id: i64,
+        task: &crate::tracker::ImportedTask,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+    ) -> Result<(TodoItem, bool)> {
+        let existing_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM todos WHERE project_id = ?1 AND source_url = ?2",
+                params![project_id, &task.source_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing_id {
+            self.conn.execute(
+                "UPDATE todos
+                 SET title = ?1,
+                     description = ?2,
+                     source_ref = ?3,
+                     updated_at = datetime('now')
+                 WHERE id = ?4",
+                params![&task.title, &task.description, &task.source_ref, id],
+            )?;
+            let item = self.todo(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            return Ok((item, false));
+        }
+
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM todos WHERE project_id = ?1 AND status = ?2",
+            params![project_id, status.as_str()],
+            |row| row.get(0),
+        )?;
+        let pane_sql = pane_id.and_then(|id| i64::try_from(id).ok());
+        let completed_at_sql = (status == TodoStatus::Done).then_some("now");
+        self.conn.execute(
+            "INSERT INTO todos (
+                project_id, title, description, status, position,
+                pane_id, agent_id, agent_session_id, awaiting_review, completed_at,
+                source_url, source_ref
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, 0,
+                CASE WHEN ?9 IS NOT NULL THEN datetime('now') ELSE NULL END,
+                ?10, ?11
+             )",
+            params![
+                project_id,
+                &task.title,
+                &task.description,
+                status.as_str(),
+                next_pos,
+                pane_sql,
+                agent_id,
+                agent_session_id,
+                completed_at_sql,
+                &task.source_url,
+                &task.source_ref,
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        let item = self.todo(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok((item, true))
     }
 
     /// Apply a partial update to one TODO item, returning the updated row.

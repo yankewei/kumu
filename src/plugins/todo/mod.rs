@@ -32,14 +32,20 @@ use crate::theme::KumuTheme;
 pub(super) fn format_task_prompt(todo: &TodoItem) -> String {
     let title = todo.title.trim();
     let desc = todo.description.trim();
-    if desc.is_empty() {
-        format!("请完成以下 TODO 任务（#{}）：{}", todo.id, title)
-    } else {
-        format!(
-            "请完成以下 TODO 任务（#{}）：{}\n\n{}",
-            todo.id, title, desc
-        )
+    let mut prompt = format!("请完成以下 TODO 任务（#{}）：{}", todo.id, title);
+    if let Some(url) = todo
+        .source_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        prompt.push_str(&format!("\n来源：{url}"));
     }
+    if !desc.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(desc);
+    }
+    prompt
 }
 
 /// Short display name for a known agent id (e.g. `"claude"` → `"Claude"`).
@@ -102,6 +108,7 @@ pub(super) enum TodoHostEvent {
     ClearNotice,
     OpenInProgressLane,
     ClearFollowup,
+    ImportFinished { clear_input: bool },
 }
 
 /// Where a newly dispatched TODO Agent should open.
@@ -120,6 +127,11 @@ pub(super) enum TodoAction {
         description: String,
         dispatch_default: bool,
     },
+    ImportTask {
+        input: String,
+        dispatch_default: bool,
+    },
+    OpenUrl(String),
     SetStatus {
         id: i64,
         status: TodoStatus,
@@ -422,6 +434,15 @@ impl TodoPanel {
                 }
                 self.push_snapshot(cx);
             }
+            TodoAction::ImportTask {
+                input,
+                dispatch_default,
+            } => {
+                self.import_task(input, dispatch_default, cx);
+            }
+            TodoAction::OpenUrl(url) => {
+                self.open_external_url(&url);
+            }
             TodoAction::SetStatus { id, status } => {
                 self.set_status(id, status, cx);
                 self.push_snapshot(cx);
@@ -542,6 +563,92 @@ impl TodoPanel {
                 cx,
             )
         })
+    }
+
+    fn import_task(&mut self, input: String, dispatch_default: bool, cx: &mut Context<Self>) {
+        let Some(project) = self.project.clone() else {
+            let _ = self
+                .events_tx
+                .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
+            self.push_notice("请先选择一个项目", true);
+            return;
+        };
+        let _ = self.events_tx.unbounded_send(TodoHostEvent::ClearNotice);
+        let repo_dir = project.path.clone();
+        let project_id = project.id;
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_executor()
+                .spawn(async move { crate::tracker::fetch_task(&input, &repo_dir) })
+                .await;
+            let _ = this.update(cx, |panel, cx| match fetched {
+                Ok(task) => {
+                    let Some(workspace) = panel.host.workspace() else {
+                        let _ = panel
+                            .events_tx
+                            .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
+                        return;
+                    };
+                    let result = workspace.update(cx, |ws, cx| {
+                        ws.upsert_imported_todo(
+                            project_id,
+                            &task,
+                            TodoStatus::Todo,
+                            None,
+                            None,
+                            None,
+                            cx,
+                        )
+                    });
+                    match result {
+                        Some((item, created)) => {
+                            let _ = panel
+                                .events_tx
+                                .unbounded_send(TodoHostEvent::ImportFinished {
+                                    clear_input: true,
+                                });
+                            if !created {
+                                panel.push_notice(
+                                    "该任务已在看板中，已保留本地进度并同步最新内容",
+                                    false,
+                                );
+                            } else if dispatch_default {
+                                panel.dispatch_default_agent(&item, cx);
+                            } else {
+                                panel.push_notice(format!("已导入 {}", task.source_ref), false);
+                            }
+                            panel.push_snapshot(cx);
+                        }
+                        None => {
+                            let _ = panel
+                                .events_tx
+                                .unbounded_send(TodoHostEvent::ImportFinished {
+                                    clear_input: false,
+                                });
+                            panel.push_notice("保存导入任务失败", true);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = panel
+                        .events_tx
+                        .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
+                    panel.push_notice(err.to_string(), true);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_external_url(&self, url: &str) {
+        let trimmed = url.trim();
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(trimmed).spawn();
+        }
     }
 
     fn set_status(&mut self, id: i64, status: TodoStatus, cx: &mut Context<Self>) {
@@ -733,6 +840,8 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
+            source_url: None,
+            source_ref: None,
         };
         assert_eq!(
             todo_branch_name(&mk(12, "Fix OSC parser!")),
@@ -758,6 +867,8 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
+            source_url: None,
+            source_ref: None,
         };
         assert_eq!(
             format_task_prompt(&item),
@@ -767,6 +878,11 @@ mod tests {
         assert_eq!(
             format_task_prompt(&item),
             "请完成以下 TODO 任务（#12）：Fix OSC parser\n\nHandle kumu-status signals\nAdd tests"
+        );
+        item.source_url = Some("https://github.com/kumu-one/kumu/issues/40".into());
+        assert_eq!(
+            format_task_prompt(&item),
+            "请完成以下 TODO 任务（#12）：Fix OSC parser\n来源：https://github.com/kumu-one/kumu/issues/40\n\nHandle kumu-status signals\nAdd tests"
         );
     }
 
@@ -794,6 +910,8 @@ mod tests {
                     created_at: String::new(),
                     updated_at: String::new(),
                     completed_at: None,
+                    source_url: None,
+                    source_ref: None,
                 },
                 TodoItem {
                     id: 2,
@@ -809,6 +927,8 @@ mod tests {
                     created_at: String::new(),
                     updated_at: String::new(),
                     completed_at: None,
+                    source_url: None,
+                    source_ref: None,
                 },
             ],
             live_panes: vec![AgentPaneInfo {

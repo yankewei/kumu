@@ -12,7 +12,7 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in `PRAGMA user_version`. Bump it with a new
 /// `migrate_vN` step; opening an older database applies the steps it is
 /// missing exactly once.
-pub(super) const SCHEMA_VERSION: i64 = 6;
+pub(super) const SCHEMA_VERSION: i64 = 7;
 
 impl Store {
     pub(super) fn init(&mut self) -> Result<(), OpenError> {
@@ -46,6 +46,9 @@ impl Store {
         }
         if version < 6 {
             Self::migrate_v6_conn(&transaction)?;
+        }
+        if version < 7 {
+            Self::migrate_v7_conn(&transaction)?;
         }
         if version < SCHEMA_VERSION {
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -242,6 +245,33 @@ impl Store {
                 ON todos(project_id, status, position, id);
             CREATE INDEX IF NOT EXISTS todos_pane
                 ON todos(pane_id) WHERE pane_id IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
+    /// External issue tracker metadata (`source_url` + `source_ref`) with
+    /// per-project URL uniqueness for idempotent re-imports.
+    fn migrate_v7_conn(conn: &Connection) -> Result<()> {
+        let has_source_url: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('todos') WHERE name = 'source_url')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_source_url {
+            conn.execute("ALTER TABLE todos ADD COLUMN source_url TEXT", [])?;
+        }
+        let has_source_ref: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('todos') WHERE name = 'source_ref')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_source_ref {
+            conn.execute("ALTER TABLE todos ADD COLUMN source_ref TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_todos_project_source_url
+             ON todos(project_id, source_url) WHERE source_url IS NOT NULL",
+            [],
         )?;
         Ok(())
     }

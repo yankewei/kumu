@@ -57,6 +57,60 @@ fn send_action(tx: &Option<UnboundedSender<TodoAction>>, action: TodoAction) {
     }
 }
 
+pub(super) fn render_source_badge(
+    tx: &Option<UnboundedSender<TodoAction>>,
+    item: &TodoItem,
+) -> Option<AnyElement> {
+    let ref_label = item
+        .source_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let external_url = item
+        .source_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+        .map(str::to_string);
+
+    let label_text = text(ref_label.to_string())
+        .text_size(text_xs_size)
+        .text_color(move || active_theme().muted_foreground);
+
+    if let Some(url) = external_url {
+        let tx = tx.clone();
+        Some(
+            view()
+                .role(AccessibilityRole::Button)
+                .label(format!("打开 {ref_label}"))
+                .flex_row()
+                .flex_shrink_0()
+                .h(px(18.0))
+                .px_1p5()
+                .rounded(px(4.0))
+                .bg(move || active_theme().sidebar_accent.opacity(0.65))
+                .hover(|s| s.bg(move || link_color().opacity(0.16)))
+                .items_center()
+                .on_press(move || send_action(&tx, TodoAction::OpenUrl(url.clone())))
+                .child(label_text)
+                .into_element(),
+        )
+    } else {
+        Some(
+            view()
+                .flex_row()
+                .flex_shrink_0()
+                .h(px(18.0))
+                .px_1p5()
+                .rounded(px(4.0))
+                .bg(move || active_theme().sidebar_accent.opacity(0.65))
+                .items_center()
+                .child(label_text)
+                .into_element(),
+        )
+    }
+}
+
 fn render_notice_banner(notice: Signal<Option<(String, bool)>>) -> impl IntoElement {
     dynamic(move || {
         let Some((message, is_error)) = notice.get() else {
@@ -112,6 +166,9 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
         composer_open: signal(false),
         composer_title: signal(String::new()),
         composer_desc: signal(String::new()),
+        import_open: signal(false),
+        import_draft: signal(String::new()),
+        importing: signal(false),
     };
 
     let lanes = LaneSignals {
@@ -172,6 +229,13 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
                     }
                     TodoHostEvent::ClearFollowup => {
                         detail.followup.set(String::new());
+                    }
+                    TodoHostEvent::ImportFinished { clear_input } => {
+                        composer.importing.set(false);
+                        if clear_input {
+                            composer.import_draft.set(String::new());
+                            composer.import_open.set(false);
+                        }
                     }
                 }
             }
