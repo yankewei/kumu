@@ -29,7 +29,7 @@ use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::nsh_ui::agent_picker::ActiveAgentPicker;
 use crate::nsh_ui::command_palette::ActiveCommandPalette;
 use crate::nsh_ui::dialogs::ActiveDialog;
-use crate::nsh_ui::toast::ToastItem;
+use crate::nsh_ui::toast::{ToastItem, ToastOverlay};
 use crate::theme::KumuTheme;
 use crate::updates::Updater;
 use agents::{AgentEntry, agent_display_name};
@@ -133,8 +133,11 @@ pub struct KumuApp {
     pub(super) hovered_plugin_tooltip: Option<&'static str>,
     /// Registry backing `"kumu.terminal"` and `"kumu.plugin"` native NSH slots.
     native_registry: NativeViewRegistry,
-    /// Unified Pure Rust NSH home shell (sidebar + tabs + split pane grid + plugin slot + toast stack).
+    /// Unified Pure Rust NSH home shell (sidebar + tabs + split pane grid + plugin slot).
     shell_nsh: NshHomeShell,
+    /// GPUI-level foreground toast overlay above `shell_nsh` (so native terminal
+    /// hitboxes never block hover or clicks on notification cards).
+    toast_overlay: ToastOverlay,
     /// Full-window Pure Rust NSH `⌘K` command palette overlay (mounted only while open).
     active_palette: Option<ActiveCommandPalette>,
     /// Full-window Pure Rust NSH modal dialog overlay (mounted only while open).
@@ -199,8 +202,8 @@ impl KumuApp {
                 this.unread_notifications.insert(*terminal, *project);
                 let terminal = *terminal;
                 if window.is_window_active() {
-                    // Foreground window uses Pure Rust NSH toast stack inside the home shell.
-                    this.shell_nsh.push_toast(
+                    // Foreground window uses the GPUI-level NSH toast overlay above the home shell.
+                    this.toast_overlay.push(
                         ToastItem::info(terminal.to_string(), Some(title), message).clickable(true),
                     );
                 } else {
@@ -449,9 +452,23 @@ impl KumuApp {
             cx,
             |app, action, window, cx| app.handle_shell_action(action, window, cx),
         );
+        let toast_overlay = ToastOverlay::new(
+            nsh_base::Anchor::TopRight,
+            &initial_theme,
+            window,
+            cx,
+            |app, id, window, cx| {
+                if let Ok(terminal) = id.parse::<u64>() {
+                    app.reveal_terminal_by_id(terminal, window, cx);
+                } else {
+                    app.focus_terminal(window, cx);
+                }
+            },
+        );
         let nsh_theme_sub = cx.observe_global::<KumuTheme>(|app: &mut Self, cx| {
             let theme = KumuTheme::global(cx).clone();
             app.shell_nsh.sync_theme(&theme, cx);
+            app.toast_overlay.sync_theme(&theme, cx);
             if let Some(palette) = &app.active_palette {
                 palette.sync_theme(&theme, cx);
             }
@@ -496,6 +513,7 @@ impl KumuApp {
             hovered_plugin_tooltip: None,
             native_registry,
             shell_nsh,
+            toast_overlay,
             active_palette: None,
             active_dialog: None,
             active_agent_picker: None,
@@ -663,11 +681,6 @@ impl KumuApp {
                     view.update(cx, |v, cx| v.close_find(window, cx));
                 }
             }
-            HomeShellAction::ToastClicked(id) => {
-                if let Ok(terminal) = id.parse::<u64>() {
-                    self.reveal_terminal_by_id(terminal, window, cx);
-                }
-            }
         }
     }
 
@@ -700,10 +713,20 @@ impl KumuApp {
             .child(title_bar)
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .child(self.shell_nsh.app_view.clone()),
+                    .child(self.shell_nsh.app_view.clone())
+                    .children(self.toast_overlay.overlay_size().map(|(w, h)| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(w))
+                            .h(px(h))
+                            .child(self.toast_overlay.app_view.clone())
+                    })),
             )
             .children(self.active_sheet.as_ref().map(|sheet| {
                 div()
@@ -782,7 +805,7 @@ impl Render for KumuApp {
         if !read.is_empty() {
             for &terminal in &read {
                 self.unread_notifications.remove(&terminal);
-                self.shell_nsh.dismiss_toast(terminal.to_string());
+                self.toast_overlay.dismiss(terminal.to_string());
                 cx.dismiss_system_notification(&terminal.to_string());
             }
         }

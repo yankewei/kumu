@@ -268,7 +268,7 @@ impl KumuApp {
     /// failed write becomes a toast instead of looking like it worked.
     fn save_shortcut_setting(&self, key: &str, value: &str, label: &str) {
         if let Err(error) = crate::db::set_setting(key, value) {
-            self.shell_nsh.push_toast(ToastItem::error(
+            self.toast_overlay.push(ToastItem::error(
                 "settings",
                 format!("保存{label}失败：{error}"),
             ));
