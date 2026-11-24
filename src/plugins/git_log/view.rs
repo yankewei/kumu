@@ -242,17 +242,12 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                         .child(make_tab_btn(history_label, PanelTab::History, tx_h)),
                 )
                 .child(
-                    view()
-                        .flex_1()
-                        .min_w_0()
-                        .flex_row()
-                        .justify_end()
-                        .child(
-                            meta_text(branch)
-                                .flex_shrink(1.0)
-                                .min_w_0()
-                                .app_class("truncate"),
-                        ),
+                    view().flex_1().min_w_0().flex_row().justify_end().child(
+                        meta_text(branch)
+                            .flex_shrink(1.0)
+                            .min_w_0()
+                            .app_class("truncate"),
+                    ),
                 ),
         );
 
