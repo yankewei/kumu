@@ -434,4 +434,8 @@ fn a_long_branch_name_stays_inside_the_git_panel_header() {
         "branch label {branch_label:?} overlaps the tab bar ending at {:?}",
         tab_button.bounds
     );
+    assert!(
+        branch_label.right() <= nsh_core::Points(300.0),
+        "branch label {branch_label:?} overflows the 300pt panel"
+    );
 }
