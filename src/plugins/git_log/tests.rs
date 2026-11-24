@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::mpsc::unbounded;
@@ -367,4 +368,70 @@ fn the_panel_draws_changes_switches_tabs_and_opens_commits() {
     ));
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_long_branch_name_stays_inside_the_git_panel_header() {
+    let branch = "feature/DEV-20897-saml-adapter";
+    let commit = crate::git::Commit {
+        hash: "0".repeat(40),
+        short: "0000000".into(),
+        refs: Vec::new(),
+        author: String::new(),
+        email: String::new(),
+        date: String::new(),
+        subject: "init".into(),
+        body: String::new(),
+        parents: 0,
+    };
+    let (_events_tx, events_rx) = unbounded::<GitHostEvent>();
+    let (actions_tx, _actions_rx) = unbounded::<GitPanelAction>();
+    let initial = GitPanelSnapshot {
+        project_id: Some(1),
+        tab: PanelTab::Changes,
+        branch: Some(branch.to_string()),
+        branch_diff: None,
+        loaded: true,
+        error: None,
+        change_count: 0,
+        change_rows: Vec::new(),
+        commits: Arc::new(vec![commit; 5000]),
+        filter: None,
+        marks: Default::default(),
+    };
+    let mount_id = register_panel_mount(GitPanelMount {
+        initial,
+        events_rx,
+        actions_tx,
+    });
+    let root = nsh_core::element::Root::new::<view::GitLogRoot>(move || view::GitLogRootProps {
+        mount_id: mount_id.into(),
+    });
+    let mut app = nsh_testing::Headless::start(EngineConfig::new(root)).expect("start git NSH");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_core::Points(300.0),
+        nsh_core::Points(400.0),
+    ))
+    .expect("set the panel viewport");
+    app.wait_for("工作区没有未提交的改动")
+        .expect("panel body renders");
+
+    let nodes = app.screen().layout_nodes();
+    let text_node = |needle: &str| {
+        nodes
+            .iter()
+            .find(|n| n.text.as_ref().is_some_and(|t| t.text.text == needle))
+            .unwrap_or_else(|| panic!("no {needle} text node"))
+    };
+    let history_tab = text_node("历史 5000");
+    let tab_button = nodes
+        .iter()
+        .find(|n| n.id == history_tab.parent)
+        .expect("the history tab button around its label");
+    let branch_label = text_node(branch).bounds;
+    assert!(
+        branch_label.origin.x >= tab_button.bounds.right(),
+        "branch label {branch_label:?} overlaps the tab bar ending at {:?}",
+        tab_button.bounds
+    );
 }
