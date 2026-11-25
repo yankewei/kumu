@@ -381,6 +381,9 @@ impl KumuApp {
             } => {
                 this.note_pane_title(PaneId(*pane), *project, title, cx);
             }
+            WorkspaceEvent::ClipboardWrite(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }
             WorkspaceEvent::TodosChanged(_) => cx.notify(),
         })
         .detach();

@@ -139,6 +139,12 @@ fn a_device_attributes_query_is_answered() {
                 .all(|field| field.parse::<u16>().is_ok()),
         "DA1 reply {reply:?}"
     );
+    assert!(
+        reply[3..reply.len() - 1]
+            .split(';')
+            .any(|field| field == "52"),
+        "DA1 should advertise OSC 52 clipboard support: {reply:?}"
+    );
 }
 
 #[test]
@@ -508,5 +514,41 @@ fn wrapped_search_match_highlights_the_start_column_accurately() {
     assert_eq!(
         (search.hits[1].row, search.hits[1].from, search.hits[1].to),
         (1, 0, 3)
+    );
+}
+
+#[test]
+fn osc52_and_kitty_clipboard_writes_decode_and_ignore_reads_and_clears() {
+    let mut vt = Vt::new(40, 4);
+
+    // OSC 52 standard (`c`) with UTF-8 content across chunks.
+    vt.write(b"\x1b]52;c;5L2g5aW9");
+    assert_eq!(vt.take_clipboard_write(), None);
+    vt.write(b"IGt1bXU=\x07");
+    assert_eq!(vt.take_clipboard_write().as_deref(), Some("你好 kumu"));
+    assert_eq!(vt.take_clipboard_write(), None);
+
+    // OSC 52 primary (`p`) and selection (`s`) also map to the macOS pasteboard.
+    vt.write(b"\x1b]52;p;cHJpbWFyeQ==\x1b\\");
+    assert_eq!(vt.take_clipboard_write().as_deref(), Some("primary"));
+    vt.write(b"\x1b]52;s;c2VsZWN0aW9u\x07");
+    assert_eq!(vt.take_clipboard_write().as_deref(), Some("selection"));
+
+    // Clear requests and read queries (`?`) must not overwrite or reply.
+    vt.write(b"\x1b]52;c;\x07");
+    assert_eq!(vt.take_clipboard_write(), None);
+    vt.write(b"\x1b]52;c;?\x07");
+    assert_eq!(vt.take_clipboard_write(), None);
+    assert!(vt.take_replies().is_empty());
+
+    // Kitty clipboard protocol (OSC 5522) write decodes and acknowledges DONE.
+    vt.write(b"\x1b]5522;type=write:id=k1\x1b\\");
+    vt.write(b"\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1b\\");
+    vt.write(b"\x1b]5522;type=wdata\x1b\\");
+    assert_eq!(vt.take_clipboard_write().as_deref(), Some("hello"));
+    let reply = vt.take_replies();
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        "\x1b]5522;type=write:status=DONE:id=k1\x1b\\"
     );
 }

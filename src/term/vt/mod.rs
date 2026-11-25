@@ -21,6 +21,7 @@ const SYNC_OUTPUT: GhosttyMode = 2026;
 const GRAPHEME_CLUSTER: GhosttyMode = 2027;
 pub(super) const MAX_NOTIFICATIONS: usize = 128;
 const MAX_REPLIES_BYTES: usize = 64 * 1024;
+const MAX_CLIPBOARD_WRITE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HYPERLINK_URI_BYTES: usize = 8192;
 const MAX_HOLD: Duration = Duration::from_millis(1000);
 const SCROLLBACK_MAX_LINES: usize = 10_000;
@@ -32,6 +33,7 @@ struct Shared {
     held_since: Option<Instant>,
     replies: Vec<u8>,
     notifications: VecDeque<TermNotification>,
+    clipboard: Option<String>,
 }
 
 /// Log a libghostty failure instead of panicking the terminal thread.
@@ -218,6 +220,117 @@ unsafe extern "C" fn on_desktop_notification(
     });
 }
 
+fn mime_is_plain_text(mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("text/plain")
+        || mime
+            .get(..11)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/plain;"))
+}
+
+fn mime_is_text(mime: &str) -> bool {
+    mime.is_empty()
+        || mime
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("text/"))
+}
+
+fn select_clipboard_text(contents: &[GhosttyClipboardContent]) -> Option<&[u8]> {
+    let as_bytes = |value: GhosttyString| -> &[u8] {
+        if value.ptr.is_null() || value.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+        }
+    };
+    let mut fallback: Option<&[u8]> = None;
+    for entry in contents {
+        let mime = std::str::from_utf8(as_bytes(entry.mime)).unwrap_or("");
+        if mime_is_plain_text(mime) {
+            return Some(as_bytes(entry.data));
+        }
+        if fallback.is_none() && mime_is_text(mime) {
+            fallback = Some(as_bytes(entry.data));
+        }
+    }
+    fallback
+}
+
+unsafe extern "C" fn on_clipboard_write(
+    _term: GhosttyTerminal,
+    userdata: *mut c_void,
+    write: *const GhosttyClipboardWrite,
+) {
+    if userdata.is_null() {
+        return;
+    }
+    let Some(write) = (unsafe { write.as_ref() }) else {
+        return;
+    };
+    let reply_with = |result: GhosttyClipboardWriteResult| {
+        if let Some(reply_fn) = write.reply {
+            let reply = GhosttyClipboardWriteReply {
+                size: std::mem::size_of::<GhosttyClipboardWriteReply>(),
+                result,
+                remember: false,
+            };
+            unsafe { reply_fn(write, &reply) };
+        }
+    };
+    // macOS exposes a single system pasteboard; map STANDARD (`c`/empty),
+    // SELECTION (`s`), and PRIMARY (`p`, e.g. remote Vim `clipboard=unnamed`)
+    // onto it so remote copies over SSH always land on the clipboard.
+    if !matches!(
+        write.location,
+        GHOSTTY_CLIPBOARD_LOCATION_STANDARD
+            | GHOSTTY_CLIPBOARD_LOCATION_SELECTION
+            | GHOSTTY_CLIPBOARD_LOCATION_PRIMARY
+    ) {
+        reply_with(GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED);
+        return;
+    }
+    // Ignore clear requests (`OSC 52 ; c ; ST`) so a remote program cannot
+    // accidentally wipe the user's local clipboard.
+    if write.contents.is_null() || write.contents_len == 0 {
+        reply_with(GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS);
+        return;
+    }
+    let contents = unsafe { std::slice::from_raw_parts(write.contents, write.contents_len) };
+    let Some(data) = select_clipboard_text(contents) else {
+        reply_with(GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED);
+        return;
+    };
+    if data.len() > MAX_CLIPBOARD_WRITE_BYTES {
+        reply_with(GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA);
+        return;
+    }
+    if !data.is_empty() {
+        let shared = unsafe { &mut *(userdata as *mut Shared) };
+        shared.clipboard = Some(String::from_utf8_lossy(data).into_owned());
+    }
+    reply_with(GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS);
+}
+
+unsafe extern "C" fn on_device_attributes(
+    _term: GhosttyTerminal,
+    _userdata: *mut c_void,
+    out: *mut GhosttyDeviceAttributes,
+) -> bool {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return false;
+    };
+    // Advertise DA1 feature 52 (`clipboard`) alongside ANSI color so remote
+    // multiplexers like tmux auto-enable OSC 52 without extra user config.
+    out.primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220 as u16;
+    out.primary.features[0] = GHOSTTY_DA_FEATURE_ANSI_COLOR as u16;
+    out.primary.features[1] = GHOSTTY_DA_FEATURE_CLIPBOARD as u16;
+    out.primary.num_features = 2;
+    out.secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220 as u16;
+    out.secondary.firmware_version = 0;
+    out.secondary.rom_cartridge = 0;
+    out.tertiary.unit_id = 0;
+    true
+}
+
 unsafe extern "C" fn on_render_hold(term: GhosttyTerminal, userdata: *mut c_void, held: bool) {
     if userdata.is_null() {
         return;
@@ -384,6 +497,7 @@ impl Vt {
                 held_since: None,
                 replies: Vec::new(),
                 notifications: VecDeque::new(),
+                clipboard: None,
             })))
             .expect("Box::into_raw returned null");
             let userdata = shared.as_ptr() as *const c_void;
@@ -406,6 +520,30 @@ impl Vt {
                 GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
                 std::mem::transmute::<GhosttyTerminalDesktopNotificationFn, *const c_void>(
                     notification,
+                ),
+            );
+            let clipboard_write: GhosttyTerminalClipboardWriteFn = Some(on_clipboard_write);
+            ghostty_terminal_set(
+                term,
+                GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+                std::mem::transmute::<GhosttyTerminalClipboardWriteFn, *const c_void>(
+                    clipboard_write,
+                ),
+            );
+            ok(
+                ghostty_terminal_set(
+                    term,
+                    GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES,
+                    &MAX_CLIPBOARD_WRITE_BYTES as *const _ as *const c_void,
+                ),
+                "clipboard_write_max_bytes",
+            );
+            let device_attributes: GhosttyTerminalDeviceAttributesFn = Some(on_device_attributes);
+            ghostty_terminal_set(
+                term,
+                GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES,
+                std::mem::transmute::<GhosttyTerminalDeviceAttributesFn, *const c_void>(
+                    device_attributes,
                 ),
             );
             let write: GhosttyTerminalWritePtyFn = Some(on_write_pty);
@@ -517,6 +655,10 @@ impl Vt {
 
     pub fn take_notification(&mut self) -> Option<TermNotification> {
         unsafe { (*self.shared.as_ptr()).notifications.pop_front() }
+    }
+
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        unsafe { (*self.shared.as_ptr()).clipboard.take() }
     }
 
     /// Whether a synchronized-output hold is still within its deadline.
