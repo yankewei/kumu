@@ -99,6 +99,8 @@ pub enum WorkspaceEvent {
         project: i64,
         title: String,
     },
+    /// A terminal requested writing text to the system clipboard (OSC 52 / 1337 / 5522).
+    ClipboardWrite(String),
     /// A repository's TODO board changed. Payload is the root board project id.
     TodosChanged(i64),
 }
@@ -689,6 +691,9 @@ impl WorkspaceCore {
                     notification,
                 });
             }
+        }
+        if let Some(text) = term.take_clipboard_write() {
+            pending_events.push(WorkspaceEvent::ClipboardWrite(text));
         }
         if snapshot.title != live.last_title {
             live.last_title = snapshot.title.clone();

@@ -96,6 +96,7 @@ pub struct ScrollOutcome {
 struct Live {
     screen: Mutex<Snapshot>,
     notifications: Mutex<VecDeque<TermNotification>>,
+    clipboard: Mutex<Option<String>>,
     queued: AtomicBool,
     /// Monotonic counter bumped on every published snapshot, used by control
     /// requests to observe TUI redraws even on hidden/parked panes.
@@ -117,7 +118,7 @@ impl Live {
         }
     }
 
-    fn wake_for_notification(&self) {
+    fn wake_for_effect(&self) {
         self.queued.store(true, Ordering::SeqCst);
         let _ = self.wake.unbounded_send(());
     }
@@ -409,6 +410,7 @@ impl Term {
                 &command, &cwd_text, colors.fg, colors.bg,
             )),
             notifications: Mutex::new(VecDeque::new()),
+            clipboard: Mutex::new(None),
             queued: AtomicBool::new(false),
             frame_rev: AtomicU64::new(0),
             pid: AtomicU64::new(0),
@@ -487,6 +489,15 @@ impl Term {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
+    }
+
+    /// Consume the latest OSC clipboard write request, if any.
+    pub fn take_clipboard_write(&self) -> Option<String> {
+        self.live
+            .clipboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// The pid of the PTY child, once it has spawned.
@@ -960,9 +971,10 @@ impl Running {
                     }
                     if self.vt.is_held() {
                         // A synchronized-output hold freezes the frame; still
-                        // deliver notifications without taking a redundant snapshot.
-                        if self.drain_notifications() {
-                            self.live.wake_for_notification();
+                        // deliver notifications and clipboard writes without
+                        // taking a redundant snapshot.
+                        if self.drain_notifications() | self.drain_clipboard() {
+                            self.live.wake_for_effect();
                         }
                     } else {
                         self.publish(false);
@@ -1236,14 +1248,27 @@ impl Running {
         any
     }
 
+    fn drain_clipboard(&mut self) -> bool {
+        let Some(text) = self.vt.take_clipboard_write() else {
+            return false;
+        };
+        *self
+            .live
+            .clipboard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(text);
+        true
+    }
+
     fn publish(&mut self, force_wake: bool) {
         let got_notification = self.drain_notifications();
+        let got_clipboard = self.drain_clipboard();
         // A running find bar has to see new output and viewport scrolls; with
         // no needle this is a no-op.
         self.vt.search_feed();
         self.live.publish(
             self.vt.snapshot(&self.command, &self.cwd, self.exited),
-            force_wake || got_notification,
+            force_wake || got_notification || got_clipboard,
         );
     }
 }
@@ -1328,6 +1353,22 @@ mod tests {
         assert_eq!(term.take_notification().expect("first").body, "first");
         assert_eq!(term.take_notification().expect("second").body, "second");
         assert_eq!(term.take_notification(), None);
+    }
+
+    #[test]
+    fn pty_osc52_clipboard_write_reaches_term() {
+        let (term, _wake) = Term::launch(
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                r"printf '\033]52;c;aGVsbG8tc3No\007'; echo clipboard-sent; sleep 1".into(),
+            ],
+            std::env::temp_dir(),
+            TermColors::default(),
+        );
+        assert!(wait_text(&term, "clipboard-sent").contains("clipboard-sent"));
+        assert_eq!(term.take_clipboard_write().as_deref(), Some("hello-ssh"));
+        assert_eq!(term.take_clipboard_write(), None);
     }
 
     #[test]
