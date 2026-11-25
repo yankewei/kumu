@@ -321,7 +321,7 @@ impl KumuApp {
         if self.zoomed_pane == Some(pane) {
             self.zoomed_pane = None;
         } else {
-            self.focus_pane(pane, cx);
+            self.focus_pane_from_user(pane, cx);
             self.zoomed_pane = Some(pane);
         }
         self.pending_focus = Some(pane);
@@ -376,15 +376,16 @@ impl KumuApp {
         let visible = self.sidebar_visible;
         let hovered = self.hovered_sidebar_tooltip;
         let hover_bg = colors.accent.opacity(0.5);
+        let unseen = self.agent_status.values().any(|entry| entry.unseen);
         let fg = if visible {
             colors.muted_foreground
         } else {
             colors.link
         };
-        let tooltip = if visible {
-            "折叠侧边栏 ⌘B"
-        } else {
-            "展开侧边栏 ⌘B"
+        let tooltip = match (visible, unseen) {
+            (true, _) => "折叠侧边栏 ⌘B",
+            (false, true) => "展开侧边栏 ⌘B（有未查看的 Agent 状态）",
+            (false, false) => "展开侧边栏 ⌘B",
         };
 
         let button = div()
@@ -422,6 +423,20 @@ impl KumuApp {
             );
 
         let mut wrapper = div().relative().child(button);
+        // With the sidebar hidden, the toggle is the only place left to
+        // notice a status change on another project or tab.
+        if !visible && unseen {
+            wrapper = wrapper.child(
+                div()
+                    .absolute()
+                    .top(px(1.))
+                    .right(px(1.))
+                    .w(px(7.))
+                    .h(px(7.))
+                    .rounded(px(3.5))
+                    .bg(colors.link),
+            );
+        }
         if hovered {
             wrapper = wrapper.child(
                 deferred(
@@ -493,7 +508,13 @@ impl KumuApp {
                 ),
                 icon: PaletteIcon::AgentLogo(logo),
                 agent_state: agent.state,
-                badge: agent.focused.then(|| "当前".to_string()),
+                badge: if agent.unseen {
+                    Some("未查看".to_string())
+                } else if agent.focused {
+                    Some("当前".to_string())
+                } else {
+                    None
+                },
                 shortcut: None,
                 target: PaletteTarget::RevealAgent(agent.pane),
             });
@@ -538,7 +559,13 @@ impl KumuApp {
         {
             for (index, tab) in tabs.tabs.iter().enumerate() {
                 let name = Self::tab_name(tabs, index);
-                let pane_count = tab.layout.panes().len();
+                let panes = tab.layout.panes();
+                let pane_count = panes.len();
+                let unseen = panes.iter().any(|pane| {
+                    self.agent_status
+                        .get(pane)
+                        .is_some_and(|entry| entry.unseen)
+                });
                 items.push(PaletteItem {
                     section: PaletteSection::Tabs,
                     title: name,
@@ -546,7 +573,13 @@ impl KumuApp {
                     keywords: format!("tab workspace {}", index + 1),
                     icon: PaletteIcon::Svg("icons/layout-dashboard.svg"),
                     agent_state: None,
-                    badge: (tabs.selected == index).then(|| "当前".to_string()),
+                    badge: if unseen {
+                        Some("未查看".to_string())
+                    } else if tabs.selected == index {
+                        Some("当前".to_string())
+                    } else {
+                        None
+                    },
                     shortcut: match index {
                         0 => Some("⌘1"),
                         1 => Some("⌘2"),

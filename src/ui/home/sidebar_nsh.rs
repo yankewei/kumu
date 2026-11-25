@@ -24,6 +24,8 @@ pub(super) struct AgentRowSnapshot {
     pub(super) title: String,
     pub(super) state: Option<AgentState>,
     pub(super) focused: bool,
+    /// The agent changed status while the user was looking elsewhere.
+    pub(super) unseen: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +147,7 @@ pub(super) mod view {
     }
 
     fn render_agent_summary(rows: &[AgentRowSnapshot]) -> AnyElement {
+        let unseen = rows.iter().any(|row| row.unseen);
         let (mut waiting, mut failed, mut running, mut completed) =
             (0usize, 0usize, 0usize, 0usize);
         for row in rows {
@@ -201,6 +204,16 @@ pub(super) mod view {
                         2 => link_color(),
                         _ => success_color(),
                     }),
+            );
+        }
+        if unseen {
+            line = line.child(
+                view()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .flex_shrink_0()
+                    .rounded(px(3.0))
+                    .bg(link_color),
             );
         }
         line.into_element()
@@ -380,11 +393,14 @@ pub(super) mod view {
                     let pane = row.pane;
                     let focused = row.focused;
                     let state = row.state;
+                    let unseen = row.unseen;
                     let tx_reveal = tx_rows.clone();
                     let title_color = move || {
                         if focused {
                             active_theme().sidebar_accent_foreground
-                        } else if matches!(state, None | Some(AgentState::Completed)) {
+                        } else if state.is_none()
+                            || (state == Some(AgentState::Completed) && !unseen)
+                        {
                             active_theme().muted_foreground
                         } else {
                             active_theme().sidebar_foreground
@@ -399,8 +415,8 @@ pub(super) mod view {
                         )
                     };
 
-                    let agent_el = view().tooltip(kumu_tooltip(hover_detail.clone())).child(
-                        kumu_list_button(hover_detail, focused, ControlTone::Sidebar)
+                    let mut row_button =
+                        kumu_list_button(hover_detail.clone(), focused, ControlTone::Sidebar)
                             .h(px(AGENT_ROW_HEIGHT))
                             .flex_shrink_0()
                             .px_3()
@@ -438,8 +454,22 @@ pub(super) mod view {
                                                     .app_class("truncate"),
                                             ),
                                     ),
-                            ),
-                    );
+                            );
+                    // Waiting and failed already read as urgent through their
+                    // glyph; a finished turn needs this quiet dot until seen.
+                    if unseen && state == Some(AgentState::Completed) {
+                        row_button = row_button.child(
+                            view()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .flex_shrink_0()
+                                .rounded(px(3.0))
+                                .bg(move || agent_state_color(state)),
+                        );
+                    }
+                    let agent_el = view()
+                        .tooltip(kumu_tooltip(hover_detail.clone()))
+                        .child(row_button);
                     agent_el.into_element()
                 })
                 .estimated_item_size(px(AGENT_ROW_HEIGHT))
@@ -815,6 +845,7 @@ mod tests {
                     title: "Refactor UI".into(),
                     state: Some(AgentState::Waiting),
                     focused: false,
+                    unseen: false,
                 }],
                 agents_collapsed: false,
                 update_notice: None,

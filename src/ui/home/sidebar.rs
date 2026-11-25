@@ -82,6 +82,21 @@ impl KumuApp {
             }
         }
 
+        // A status change the user has not looked at yet keeps its project
+        // marked, so a change in a background project is not silent.
+        let unseen_projects: HashSet<i64> = self
+            .tabs_by_project
+            .iter()
+            .filter(|(_, tabs)| {
+                tabs.panes().iter().any(|pane| {
+                    self.agent_status
+                        .get(pane)
+                        .is_some_and(|entry| entry.unseen)
+                })
+            })
+            .map(|(project, _)| *project)
+            .collect();
+
         let project_rows: Vec<ProjectRowSnapshot> = ordered_projects
             .iter()
             .map(|(project, worktree)| ProjectRowSnapshot {
@@ -93,7 +108,8 @@ impl KumuApp {
                 unread: self
                     .unread_notifications
                     .values()
-                    .any(|&pid| pid == project.id),
+                    .any(|&pid| pid == project.id)
+                    || unseen_projects.contains(&project.id),
             })
             .collect();
 
@@ -117,6 +133,7 @@ impl KumuApp {
                         title: entry.display_title(),
                         state: entry.state,
                         focused: self.selected == Some(project.id) && self.focused == pane,
+                        unseen: entry.unseen,
                     });
                 }
             }
@@ -189,7 +206,7 @@ impl KumuApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_pane(pane, cx);
+        self.focus_pane_from_user(pane, cx);
         self.focus_terminal(window, cx);
         cx.notify();
     }

@@ -37,9 +37,18 @@ impl KumuApp {
         }) else {
             return;
         };
-        self.focus_pane(next, cx);
+        self.focus_pane_from_user(next, cx);
     }
 
+    /// Focus a pane from a user gesture. Looking at the pane acknowledges a
+    /// status change that arrived while the user was elsewhere.
+    pub(super) fn focus_pane_from_user(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.acknowledge_pane(pane, cx);
+        self.focus_pane(pane, cx);
+    }
+
+    /// Move focus without treating it as the user looking at the pane. Control
+    /// and auto-close paths use this so they cannot clear an unseen marker.
     pub(super) fn focus_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         let Some((project, tab_index)) = self.pane_tab(pane) else {
             return;
@@ -109,6 +118,7 @@ impl KumuApp {
             .unwrap_or(PaneId(1));
         self.pending_focus = self.active_tab(id).map(|_| self.focused);
         self.show_selected_tab(id, cx);
+        self.acknowledge_visible_tab(id, cx);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
@@ -386,7 +396,7 @@ impl KumuApp {
             {
                 view.update(cx, |view, cx| view.attach(project, snapshot, cx));
             }
-            self.focus_pane(pane, cx);
+            self.focus_pane_from_user(pane, cx);
             self.focus_terminal(window, cx);
         }
     }

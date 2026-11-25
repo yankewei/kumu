@@ -6,6 +6,8 @@ use crate::app::layout::TabId;
 pub(super) enum TabAttention {
     Waiting(usize),
     Failed(usize),
+    /// A finished turn the user has not looked at yet.
+    Completed(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +57,7 @@ pub(super) mod view {
     use crate::nsh_ui::components::{
         ButtonVariant, ControlTone, kumu_button, kumu_icon_button, kumu_tab_button, kumu_tooltip,
     };
-    use crate::nsh_ui::theme::{TOKEN_WARNING, kumu_color, text_xs_size};
+    use crate::nsh_ui::theme::{TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size};
 
     fn send(tx: &Option<UnboundedSender<TabBarAction>>, action: TabBarAction) {
         if let Some(tx) = tx {
@@ -65,6 +67,10 @@ pub(super) mod view {
 
     fn warning_color() -> AdaptiveColor {
         kumu_color(TOKEN_WARNING, |t| t.destructive)
+    }
+
+    fn success_color() -> AdaptiveColor {
+        kumu_color(TOKEN_SUCCESS, |t| t.primary)
     }
 
     pub(in crate::ui::home) fn render_tab_bar(
@@ -174,6 +180,13 @@ pub(super) mod view {
                                     icon_svg("icons/triangle-alert.svg", 12.0)
                                         .text_color(move || active_theme().destructive),
                                 )
+                                .into_element(),
+                            TabAttention::Completed(count) => view()
+                                .flex_shrink_0()
+                                .tooltip(kumu_tooltip(format!(
+                                    "{count} 个 Agent 已完成，点击页签查看"
+                                )))
+                                .child(icon_svg("icons/check.svg", 12.0).text_color(success_color))
                                 .into_element(),
                         });
                     }

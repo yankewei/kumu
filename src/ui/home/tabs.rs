@@ -154,15 +154,39 @@ impl KumuApp {
         self.select_tab(next, cx);
     }
 
+    /// A user gesture showed this project's selected tab. Acknowledge the
+    /// status changes in the panes that are actually visible, so a zoomed
+    /// sibling hidden behind the front pane keeps its marker.
+    pub(super) fn acknowledge_visible_tab(&mut self, project: i64, cx: &mut Context<Self>) -> bool {
+        let Some(panes) = self.active_tab(project).map(|tab| tab.layout.panes()) else {
+            return false;
+        };
+        let panes = match self.active_zoomed_pane() {
+            Some(zoomed) if panes.contains(&zoomed) => vec![zoomed],
+            _ => panes,
+        };
+        let mut cleared = false;
+        for pane in panes {
+            cleared |= self.acknowledge_pane(pane, cx);
+        }
+        cleared
+    }
+
     /// Show tab `index` (0-based) of the selected project.
     pub(super) fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(project) = self.selected else {
             return;
         };
-        let Some(tabs) = self.tabs_by_project.get(&project) else {
-            return;
+        let already_selected = match self.tabs_by_project.get(&project) {
+            Some(tabs) if index < tabs.tabs.len() => tabs.selected == index,
+            _ => return,
         };
-        if index >= tabs.tabs.len() || tabs.selected == index {
+        if already_selected {
+            // Clicking the tab that is already open still acknowledges the
+            // status changes inside it.
+            if self.acknowledge_visible_tab(project, cx) {
+                cx.notify();
+            }
             return;
         }
         self.pending_close_tab = None;
@@ -175,6 +199,7 @@ impl KumuApp {
             self.pending_focus = Some(focused);
         }
         self.show_selected_tab(project, cx);
+        self.acknowledge_visible_tab(project, cx);
         self.sync_pane_chrome(cx);
         self.sync_plugin_project(cx);
         self.persist_workspace(cx);
@@ -382,10 +407,18 @@ impl KumuApp {
                 let tab = &tabs.tabs[index];
                 let mut waiting = 0usize;
                 let mut failed = 0usize;
+                let mut completed = 0usize;
                 for pane in tab.layout.panes() {
-                    match self.agent_status.get(&pane).and_then(|entry| entry.state) {
+                    let Some(entry) = self.agent_status.get(&pane) else {
+                        continue;
+                    };
+                    match entry.state {
                         Some(AgentState::Waiting) => waiting += 1,
                         Some(AgentState::Failed) => failed += 1,
+                        // A finished turn only needs a hint until the pane has
+                        // been looked at; a repeated `completed` signal must not
+                        // bring the marker back.
+                        Some(AgentState::Completed) if entry.unseen => completed += 1,
                         _ => {}
                     }
                 }
@@ -393,6 +426,8 @@ impl KumuApp {
                     Some(TabAttention::Waiting(waiting))
                 } else if failed > 0 {
                     Some(TabAttention::Failed(failed))
+                } else if completed > 0 {
+                    Some(TabAttention::Completed(completed))
                 } else {
                     None
                 };
