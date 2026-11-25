@@ -22,7 +22,7 @@ use crate::ui::home::terminal::PaneChromeSnapshot;
 
 pub(super) type PaneSignalMap = Rc<RefCell<HashMap<PaneId, Signal<Option<PaneChromeSnapshot>>>>>;
 
-fn render_agent_badge(state: AgentState) -> AnyElement {
+fn render_agent_badge(state: AgentState, unseen: bool) -> AnyElement {
     let color = move || match state {
         AgentState::Running => link_color(),
         AgentState::Waiting => warning_color(),
@@ -52,7 +52,7 @@ fn render_agent_badge(state: AgentState) -> AnyElement {
             .text_color(color)
             .into_element(),
     };
-    view()
+    let mut badge = view()
         .flex_row()
         .flex_shrink_0()
         .h(px(20.0))
@@ -67,8 +67,11 @@ fn render_agent_badge(state: AgentState) -> AnyElement {
                 .text_size(text_xs_size)
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(color),
-        )
-        .into_element()
+        );
+    if unseen {
+        badge = badge.border_1().border_color(color);
+    }
+    badge.into_element()
 }
 
 pub(super) fn header_icon_button(
@@ -171,7 +174,7 @@ fn render_pane_leaf(
             );
         }
         if let Some(status) = snap.agent_status {
-            extras = extras.child(render_agent_badge(status));
+            extras = extras.child(render_agent_badge(status, snap.agent_unseen));
         }
         if zoomed {
             extras = extras.child(pill("已最大化", PillTone::Neutral).flex_shrink_0());

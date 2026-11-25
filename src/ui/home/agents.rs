@@ -35,6 +35,31 @@ pub(super) struct AgentEntry {
     /// Whether the background shell-process watcher has observed this agent's
     /// process in the pane's process tree (so it can safely prune it on exit).
     pub(super) process_tracked: bool,
+    /// A status change arrived while this pane was not being looked at. The
+    /// sidebar and tab markers keep it visible until the user views the pane.
+    pub(super) unseen: bool,
+}
+
+/// Decide whether a status transition leaves the pane needing the user's
+/// attention. `existing` is kept for a repeated signal so a marker the user
+/// already acknowledged does not come back, and a non-actionable state (idle,
+/// running) clears it.
+fn unseen_after_status(
+    existing: bool,
+    previous: Option<AgentState>,
+    current: Option<AgentState>,
+    attended: bool,
+) -> bool {
+    match current {
+        Some(AgentState::Waiting | AgentState::Completed | AgentState::Failed) => {
+            if previous == current {
+                existing
+            } else {
+                !attended
+            }
+        }
+        None | Some(AgentState::Running) => false,
+    }
 }
 
 impl AgentEntry {
@@ -46,6 +71,7 @@ impl AgentEntry {
             osc_title: None,
             agent,
             process_tracked: false,
+            unseen: false,
         }
     }
 
@@ -69,7 +95,12 @@ impl KumuApp {
         cx: &mut Context<Self>,
     ) {
         match ev {
-            TerminalEvent::Activated => self.focus_pane(pane, cx),
+            TerminalEvent::Activated => self.focus_pane_from_user(pane, cx),
+            TerminalEvent::Interacted => {
+                if self.acknowledge_pane(pane, cx) {
+                    cx.notify();
+                }
+            }
             TerminalEvent::ChromeChanged => cx.notify(),
         }
     }
@@ -109,6 +140,8 @@ impl KumuApp {
             entry.agent = agent;
             entry.session_title = None;
             entry.prompt_title = None;
+            entry.state = None;
+            entry.unseen = false;
         }
         entry
     }
@@ -138,7 +171,11 @@ impl KumuApp {
             }
             return;
         }
+        // Whether the user is looking at this pane decides whether the status
+        // becomes an unseen marker. Read it before borrowing the entry.
+        let attended = self.pane_is_attended(pane);
         let entry = self.ensure_agent_entry(pane, agent, cx);
+        let previous = entry.state;
         match signal {
             StatusSignal::Active(state) => entry.state = Some(state),
             StatusSignal::Resume => {
@@ -149,6 +186,7 @@ impl KumuApp {
             StatusSignal::Idle => entry.state = None,
             StatusSignal::Exited => unreachable!(),
         }
+        entry.unseen = unseen_after_status(entry.unseen, previous, entry.state, attended);
         match signal {
             StatusSignal::Active(AgentState::Completed) => {
                 self.workspace.update(cx, |workspace, cx| {
@@ -210,12 +248,45 @@ impl KumuApp {
         }
     }
 
+    /// Whether the user can actually see this pane right now: the window has
+    /// focus, no full-window overlay covers it, its tab is selected, it is not
+    /// hidden behind a zoomed sibling, and it holds keyboard focus.
+    fn pane_is_attended(&self, pane: PaneId) -> bool {
+        self.window_active
+            && self.active_sheet.is_none()
+            && self.active_dialog.is_none()
+            && self.active_palette.is_none()
+            && self.active_agent_picker.is_none()
+            && self.pane_is_visible(pane)
+            && self
+                .active_zoomed_pane()
+                .is_none_or(|zoomed| zoomed == pane)
+            && self.focused == pane
+    }
+
+    /// Clear the unseen marker for a pane whose contents are now on screen.
+    /// Returns whether a marker was actually cleared.
+    pub(super) fn acknowledge_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self.agent_status.get_mut(&pane) else {
+            return false;
+        };
+        if !entry.unseen {
+            return false;
+        }
+        entry.unseen = false;
+        self.sync_pane_agent_status(pane, cx);
+        true
+    }
+
     /// Push the active state the pane's header should draw (`None` for idle
     /// agents and plain shells).
     pub(super) fn sync_pane_agent_status(&self, pane: PaneId, cx: &mut Context<Self>) {
-        let state = self.agent_status.get(&pane).and_then(|entry| entry.state);
+        let (state, unseen) = self
+            .agent_status
+            .get(&pane)
+            .map_or((None, false), |entry| (entry.state, entry.unseen));
         if let Some(view) = self.panes.get(&pane) {
-            view.update(cx, |view, cx| view.set_agent_status(state, cx));
+            view.update(cx, |view, cx| view.set_agent_status(state, unseen, cx));
         }
     }
 
@@ -309,5 +380,72 @@ impl KumuApp {
         if changed {
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unseen_after_status;
+    use crate::agent::AgentState;
+
+    #[test]
+    fn status_changes_mark_unseen_only_when_the_pane_is_not_being_watched() {
+        // A transition to a state that wants the user's attention marks the
+        // pane when it is off screen or not focused.
+        assert!(unseen_after_status(
+            false,
+            Some(AgentState::Running),
+            Some(AgentState::Waiting),
+            false,
+        ));
+        assert!(unseen_after_status(
+            false,
+            Some(AgentState::Running),
+            Some(AgentState::Completed),
+            false,
+        ));
+        assert!(unseen_after_status(
+            false,
+            Some(AgentState::Running),
+            Some(AgentState::Failed),
+            false,
+        ));
+
+        // The same transition on the focused pane is already visible.
+        assert!(!unseen_after_status(
+            false,
+            Some(AgentState::Running),
+            Some(AgentState::Completed),
+            true,
+        ));
+
+        // A repeated signal must not resurrect a marker the user cleared, even
+        // while the pane is unattended.
+        assert!(!unseen_after_status(
+            false,
+            Some(AgentState::Completed),
+            Some(AgentState::Completed),
+            false,
+        ));
+        assert!(unseen_after_status(
+            true,
+            Some(AgentState::Completed),
+            Some(AgentState::Completed),
+            false,
+        ));
+
+        // Starting a new turn or going idle no longer needs attention.
+        assert!(!unseen_after_status(
+            true,
+            Some(AgentState::Completed),
+            Some(AgentState::Running),
+            false,
+        ));
+        assert!(!unseen_after_status(
+            true,
+            Some(AgentState::Waiting),
+            None,
+            false,
+        ));
     }
 }

@@ -23,6 +23,8 @@ pub(crate) struct PaneChromeSnapshot {
     pub(crate) cwd: String,
     pub(crate) note: Option<String>,
     pub(crate) agent_status: Option<AgentState>,
+    /// The shown state arrived while the user was looking elsewhere.
+    pub(crate) agent_unseen: bool,
     pub(crate) active: bool,
     pub(crate) can_close: bool,
     pub(crate) can_zoom: bool,

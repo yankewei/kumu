@@ -79,6 +79,10 @@ pub struct KumuApp {
     /// Terminals that requested attention while unattended, mapped to their
     /// project for the sidebar marker.
     unread_notifications: HashMap<u64, i64>,
+    /// Whether the home window currently has keyboard focus. A status change
+    /// while it does not still becomes an unseen marker until the pane is
+    /// clicked.
+    window_active: bool,
     /// Active agent state per pane. Idle and plain shell panes have no entry.
     agent_status: HashMap<PaneId, AgentEntry>,
     /// Whether the sidebar's agent section is collapsed to its summary line.
@@ -339,7 +343,15 @@ impl KumuApp {
                     entry.session_title = None;
                     entry.prompt_title = None;
                 }
+                if agent_changed {
+                    // A different agent owns this pane now; the old state and
+                    // marker must not make the new agent's first report look
+                    // like a repeat.
+                    entry.state = None;
+                    entry.unseen = false;
+                }
                 entry.agent = agent.to_string();
+                this.sync_pane_agent_status(pane, cx);
                 this.workspace.update(cx, |workspace, cx| {
                     workspace.update_pane_todos_session(pane.0, agent, session, cx);
                 });
@@ -375,8 +387,11 @@ impl KumuApp {
 
         cx.observe_global::<NotificationSettings>(|_, cx| cx.notify())
             .detach();
-        cx.observe_window_activation(window, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            this.window_active = window.is_window_active();
+            cx.notify();
+        })
+        .detach();
 
         let updater = crate::updates::init(cx);
         cx.observe(&updater, |_, _, cx| cx.notify()).detach();
@@ -487,6 +502,7 @@ impl KumuApp {
             settings_window: None,
             selected: None,
             unread_notifications: HashMap::new(),
+            window_active: window.is_window_active(),
             agent_status: HashMap::new(),
             agents_collapsed: false,
             store_error: startup_error,
@@ -647,7 +663,7 @@ impl KumuApp {
                 self.persist_workspace(cx);
             }
             HomeShellAction::FocusPane(pane) => {
-                self.focus_pane(pane, cx);
+                self.focus_pane_from_user(pane, cx);
                 self.focus_terminal(window, cx);
                 cx.notify();
             }

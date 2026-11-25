@@ -75,6 +75,7 @@ Agent 不一定从「新建 Agent 窗格」启动：手动在普通 shell 窗格
 它们都不弹提醒，只更新该 PTY 所属窗格的状态与标题：
 
 - 存活即入列：只要 Agent 窗格存在或普通 shell 中启动的 Agent 上报了会话／状态，就会持续留在侧边栏全局列表中，点击只跨项目／跨页签跳转聚焦，**不因查看清除**；只有进程退出回 shell 或关闭窗格时移出。
+- 未查看提示：`waiting`／`failed` 在状态解除前持续显示在 Agent 行和页签。三种状态（`waiting`／`failed`／`completed`）发生在窗格未被聚焦、窗口不在前台或被覆盖层遮挡时都会记录为未查看，并点亮项目行、折叠侧边栏按钮、窗格状态胶囊和页签；切到对应页签、点击窗格或开始输入／滚动后清除。重复的状态上报不会让已经清除的标记重新出现。
 - 标题优先级：Agent 协议上报（`kumu-title:`） > 终端 OSC 0/2 标题（清洗前缀符号并过滤通用程序名／路径） > 回退到 Agent 名称；不再通过拦截终端按键猜测输入标题。
 - 状态流转：新建或重启后为空闲（窗格标题栏不显示胶囊）；提交任务（`UserPromptSubmit`／`agent_start`／`session.execution.started`／Antigravity `PreInvocation`）进入 `running`；权限或提问进入 `waiting`，确认后继续执行（`PostToolUse`／`replied`／对话框结束）发送 `resume` 从 `waiting` 回到 `running`；本轮结束为 `completed`，失败为 `failed`；用户取消中断（OpenCode `interrupted`、Pi `aborted`、OMP `ompInterrupted`、Antigravity `USER_CANCELED`）发送 `idle` 回到空闲。
 

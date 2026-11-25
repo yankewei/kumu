@@ -38,6 +38,9 @@ use crate::theme::{self, KumuTheme, ThemeRevision};
 pub enum TerminalEvent {
     /// The user clicked into this pane; the home window should focus it.
     Activated,
+    /// The user typed into or scrolled this pane, so a status change left while
+    /// the window was in the background has now been seen.
+    Interacted,
     /// Pane header metadata or find-bar state changed; refresh the NSH shell.
     ChromeChanged,
 }
@@ -108,6 +111,8 @@ pub struct TerminalView {
     marked: Option<String>,
     /// Active agent state for the pane header's status pill.
     agent_status: Option<AgentState>,
+    /// Whether that status arrived while the user was looking elsewhere.
+    agent_unseen: bool,
     cursor_at: Rc<Cell<CursorAt>>,
     grid_at: Rc<Cell<GridAt>>,
     /// Left-button selection drag in progress.
@@ -192,6 +197,7 @@ impl TerminalView {
             theme_rev: u64::MAX,
             marked: None,
             agent_status: None,
+            agent_unseen: false,
             cursor_at: Rc::new(Cell::new(CursorAt {
                 bounds: None,
                 cell: (px(0.), px(0.)),
@@ -236,6 +242,7 @@ impl TerminalView {
             cwd: short_cwd(&self.snapshot.cwd),
             note: header_note(&self.snapshot),
             agent_status: self.agent_status,
+            agent_unseen: self.agent_unseen,
             active: self.active,
             can_close: self.can_close,
             can_zoom: self.can_zoom,
@@ -275,11 +282,17 @@ impl TerminalView {
     }
 
     /// The state the pane header shows beside the path, or `None` for a shell.
-    pub fn set_agent_status(&mut self, status: Option<AgentState>, cx: &mut Context<Self>) {
-        if self.agent_status == status {
+    pub fn set_agent_status(
+        &mut self,
+        status: Option<AgentState>,
+        unseen: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_status == status && self.agent_unseen == unseen {
             return;
         }
         self.agent_status = status;
+        self.agent_unseen = unseen;
         cx.notify();
     }
 
@@ -575,9 +588,11 @@ impl Render for TerminalView {
             )
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
                 this.on_scroll(ev, cx);
+                cx.emit(TerminalEvent::Interacted);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key(event, window, cx);
+                cx.emit(TerminalEvent::Interacted);
             }))
             .child(
                 canvas(

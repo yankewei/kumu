@@ -7,6 +7,7 @@ Coding agents report task completion, permission prompts, and input waits back t
 - `notify-claude-stdout` emits a JSON payload containing `\x1b]777;notify;claude;...\x07` for `complete`, `permission`, and `input`.
 - `notify-tty-agents` writes OSC 777 sequences to `KUMU_TTY` from a detached session (`setsid`) for `codex`, `grok`, `cursor`, and `agy`.
 - `notify-custom-launcher` preserves arbitrary arguments with spaces when a custom launcher script invokes `$KUMU_APP_BINARY --kumu-notify`.
+- `status-unseen-marker` shows `waiting`/`failed` on the Agent row and tab until resolved, and marks the project row, collapsed sidebar toggle, pane pill, and tab for any unviewed status change until the pane is clicked or typed in.
 
 ## How to get to it (user POV)
 
