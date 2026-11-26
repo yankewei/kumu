@@ -85,6 +85,9 @@ pub struct KumuApp {
     window_active: bool,
     /// Active agent state per pane. Idle and plain shell panes have no entry.
     agent_status: HashMap<PaneId, AgentEntry>,
+    /// Current git branch checked out in each root project directory; absent
+    /// for non-git folders or before the first background probe completes.
+    project_branches: HashMap<i64, String>,
     /// Whether the sidebar's agent section is collapsed to its summary line.
     agents_collapsed: bool,
     /// A persistence failure the workspace reported, shown above the panes
@@ -507,6 +510,7 @@ impl KumuApp {
             unread_notifications: HashMap::new(),
             window_active: window.is_window_active(),
             agent_status: HashMap::new(),
+            project_branches: HashMap::new(),
             agents_collapsed: false,
             store_error: startup_error,
             panes: HashMap::new(),
@@ -545,6 +549,7 @@ impl KumuApp {
         }
         app.start_control(cx);
         app.start_shell_agent_watcher(cx);
+        app.start_project_branch_watcher(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
         let shell_snap = app.build_shell_snapshot(cx);

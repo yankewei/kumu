@@ -536,6 +536,37 @@ pub fn create_worktree(dir: &Path, branch: &str) -> Result<Worktree, String> {
     Ok(Worktree { name: branch, path })
 }
 
+/// Current branch checked out in `dir`, or the abbreviated commit hash when
+/// `HEAD` is detached. Returns `None` when `dir` is not inside a git working
+/// tree.
+pub fn repo_branch(dir: &Path) -> Option<String> {
+    if let Ok(branch) = git(
+        dir,
+        &["--no-optional-locks", "symbolic-ref", "--short", "HEAD"],
+    ) && !branch.is_empty()
+    {
+        return Some(branch);
+    }
+    if let Ok(short) = git(
+        dir,
+        &["--no-optional-locks", "rev-parse", "--short", "HEAD"],
+    ) && !short.is_empty()
+    {
+        return Some(short);
+    }
+    if git(
+        dir,
+        &["--no-optional-locks", "rev-parse", "--is-inside-work-tree"],
+    )
+    .ok()
+    .as_deref()
+        == Some("true")
+    {
+        return Some("HEAD".to_string());
+    }
+    None
+}
+
 /// Every worktree attached to the repository that contains `dir`, including
 /// the main checkout. Missing directories (git still lists a worktree until it
 /// is pruned) are left out: Kumu cannot open them.
@@ -1126,6 +1157,23 @@ mod tests {
         assert!(remove_worktree(&wt.path, false).is_err());
         remove_worktree(&wt.path, true).unwrap();
         assert!(!wt.path.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repo_branch_reports_branch_detached_and_non_git() {
+        let (dir, repo) = fixture();
+        git(&repo, &["branch", "-M", "main"]).unwrap();
+        assert_eq!(repo_branch(&repo).as_deref(), Some("main"));
+
+        let head = git(&repo, &["rev-parse", "--short", "HEAD"]).unwrap();
+        git(&repo, &["checkout", "-q", "--detach", "HEAD"]).unwrap();
+        assert_eq!(repo_branch(&repo).as_deref(), Some(head.as_str()));
+
+        let plain = dir.join("not-a-repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(repo_branch(&plain), None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,19 +1,93 @@
 //! Left column host adapter: builds [`SidebarSnapshot`] for the Pure Rust NSH
 //! sidebar (`sidebar_nsh.rs`) and handles [`SidebarAction`] callbacks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui::{App, ClipboardItem, Context, Window};
 
 use super::KumuApp;
 use super::sidebar_nsh::{
-    AgentRowSnapshot, ProjectRowSnapshot, SidebarAction, SidebarSnapshot, UpdateNoticeSnapshot,
+    AgentRowSnapshot, ProjectRowKind, ProjectRowSnapshot, SidebarAction, SidebarSnapshot,
+    UpdateNoticeSnapshot,
 };
 use crate::agent::AgentState;
 use crate::app::layout::PaneId;
 use crate::updates::UpdateStatus;
 
 impl KumuApp {
+    /// Periodically probe each root project's checked-out git branch off the UI
+    /// thread so the sidebar's main worktree row follows branch switches.
+    pub(super) fn start_project_branch_watcher(&self, cx: &mut Context<Self>) {
+        self.refresh_project_branches(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                let Ok(roots) = this.update(cx, |app, cx| app.root_project_paths(cx)) else {
+                    break;
+                };
+                if roots.is_empty() {
+                    continue;
+                }
+                let branches = cx
+                    .background_executor()
+                    .spawn(async move { probe_project_branches(roots) })
+                    .await;
+                if this
+                    .update(cx, |app, cx| app.apply_project_branches(branches, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Trigger an immediate background probe of root project branches (e.g.
+    /// right after adding a project).
+    pub(super) fn refresh_project_branches(&self, cx: &mut Context<Self>) {
+        let roots = self.root_project_paths(cx);
+        if roots.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let branches = cx
+                .background_executor()
+                .spawn(async move { probe_project_branches(roots) })
+                .await;
+            let _ = this.update(cx, |app, cx| app.apply_project_branches(branches, cx));
+        })
+        .detach();
+    }
+
+    fn root_project_paths(&self, cx: &Context<Self>) -> Vec<(i64, PathBuf)> {
+        let workspace = self.workspace.read(cx);
+        let projects = workspace.projects();
+        projects
+            .iter()
+            .filter(|project| {
+                project.parent_id.is_none_or(|parent| {
+                    parent == project.id || !projects.iter().any(|candidate| candidate.id == parent)
+                })
+            })
+            .map(|project| (project.id, PathBuf::from(&project.path)))
+            .collect()
+    }
+
+    fn apply_project_branches(
+        &mut self,
+        branches: HashMap<i64, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.project_branches != branches {
+            self.project_branches = branches;
+            cx.notify();
+        }
+    }
+
     pub(super) fn build_sidebar_snapshot(&self, cx: &Context<Self>) -> SidebarSnapshot {
         let updater = self.updater.read(cx);
         let update_notice = match updater.status() {
@@ -97,21 +171,94 @@ impl KumuApp {
             .map(|(project, _)| *project)
             .collect();
 
-        let project_rows: Vec<ProjectRowSnapshot> = ordered_projects
-            .iter()
-            .map(|(project, worktree)| ProjectRowSnapshot {
-                id: project.id,
-                name: project.name.clone(),
-                path: project.path.clone(),
-                worktree: *worktree,
-                active: self.selected == Some(project.id),
-                unread: self
-                    .unread_notifications
-                    .values()
-                    .any(|&pid| pid == project.id)
-                    || unseen_projects.contains(&project.id),
+        let is_unread = |project_id: i64| {
+            self.unread_notifications
+                .values()
+                .any(|&pid| pid == project_id)
+                || unseen_projects.contains(&project_id)
+        };
+
+        let mut project_rows: Vec<ProjectRowSnapshot> = Vec::with_capacity(projects.len() * 2);
+        let mut root_seen = HashSet::with_capacity(projects.len());
+        let roots = projects.iter().filter(|project| {
+            project.parent_id.is_none_or(|parent| {
+                parent == project.id || !projects.iter().any(|candidate| candidate.id == parent)
             })
-            .collect();
+        });
+        for project in roots {
+            if !root_seen.insert(project.id) {
+                continue;
+            }
+            let children: Vec<&crate::db::Project> = projects
+                .iter()
+                .filter(|wt| wt.parent_id == Some(project.id) && root_seen.insert(wt.id))
+                .collect();
+
+            if let Some(branch) = self.project_branches.get(&project.id) {
+                let has_active_child = self.selected == Some(project.id)
+                    || children
+                        .iter()
+                        .any(|wt| self.selected == Some(wt.id));
+                project_rows.push(ProjectRowSnapshot {
+                    id: project.id,
+                    name: project.name.clone(),
+                    path: project.path.clone(),
+                    kind: ProjectRowKind::RepoHeader,
+                    repo_name: None,
+                    active: false,
+                    has_active_child,
+                    unread: false,
+                });
+                project_rows.push(ProjectRowSnapshot {
+                    id: project.id,
+                    name: branch.clone(),
+                    path: project.path.clone(),
+                    kind: ProjectRowKind::MainWorktree,
+                    repo_name: Some(project.name.clone()),
+                    active: self.selected == Some(project.id),
+                    has_active_child: false,
+                    unread: is_unread(project.id),
+                });
+            } else {
+                project_rows.push(ProjectRowSnapshot {
+                    id: project.id,
+                    name: project.name.clone(),
+                    path: project.path.clone(),
+                    kind: ProjectRowKind::PlainProject,
+                    repo_name: None,
+                    active: self.selected == Some(project.id),
+                    has_active_child: false,
+                    unread: is_unread(project.id),
+                });
+            }
+
+            for worktree in children {
+                project_rows.push(ProjectRowSnapshot {
+                    id: worktree.id,
+                    name: worktree.name.clone(),
+                    path: worktree.path.clone(),
+                    kind: ProjectRowKind::LinkedWorktree,
+                    repo_name: Some(project.name.clone()),
+                    active: self.selected == Some(worktree.id),
+                    has_active_child: false,
+                    unread: is_unread(worktree.id),
+                });
+            }
+        }
+        for project in projects {
+            if root_seen.insert(project.id) {
+                project_rows.push(ProjectRowSnapshot {
+                    id: project.id,
+                    name: project.name.clone(),
+                    path: project.path.clone(),
+                    kind: ProjectRowKind::PlainProject,
+                    repo_name: None,
+                    active: self.selected == Some(project.id),
+                    has_active_child: false,
+                    unread: is_unread(project.id),
+                });
+            }
+        }
 
         let mut agent_rows = Vec::new();
         for (project, _) in &ordered_projects {
@@ -210,6 +357,17 @@ impl KumuApp {
         self.focus_terminal(window, cx);
         cx.notify();
     }
+}
+
+/// Probe the checked-out git branch for each root project path.
+fn probe_project_branches(roots: Vec<(i64, PathBuf)>) -> HashMap<i64, String> {
+    let mut branches = HashMap::with_capacity(roots.len());
+    for (id, path) in roots {
+        if let Some(branch) = crate::git::repo_branch(&path) {
+            branches.insert(id, branch);
+        }
+    }
+    branches
 }
 
 /// Show `path` in a Finder window without blocking the UI thread.

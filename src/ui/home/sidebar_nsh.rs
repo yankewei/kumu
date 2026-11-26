@@ -4,13 +4,29 @@
 use crate::agent::AgentState;
 use crate::app::layout::PaneId;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProjectRowKind {
+    /// Non-git directory: a standalone clickable project row.
+    PlainProject,
+    /// Git repository group header; its worktrees (starting with main) sit below.
+    RepoHeader,
+    /// Main checkout of a git repository (e.g. `main`), bound to the root project id.
+    MainWorktree,
+    /// Linked git worktree row, bound to its own project id.
+    LinkedWorktree,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProjectRowSnapshot {
     pub(super) id: i64,
     pub(super) name: String,
     pub(super) path: String,
-    pub(super) worktree: bool,
+    pub(super) kind: ProjectRowKind,
+    /// Owning repository name for worktree rows (used by command palette search).
+    pub(super) repo_name: Option<String>,
     pub(super) active: bool,
+    /// True on a `RepoHeader` when its main or any linked worktree is selected.
+    pub(super) has_active_child: bool,
     pub(super) unread: bool,
 }
 
@@ -71,7 +87,9 @@ pub(super) mod view {
 
     const AGENT_ROW_HEIGHT: f32 = 40.0;
 
-    use super::{AgentRowSnapshot, ProjectRowSnapshot, SidebarAction, SidebarSnapshot};
+    use super::{
+        AgentRowSnapshot, ProjectRowKind, ProjectRowSnapshot, SidebarAction, SidebarSnapshot,
+    };
     use crate::agent::AgentState;
     use crate::nsh_ui::assets::icon_svg;
     use crate::nsh_ui::components::{
@@ -226,16 +244,16 @@ pub(super) mod view {
         let project_id = project.id;
         let path = project.path.clone();
         let name = project.name.clone();
-        let worktree = project.worktree;
+        let kind = project.kind;
 
         let mut items = Vec::new();
-        {
+        if kind != ProjectRowKind::RepoHeader {
             let tx = tx.clone();
             items.push(MenuItem::new("新建终端").on_select(move || {
                 send(&tx, SidebarAction::NewTerminal(project_id));
             }));
         }
-        if !worktree {
+        if matches!(kind, ProjectRowKind::PlainProject | ProjectRowKind::RepoHeader) {
             let tx_c = tx.clone();
             let tx_o = tx.clone();
             items.push(MenuItem::new("新建 worktree").on_select(move || {
@@ -255,48 +273,55 @@ pub(super) mod view {
         {
             let tx_p = tx.clone();
             let tx_n = tx.clone();
+            let copy_name_label = if kind == ProjectRowKind::MainWorktree {
+                "复制分支名"
+            } else {
+                "复制名称"
+            };
             items.push(MenuItem::submenu(
                 "复制",
                 [
                     MenuItem::new("复制路径").on_select(move || {
                         send(&tx_p, SidebarAction::CopyText(path.clone()));
                     }),
-                    MenuItem::new("复制名称").on_select(move || {
+                    MenuItem::new(copy_name_label).on_select(move || {
                         send(&tx_n, SidebarAction::CopyText(name.clone()));
                     }),
                 ],
             ));
         }
-        items.push(MenuItem::separator());
-        {
-            let tx = tx.clone();
-            items.push(MenuItem::new("重命名").on_select(move || {
-                send(&tx, SidebarAction::PromptRenameProject(project_id));
-            }));
-        }
-        items.push(MenuItem::separator());
-        if worktree {
+        if kind != ProjectRowKind::MainWorktree {
+            items.push(MenuItem::separator());
             {
                 let tx = tx.clone();
-                items.push(MenuItem::new("从列表移除").on_select(move || {
+                items.push(MenuItem::new("重命名").on_select(move || {
+                    send(&tx, SidebarAction::PromptRenameProject(project_id));
+                }));
+            }
+            items.push(MenuItem::separator());
+            if kind == ProjectRowKind::LinkedWorktree {
+                {
+                    let tx = tx.clone();
+                    items.push(MenuItem::new("从列表移除").on_select(move || {
+                        send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
+                    }));
+                }
+                {
+                    let tx = tx.clone();
+                    items.push(
+                        MenuItem::new("删除 worktree（清理目录）")
+                            .destructive(true)
+                            .on_select(move || {
+                                send(&tx, SidebarAction::ConfirmRemoveWorktree(project_id));
+                            }),
+                    );
+                }
+            } else {
+                let tx = tx.clone();
+                items.push(MenuItem::new("删除").destructive(true).on_select(move || {
                     send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
                 }));
             }
-            {
-                let tx = tx.clone();
-                items.push(
-                    MenuItem::new("删除 worktree（清理目录）")
-                        .destructive(true)
-                        .on_select(move || {
-                            send(&tx, SidebarAction::ConfirmRemoveWorktree(project_id));
-                        }),
-                );
-            }
-        } else {
-            let tx = tx.clone();
-            items.push(MenuItem::new("删除").destructive(true).on_select(move || {
-                send(&tx, SidebarAction::ConfirmDeleteProject(project_id));
-            }));
         }
         items
     }
@@ -305,7 +330,7 @@ pub(super) mod view {
         state: Signal<SidebarSnapshot>,
         actions_tx: Option<UnboundedSender<SidebarAction>>,
     ) -> impl IntoElement {
-        let hovered_project = signal(Option::<i64>::None);
+        let hovered_row = signal(Option::<(i64, ProjectRowKind)>::None);
 
         let tx_body = actions_tx.clone();
         let middle = dynamic(move || {
@@ -520,17 +545,31 @@ pub(super) mod view {
             let mut proj_col = view().flex_col().w_full().px_1p5().py_1p5().gap_0p5();
             for (idx, project) in snap.projects.iter().enumerate() {
                 let id = project.id;
+                let kind = project.kind;
+                let row_key = (id, kind);
                 let active = project.active;
-                let worktree = project.worktree;
+                let has_active_child = project.has_active_child;
+                let is_worktree = matches!(
+                    kind,
+                    ProjectRowKind::MainWorktree | ProjectRowKind::LinkedWorktree
+                );
+                let is_header = kind == ProjectRowKind::RepoHeader;
                 let tx_sel = tx_body.clone();
                 let tx_del = tx_body.clone();
                 let tx_term = tx_body.clone();
+                let tx_wt = tx_body.clone();
                 let tx_ctx = tx_body.clone();
                 let ctx_proj = project.clone();
 
                 let text_fg = move || {
                     if active {
                         active_theme().sidebar_accent_foreground
+                    } else if is_header {
+                        if has_active_child {
+                            active_theme().sidebar_foreground
+                        } else {
+                            active_theme().muted_foreground
+                        }
                     } else {
                         active_theme().sidebar_foreground
                     }
@@ -543,37 +582,44 @@ pub(super) mod view {
                     }
                 };
 
-                let icon_path = if worktree {
+                let icon_path = if is_worktree {
                     "icons/git-branch.svg"
-                } else if active {
+                } else if active || has_active_child {
                     "icons/folder-open.svg"
                 } else {
                     "icons/folder.svg"
                 };
 
                 let project_path = project.path.clone();
+                let top_margin = if is_worktree || idx == 0 {
+                    0.0
+                } else if is_header {
+                    6.0
+                } else {
+                    4.0
+                };
                 let mut row = view()
                     .flex_row()
                     .w_full()
-                    .h(px(30.0))
+                    .h(px(if is_header || is_worktree { 28.0 } else { 30.0 }))
                     .pr_1()
-                    .mt(px(if worktree || idx == 0 { 0.0 } else { 4.0 }))
+                    .mt(px(top_margin))
                     .items_center()
                     .rounded(move || active_theme().radius)
                     .bg(move || {
                         if active {
                             active_theme().sidebar_accent
-                        } else if hovered_project.get() == Some(id) {
+                        } else if hovered_row.get() == Some(row_key) {
                             active_theme().sidebar_accent.opacity(0.5)
                         } else {
                             AdaptiveColor::TRANSPARENT
                         }
                     })
                     .when(!reduce_motion(), |s| s.transition_colors().duration(120.0))
-                    .on_mouse_enter(move |_: &nsh_core::MouseEvent| hovered_project.set(Some(id)))
+                    .on_mouse_enter(move |_: &nsh_core::MouseEvent| hovered_row.set(Some(row_key)))
                     .on_mouse_leave(move |_: &nsh_core::MouseEvent| {
-                        if hovered_project.get_untracked() == Some(id) {
-                            hovered_project.set(None);
+                        if hovered_row.get_untracked() == Some(row_key) {
+                            hovered_row.set(None);
                         }
                     });
 
@@ -591,7 +637,7 @@ pub(super) mod view {
                         s.outline(px(2.0))
                             .outline_color(move || active_theme().ring)
                     })
-                    .pl(px(if worktree { 22.0 } else { 6.0 }))
+                    .pl(px(if is_worktree { 22.0 } else { 6.0 }))
                     .pr_1()
                     .gap_1p5()
                     .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
@@ -607,7 +653,11 @@ pub(super) mod view {
                             .app_class("truncate")
                             .tooltip(kumu_tooltip(project_path))
                             .text_size(text_xs_size)
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(if is_header {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
                             .text_color(text_fg),
                     );
 
@@ -622,41 +672,79 @@ pub(super) mod view {
                     );
                 }
 
-                let remove_label = if worktree {
-                    "移除 worktree"
-                } else {
-                    "移除项目"
-                };
                 let row_actions = dynamic(move || {
-                    if hovered_project.get() != Some(id) {
+                    if hovered_row.get() != Some(row_key) {
                         return view().into_element();
                     }
                     let tx_del = tx_del.clone();
                     let tx_term = tx_term.clone();
-                    view()
+                    let tx_wt = tx_wt.clone();
+                    let mut actions = view()
                         .flex_row()
                         .flex_shrink_0()
                         .items_center()
-                        .gap_0p5()
-                        .child(kumu_icon_button(
-                            remove_label,
-                            icon_svg("icons/x.svg", 13.0)
-                                .text_color(move || active_theme().muted_foreground),
-                            ControlTone::Sidebar,
-                            move || {
-                                send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
-                            },
-                        ))
-                        .child(kumu_icon_button(
-                            "新建终端",
-                            icon_svg("icons/square-terminal.svg", 13.0)
-                                .text_color(move || active_theme().muted_foreground),
-                            ControlTone::Sidebar,
-                            move || {
-                                send(&tx_term, SidebarAction::NewTerminal(id));
-                            },
-                        ))
-                        .into_element()
+                        .gap_0p5();
+                    match kind {
+                        ProjectRowKind::RepoHeader => {
+                            actions = actions
+                                .child(kumu_icon_button(
+                                    "移除项目",
+                                    icon_svg("icons/x.svg", 13.0)
+                                        .text_color(move || active_theme().muted_foreground),
+                                    ControlTone::Sidebar,
+                                    move || {
+                                        send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
+                                    },
+                                ))
+                                .child(kumu_icon_button(
+                                    "新建 worktree",
+                                    icon_svg("icons/plus.svg", 13.0)
+                                        .text_color(move || active_theme().muted_foreground),
+                                    ControlTone::Sidebar,
+                                    move || {
+                                        send(&tx_wt, SidebarAction::PromptCreateWorktree(id));
+                                    },
+                                ));
+                        }
+                        ProjectRowKind::MainWorktree => {
+                            actions = actions.child(kumu_icon_button(
+                                "新建终端",
+                                icon_svg("icons/square-terminal.svg", 13.0)
+                                    .text_color(move || active_theme().muted_foreground),
+                                ControlTone::Sidebar,
+                                move || {
+                                    send(&tx_term, SidebarAction::NewTerminal(id));
+                                },
+                            ));
+                        }
+                        ProjectRowKind::PlainProject | ProjectRowKind::LinkedWorktree => {
+                            let remove_label = if kind == ProjectRowKind::LinkedWorktree {
+                                "移除 worktree"
+                            } else {
+                                "移除项目"
+                            };
+                            actions = actions
+                                .child(kumu_icon_button(
+                                    remove_label,
+                                    icon_svg("icons/x.svg", 13.0)
+                                        .text_color(move || active_theme().muted_foreground),
+                                    ControlTone::Sidebar,
+                                    move || {
+                                        send(&tx_del, SidebarAction::ConfirmDeleteProject(id));
+                                    },
+                                ))
+                                .child(kumu_icon_button(
+                                    "新建终端",
+                                    icon_svg("icons/square-terminal.svg", 13.0)
+                                        .text_color(move || active_theme().muted_foreground),
+                                    ControlTone::Sidebar,
+                                    move || {
+                                        send(&tx_term, SidebarAction::NewTerminal(id));
+                                    },
+                                ));
+                        }
+                    }
+                    actions.into_element()
                 });
                 row = row.child(project_button).child(row_actions);
                 proj_col = proj_col.child(row);
@@ -797,14 +885,28 @@ mod tests {
         let (events_tx, events_rx) = unbounded::<SidebarSnapshot>();
         let (actions_tx, mut actions_rx) = unbounded::<SidebarAction>();
         let initial = SidebarSnapshot {
-            projects: vec![ProjectRowSnapshot {
-                id: 7,
-                name: "kumu".into(),
-                path: "/tmp/kumu".into(),
-                worktree: false,
-                active: true,
-                unread: false,
-            }],
+            projects: vec![
+                ProjectRowSnapshot {
+                    id: 7,
+                    name: "kumu".into(),
+                    path: "/tmp/kumu".into(),
+                    kind: ProjectRowKind::RepoHeader,
+                    repo_name: None,
+                    active: false,
+                    has_active_child: true,
+                    unread: false,
+                },
+                ProjectRowSnapshot {
+                    id: 7,
+                    name: "main".into(),
+                    path: "/tmp/kumu".into(),
+                    kind: ProjectRowKind::MainWorktree,
+                    repo_name: Some("kumu".into()),
+                    active: true,
+                    has_active_child: false,
+                    unread: false,
+                },
+            ],
             agents: vec![],
             agents_collapsed: false,
             update_notice: None,
@@ -821,6 +923,13 @@ mod tests {
             nsh_testing::Headless::start(EngineConfig::new(root)).expect("start sidebar NSH");
 
         // Fixed-height Agent section stays visible with a calm empty state when 0 agents exist.
+        app.wait_for("kumu").expect("repo header renders");
+        app.wait_for("main").expect("main worktree renders");
+        app.press("main").expect("click main worktree");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(SidebarAction::SelectProject(7))
+        );
         app.wait_for("Agent 状态").expect("persistent agent header");
         app.wait_for("暂无运行中的 Agent")
             .expect("empty agent placeholder");
@@ -828,14 +937,28 @@ mod tests {
         // Populating agents renders them inside the virtualized fixed-height list.
         events_tx
             .unbounded_send(SidebarSnapshot {
-                projects: vec![ProjectRowSnapshot {
-                    id: 7,
-                    name: "kumu".into(),
-                    path: "/tmp/kumu".into(),
-                    worktree: false,
-                    active: true,
-                    unread: false,
-                }],
+                projects: vec![
+                    ProjectRowSnapshot {
+                        id: 7,
+                        name: "kumu".into(),
+                        path: "/tmp/kumu".into(),
+                        kind: ProjectRowKind::RepoHeader,
+                        repo_name: None,
+                        active: false,
+                        has_active_child: true,
+                        unread: false,
+                    },
+                    ProjectRowSnapshot {
+                        id: 7,
+                        name: "main".into(),
+                        path: "/tmp/kumu".into(),
+                        kind: ProjectRowKind::MainWorktree,
+                        repo_name: Some("kumu".into()),
+                        active: true,
+                        has_active_child: false,
+                        unread: false,
+                    },
+                ],
                 agents: vec![AgentRowSnapshot {
                     pane: PaneId(3),
                     project_name: "kumu".into(),

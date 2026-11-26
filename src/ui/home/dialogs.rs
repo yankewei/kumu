@@ -63,6 +63,7 @@ impl KumuApp {
         if let Some(id) = id {
             self.ensure_project_layout(id, cx);
             self.select_project(id, cx);
+            self.refresh_project_branches(cx);
         }
     }
 

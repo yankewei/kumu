@@ -522,7 +522,15 @@ impl KumuApp {
 
         // 2. Projects & worktrees.
         for project in sidebar.projects {
-            let icon = if project.worktree {
+            if project.kind == super::sidebar_nsh::ProjectRowKind::RepoHeader {
+                continue;
+            }
+            let is_worktree = matches!(
+                project.kind,
+                super::sidebar_nsh::ProjectRowKind::MainWorktree
+                    | super::sidebar_nsh::ProjectRowKind::LinkedWorktree
+            );
+            let icon = if is_worktree {
                 "icons/git-branch.svg"
             } else if project.active {
                 "icons/folder-open.svg"
@@ -536,13 +544,18 @@ impl KumuApp {
             } else {
                 None
             };
+            let title = match &project.repo_name {
+                Some(repo) => format!("{repo} / {}", project.name),
+                None => project.name.clone(),
+            };
             items.push(PaletteItem {
                 section: PaletteSection::Projects,
-                title: project.name,
+                title,
                 subtitle: Some(short_cwd_display(&project.path)),
                 keywords: format!(
-                    "project repo {} {}",
-                    if project.worktree { "worktree" } else { "" },
+                    "project repo {} {} {}",
+                    if is_worktree { "worktree" } else { "" },
+                    project.repo_name.as_deref().unwrap_or(""),
                     project.path
                 ),
                 icon: PaletteIcon::Svg(icon),
