@@ -378,8 +378,9 @@ impl KumuApp {
         has_review.then_some(colors.success)
     }
 
-    /// The panes a plugin may hand text to, in layout order. The header's label
-    /// gives way to the agent's name only when no program has set one yet.
+    /// The panes a plugin may hand text to, in layout order. For agent panes,
+    /// uses `AgentEntry::display_title()` (session title > first prompt > OSC
+    /// title > agent name) alongside the agent id and live status.
     pub(super) fn plugin_panes(&self, project: i64, cx: &App) -> Vec<PaneTarget> {
         let Some(tabs) = self.tabs_by_project.get(&project) else {
             return Vec::new();
@@ -387,6 +388,7 @@ impl KumuApp {
         let Some(tab) = tabs.active() else {
             return Vec::new();
         };
+        let tab_name = Self::tab_name(tabs, tabs.selected);
         let focused = tab.focused;
         let workspace = self.workspace.read(cx);
         tab.layout
@@ -394,21 +396,32 @@ impl KumuApp {
             .into_iter()
             .enumerate()
             .map(|(index, pane)| {
-                let agent = match self.launches.get(&pane) {
-                    Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
-                    _ => None,
-                };
-                let title = workspace
-                    .terminal_handle(pane.0)
-                    .map(|term| term.label())
+                let agent_entry = self.agent_status.get(&pane);
+                let agent = agent_entry
+                    .map(|entry| entry.agent.clone())
+                    .or_else(|| match self.launches.get(&pane) {
+                        Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
+                        _ => None,
+                    });
+                let state = agent_entry.and_then(|entry| entry.state);
+                let title = agent_entry
+                    .map(AgentEntry::display_title)
                     .filter(|label| !label.is_empty())
+                    .or_else(|| {
+                        workspace
+                            .terminal_handle(pane.0)
+                            .map(|term| term.label())
+                            .filter(|label| !label.is_empty())
+                    })
                     .or_else(|| agent.as_deref().and_then(agent_display_name))
                     .unwrap_or_else(|| "终端".to_string());
                 PaneTarget {
                     pane: pane.0,
                     ordinal: index + 1,
+                    tab_name: tab_name.clone(),
                     title,
                     agent,
+                    state,
                     focused: pane == focused,
                 }
             })

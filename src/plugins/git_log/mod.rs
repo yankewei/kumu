@@ -27,7 +27,7 @@ use nsh_platform_gpui::{AppOptions, AppView, Root};
 use self::patch_view::PatchView;
 use self::review::{PatchRequest, PatchSheet, PatchSource, ReviewMarks, ReviewStore};
 use super::{Plugin, PluginHost, PluginProject};
-use crate::git::{BranchDiffSummary, Change, Changes, Commit, History};
+use crate::git::{BranchDiffSummary, Change, Changes, Commit, History, WorkingTreeDiffScope};
 use crate::nsh_ui::mount::MountRegistry;
 use crate::nsh_ui::theme::{appearance, nsh_theme};
 use crate::theme::KumuTheme;
@@ -86,6 +86,10 @@ enum GitPanelAction {
     SelectTab(PanelTab),
     SetQuery(String),
     OpenChange(Change),
+    OpenWorkingTree {
+        scope: WorkingTreeDiffScope,
+        focus_file: Option<String>,
+    },
     OpenCommit(Commit),
     OpenBranchDiff,
 }
@@ -223,7 +227,15 @@ impl Plugin for GitLogPanel {
                         panel.push_snapshot();
                     }
                     GitPanelAction::OpenChange(change) => {
-                        panel.open_change(change, window, cx);
+                        panel.open_working_tree(
+                            WorkingTreeDiffScope::All,
+                            Some(change.path),
+                            window,
+                            cx,
+                        );
+                    }
+                    GitPanelAction::OpenWorkingTree { scope, focus_file } => {
+                        panel.open_working_tree(scope, focus_file, window, cx);
                     }
                     GitPanelAction::OpenCommit(commit) => {
                         panel.open_commit(commit, window, cx);
@@ -523,36 +535,41 @@ impl GitLogPanel {
                 },
                 message: commit.body.clone(),
                 context: format!("提交 {}", commit.short),
+                initial_file: None,
             },
             window,
             cx,
         );
     }
 
-    fn open_change(&mut self, change: Change, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_working_tree(
+        &mut self,
+        scope: WorkingTreeDiffScope,
+        focus_file: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.project.clone() else {
             return;
         };
-        let status = if change.staged {
-            "已暂存改动"
-        } else {
-            "未暂存改动"
-        };
-        let mut meta = format!("{status} · {}", status_label(change.status));
-        if let Some(original) = &change.original {
-            meta.push_str(&format!(" · 原路径 {original}"));
-        }
+        let branch = self
+            .history
+            .as_ref()
+            .map(|h| h.branch.as_str())
+            .unwrap_or("HEAD");
+        let meta = format!("{branch} · {} 个改动项", self.changes.len());
         self.open_patch(
             PatchRequest {
                 project: project.id,
-                title: change.path.clone(),
+                title: "未提交改动".to_string(),
                 meta,
-                source: PatchSource::Change {
+                source: PatchSource::WorkingTree {
                     root: project.path,
-                    change,
+                    scope,
                 },
                 message: String::new(),
-                context: status.to_string(),
+                context: "工作区未提交改动".to_string(),
+                initial_file: focus_file,
             },
             window,
             cx,
@@ -580,6 +597,7 @@ impl GitLogPanel {
                 },
                 message: String::new(),
                 context: format!("分支 {} 相对 {}", summary.head, summary.base),
+                initial_file: None,
             },
             window,
             cx,
@@ -594,6 +612,7 @@ impl GitLogPanel {
             source,
             message,
             context,
+            initial_file,
         } = request;
         let key = source.key(project);
         let reviews = self.reviews.clone();
@@ -616,6 +635,7 @@ impl GitLogPanel {
                     source,
                     message,
                     context,
+                    initial_file,
                     host: self.host.clone(),
                     reviews,
                     notify_panel: notify,
@@ -674,19 +694,4 @@ pub(super) fn file_name(path: &str) -> &str {
 /// string for a file at the root.
 pub(super) fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
-}
-
-/// The status of a change in words, for the sheet's subtitle.
-fn status_label(status: char) -> &'static str {
-    match status {
-        'M' => "已修改",
-        'A' => "已添加",
-        'D' => "已删除",
-        'R' => "已重命名",
-        'C' => "已复制",
-        'T' => "类型变更",
-        'U' => "有冲突",
-        '?' => "新文件",
-        _ => "已修改",
-    }
 }

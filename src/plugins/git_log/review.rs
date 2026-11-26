@@ -12,7 +12,7 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::git::{Change, Patch};
+use crate::git::{Change, Patch, WorkingTreeDiffScope};
 use crate::plugins::PluginHost;
 
 /// Which side of a diff a review comment targets.
@@ -88,11 +88,25 @@ impl ReviewRange {
     }
 }
 
+/// Summary of one file inside a parsed unified patch, used for the left file
+/// navigation sidebar and total `+added / −deleted` stats.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PatchFileSummary {
+    pub(super) path: String,
+    pub(super) old_path: Option<String>,
+    /// `'M'`, `'A'`, `'D'`, `'R'`, or `'C'`.
+    pub(super) status: char,
+    pub(super) added: usize,
+    pub(super) deleted: usize,
+    pub(super) binary: bool,
+}
+
 /// Exact mapping between `nsh_base::DiffView`'s joined 0-based line indices
 /// (across all files in a unified patch) and `(file_path, 1-based line)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct PatchIndex {
     pub(super) file_count: usize,
+    pub(super) files: Vec<PatchFileSummary>,
     /// `old_lines[joined_0_based] = (file_path, 1_based_old_line)`
     pub(super) old_lines: Vec<(String, usize)>,
     /// `new_lines[joined_0_based] = (file_path, 1_based_new_line)`
@@ -205,21 +219,80 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
                 current_old_path = Some(a.strip_prefix("a/").unwrap_or(a).trim_matches('"').into());
                 current_new_path = Some(b.trim_matches('"').into());
             }
+            let path = current_new_path
+                .clone()
+                .or_else(|| current_old_path.clone())
+                .unwrap_or_default();
+            index.files.push(PatchFileSummary {
+                path,
+                old_path: None,
+                status: 'M',
+                added: 0,
+                deleted: 0,
+                binary: false,
+            });
             out_lines.push(line.to_string());
             i += 1;
             continue;
+        }
+        if let Some(file) = index.files.last_mut() {
+            if line.starts_with("new file mode ") {
+                file.status = 'A';
+            } else if line.starts_with("deleted file mode ") {
+                file.status = 'D';
+            } else if let Some(from) = line.strip_prefix("rename from ") {
+                file.status = 'R';
+                file.old_path = Some(from.trim().to_string());
+            } else if let Some(to) = line.strip_prefix("rename to ") {
+                file.status = 'R';
+                file.path = to.trim().to_string();
+            } else if let Some(from) = line.strip_prefix("copy from ") {
+                file.status = 'C';
+                file.old_path = Some(from.trim().to_string());
+            } else if let Some(to) = line.strip_prefix("copy to ") {
+                file.status = 'C';
+                file.path = to.trim().to_string();
+            } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+                file.binary = true;
+            }
         }
         if line.starts_with("--- ")
             && lines
                 .get(i + 1)
                 .is_some_and(|next| next.starts_with("+++ "))
         {
-            if !in_git {
-                index.file_count += 1;
-            }
             let next = lines[i + 1].strip_suffix('\r').unwrap_or(lines[i + 1]);
             current_old_path = strip_git_prefix(&line[4..], if in_git { "a/" } else { "" });
             current_new_path = strip_git_prefix(&next[4..], if in_git { "b/" } else { "" });
+            if !in_git {
+                index.file_count += 1;
+                let path = current_new_path
+                    .clone()
+                    .or_else(|| current_old_path.clone())
+                    .unwrap_or_default();
+                let status = match (&current_old_path, &current_new_path) {
+                    (None, Some(_)) => 'A',
+                    (Some(_), None) => 'D',
+                    _ => 'M',
+                };
+                index.files.push(PatchFileSummary {
+                    path,
+                    old_path: None,
+                    status,
+                    added: 0,
+                    deleted: 0,
+                    binary: false,
+                });
+            } else if let Some(file) = index.files.last_mut() {
+                if let Some(p) = current_new_path.clone().or_else(|| current_old_path.clone()) {
+                    file.path = p;
+                }
+                if current_old_path.is_none() && current_new_path.is_some() {
+                    file.status = 'A';
+                } else if current_old_path.is_some() && current_new_path.is_none() {
+                    file.status = 'D';
+                }
+            }
             out_lines.push(line.to_string());
             out_lines.push(next.to_string());
             i += 2;
@@ -231,6 +304,17 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
         {
             if index.file_count == 0 {
                 index.file_count = 1;
+                index.files.push(PatchFileSummary {
+                    path: current_new_path
+                        .clone()
+                        .or_else(|| current_old_path.clone())
+                        .unwrap_or_default(),
+                    old_path: None,
+                    status: 'M',
+                    added: 0,
+                    deleted: 0,
+                    binary: false,
+                });
             }
             let path = current_new_path
                 .clone()
@@ -255,6 +339,9 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
                     }
                     Some(b'+') if new_left > 0 => {
                         index.new_lines.push((path.clone(), new_cursor));
+                        if let Some(file) = index.files.last_mut() {
+                            file.added += 1;
+                        }
                         new_cursor += 1;
                         actual_new += 1;
                         new_left -= 1;
@@ -262,6 +349,9 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
                     }
                     Some(b'-') if old_left > 0 => {
                         index.old_lines.push((path.clone(), old_cursor));
+                        if let Some(file) = index.files.last_mut() {
+                            file.deleted += 1;
+                        }
                         old_cursor += 1;
                         actual_old += 1;
                         old_left -= 1;
@@ -310,8 +400,11 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
 pub(super) enum PatchSource {
     /// One commit in the repository at `root`.
     Commit { root: PathBuf, hash: String },
-    /// One uncommitted change in the repository at `root`.
-    Change { root: PathBuf, change: Change },
+    /// Combined uncommitted changes in the working tree / index at `root`.
+    WorkingTree {
+        root: PathBuf,
+        scope: WorkingTreeDiffScope,
+    },
     /// Cumulative diff of the current branch relative to `base` (`base...HEAD`).
     BranchDiff {
         root: PathBuf,
@@ -326,7 +419,7 @@ impl PatchSource {
     pub(super) fn key(&self, project: i64) -> PatchKey {
         match self {
             Self::Commit { hash, .. } => PatchKey::commit(project, hash),
-            Self::Change { change, .. } => PatchKey::change(project, change),
+            Self::WorkingTree { scope, .. } => PatchKey::working_tree(project, *scope),
             Self::BranchDiff { base, head, .. } => PatchKey::branch_diff(project, base, head),
         }
     }
@@ -335,8 +428,16 @@ impl PatchSource {
     pub(super) fn read(&self) -> Result<Patch, String> {
         match self {
             Self::Commit { root, hash } => crate::git::commit_diff(root, hash),
-            Self::Change { root, change } => crate::git::change_diff(root, change),
+            Self::WorkingTree { root, scope } => crate::git::working_tree_diff(root, *scope),
             Self::BranchDiff { root, base, .. } => crate::git::branch_diff(root, base),
+        }
+    }
+
+    /// Returns the active working-tree scope if this source is a combined working-tree diff.
+    pub(super) fn working_tree_scope(&self) -> Option<WorkingTreeDiffScope> {
+        match self {
+            Self::WorkingTree { scope, .. } => Some(*scope),
+            _ => None,
         }
     }
 }
@@ -365,6 +466,18 @@ impl PatchKey {
                 if change.staged { "index" } else { "worktree" },
                 change.path
             ),
+        }
+    }
+
+    pub(super) fn working_tree(project: i64, scope: WorkingTreeDiffScope) -> Self {
+        let name = match scope {
+            WorkingTreeDiffScope::All => "all",
+            WorkingTreeDiffScope::Staged => "staged",
+            WorkingTreeDiffScope::Unstaged => "unstaged",
+        };
+        Self {
+            project,
+            target: format!("working-tree:{name}"),
         }
     }
 
@@ -509,6 +622,8 @@ pub(super) struct PatchRequest {
     /// Where the patch's line numbers point, named when they are sent to the
     /// agent: a commit's numbers are not the working tree's.
     pub(super) context: String,
+    /// Optional file path to scroll to immediately once the multi-file patch loads.
+    pub(super) initial_file: Option<String>,
 }
 
 /// One review comment, edited beneath the line it targets.
@@ -544,6 +659,7 @@ pub(super) struct PatchSheet {
     pub(super) source: PatchSource,
     pub(super) message: String,
     pub(super) context: String,
+    pub(super) initial_file: Option<String>,
     pub(super) host: PluginHost,
     pub(super) reviews: Rc<RefCell<ReviewStore>>,
     pub(super) notify_panel: Rc<dyn Fn(&mut gpui::App)>,

@@ -223,6 +223,18 @@ pub fn changes(dir: &Path) -> Result<Changes, String> {
     Ok(parse_status(&output))
 }
 
+/// Which slice of uncommitted changes to include in a combined working-tree diff.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WorkingTreeDiffScope {
+    /// Both staged and unstaged tracked changes (relative to `HEAD`), plus untracked files.
+    #[default]
+    All,
+    /// Only staged changes (`git diff --cached`).
+    Staged,
+    /// Only unstaged tracked changes (`git diff`) plus untracked files.
+    Unstaged,
+}
+
 /// The patch one uncommitted change introduced, cut at [`MAX_PATCH_BYTES`].
 pub fn change_diff(dir: &Path, change: &Change) -> Result<Patch, String> {
     let root = repo_root(dir)?;
@@ -251,7 +263,100 @@ pub fn change_diff(dir: &Path, change: &Change) -> Result<Patch, String> {
         }
         args.push((&change.path).into());
     }
-    read_patch(&root, &args, untracked)
+    let mut patch = read_patch(&root, &args, untracked)?;
+    if untracked {
+        patch.patch = normalize_untracked_patch(&patch.patch, &change.path);
+    }
+    Ok(patch)
+}
+
+/// Combined unified diff of uncommitted changes in `dir` for `scope`, cut at
+/// [`MAX_PATCH_BYTES`]. Includes untracked files for [`WorkingTreeDiffScope::All`]
+/// and [`WorkingTreeDiffScope::Unstaged`].
+pub fn working_tree_diff(dir: &Path, scope: WorkingTreeDiffScope) -> Result<Patch, String> {
+    let root = repo_root(dir)?;
+    let has_head = git(
+        &root,
+        &["--no-optional-locks", "rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .is_ok();
+
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--no-optional-locks".into(),
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+    ];
+    match scope {
+        WorkingTreeDiffScope::All => {
+            if has_head {
+                args.push("HEAD".into());
+            } else {
+                args.push("--cached".into());
+            }
+        }
+        WorkingTreeDiffScope::Staged => {
+            args.push("--cached".into());
+        }
+        WorkingTreeDiffScope::Unstaged => {}
+    }
+
+    let mut combined = read_patch(&root, &args, false)?;
+    if scope == WorkingTreeDiffScope::Staged || combined.truncated {
+        return Ok(combined);
+    }
+
+    let untracked_files: Vec<Change> = changes(&root)?
+        .unstaged
+        .into_iter()
+        .filter(|change| change.status == '?')
+        .collect();
+    for file in untracked_files {
+        if combined.patch.len() >= MAX_PATCH_BYTES {
+            combined.truncated = true;
+            break;
+        }
+        let Ok(file_patch) = change_diff(&root, &file) else {
+            continue;
+        };
+        if file_patch.patch.is_empty() {
+            continue;
+        }
+        if !combined.patch.is_empty() && !combined.patch.ends_with('\n') {
+            combined.patch.push('\n');
+        }
+        let remaining = MAX_PATCH_BYTES.saturating_sub(combined.patch.len());
+        if file_patch.patch.len() > remaining {
+            combined.truncated = true;
+            break;
+        }
+        combined.patch.push_str(&file_patch.patch);
+        if file_patch.truncated {
+            combined.truncated = true;
+            break;
+        }
+    }
+
+    Ok(combined)
+}
+
+/// Rewrite `git diff --no-index /dev/null /abs/path/to/file` headers so the
+/// file shows its repository-relative path (`a/<rel> b/<rel>`) in the diff view.
+fn normalize_untracked_patch(raw: &str, rel_path: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for (idx, line) in raw.split_inclusive('\n').enumerate() {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[trimmed.len()..];
+        if idx == 0 && trimmed.starts_with("diff --git ") {
+            out.push_str(&format!("diff --git a/{rel_path} b/{rel_path}{ending}"));
+        } else if trimmed.starts_with("+++ ") && trimmed != "+++ /dev/null" {
+            out.push_str(&format!("+++ b/{rel_path}{ending}"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 struct ChildGuard(Option<std::process::Child>);

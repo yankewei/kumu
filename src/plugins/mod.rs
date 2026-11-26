@@ -38,18 +38,68 @@ pub struct PaneTarget {
     /// 1-based position in the visible tab's layout, so two panes running the
     /// same agent stay distinguishable in a menu.
     pub ordinal: usize,
-    /// What the pane header calls the pane.
+    /// Display name of the tab containing this pane.
+    pub tab_name: String,
+    /// Primary display title: for agents, `AgentEntry::display_title()`
+    /// (session title > first prompt > OSC title > agent name); for shells, the
+    /// terminal title.
     pub title: String,
-    /// The registry id when the pane was started as an agent.
+    /// The registry id when the pane runs an agent (`codex`, `claude`, etc.).
     pub agent: Option<String>,
+    /// Live agent state (`Working`, `Waiting`, `Idle`), when known.
+    pub state: Option<AgentState>,
     /// The pane the project had focused when the panel asked.
     pub focused: bool,
 }
 
 impl PaneTarget {
-    /// How the target reads in a button or a record: `窗格 2 · codex`.
+    /// Human-readable agent name from the registry (e.g. `"Codex"`, `"Claude Code"`).
+    pub fn agent_name(&self) -> Option<&'static str> {
+        let id = self.agent.as_deref()?;
+        crate::agent::AGENTS
+            .iter()
+            .find(|a| a.id.eq_ignore_ascii_case(id) || a.name.eq_ignore_ascii_case(id))
+            .map(|a| a.name)
+    }
+
+    /// Embedded logo asset path for this pane's agent, if any.
+    pub fn agent_logo(&self) -> Option<&'static str> {
+        let id = self.agent.as_deref()?;
+        crate::agent::AGENTS
+            .iter()
+            .find(|a| a.id.eq_ignore_ascii_case(id) || a.name.eq_ignore_ascii_case(id))
+            .and_then(|a| a.logo)
+    }
+
+    /// How the target reads in compact buttons or sent receipts.
     pub fn label(&self) -> String {
-        format!("窗格 {} · {}", self.ordinal, self.title)
+        if !self.title.is_empty() {
+            self.title.clone()
+        } else if let Some(name) = self.agent_name() {
+            format!("{name} · 窗格 {}", self.ordinal)
+        } else {
+            format!("窗格 {}", self.ordinal)
+        }
+    }
+
+    /// Secondary metadata line shown in target picker rows.
+    pub fn subtitle(&self) -> String {
+        let mut parts = Vec::with_capacity(4);
+        if let Some(name) = self.agent_name() {
+            parts.push(name.to_string());
+        } else if let Some(agent) = &self.agent {
+            parts.push(agent.clone());
+        } else {
+            parts.push("Shell".to_string());
+        }
+        if !self.tab_name.is_empty() {
+            parts.push(self.tab_name.clone());
+        }
+        parts.push(format!("窗格 {}", self.ordinal));
+        if self.focused {
+            parts.push("当前聚焦".to_string());
+        }
+        parts.join(" · ")
     }
 }
 

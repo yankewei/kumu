@@ -49,6 +49,7 @@ fn patch_view(
                 source,
                 message,
                 context,
+                initial_file: None,
                 host,
                 reviews: store,
                 notify_panel: Rc::new(|_| {}),
@@ -133,19 +134,41 @@ fn the_diff_view_parses_the_commits_patch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_diff_view_parses_an_uncommitted_change(cx: &mut TestAppContext) {
+fn the_diff_view_parses_combined_working_tree_changes(cx: &mut TestAppContext) {
     let (dir, path) = fixture();
-    std::fs::write(path.join("new"), "new\n").unwrap();
-    let changes = crate::git::changes(&path).unwrap();
-    let change = changes.unstaged[0].clone();
+    std::fs::write(path.join("a"), "a\nmodified\n").unwrap();
+    std::fs::write(path.join("new.rs"), "fn hello() {}\n").unwrap();
 
-    let source = PatchSource::Change { root: path, change };
-    let view = patch_view(cx, 1, source, "", "未暂存改动", test_host(), empty_store());
+    let source = PatchSource::WorkingTree {
+        root: path,
+        scope: crate::git::WorkingTreeDiffScope::All,
+    };
+    let view = patch_view(
+        cx,
+        1,
+        source,
+        "",
+        "工作区未提交改动",
+        test_host(),
+        empty_store(),
+    );
     cx.run_until_parked();
 
-    let (files, error) = view.read_with(cx, |view, _| (view.index.file_count, view.error.clone()));
+    let (files, paths, error) = view.read_with(cx, |view, _| {
+        (
+            view.index.file_count,
+            view.index
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
+            view.error.clone(),
+        )
+    });
     assert_eq!(error, None);
-    assert_eq!(files, 1);
+    assert_eq!(files, 2);
+    assert!(paths.contains(&"a".to_string()));
+    assert!(paths.contains(&"new.rs".to_string()));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -230,15 +253,19 @@ fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppCo
                 PaneTarget {
                     pane: 7,
                     ordinal: 1,
-                    title: "codex".to_string(),
+                    tab_name: "主工作区".to_string(),
+                    title: "优化 Diff 视图".to_string(),
                     agent: Some("codex".to_string()),
+                    state: None,
                     focused: true,
                 },
                 PaneTarget {
                     pane: 8,
                     ordinal: 2,
-                    title: "claude".to_string(),
+                    tab_name: "主工作区".to_string(),
+                    title: "修复终端换行".to_string(),
                     agent: Some("claude".to_string()),
+                    state: None,
                     focused: false,
                 },
             ]
@@ -273,7 +300,7 @@ fn a_review_comment_reaches_the_chosen_pane_with_its_location(cx: &mut TestAppCo
     assert!(store.drafts.is_empty(), "a sent draft is no longer a draft");
     let record = store.sent.values().next().expect("the send is recorded");
     assert_eq!(record.count, 1);
-    assert_eq!(record.target, "窗格 2 · claude");
+    assert_eq!(record.target, "修复终端换行");
 }
 
 #[gpui::test]

@@ -14,7 +14,7 @@ use super::{
     CHANGE_ROW_HEIGHT, ChangeRow, GitHostEvent, GitPanelAction, GitPanelSnapshot, PanelTab,
     ROW_HEIGHT, file_name, parent_dir, take_panel_mount,
 };
-use crate::git::Commit;
+use crate::git::{Commit, WorkingTreeDiffScope};
 use crate::nsh_ui::assets::icon_svg;
 use crate::nsh_ui::components::meta_text;
 use crate::nsh_ui::theme::{TOKEN_LINK, TOKEN_SUCCESS, TOKEN_WARNING, kumu_color, text_xs_size};
@@ -405,6 +405,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
             let rows = Arc::new(snap.change_rows);
             let rows_len = rows.len();
             let tx = tx_body.clone();
+            let list_marks = marks.clone();
             let list = virtual_list(rows_len, move |pos| {
                 let Some(row) = rows.get(pos.index()) else {
                     return view().h(px(CHANGE_ROW_HEIGHT)).into_element();
@@ -429,7 +430,7 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
                             None => parent_dir(&change.path).to_string(),
                         };
                         let status = change.status;
-                        let mark = marks.mark(&PatchKey::change(project_id, change));
+                        let mark = list_marks.mark(&PatchKey::change(project_id, change));
                         let clicked = change.clone();
                         let tx = tx.clone();
 
@@ -485,17 +486,76 @@ pub(super) fn GitLogRoot(props: GitLogRootProps) -> impl IntoElement {
             .estimated_item_size(px(CHANGE_ROW_HEIGHT))
             .flex_1()
             .into_element();
-            if let Some(banner) = branch_banner {
-                return view()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
+            let working_tree_banner = {
+                let mark = marks.mark(&PatchKey::working_tree(
+                    project_id,
+                    WorkingTreeDiffScope::All,
+                ));
+                let tx_all = tx_body.clone();
+                let title = "查看全部未提交改动".to_string();
+                let subtitle = format!("{} 个文件 · 聚合折叠浏览", snap.change_count);
+                let mut card = view()
+                    .role(AccessibilityRole::Button)
+                    .flex_row()
                     .w_full()
-                    .child(banner)
-                    .child(list)
-                    .into_element();
+                    .px_2p5()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(move || active_theme().radius)
+                    .border_1()
+                    .border_color(move || active_theme().sidebar_border)
+                    .bg(move || active_theme().background)
+                    .app_class("cursor-pointer")
+                    .hover(|s| s.bg(move || active_theme().accent.opacity(0.45)))
+                    .on_press(move || {
+                        send_action(
+                            &tx_all,
+                            GitPanelAction::OpenWorkingTree {
+                                scope: WorkingTreeDiffScope::All,
+                                focus_file: None,
+                            },
+                        );
+                    })
+                    .child(icon_svg("icons/file.svg", 13.0).text_color(link_color))
+                    .child(
+                        view()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                text(title)
+                                    .app_class("truncate")
+                                    .text_size(text_xs_size)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(move || active_theme().foreground),
+                            )
+                            .child(meta_text(subtitle).app_class("truncate")),
+                    );
+                if let Some(mark_el) = render_mark(mark) {
+                    card = card.child(mark_el);
+                }
+                card = card.child(
+                    icon_svg("icons/chevron-right.svg", 12.0)
+                        .text_color(move || active_theme().muted_foreground),
+                );
+                view()
+                    .flex_shrink_0()
+                    .w_full()
+                    .px_2()
+                    .pt_1p5()
+                    .pb_1()
+                    .child(card)
+            };
+
+            let mut container = view().flex_col().flex_1().min_h_0().w_full();
+            if let Some(banner) = branch_banner {
+                container = container.child(banner);
             }
-            return list;
+            return container
+                .child(working_tree_banner)
+                .child(list)
+                .into_element();
         }
 
         // History tab
