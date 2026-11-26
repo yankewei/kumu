@@ -277,7 +277,13 @@ pub fn working_tree_diff(dir: &Path, scope: WorkingTreeDiffScope) -> Result<Patc
     let root = repo_root(dir)?;
     let has_head = git(
         &root,
-        &["--no-optional-locks", "rev-parse", "--verify", "--quiet", "HEAD"],
+        &[
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "HEAD",
+        ],
     )
     .is_ok();
 

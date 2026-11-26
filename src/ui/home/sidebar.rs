@@ -77,11 +77,7 @@ impl KumuApp {
             .collect()
     }
 
-    fn apply_project_branches(
-        &mut self,
-        branches: HashMap<i64, String>,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_project_branches(&mut self, branches: HashMap<i64, String>, cx: &mut Context<Self>) {
         if self.project_branches != branches {
             self.project_branches = branches;
             cx.notify();
@@ -196,9 +192,7 @@ impl KumuApp {
 
             if let Some(branch) = self.project_branches.get(&project.id) {
                 let has_active_child = self.selected == Some(project.id)
-                    || children
-                        .iter()
-                        .any(|wt| self.selected == Some(wt.id));
+                    || children.iter().any(|wt| self.selected == Some(wt.id));
                 project_rows.push(ProjectRowSnapshot {
                     id: project.id,
                     name: project.name.clone(),

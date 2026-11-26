@@ -253,7 +253,10 @@ pub(super) mod view {
                 send(&tx, SidebarAction::NewTerminal(project_id));
             }));
         }
-        if matches!(kind, ProjectRowKind::PlainProject | ProjectRowKind::RepoHeader) {
+        if matches!(
+            kind,
+            ProjectRowKind::PlainProject | ProjectRowKind::RepoHeader
+        ) {
             let tx_c = tx.clone();
             let tx_o = tx.clone();
             items.push(MenuItem::new("新建 worktree").on_select(move || {
@@ -679,11 +682,7 @@ pub(super) mod view {
                     let tx_del = tx_del.clone();
                     let tx_term = tx_term.clone();
                     let tx_wt = tx_wt.clone();
-                    let mut actions = view()
-                        .flex_row()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap_0p5();
+                    let mut actions = view().flex_row().flex_shrink_0().items_center().gap_0p5();
                     match kind {
                         ProjectRowKind::RepoHeader => {
                             actions = actions

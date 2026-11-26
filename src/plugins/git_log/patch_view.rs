@@ -646,15 +646,13 @@ mod nsh_view {
                         .app_class("cursor-pointer")
                         .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                         .on_press(move || sidebar_open.update(|s| *s = !*s))
-                        .child(
-                            icon_svg("icons/panel-left.svg", 14.0).text_color(move || {
-                                if cur_sidebar {
-                                    active_theme().foreground
-                                } else {
-                                    active_theme().muted_foreground
-                                }
-                            }),
-                        ),
+                        .child(icon_svg("icons/panel-left.svg", 14.0).text_color(move || {
+                            if cur_sidebar {
+                                active_theme().foreground
+                            } else {
+                                active_theme().muted_foreground
+                            }
+                        })),
                 );
             }
 
@@ -908,9 +906,7 @@ mod nsh_view {
                 }
 
                 if is_viewed {
-                    row = row.child(
-                        icon_svg("icons/check.svg", 12.0).text_color(success_color),
-                    );
+                    row = row.child(icon_svg("icons/check.svg", 12.0).text_color(success_color));
                 }
 
                 list = list.child(row);
@@ -1154,9 +1150,8 @@ mod nsh_view {
                                     .app_class("cursor-pointer")
                                     .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                                     .on_press(move || {
-                                        let now_viewed = !viewed_files
-                                            .get_untracked()
-                                            .contains(&viewed_path);
+                                        let now_viewed =
+                                            !viewed_files.get_untracked().contains(&viewed_path);
                                         viewed_files.update(|set| {
                                             if now_viewed {
                                                 set.insert(viewed_path.clone());
@@ -1181,13 +1176,15 @@ mod nsh_view {
                                             }
                                         })
                                         .text_size(text_xs_size)
-                                        .text_color(move || {
-                                            if viewed_files.get().contains(&path) {
-                                                success_color()
-                                            } else {
-                                                active_theme().muted_foreground
-                                            }
-                                        }),
+                                        .text_color(
+                                            move || {
+                                                if viewed_files.get().contains(&path) {
+                                                    success_color()
+                                                } else {
+                                                    active_theme().muted_foreground
+                                                }
+                                            },
+                                        ),
                                     ),
                             )
                             .into_element()
@@ -1287,11 +1284,9 @@ mod nsh_view {
                                             .on_press(move || {
                                                 send(&tx_remove, PatchAction::RemoveComment(idx));
                                             })
-                                            .child(
-                                                icon_svg("icons/x.svg", 11.0).text_color(
-                                                    move || active_theme().muted_foreground,
-                                                ),
-                                            ),
+                                            .child(icon_svg("icons/x.svg", 11.0).text_color(
+                                                move || active_theme().muted_foreground,
+                                            )),
                                     ),
                             )
                             .child(

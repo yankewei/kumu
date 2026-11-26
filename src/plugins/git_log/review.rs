@@ -284,7 +284,10 @@ pub(super) fn normalize_and_index_patch(raw: &str, truncated: bool) -> (String, 
                     binary: false,
                 });
             } else if let Some(file) = index.files.last_mut() {
-                if let Some(p) = current_new_path.clone().or_else(|| current_old_path.clone()) {
+                if let Some(p) = current_new_path
+                    .clone()
+                    .or_else(|| current_old_path.clone())
+                {
                     file.path = p;
                 }
                 if current_old_path.is_none() && current_new_path.is_some() {

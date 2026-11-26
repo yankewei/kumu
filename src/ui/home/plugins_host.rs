@@ -397,12 +397,12 @@ impl KumuApp {
             .enumerate()
             .map(|(index, pane)| {
                 let agent_entry = self.agent_status.get(&pane);
-                let agent = agent_entry
-                    .map(|entry| entry.agent.clone())
-                    .or_else(|| match self.launches.get(&pane) {
+                let agent = agent_entry.map(|entry| entry.agent.clone()).or_else(|| {
+                    match self.launches.get(&pane) {
                         Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
                         _ => None,
-                    });
+                    }
+                });
                 let state = agent_entry.and_then(|entry| entry.state);
                 let title = agent_entry
                     .map(AgentEntry::display_title)
