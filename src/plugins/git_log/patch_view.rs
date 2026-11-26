@@ -337,8 +337,8 @@ mod nsh_view {
 
         // --- Header & Top Reading Toolbar ---
         let tx_scope = actions_tx.clone();
-        let dv_hunk_prev = dv_ref.clone();
-        let dv_hunk_next = dv_ref.clone();
+        let dv_hunk_prev = dv_ref;
+        let dv_hunk_next = dv_ref;
 
         let header = dynamic(move || {
             let title = title_sig.get();
@@ -564,8 +564,8 @@ mod nsh_view {
 
             // Hunk navigation stepper
             if hunks_total > 0 {
-                let dv_prev = dv_hunk_prev.clone();
-                let dv_next = dv_hunk_next.clone();
+                let dv_prev = dv_hunk_prev;
+                let dv_next = dv_hunk_next;
                 let counter = match hunk_pos {
                     Some(i) => format!("{} / {}", i + 1, hunks_total),
                     None => format!("{hunks_total} 处"),
@@ -778,7 +778,7 @@ mod nsh_view {
         });
 
         // --- Left Collapsible File List Sidebar ---
-        let dv_sidebar = dv_ref.clone();
+        let dv_sidebar = dv_ref;
         let file_sidebar = dynamic(move || {
             let files = files_sig.get();
             if files.len() <= 1 || !sidebar_open.get() {
@@ -788,8 +788,8 @@ mod nsh_view {
             let viewed = viewed_files.get();
             let collapsed = collapsed_files.get();
 
-            let dv_collapse_all = dv_sidebar.clone();
-            let dv_expand_all = dv_sidebar.clone();
+            let dv_collapse_all = dv_sidebar;
+            let dv_expand_all = dv_sidebar;
             let files_for_collapse = files.clone();
             let files_for_expand = files.clone();
 
@@ -804,7 +804,7 @@ mod nsh_view {
                 let dir = parent_dir(&path).to_string();
                 let added = file.added;
                 let deleted = file.deleted;
-                let dv_jump = dv_sidebar.clone();
+                let dv_jump = dv_sidebar;
                 let jump_path = path.clone();
 
                 let mut row = view()
@@ -985,7 +985,7 @@ mod nsh_view {
 
         // --- Diff Viewport (Mounted once per Ready state; updates reactively without losing scroll!) ---
         let tx_diff = actions_tx.clone();
-        let dv_for_body = dv_ref.clone();
+        let dv_for_body = dv_ref;
         let diff_viewport = dynamic(move || match body_state.get() {
             DiffBodyState::Error(error) => view()
                 .flex_1()
@@ -1012,8 +1012,8 @@ mod nsh_view {
             DiffBodyState::Ready => {
                 let tx_add = tx_diff.clone();
                 let tx_edit = tx_diff.clone();
-                let dv_header = dv_for_body.clone();
-                let dv_stats = dv_for_body.clone();
+                let dv_header = dv_for_body;
+                let dv_stats = dv_for_body;
 
                 diff_view()
                     .component_ref(&dv_for_body)
@@ -1057,9 +1057,9 @@ mod nsh_view {
                         let deleted = file.deleted;
                         let binary = file.binary;
 
-                        let dv_toggle = dv_header.clone();
+                        let dv_toggle = dv_header;
                         let toggle_path = path.clone();
-                        let dv_viewed = dv_header.clone();
+                        let dv_viewed = dv_header;
                         let viewed_path = path.clone();
                         let viewed_path_check = path.clone();
 
