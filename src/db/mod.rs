@@ -101,10 +101,6 @@ pub struct TodoItem {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_ref: Option<String>,
 }
 
 /// Partial update for [`Store::update_todo`]. `None` leaves a field untouched;
@@ -684,69 +680,5 @@ mod tests {
         // Deleting the root project cascades to its todos.
         store.delete_project(root).unwrap();
         assert!(store.todos(root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn migrate_v7_and_idempotent_upsert_imported_todo_preserve_local_progress() {
-        let store = store();
-        let version: i64 = store
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 7);
-
-        let root = store.insert_project("kumu", "/tmp/kumu").unwrap();
-        let task = crate::tracker::ImportedTask {
-            kind: crate::tracker::TrackerKind::GitHub,
-            source_ref: "GitHub #40".into(),
-            source_url: "https://github.com/kumu-one/kumu/issues/40".into(),
-            title: "Original issue title".into(),
-            description: "Original body".into(),
-        };
-
-        let (created_item, created) = store
-            .upsert_imported_todo(root, &task, TodoStatus::Todo, None, None, None)
-            .unwrap();
-        assert!(created);
-        assert_eq!(
-            created_item.source_url.as_deref(),
-            Some("https://github.com/kumu-one/kumu/issues/40")
-        );
-        assert_eq!(created_item.source_ref.as_deref(), Some("GitHub #40"));
-
-        // Move locally to InProgress and bind a pane.
-        let active = store
-            .update_todo(
-                created_item.id,
-                &TodoPatch {
-                    status: Some(TodoStatus::InProgress),
-                    pane_id: Some(Some(11)),
-                    agent_id: Some(Some("claude".into())),
-                    awaiting_review: Some(true),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(active.status, TodoStatus::InProgress);
-
-        // Re-importing the same URL updates title/description while preserving local workflow state.
-        let updated_task = crate::tracker::ImportedTask {
-            title: "Updated issue title".into(),
-            description: "Updated body".into(),
-            ..task
-        };
-        let (synced_item, created_again) = store
-            .upsert_imported_todo(root, &updated_task, TodoStatus::Todo, None, None, None)
-            .unwrap();
-        assert!(!created_again);
-        assert_eq!(synced_item.id, created_item.id);
-        assert_eq!(synced_item.title, "Updated issue title");
-        assert_eq!(synced_item.description, "Updated body");
-        assert_eq!(synced_item.status, TodoStatus::InProgress);
-        assert_eq!(synced_item.pane_id, Some(11));
-        assert_eq!(synced_item.agent_id.as_deref(), Some("claude"));
-        assert!(synced_item.awaiting_review);
-        assert_eq!(store.todos(root).unwrap().len(), 1);
     }
 }

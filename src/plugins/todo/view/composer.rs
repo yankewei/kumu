@@ -18,9 +18,6 @@ pub(super) struct ComposerSignals {
     pub composer_open: Signal<bool>,
     pub composer_title: Signal<String>,
     pub composer_desc: Signal<String>,
-    pub import_open: Signal<bool>,
-    pub import_draft: Signal<String>,
-    pub importing: Signal<bool>,
 }
 
 pub(super) fn render_composer_section(
@@ -66,28 +63,6 @@ pub(super) fn render_composer_section(
                 TodoAction::CreateTodo {
                     title,
                     description,
-                    dispatch_default: dispatch,
-                },
-            );
-        }
-    };
-
-    let submit_import = {
-        let tx = tx.clone();
-        move |dispatch: bool| {
-            if signals.importing.get_untracked() {
-                return;
-            }
-            let input_val = signals.import_draft.get_untracked().trim().to_string();
-            if input_val.is_empty() {
-                return;
-            }
-            signals.importing.set(true);
-            signals.notice.set(None);
-            send_action(
-                &tx,
-                TodoAction::ImportTask {
-                    input: input_val,
                     dispatch_default: dispatch,
                 },
             );
@@ -188,201 +163,53 @@ pub(super) fn render_composer_section(
                         ),
                 ),
         );
-    } else if signals.import_open.get() {
-        let is_importing = signals.importing.get();
-        let submit_only = submit_import.clone();
-        let submit_dispatch = submit_import.clone();
-        let submit_enter = submit_import;
-        let import_label = if is_importing {
-            "导入中…"
-        } else {
-            "导入"
-        };
-        let import_dispatch_label = if is_importing {
-            "导入中…".to_string()
-        } else {
-            format!("导入并交给 {default_label}")
-        };
+    } else {
         quick_wrap = quick_wrap.child(
             view()
-                .flex_col()
-                .p_2()
+                .flex_row()
                 .gap_1p5()
-                .rounded(move || active_theme().radius)
-                .bg(move || active_theme().background)
-                .border_1()
-                .border_color(move || active_theme().border)
+                .items_center()
                 .child(
                     input()
-                        .w_full()
+                        .flex_1()
                         .px_2()
                         .py_1()
                         .rounded(move || active_theme().radius)
                         .border_1()
                         .border_color(move || active_theme().input)
                         .bg(move || active_theme().background)
-                        .placeholder("粘贴 GitHub / GitLab / Jira 链接，或 #40 / PROJ-123")
+                        .placeholder("添加待办…")
                         .placeholder_color(move || active_theme().muted_foreground.light)
                         .text_size(text_xs_size)
                         .text_color(move || active_theme().foreground)
-                        .value(move || signals.import_draft.get())
-                        .on_change(move |v: &str| signals.import_draft.set(v.to_owned()))
-                        .on_submit(move |_: &str| submit_enter(false)),
+                        .value(move || signals.quick_draft.get())
+                        .on_change(move |v: &str| signals.quick_draft.set(v.to_owned()))
+                        .on_submit(move |_: &str| submit_quick(false)),
                 )
                 .child(
                     view()
-                        .flex_row()
-                        .gap_1p5()
-                        .items_center()
+                        .role(AccessibilityRole::Button)
+                        .label("展开多行说明")
+                        .p_1p5()
+                        .rounded(move || active_theme().radius)
+                        .bg(move || active_theme().background)
+                        .border_1()
+                        .border_color(move || active_theme().border)
+                        .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
+                        .on_press(move || {
+                            let draft = signals.quick_draft.get_untracked();
+                            if !draft.trim().is_empty() {
+                                signals.composer_title.set(draft);
+                                signals.quick_draft.set(String::new());
+                            }
+                            signals.composer_open.set(true);
+                        })
                         .child(
-                            kumu_button(import_label, ButtonVariant::Ghost)
-                                .disabled(is_importing)
-                                .on_press(move || submit_only(false)),
-                        )
-                        .child(
-                            kumu_button(import_dispatch_label, ButtonVariant::Primary)
-                                .disabled(is_importing)
-                                .on_press(move || submit_dispatch(true)),
-                        )
-                        .child(view().flex_1())
-                        .child(
-                            view()
-                                .role(AccessibilityRole::Button)
-                                .label("关闭导入")
-                                .p_1()
-                                .rounded(move || active_theme().radius)
-                                .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
-                                .on_press(move || signals.import_open.set(false))
-                                .child(
-                                    icon_svg("icons/x.svg", 12.0)
-                                        .text_color(move || active_theme().muted_foreground),
-                                ),
+                            icon_svg("icons/plus.svg", 13.0)
+                                .text_color(move || active_theme().foreground),
                         ),
                 ),
         );
-    } else {
-        let tx_quick_import = tx;
-        quick_wrap = quick_wrap
-            .child(
-                view()
-                    .flex_row()
-                    .gap_1p5()
-                    .items_center()
-                    .child(
-                        input()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded(move || active_theme().radius)
-                            .border_1()
-                            .border_color(move || active_theme().input)
-                            .bg(move || active_theme().background)
-                            .placeholder("添加待办…")
-                            .placeholder_color(move || active_theme().muted_foreground.light)
-                            .text_size(text_xs_size)
-                            .text_color(move || active_theme().foreground)
-                            .value(move || signals.quick_draft.get())
-                            .on_change(move |v: &str| signals.quick_draft.set(v.to_owned()))
-                            .on_submit(move |_: &str| submit_quick(false)),
-                    )
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label("展开多行说明")
-                            .p_1p5()
-                            .rounded(move || active_theme().radius)
-                            .bg(move || active_theme().background)
-                            .border_1()
-                            .border_color(move || active_theme().border)
-                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
-                            .on_press(move || {
-                                let draft = signals.quick_draft.get_untracked();
-                                if !draft.trim().is_empty() {
-                                    signals.composer_title.set(draft);
-                                    signals.quick_draft.set(String::new());
-                                }
-                                signals.import_open.set(false);
-                                signals.composer_open.set(true);
-                            })
-                            .child(
-                                icon_svg("icons/plus.svg", 13.0)
-                                    .text_color(move || active_theme().foreground),
-                            ),
-                    )
-                    .child(
-                        view()
-                            .role(AccessibilityRole::Button)
-                            .label("从外部导入")
-                            .p_1p5()
-                            .rounded(move || active_theme().radius)
-                            .bg(move || active_theme().background)
-                            .border_1()
-                            .border_color(move || active_theme().border)
-                            .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
-                            .on_press(move || {
-                                let draft = signals.quick_draft.get_untracked();
-                                if crate::tracker::looks_like_tracker_url(&draft) {
-                                    signals.import_draft.set(draft.trim().to_string());
-                                    signals.quick_draft.set(String::new());
-                                }
-                                signals.composer_open.set(false);
-                                signals.import_open.set(true);
-                            })
-                            .child(
-                                icon_svg("icons/git-branch.svg", 13.0)
-                                    .text_color(move || active_theme().foreground),
-                            ),
-                    ),
-            )
-            .child(dynamic(move || {
-                let draft = signals.quick_draft.get();
-                if !crate::tracker::looks_like_tracker_url(&draft) {
-                    return view().into_element();
-                }
-                let is_importing = signals.importing.get();
-                let tx_btn = tx_quick_import.clone();
-                view()
-                    .flex_row()
-                    .px_2()
-                    .py_1()
-                    .gap_1p5()
-                    .rounded(move || active_theme().radius)
-                    .bg(move || active_theme().sidebar_accent.opacity(0.55))
-                    .items_center()
-                    .child(meta_text("识别为外部任务链接"))
-                    .child(view().flex_1())
-                    .child(
-                        kumu_button(
-                            if is_importing {
-                                "导入中…"
-                            } else {
-                                "直接导入"
-                            },
-                            ButtonVariant::Ghost,
-                        )
-                        .disabled(is_importing)
-                        .on_press(move || {
-                            if signals.importing.get_untracked() {
-                                return;
-                            }
-                            let url = signals.quick_draft.get_untracked().trim().to_string();
-                            if url.is_empty() {
-                                return;
-                            }
-                            signals.quick_draft.set(String::new());
-                            signals.importing.set(true);
-                            signals.notice.set(None);
-                            send_action(
-                                &tx_btn,
-                                TodoAction::ImportTask {
-                                    input: url,
-                                    dispatch_default: false,
-                                },
-                            );
-                        }),
-                    )
-                    .into_element()
-            }));
     }
 
     quick_wrap.child(render_notice_banner(signals.notice))

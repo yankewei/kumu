@@ -7,6 +7,7 @@ mod board;
 mod cards;
 mod composer;
 mod detail;
+mod dispatch_picker;
 mod menus;
 
 use futures::StreamExt;
@@ -14,7 +15,7 @@ use futures::channel::mpsc::UnboundedSender;
 use nsh_base::theme as active_theme;
 use nsh_core::element::{AccessibilityRole, SignalEquals, signal_with};
 use nsh_core::prelude::*;
-use nsh_core::{MouseButton, MouseEvent};
+use nsh_core::{KeyEvent, MouseButton, MouseEvent};
 
 use super::{TodoAction, TodoBoardSnapshot, TodoHostEvent, take_mount};
 use crate::db::{TodoItem, TodoStatus};
@@ -24,6 +25,7 @@ use crate::nsh_ui::theme::{link_color, text_xs_size};
 use self::board::{BoardContext, LaneSignals, render_board_view};
 use self::composer::ComposerSignals;
 use self::detail::{DetailSignals, render_detail_view};
+use self::dispatch_picker::{DispatchPickerState, render_dispatch_picker_overlay};
 
 #[derive(Clone, Debug, PartialEq, Props)]
 pub(super) struct TodoRootProps {
@@ -54,60 +56,6 @@ struct DragState {
 fn send_action(tx: &Option<UnboundedSender<TodoAction>>, action: TodoAction) {
     if let Some(tx) = tx {
         let _ = tx.unbounded_send(action);
-    }
-}
-
-pub(super) fn render_source_badge(
-    tx: &Option<UnboundedSender<TodoAction>>,
-    item: &TodoItem,
-) -> Option<AnyElement> {
-    let ref_label = item
-        .source_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    let external_url = item
-        .source_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
-        .map(str::to_string);
-
-    let label_text = text(ref_label.to_string())
-        .text_size(text_xs_size)
-        .text_color(move || active_theme().muted_foreground);
-
-    if let Some(url) = external_url {
-        let tx = tx.clone();
-        Some(
-            view()
-                .role(AccessibilityRole::Button)
-                .label(format!("打开 {ref_label}"))
-                .flex_row()
-                .flex_shrink_0()
-                .h(px(18.0))
-                .px_1p5()
-                .rounded(px(4.0))
-                .bg(move || active_theme().sidebar_accent.opacity(0.65))
-                .hover(|s| s.bg(move || link_color().opacity(0.16)))
-                .items_center()
-                .on_press(move || send_action(&tx, TodoAction::OpenUrl(url.clone())))
-                .child(label_text)
-                .into_element(),
-        )
-    } else {
-        Some(
-            view()
-                .flex_row()
-                .flex_shrink_0()
-                .h(px(18.0))
-                .px_1p5()
-                .rounded(px(4.0))
-                .bg(move || active_theme().sidebar_accent.opacity(0.65))
-                .items_center()
-                .child(label_text)
-                .into_element(),
-        )
     }
 }
 
@@ -166,9 +114,6 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
         composer_open: signal(false),
         composer_title: signal(String::new()),
         composer_desc: signal(String::new()),
-        import_open: signal(false),
-        import_draft: signal(String::new()),
-        importing: signal(false),
     };
 
     let lanes = LaneSignals {
@@ -186,6 +131,9 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
         followup: signal(String::new()),
     };
 
+    // Custom NSH dispatch / bind agent popover state.
+    let picker = DispatchPickerState::new();
+
     // Lightweight mouse drag state across lanes (never interferes with wheel scroll).
     let drag = DragState {
         candidate: signal(Option::<DragCandidate>::None),
@@ -194,6 +142,7 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
     };
 
     let open_detail = move |item: TodoItem| {
+        picker.close();
         detail.notice.set(None);
         detail.title.set(item.title);
         detail.desc.set(item.description);
@@ -210,11 +159,19 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
                         let next_board = next.board_id;
                         if prev_board != next_board {
                             detail.id.set(None);
+                            picker.close();
                             notice.set(None);
-                        } else if let Some(id) = detail.id.get_untracked()
-                            && !next.todos.iter().any(|t| t.id == id)
-                        {
-                            detail.id.set(None);
+                        } else {
+                            if let Some(id) = detail.id.get_untracked()
+                                && !next.todos.iter().any(|t| t.id == id)
+                            {
+                                detail.id.set(None);
+                            }
+                            if let Some(id) = picker.todo_id.get_untracked()
+                                && !next.todos.iter().any(|t| t.id == id)
+                            {
+                                picker.close();
+                            }
                         }
                         board.set(next);
                     }
@@ -230,19 +187,13 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
                     TodoHostEvent::ClearFollowup => {
                         detail.followup.set(String::new());
                     }
-                    TodoHostEvent::ImportFinished { clear_input } => {
-                        composer.importing.set(false);
-                        if clear_input {
-                            composer.import_draft.set(String::new());
-                            composer.import_open.set(false);
-                        }
-                    }
                 }
             }
         });
     }
 
     let tx_content = actions_tx.clone();
+    let tx_picker = actions_tx.clone();
     let tx_drop = actions_tx;
 
     let content = dynamic(move || {
@@ -259,7 +210,8 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
         if let Some(id) = detail.id.get()
             && let Some(item) = snap.todos.iter().find(|t| t.id == id).cloned()
         {
-            return render_detail_view(tx_content.clone(), detail, item, snap).into_element();
+            return render_detail_view(tx_content.clone(), detail, picker, item, snap)
+                .into_element();
         }
 
         render_board_view(
@@ -268,10 +220,16 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
                 composer,
                 lanes,
                 drag,
+                picker,
                 open_detail,
             },
             snap,
         )
+    });
+
+    let picker_overlay = dynamic(move || {
+        let snap = board.get();
+        render_dispatch_picker_overlay(tx_picker.clone(), picker, &snap)
     });
 
     // Floating drag preview chip
@@ -312,6 +270,11 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
                 .font_sans
                 .clone()
                 .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
+        })
+        .on_key_down(move |ev: &KeyEvent| {
+            if ev.key == "Escape" && picker.todo_id.get_untracked().is_some() {
+                picker.close();
+            }
         })
         .on_mouse_move(move |ev: &MouseEvent| {
             if ev.pressed_button != Some(MouseButton::Left) {
@@ -356,4 +319,5 @@ pub(super) fn TodoRoot(props: TodoRootProps) -> impl IntoElement {
         })
         .child(content)
         .child(drag_chip)
+        .child(picker_overlay)
 }

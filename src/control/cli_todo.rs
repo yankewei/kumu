@@ -1,14 +1,13 @@
 use crate::db::{TodoItem, TodoStatus};
 
 use super::cli::{USAGE, call, caller_pane, flags, print_json, runtime_error, usage_error};
-use super::protocol::{Request, TodoImportResult};
+use super::protocol::Request;
 
 pub(super) fn todo_cli(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("list" | "ls") => todo_list(&args[1..]),
         Some("show" | "get") => todo_show(&args[1..]),
         Some("add" | "new") => todo_add(&args[1..]),
-        Some("import") => todo_import(&args[1..]),
         Some("update" | "edit") => todo_update(&args[1..]),
         Some("review") => todo_review(&args[1..]),
         Some("done" | "complete") => todo_done(&args[1..]),
@@ -171,65 +170,6 @@ fn todo_add(args: &[String]) -> i32 {
         return print_json(&item);
     }
     println!("{}", todo_summary_line(&item));
-    0
-}
-
-fn todo_import(args: &[String]) -> i32 {
-    let mut input = None;
-    let mut status = TodoStatus::Todo;
-    let mut bind = false;
-    let mut json = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--json" => json = true,
-            "--bind" => bind = true,
-            "--status" | "-s" => {
-                let Some(raw) = iter.next() else {
-                    return usage_error("--status needs todo, in_progress, or done");
-                };
-                let Some(parsed) = TodoStatus::parse(raw) else {
-                    return usage_error(&format!(
-                        "unknown status '{raw}': use todo, in_progress, or done"
-                    ));
-                };
-                status = parsed;
-            }
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return 0;
-            }
-            other if other.starts_with('-') => {
-                return usage_error(&format!("unknown option {other}"));
-            }
-            other if input.is_none() => input = Some(other),
-            other => return usage_error(&format!("unexpected argument '{other}'")),
-        }
-    }
-    let Some(input) = input.filter(|s| !s.trim().is_empty()) else {
-        return usage_error("give an issue URL or shorthand reference (#40 / PROJ-123)");
-    };
-    let value = match call(&Request::TodoImport {
-        from: caller_pane(),
-        input: input.to_string(),
-        status,
-        bind,
-    }) {
-        Ok(value) => value,
-        Err(error) => return runtime_error(&error),
-    };
-    let result: TodoImportResult = match serde_json::from_value(value) {
-        Ok(result) => result,
-        Err(error) => return runtime_error(&format!("unexpected reply: {error}")),
-    };
-    if json {
-        return print_json(&result);
-    }
-    if result.created {
-        println!("{}", todo_summary_line(&result.todo));
-    } else {
-        println!("{} (synced)", todo_summary_line(&result.todo));
-    }
     0
 }
 

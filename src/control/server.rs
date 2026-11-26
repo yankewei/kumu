@@ -485,20 +485,6 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
                 Err(_) => Err(ControlError::new("timeout", "kumu did not answer")),
             }
         }
-        Request::TodoImport {
-            from,
-            input,
-            status,
-            bind,
-        } => exchange_with_timeout(commands, Duration::from_secs(20), |reply| {
-            Command::TodoImport {
-                from,
-                input,
-                status,
-                bind,
-                reply,
-            }
-        }),
     }
 }
 

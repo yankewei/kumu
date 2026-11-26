@@ -4,10 +4,11 @@ use futures::channel::mpsc::UnboundedSender;
 use nsh_core::element::desktop::MenuItem;
 
 use super::send_action;
-use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
 use crate::plugins::AgentPaneInfo;
-use crate::plugins::todo::{TodoAction, TodoDispatchTarget, short_agent_name};
+use crate::plugins::todo::{
+    TodoAction, TodoDispatchTarget, format_pane_menu_label, pane_disambiguation, short_agent_name,
+};
 
 /// Arguments for building the right-click context menu of a TODO card or row.
 pub(super) struct CardContextMenuArgs<F> {
@@ -32,12 +33,13 @@ pub(super) fn build_dispatch_menu_items(
     if installed_agents.is_empty() {
         items.push(MenuItem::new("未检测到已安装的 Agent").disabled(true));
     } else {
-        for (agent_id, agent_name) in &installed_agents {
+        for (agent_id, _agent_name) in &installed_agents {
             let is_default = default_agent.as_deref() == Some(agent_id.as_str());
+            let name = short_agent_name(agent_id);
             let label = if is_default {
-                format!("分屏启动 {agent_name}（默认）")
+                format!("分屏启动 {name}（默认）")
             } else {
-                format!("分屏启动 {agent_name}")
+                format!("分屏启动 {name}")
             };
             let tx = tx.clone();
             let todo_id = item.id;
@@ -55,11 +57,11 @@ pub(super) fn build_dispatch_menu_items(
         }
         let sub_items: Vec<MenuItem> = installed_agents
             .iter()
-            .map(|(agent_id, agent_name)| {
+            .map(|(agent_id, _agent_name)| {
                 let tx = tx.clone();
                 let todo_id = item.id;
                 let agent_id = agent_id.clone();
-                MenuItem::new(agent_name.clone()).on_select(move || {
+                MenuItem::new(short_agent_name(&agent_id)).on_select(move || {
                     send_action(
                         &tx,
                         TodoAction::DispatchNewAgent {
@@ -75,11 +77,11 @@ pub(super) fn build_dispatch_menu_items(
 
         let wt_items: Vec<MenuItem> = installed_agents
             .iter()
-            .map(|(agent_id, agent_name)| {
+            .map(|(agent_id, _agent_name)| {
                 let tx = tx.clone();
                 let todo_id = item.id;
                 let agent_id = agent_id.clone();
-                MenuItem::new(agent_name.clone()).on_select(move || {
+                MenuItem::new(short_agent_name(&agent_id)).on_select(move || {
                     send_action(
                         &tx,
                         TodoAction::DispatchNewAgent {
@@ -95,14 +97,17 @@ pub(super) fn build_dispatch_menu_items(
     }
 
     if !live_panes.is_empty() {
+        let (multi_project, tab_counts) = pane_disambiguation(&live_panes);
         items.push(MenuItem::separator());
         for pane in &live_panes {
-            let status = pane.state.map_or("空闲", AgentState::label);
+            let multi_in_tab = tab_counts
+                .get(&(pane.project_id, pane.tab_name.clone()))
+                .copied()
+                .unwrap_or(0)
+                > 1;
             let label = format!(
-                "发送到 窗格 {} · {}（{}）",
-                pane.ordinal,
-                short_agent_name(&pane.agent),
-                status
+                "发送到 {}",
+                format_pane_menu_label(pane, multi_project, multi_in_tab)
             );
             let tx = tx.clone();
             let todo_id = item.id;
@@ -121,13 +126,12 @@ pub(super) fn build_dispatch_menu_items(
         let link_items: Vec<MenuItem> = live_panes
             .iter()
             .map(|pane| {
-                let status = pane.state.map_or("空闲", AgentState::label);
-                let label = format!(
-                    "窗格 {} · {}（{}）",
-                    pane.ordinal,
-                    short_agent_name(&pane.agent),
-                    status
-                );
+                let multi_in_tab = tab_counts
+                    .get(&(pane.project_id, pane.tab_name.clone()))
+                    .copied()
+                    .unwrap_or(0)
+                    > 1;
+                let label = format_pane_menu_label(pane, multi_project, multi_in_tab);
                 let tx = tx.clone();
                 let todo_id = item.id;
                 let pane_info = pane.clone();

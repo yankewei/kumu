@@ -162,7 +162,7 @@ impl KumuApp {
                 }
             }
         }
-        out.sort_by_key(|row| row.state.map_or(4, AgentState::priority));
+        out.sort_by_key(|row| (!row.focused, row.state.map_or(4, AgentState::priority)));
         out
     }
 

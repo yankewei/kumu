@@ -33,14 +33,6 @@ pub(super) fn format_task_prompt(todo: &TodoItem) -> String {
     let title = todo.title.trim();
     let desc = todo.description.trim();
     let mut prompt = format!("请完成以下 TODO 任务（#{}）：{}", todo.id, title);
-    if let Some(url) = todo
-        .source_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        prompt.push_str(&format!("\n来源：{url}"));
-    }
     if !desc.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(desc);
@@ -64,6 +56,114 @@ pub(super) fn short_agent_name(agent_id: &str) -> String {
             .find(|def| def.id == other)
             .map(|def| def.name.to_string())
             .unwrap_or_else(|| other.to_string()),
+    }
+}
+
+/// Embedded logo asset path for an agent id or display name.
+pub(super) fn agent_logo_path(agent_id: &str) -> Option<&'static str> {
+    AGENTS
+        .iter()
+        .find(|def| {
+            def.id.eq_ignore_ascii_case(agent_id) || def.name.eq_ignore_ascii_case(agent_id)
+        })
+        .and_then(|def| def.logo)
+}
+
+/// Conversation / session title of `pane` when it carries more information than
+/// the bare agent name itself.
+pub(super) fn pane_display_title(pane: &AgentPaneInfo) -> Option<&str> {
+    let trimmed = pane.title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let short = short_agent_name(&pane.agent);
+    if trimmed.eq_ignore_ascii_case(&pane.agent) || trimmed.eq_ignore_ascii_case(&short) {
+        return None;
+    }
+    if AGENTS
+        .iter()
+        .find(|def| def.id.eq_ignore_ascii_case(&pane.agent))
+        .is_some_and(|def| trimmed.eq_ignore_ascii_case(def.name))
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// Compute `(has_multiple_projects, tab_counts)` so pane locations only show
+/// worktree names or pane ordinals when needed to disambiguate.
+pub(super) fn pane_disambiguation(
+    panes: &[AgentPaneInfo],
+) -> (bool, std::collections::HashMap<(i64, String), usize>) {
+    let mut first_project: Option<i64> = None;
+    let mut multi_project = false;
+    let mut tab_counts: std::collections::HashMap<(i64, String), usize> =
+        std::collections::HashMap::new();
+    for pane in panes {
+        match first_project {
+            None => first_project = Some(pane.project_id),
+            Some(id) if id != pane.project_id => multi_project = true,
+            _ => {}
+        }
+        *tab_counts
+            .entry((pane.project_id, pane.tab_name.clone()))
+            .or_insert(0) += 1;
+    }
+    (multi_project, tab_counts)
+}
+
+/// Compact location label for a pane (e.g. `"主终端"`, `"wt-auth / 主终端"`,
+/// `"终端 2 · 窗格 2"`).
+pub(super) fn pane_location_label(
+    pane: &AgentPaneInfo,
+    multi_project: bool,
+    multi_in_tab: bool,
+) -> String {
+    let mut base = String::new();
+    if multi_project && !pane.project_name.trim().is_empty() {
+        base.push_str(pane.project_name.trim());
+    }
+    let tab = pane.tab_name.trim();
+    if !tab.is_empty() {
+        if !base.is_empty() {
+            base.push_str(" / ");
+        }
+        base.push_str(tab);
+    }
+    if multi_in_tab || base.is_empty() {
+        if !base.is_empty() {
+            base.push_str(" · ");
+        }
+        base.push_str(&format!("窗格 {}", pane.ordinal));
+    }
+    base
+}
+
+/// Single-line label for native context menus (`Agent「对话标题」· 页签（当前 · 状态）`).
+pub(super) fn format_pane_menu_label(
+    pane: &AgentPaneInfo,
+    multi_project: bool,
+    multi_in_tab: bool,
+) -> String {
+    let agent = short_agent_name(&pane.agent);
+    let location = pane_location_label(pane, multi_project, multi_in_tab);
+    let status = pane.state.map_or("空闲", AgentState::label);
+    let suffix = if pane.focused {
+        format!("当前 · {status}")
+    } else {
+        status.to_string()
+    };
+    if let Some(title) = pane_display_title(pane) {
+        let clipped: String = if title.chars().count() > 18 {
+            let mut s: String = title.chars().take(18).collect();
+            s.push('…');
+            s
+        } else {
+            title.to_string()
+        };
+        format!("{agent}「{clipped}」· {location}（{suffix}）")
+    } else {
+        format!("{agent} · {location}（{suffix}）")
     }
 }
 
@@ -108,7 +208,6 @@ pub(super) enum TodoHostEvent {
     ClearNotice,
     OpenInProgressLane,
     ClearFollowup,
-    ImportFinished { clear_input: bool },
 }
 
 /// Where a newly dispatched TODO Agent should open.
@@ -127,11 +226,6 @@ pub(super) enum TodoAction {
         description: String,
         dispatch_default: bool,
     },
-    ImportTask {
-        input: String,
-        dispatch_default: bool,
-    },
-    OpenUrl(String),
     SetStatus {
         id: i64,
         status: TodoStatus,
@@ -434,15 +528,6 @@ impl TodoPanel {
                 }
                 self.push_snapshot(cx);
             }
-            TodoAction::ImportTask {
-                input,
-                dispatch_default,
-            } => {
-                self.import_task(input, dispatch_default, cx);
-            }
-            TodoAction::OpenUrl(url) => {
-                self.open_external_url(&url);
-            }
             TodoAction::SetStatus { id, status } => {
                 self.set_status(id, status, cx);
                 self.push_snapshot(cx);
@@ -563,92 +648,6 @@ impl TodoPanel {
                 cx,
             )
         })
-    }
-
-    fn import_task(&mut self, input: String, dispatch_default: bool, cx: &mut Context<Self>) {
-        let Some(project) = self.project.clone() else {
-            let _ = self
-                .events_tx
-                .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
-            self.push_notice("请先选择一个项目", true);
-            return;
-        };
-        let _ = self.events_tx.unbounded_send(TodoHostEvent::ClearNotice);
-        let repo_dir = project.path.clone();
-        let project_id = project.id;
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_executor()
-                .spawn(async move { crate::tracker::fetch_task(&input, &repo_dir) })
-                .await;
-            let _ = this.update(cx, |panel, cx| match fetched {
-                Ok(task) => {
-                    let Some(workspace) = panel.host.workspace() else {
-                        let _ = panel
-                            .events_tx
-                            .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
-                        return;
-                    };
-                    let result = workspace.update(cx, |ws, cx| {
-                        ws.upsert_imported_todo(
-                            project_id,
-                            &task,
-                            TodoStatus::Todo,
-                            None,
-                            None,
-                            None,
-                            cx,
-                        )
-                    });
-                    match result {
-                        Some((item, created)) => {
-                            let _ = panel
-                                .events_tx
-                                .unbounded_send(TodoHostEvent::ImportFinished {
-                                    clear_input: true,
-                                });
-                            if !created {
-                                panel.push_notice(
-                                    "该任务已在看板中，已保留本地进度并同步最新内容",
-                                    false,
-                                );
-                            } else if dispatch_default {
-                                panel.dispatch_default_agent(&item, cx);
-                            } else {
-                                panel.push_notice(format!("已导入 {}", task.source_ref), false);
-                            }
-                            panel.push_snapshot(cx);
-                        }
-                        None => {
-                            let _ = panel
-                                .events_tx
-                                .unbounded_send(TodoHostEvent::ImportFinished {
-                                    clear_input: false,
-                                });
-                            panel.push_notice("保存导入任务失败", true);
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = panel
-                        .events_tx
-                        .unbounded_send(TodoHostEvent::ImportFinished { clear_input: false });
-                    panel.push_notice(err.to_string(), true);
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn open_external_url(&self, url: &str) {
-        let trimmed = url.trim();
-        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(trimmed).spawn();
-        }
     }
 
     fn set_status(&mut self, id: i64, status: TodoStatus, cx: &mut Context<Self>) {
@@ -840,8 +839,6 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
-            source_url: None,
-            source_ref: None,
         };
         assert_eq!(
             todo_branch_name(&mk(12, "Fix OSC parser!")),
@@ -867,8 +864,6 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
-            source_url: None,
-            source_ref: None,
         };
         assert_eq!(
             format_task_prompt(&item),
@@ -878,11 +873,6 @@ mod tests {
         assert_eq!(
             format_task_prompt(&item),
             "请完成以下 TODO 任务（#12）：Fix OSC parser\n\nHandle kumu-status signals\nAdd tests"
-        );
-        item.source_url = Some("https://github.com/kumu-one/kumu/issues/40".into());
-        assert_eq!(
-            format_task_prompt(&item),
-            "请完成以下 TODO 任务（#12）：Fix OSC parser\n来源：https://github.com/kumu-one/kumu/issues/40\n\nHandle kumu-status signals\nAdd tests"
         );
     }
 
@@ -910,8 +900,6 @@ mod tests {
                     created_at: String::new(),
                     updated_at: String::new(),
                     completed_at: None,
-                    source_url: None,
-                    source_ref: None,
                 },
                 TodoItem {
                     id: 2,
@@ -927,8 +915,6 @@ mod tests {
                     created_at: String::new(),
                     updated_at: String::new(),
                     completed_at: None,
-                    source_url: None,
-                    source_ref: None,
                 },
             ],
             live_panes: vec![AgentPaneInfo {
@@ -992,6 +978,116 @@ mod tests {
             })
             .expect("send notice");
         app.wait_for("测试提示").expect("notice renders");
+    }
+
+    #[test]
+    fn todo_dispatch_picker_shows_pane_identity_and_emits_bind_and_launch() {
+        let (_events_tx, events_rx) = unbounded::<TodoHostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<TodoAction>();
+
+        let focused_pane = AgentPaneInfo {
+            pane: 8,
+            project_id: 1,
+            project_name: "kumu".into(),
+            tab_name: "主终端".into(),
+            ordinal: 1,
+            agent: "agy".into(),
+            title: "优化 TODO 插件".into(),
+            state: Some(AgentState::Running),
+            focused: true,
+        };
+        let initial = TodoBoardSnapshot {
+            has_project: true,
+            board_id: Some(1),
+            shared_board_name: None,
+            todos: vec![
+                TodoItem {
+                    id: 1,
+                    project_id: 1,
+                    title: "完善派发选择器".into(),
+                    description: String::new(),
+                    status: TodoStatus::Todo,
+                    position: 0,
+                    pane_id: None,
+                    agent_id: None,
+                    agent_session_id: None,
+                    awaiting_review: false,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    completed_at: None,
+                },
+                TodoItem {
+                    id: 2,
+                    project_id: 1,
+                    title: "已关联的任务".into(),
+                    description: String::new(),
+                    status: TodoStatus::InProgress,
+                    position: 0,
+                    pane_id: Some(8),
+                    agent_id: Some("agy".into()),
+                    agent_session_id: None,
+                    awaiting_review: false,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    completed_at: None,
+                },
+            ],
+            live_panes: vec![focused_pane.clone()],
+            installed_agents: vec![("claude".into(), "Claude Code".into())],
+            default_agent: Some("claude".into()),
+        };
+
+        let mount_id = MOUNTS.register(TodoMount {
+            initial,
+            events_rx,
+            actions_tx,
+        });
+        let root = nsh_core::element::Root::new::<view::TodoRoot>(move || view::TodoRootProps {
+            mount_id: mount_id.into(),
+        });
+        let mut app = nsh_testing::Headless::start(EngineConfig::new(root)).expect("start TODO");
+
+        app.wait_for("完善派发选择器").expect("todo card renders");
+
+        // Open the custom NSH dispatch picker from the split button's chevron.
+        app.press("选择 Agent 或关联已有窗格")
+            .expect("open dispatch picker");
+        app.wait_for("优化 TODO 插件")
+            .expect("pane conversation title renders");
+        app.wait_for("当前").expect("focused badge renders");
+        app.wait_for("Agy · 主终端 · 运行中")
+            .expect("pane metadata renders");
+
+        // Toggle off sending prompt, then bind the existing pane.
+        app.press("切换是否同时发送任务 Prompt")
+            .expect("toggle send prompt");
+        app.wait_for("仅关联窗格").expect("footer hint updates");
+        app.press("优化 TODO 插件 · Agy · 主终端 · 运行中")
+            .expect("select existing pane");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(TodoAction::BindExistingPane {
+                id: 1,
+                pane: focused_pane,
+                send_prompt: false,
+            })
+        );
+
+        // Re-open picker, switch to "启动新 Agent" tab, and launch in new tab.
+        app.press("选择 Agent 或关联已有窗格")
+            .expect("reopen dispatch picker");
+        app.press("启动新 Agent").expect("switch to new agent tab");
+        app.wait_for("Claude").expect("installed agent renders");
+        app.press("在新页签中启动 Claude")
+            .expect("launch agent in new tab");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(TodoAction::DispatchNewAgent {
+                id: 1,
+                agent_id: "claude".into(),
+                target: TodoDispatchTarget::NewTab,
+            })
+        );
     }
 
     #[gpui::test]

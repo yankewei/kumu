@@ -10,6 +10,7 @@ use nsh_core::prelude::*;
 
 use super::cards::{CardContext, render_done_row, render_in_progress_card, render_todo_card};
 use super::composer::{ComposerSignals, render_composer_section};
+use super::dispatch_picker::DispatchPickerState;
 use super::{DragState, send_action};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
@@ -31,6 +32,7 @@ pub(super) struct BoardContext<F> {
     pub composer: ComposerSignals,
     pub lanes: LaneSignals,
     pub drag: DragState,
+    pub picker: DispatchPickerState,
     pub open_detail: F,
 }
 
@@ -91,6 +93,7 @@ where
         tx: &ctx.tx,
         snap: &snap,
         drag: ctx.drag,
+        picker: ctx.picker,
         open_detail: ctx.open_detail,
     };
 

@@ -39,7 +39,6 @@ mod nsh_ui;
 mod plugins;
 mod term;
 mod theme;
-mod tracker;
 mod ui;
 mod updates;
 mod window_state;

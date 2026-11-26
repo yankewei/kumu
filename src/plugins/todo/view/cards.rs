@@ -6,11 +6,12 @@ use futures::channel::mpsc::UnboundedSender;
 use nsh_base::theme as active_theme;
 use nsh_core::ContextMenuEvent;
 use nsh_core::element::AccessibilityRole;
-use nsh_core::element::desktop::{popup_menu, popup_menu_at};
+use nsh_core::element::desktop::popup_menu_at;
 use nsh_core::prelude::*;
 
-use super::menus::{CardContextMenuArgs, build_card_context_menu_items, build_dispatch_menu_items};
-use super::{DragCandidate, DragState, render_source_badge, send_action};
+use super::dispatch_picker::DispatchPickerState;
+use super::menus::{CardContextMenuArgs, build_card_context_menu_items};
+use super::{DragCandidate, DragState, send_action};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
 use crate::nsh_ui::assets::icon_svg;
@@ -23,6 +24,7 @@ pub(super) struct CardContext<'a, F> {
     pub tx: &'a Option<UnboundedSender<TodoAction>>,
     pub snap: &'a TodoBoardSnapshot,
     pub drag: DragState,
+    pub picker: DispatchPickerState,
     pub open_detail: F,
 }
 
@@ -196,14 +198,12 @@ where
                 .into_element(),
         )
     } else if live_pane.is_none() {
-        let tx = ctx.tx.clone();
-        let menu_item = item.clone();
-        let installed = ctx.snap.installed_agents.clone();
-        let panes = ctx.snap.live_panes.clone();
-        let def = ctx.snap.default_agent.clone();
+        let picker = ctx.picker;
+        let has_live_panes = !ctx.snap.live_panes.is_empty();
         Some(
             view()
                 .role(AccessibilityRole::Button)
+                .label("派发或关联 Agent")
                 .flex_shrink_0()
                 .flex_row()
                 .items_center()
@@ -213,16 +213,7 @@ where
                 .rounded(px(5.0))
                 .bg(move || active_theme().sidebar)
                 .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
-                .on_press(move || {
-                    let items = build_dispatch_menu_items(
-                        tx.clone(),
-                        menu_item.clone(),
-                        installed.clone(),
-                        panes.clone(),
-                        def.clone(),
-                    );
-                    drop(popup_menu(items));
-                })
+                .on_press(move || picker.open(id, has_live_panes))
                 .child(
                     text("派发")
                         .text_size(text_xs_size)
@@ -286,10 +277,6 @@ where
                         ),
                 ),
         );
-
-    if let Some(badge) = render_source_badge(ctx.tx, item) {
-        body = body.child(view().flex_row().items_center().child(badge));
-    }
 
     body = body.child({
         let mut footer = view()
@@ -365,18 +352,14 @@ where
 {
     let id = item.id;
     let drag = ctx.drag;
+    let picker = ctx.picker;
+    let has_live_panes = !ctx.snap.live_panes.is_empty();
     let open_detail = ctx.open_detail;
     let drag_title = item.title.clone();
     let open_item = item.clone();
     let more_item = item.clone();
     let tx_dispatch = ctx.tx.clone();
-    let tx_menu = ctx.tx.clone();
     let tx_done = ctx.tx.clone();
-
-    let menu_item = item.clone();
-    let menu_installed = ctx.snap.installed_agents.clone();
-    let menu_panes = ctx.snap.live_panes.clone();
-    let menu_default = ctx.snap.default_agent.clone();
 
     let ctx_tx = ctx.tx.clone();
     let ctx_item = item.clone();
@@ -434,16 +417,7 @@ where
                 .items_center()
                 .justify_center()
                 .hover(|s| s.bg(move || active_theme().accent.opacity(0.75)))
-                .on_press(move || {
-                    let items = build_dispatch_menu_items(
-                        tx_menu.clone(),
-                        menu_item.clone(),
-                        menu_installed.clone(),
-                        menu_panes.clone(),
-                        menu_default.clone(),
-                    );
-                    drop(popup_menu(items));
-                })
+                .on_press(move || picker.open(id, has_live_panes))
                 .child(
                     icon_svg("icons/chevron-down.svg", 11.0)
                         .text_color(move || active_theme().muted_foreground),
@@ -536,10 +510,6 @@ where
                 ),
         );
 
-    if let Some(badge) = render_source_badge(ctx.tx, item) {
-        card = card.child(view().flex_row().items_center().child(badge));
-    }
-
     if let Some(preview) = desc_preview {
         card = card.child(meta_text(preview));
     }
@@ -614,9 +584,6 @@ where
                 .text_color(move || active_theme().muted_foreground)
                 .line_through(),
         );
-    if let Some(badge) = render_source_badge(ctx.tx, item) {
-        row = row.child(badge);
-    }
     if let Some(agent) = item.agent_id.as_deref() {
         row = row.child(meta_text(short_agent_name(agent)));
     }

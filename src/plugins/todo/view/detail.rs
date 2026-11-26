@@ -4,19 +4,21 @@ use std::collections::HashMap;
 
 use futures::channel::mpsc::UnboundedSender;
 use nsh_base::{input, theme as active_theme};
-use nsh_core::element::desktop::popup_menu;
 use nsh_core::element::{AccessibilityRole, scroll};
 use nsh_core::prelude::*;
 
-use super::menus::build_dispatch_menu_items;
-use super::{render_notice_banner, render_source_badge, send_action};
+use super::dispatch_picker::DispatchPickerState;
+use super::{render_notice_banner, send_action};
 use crate::agent::AgentState;
 use crate::db::{TodoItem, TodoStatus};
-use crate::nsh_ui::assets::icon_svg;
+use crate::nsh_ui::assets::{agent_logo, icon_svg};
 use crate::nsh_ui::components::{ButtonVariant, kumu_button, meta_text};
 use crate::nsh_ui::theme::{link_color, success_color, text_xs_size, warning_color};
 use crate::plugins::AgentPaneInfo;
-use crate::plugins::todo::{TodoAction, TodoBoardSnapshot, short_agent_name};
+use crate::plugins::todo::{
+    TodoAction, TodoBoardSnapshot, agent_logo_path, pane_disambiguation, pane_display_title,
+    pane_location_label, short_agent_name,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct DetailSignals {
@@ -37,6 +39,7 @@ impl DetailSignals {
 pub(super) fn render_detail_view(
     tx: Option<UnboundedSender<TodoAction>>,
     signals: DetailSignals,
+    picker: DispatchPickerState,
     item: TodoItem,
     snap: TodoBoardSnapshot,
 ) -> View {
@@ -56,6 +59,7 @@ pub(super) fn render_detail_view(
     let agent_section = render_agent_section(
         tx.clone(),
         signals.followup,
+        picker,
         &item,
         &snap,
         live_pane,
@@ -183,7 +187,7 @@ fn render_detail_header(
     item: &TodoItem,
 ) -> View {
     let id = item.id;
-    let mut header = view()
+    view()
         .flex_row()
         .flex_shrink_0()
         .h(px(32.0))
@@ -213,13 +217,7 @@ fn render_detail_header(
                         .text_color(move || active_theme().foreground),
                 ),
         )
-        .child(view().flex_1());
-
-    if let Some(badge) = render_source_badge(&tx, item) {
-        header = header.child(badge);
-    }
-
-    header
+        .child(view().flex_1())
         .child(
             text(format!("#{id}"))
                 .font_family(move || {
@@ -301,9 +299,11 @@ fn render_status_segmented(
     status_seg
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_agent_section(
     tx: Option<UnboundedSender<TodoAction>>,
     detail_followup: Signal<String>,
+    picker: DispatchPickerState,
     item: &TodoItem,
     snap: &TodoBoardSnapshot,
     live_pane: Option<AgentPaneInfo>,
@@ -344,6 +344,18 @@ fn render_agent_section(
         };
 
         let pane_id = pane.pane;
+        let (multi_project, tab_counts) = pane_disambiguation(&snap.live_panes);
+        let multi_in_tab = tab_counts
+            .get(&(pane.project_id, pane.tab_name.clone()))
+            .copied()
+            .unwrap_or(0)
+            > 1;
+        let location_label = pane_location_label(&pane, multi_project, multi_in_tab);
+        let session_title = pane_display_title(&pane)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}（新会话）", short_agent_name(&pane.agent)));
+        let logo_path = agent_logo_path(&pane.agent);
+
         let tx_jump = tx.clone();
         let tx_unbind = tx.clone();
         let tx_followup_submit = tx.clone();
@@ -389,7 +401,29 @@ fn render_agent_section(
                                     ),
                             )
                             .child(view().flex_1())
-                            .child(meta_text(format!("窗格 {}", pane.ordinal))),
+                            .child(meta_text(location_label)),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .w_full()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .gap_1p5()
+                            .rounded(px(5.0))
+                            .bg(move || active_theme().sidebar.opacity(0.75))
+                            .items_center()
+                            .child(agent_logo(logo_path, 14.0))
+                            .child(
+                                text(session_title)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .app_class("truncate")
+                                    .text_size(text_xs_size)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(move || active_theme().foreground),
+                            ),
                     )
                     .child(
                         view()
@@ -482,12 +516,8 @@ fn render_agent_section(
             .as_deref()
             .map(short_agent_name)
             .unwrap_or_else(|| "Agent".to_string());
-        let tx_default = tx.clone();
-        let tx_menu = tx;
-        let menu_item = item.clone();
-        let menu_installed = snap.installed_agents.clone();
-        let menu_panes = snap.live_panes.clone();
-        let menu_default = snap.default_agent.clone();
+        let tx_default = tx;
+        let has_live_panes = !snap.live_panes.is_empty();
 
         let mut box_el = view()
             .flex_col()
@@ -529,16 +559,7 @@ fn render_agent_section(
                             .hover(|s| s.bg(move || active_theme().accent.opacity(0.6)))
                             .items_center()
                             .justify_center()
-                            .on_press(move || {
-                                let items = build_dispatch_menu_items(
-                                    tx_menu.clone(),
-                                    menu_item.clone(),
-                                    menu_installed.clone(),
-                                    menu_panes.clone(),
-                                    menu_default.clone(),
-                                );
-                                drop(popup_menu(items));
-                            })
+                            .on_press(move || picker.open(id, has_live_panes))
                             .child(
                                 icon_svg("icons/chevron-down.svg", 13.0)
                                     .text_color(move || active_theme().muted_foreground),

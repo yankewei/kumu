@@ -46,7 +46,6 @@ usage:
   kumu todo list [--status todo|in_progress|done] [--mine] [--json]
   kumu todo show <ID> [--json]
   kumu todo add <TITLE...> [--desc TEXT] [--status todo|in_progress|done] [--bind] [--json]
-  kumu todo import <URL-OR-REF> [--status todo|in_progress|done] [--bind] [--json]
   kumu todo update <ID> [--title TEXT] [--desc TEXT] [--status todo|in_progress|done] [--review|--no-review] [--bind|--unbind] [--json]
   kumu todo review <ID> [--json]
   kumu todo done <ID> [--json]
@@ -156,7 +155,6 @@ pub(super) fn call_at_instance(
         Request::Wait { timeout_secs, .. } => {
             Duration::from_secs((*timeout_secs).clamp(1, MAX_WAIT_TIMEOUT_SECS) + 10)
         }
-        Request::TodoImport { .. } => Duration::from_secs(25),
         _ => REPLY_TIMEOUT + Duration::from_secs(2),
     };
     let _ = stream.set_read_timeout(Some(read_timeout));
