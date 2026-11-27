@@ -6,7 +6,6 @@ use super::{AgentEntry, KumuApp, agent_display_name, shell_prompt, submits_after
 use crate::agent::AgentState;
 use crate::agent::launch::PaneLaunch;
 use crate::app::layout::{PaneId, PaneNode, ProjectTab, ProjectTabs, SplitAxis};
-use crate::db::TodoStatus;
 use crate::plugins::{
     AgentPaneInfo, DispatchMode, PaneTarget, PluginHost, PluginProject, PluginSpec, SendOutcome,
 };
@@ -40,10 +39,6 @@ impl KumuApp {
     pub(super) fn plugin_host(&self, cx: &Context<Self>) -> PluginHost {
         let home = cx.entity().downgrade();
         let listing = home.clone();
-        let agent_listing = home.clone();
-        let dispatcher = home.clone();
-        let any_sender = home.clone();
-        let revealer = home.clone();
         let sheet_opener = home.clone();
         let sheet_closer = home.clone();
         PluginHost::with_panes(
@@ -58,34 +53,6 @@ impl KumuApp {
                     .upgrade()
                     .map(|home| home.read(cx).plugin_panes(project, cx))
                     .unwrap_or_default()
-            },
-        )
-        .with_agent_tools(
-            self.workspace.clone(),
-            move |board_id, cx| {
-                agent_listing
-                    .upgrade()
-                    .map(|home| home.read(cx).plugin_agent_panes(board_id, cx))
-                    .unwrap_or_default()
-            },
-            move |project_id, agent_id, mode, prompt, cx| {
-                let Some(home) = dispatcher.upgrade() else {
-                    return Err("窗口已关闭".to_string());
-                };
-                home.update(cx, |app, cx| {
-                    app.dispatch_agent_for_todo(project_id, agent_id, mode, prompt, cx)
-                })
-            },
-            move |pane, text, cx| {
-                let Some(home) = any_sender.upgrade() else {
-                    return Err("窗口已关闭".to_string());
-                };
-                home.update(cx, |app, cx| app.send_text_to_any_pane(pane, text, cx))
-            },
-            move |pane, window, cx| {
-                if let Some(home) = revealer.upgrade() {
-                    home.update(cx, |app, cx| app.reveal_agent(PaneId(pane), window, cx));
-                }
             },
         )
         .with_sheet_tools(
@@ -264,7 +231,7 @@ impl KumuApp {
     }
 
     /// Open a new tab in `project_id` running `launch` directly.
-    fn open_agent_tab(
+    pub(super) fn open_agent_tab(
         &mut self,
         project_id: i64,
         tab_name: String,
@@ -349,33 +316,6 @@ impl KumuApp {
         })
         .detach();
         Ok(SendOutcome::Submitted)
-    }
-
-    /// Semantic attention color for the title-bar TODO icon, if the selected
-    /// project's board has a Waiting agent (warning) or awaiting-review task (success).
-    fn todo_attention_color(&self, cx: &Context<Self>) -> Option<Hsla> {
-        let project = self.selected?;
-        let todos = self.workspace.read(cx).todos_for_project(project);
-        let colors = &KumuTheme::global(cx).colors;
-        let mut has_review = false;
-        for todo in todos {
-            if todo.status != TodoStatus::InProgress {
-                continue;
-            }
-            if let Some(pane) = todo.pane_id
-                && self
-                    .agent_status
-                    .get(&PaneId(pane))
-                    .and_then(|entry| entry.state)
-                    == Some(AgentState::Waiting)
-            {
-                return Some(colors.warning);
-            }
-            if todo.awaiting_review {
-                has_review = true;
-            }
-        }
-        has_review.then_some(colors.success)
     }
 
     /// The panes a plugin may hand text to, in layout order. For agent panes,
@@ -613,9 +553,6 @@ impl KumuApp {
         } else {
             colors.muted_foreground
         };
-        let attention = (spec.id == "todo")
-            .then(|| self.todo_attention_color(cx))
-            .flatten();
         let icon = spec.icon;
         let plugin_id = spec.id;
         let plugin_title = spec.title;
@@ -651,18 +588,6 @@ impl KumuApp {
             .child(svg().path(icon).size(px(14.)).text_color(foreground));
 
         let mut wrapper = div().relative().child(button);
-        if let Some(dot_color) = attention {
-            wrapper = wrapper.child(
-                div()
-                    .absolute()
-                    .top(px(2.))
-                    .right(px(2.))
-                    .w(px(6.))
-                    .h(px(6.))
-                    .rounded_full()
-                    .bg(dot_color),
-            );
-        }
         if hovered {
             wrapper = wrapper.child(
                 deferred(

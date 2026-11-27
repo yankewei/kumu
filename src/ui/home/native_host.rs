@@ -5,7 +5,7 @@
 //!   renderer + macOS CJK IME). Deliberately returns `focus_handle() -> None` so
 //!   NSH's `AppView::tab_entered` never steals `Tab` / `Shift-Tab` completion.
 //! - `"kumu.plugin"` — embeds the active right-hand plugin `AnyView`
-//!   (`TodoPanel` or `GitLogPanel`).
+//!   (such as `GitLogPanel`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;

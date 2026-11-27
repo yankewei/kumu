@@ -263,6 +263,7 @@ mod tests {
                                 agent_id: Some("claude".into()),
                                 agent_session_id: None,
                                 awaiting_review: true,
+                                links: Vec::new(),
                                 created_at: "2026-11-21 00:00:00".into(),
                                 updated_at: "2026-11-21 00:00:00".into(),
                                 completed_at: None,

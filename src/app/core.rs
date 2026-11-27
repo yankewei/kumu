@@ -11,7 +11,7 @@ use crate::agent::launch::{AgentCommand, PaneLaunch, SESSION_PREFIX, authenticat
 use crate::agent::status::{
     STATUS_PREFIX, StatusSignal, TITLE_PREFIX, TITLE_PROMPT_PREFIX, clean_reported_title,
 };
-use crate::db::{Project, Store, TodoItem, TodoPatch, TodoStatus, db_path};
+use crate::db::{Project, Store, TodoAgentLink, TodoItem, TodoPatch, TodoStatus, db_path};
 use crate::term::{
     KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification,
     TermProgramStatus,
@@ -446,7 +446,7 @@ impl WorkspaceCore {
         }
     }
 
-    /// Record the latest agent id and session id for TODOs linked to `pane_id`.
+    /// Record the latest agent id and session id for TODO links bound to `pane_id`.
     pub fn update_pane_todos_session(
         &mut self,
         pane_id: u64,
@@ -456,7 +456,7 @@ impl WorkspaceCore {
     ) {
         match self
             .store
-            .update_pane_todos_session(pane_id, agent_id, session_id)
+            .sync_pane_link_session(pane_id, agent_id, session_id)
         {
             Ok(boards) => {
                 for board_id in boards {
@@ -467,9 +467,26 @@ impl WorkspaceCore {
         }
     }
 
-    /// Detach `pane_id` from TODOs when that pane closes or exits back to a shell.
+    /// Record the latest display title for TODO links bound to `pane_id`.
+    pub fn sync_pane_link_label(
+        &mut self,
+        pane_id: u64,
+        label: &str,
+        events: &mut Vec<WorkspaceEvent>,
+    ) {
+        match self.store.sync_pane_link_label(pane_id, label) {
+            Ok(boards) => {
+                for board_id in boards {
+                    self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 更新 TODO 会话标题失败：{error}"),
+        }
+    }
+
+    /// Detach `pane_id` from TODO links when that pane closes or exits back to a shell.
     pub fn unbind_pane_todos(&mut self, pane_id: u64, events: &mut Vec<WorkspaceEvent>) {
-        match self.store.unbind_pane_todos(pane_id) {
+        match self.store.detach_pane_links(pane_id) {
             Ok(boards) => {
                 for board_id in boards {
                     self.emit(events, WorkspaceEvent::TodosChanged(board_id));
@@ -477,6 +494,229 @@ impl WorkspaceCore {
             }
             Err(error) => eprintln!("[app] 解绑 TODO 窗格失败：{error}"),
         }
+    }
+
+    /// Create a TODO item and optional initial link atomically in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_todo_with_link(
+        &mut self,
+        project_id: i64,
+        title: &str,
+        description: &str,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        link_project_id: Option<i64>,
+        link_label: &str,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> Option<TodoItem> {
+        let board_id = self.board_project_id(project_id);
+        match self.store.insert_todo_with_link(
+            board_id,
+            title,
+            description,
+            status,
+            pane_id,
+            agent_id,
+            agent_session_id,
+            link_project_id,
+            link_label,
+        ) {
+            Ok(item) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                Some(item)
+            }
+            Err(error) => {
+                self.emit_failed(events, "创建 TODO 失败", error);
+                None
+            }
+        }
+    }
+
+    /// Append or idempotently update an agent/session link on `todo_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_todo_link(
+        &mut self,
+        todo_id: i64,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        pane_id: Option<u64>,
+        project_id: Option<i64>,
+        label: &str,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> Option<TodoAgentLink> {
+        match self.store.add_todo_link(
+            todo_id,
+            agent_id,
+            agent_session_id,
+            pane_id,
+            project_id,
+            label,
+        ) {
+            Ok(Some((board_id, link))) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                Some(link)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.emit_failed(events, "关联 Agent 会话失败", error);
+                None
+            }
+        }
+    }
+
+    /// Rebind an existing historical link to a freshly resumed live pane.
+    pub fn rebind_todo_link_pane(
+        &mut self,
+        link_id: i64,
+        pane_id: u64,
+        project_id: Option<i64>,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> bool {
+        match self
+            .store
+            .rebind_todo_link_pane(link_id, pane_id, project_id)
+        {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.emit_failed(events, "恢复会话绑定失败", error);
+                false
+            }
+        }
+    }
+
+    /// Detach live `pane_id` from one link while preserving history.
+    pub fn detach_todo_link_pane(
+        &mut self,
+        link_id: i64,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> bool {
+        match self.store.detach_todo_link_pane(link_id) {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.emit_failed(events, "断开终端关联失败", error);
+                false
+            }
+        }
+    }
+
+    /// Detach a specific pane from a specific TODO item (CLI `--unbind`).
+    pub fn detach_todo_pane_link(
+        &mut self,
+        todo_id: i64,
+        pane_id: u64,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> bool {
+        match self.store.detach_todo_pane_link(todo_id, pane_id) {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.emit_failed(events, "解除 TODO 绑定失败", error);
+                false
+            }
+        }
+    }
+
+    /// Permanently remove one `todo_agent_links` entry.
+    pub fn remove_todo_link(&mut self, link_id: i64, events: &mut Vec<WorkspaceEvent>) -> bool {
+        match self.store.remove_todo_link(link_id) {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.emit_failed(events, "移除会话绑定失败", error);
+                false
+            }
+        }
+    }
+
+    /// Clear `awaiting_review` on one specific `(todo_id, pane_id)` link.
+    pub fn clear_todo_pane_review(
+        &mut self,
+        todo_id: i64,
+        pane_id: u64,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> bool {
+        match self.store.clear_todo_pane_review(todo_id, pane_id) {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("[app] 清除 TODO 待确认状态失败：{error}");
+                false
+            }
+        }
+    }
+
+    /// Clear `awaiting_review` on one specific link id (UI confirmation).
+    pub fn clear_todo_link_review(
+        &mut self,
+        link_id: i64,
+        events: &mut Vec<WorkspaceEvent>,
+    ) -> bool {
+        match self.store.clear_todo_link_review(link_id) {
+            Ok(Some(board_id)) => {
+                self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("[app] 确认 TODO 待确认状态失败：{error}");
+                false
+            }
+        }
+    }
+
+    /// Detach any persisted TODO link `pane_id` not present in `live_pane_ids`.
+    pub fn reconcile_todo_panes(
+        &mut self,
+        live_pane_ids: &[u64],
+        events: &mut Vec<WorkspaceEvent>,
+    ) {
+        match self.store.reconcile_live_panes(live_pane_ids) {
+            Ok(boards) => {
+                for board_id in boards {
+                    self.emit(events, WorkspaceEvent::TodosChanged(board_id));
+                }
+            }
+            Err(error) => eprintln!("[app] 对账 TODO 窗格绑定失败：{error}"),
+        }
+    }
+
+    /// Look up one link by id.
+    pub fn todo_link(&self, link_id: i64) -> Option<TodoAgentLink> {
+        self.store.todo_link(link_id).ok().flatten()
+    }
+
+    /// All TODO items currently bound to live `pane_id`.
+    pub fn todos_for_pane(&self, pane_id: u64) -> Vec<TodoItem> {
+        self.store.todos_for_pane(pane_id).unwrap_or_default()
+    }
+
+    /// Batched lookup of open `(todo_id, title)` badges for a set of panes.
+    pub fn open_todo_summaries_for_panes(
+        &self,
+        pane_ids: &[u64],
+    ) -> HashMap<u64, Vec<(i64, String)>> {
+        self.store
+            .open_todo_summaries_for_panes(pane_ids)
+            .unwrap_or_default()
     }
 
     /// The first project, creating the first-run one when the list is empty.

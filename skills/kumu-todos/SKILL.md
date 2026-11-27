@@ -5,7 +5,7 @@ description: 在 Kumu 里读取和更新当前项目的 TODO 看板。当用户�
 
 # Kumu TODO 看板
 
-Kumu 的右侧 TODO 看板按根仓库隔离（Git Worktree 自动共享父仓库的看板）。在 Kumu 的窗格里，你可以直接通过 `kumu todo` 读写当前仓库的任务，无需指定项目 id——Kumu 会自动按 `$KUMU_PANE` 定位你所在的仓库看板。
+Kumu 的项目级 TODO 看板（在应用内点击左侧项目名或按 `⌘⇧T` 进入）按根仓库隔离（Git Worktree 自动共享父仓库的看板），并支持单条 TODO 同时关联多个 Agent 与历史 Session（1:N）。在 Kumu 的窗格里，你可以直接通过 `kumu todo` 读写当前仓库的任务，无需指定项目 id——Kumu 会自动按 `$KUMU_PANE` 定位你所在的仓库看板，并将 `--bind` / `--unbind` / `review` 精确作用域限定到当前窗格的关联记录，不会影响同一任务下其他协作 Agent 的状态。
 
 - `kumu todo list` 列出当前仓库的任务。
 - `kumu todo show <id>` 查看单条任务的完整描述和关联 Agent 信息。

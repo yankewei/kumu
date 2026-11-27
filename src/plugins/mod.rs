@@ -10,7 +10,6 @@
 //! current without the workspace knowing anything about it.
 
 mod git_log;
-mod todo;
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -18,7 +17,6 @@ use std::rc::Rc;
 use gpui::*;
 
 use crate::agent::AgentState;
-use crate::app::Workspace;
 use crate::db::Project;
 
 /// What happened to text a panel handed to a terminal.
@@ -137,10 +135,6 @@ type SendFn = dyn Fn(i64, Option<u64>, &str, &mut App) -> Result<SendOutcome, St
 /// The window's pane listing, erased the same way.
 type PanesFn = dyn Fn(i64, &App) -> Vec<PaneTarget>;
 
-type AgentPanesFn = dyn Fn(i64, &App) -> Vec<AgentPaneInfo>;
-type DispatchFn = dyn Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String>;
-type SendAnyPaneFn = dyn Fn(u64, &str, &mut App) -> Result<SendOutcome, String>;
-type RevealPaneFn = dyn Fn(u64, &mut Window, &mut App);
 type DismissSheetFn = dyn Fn(&mut App);
 type OpenSheetFn = dyn Fn(ActiveSheet, &mut Window, &mut App);
 type CloseSheetFn = dyn Fn(&mut Window, &mut App);
@@ -176,11 +170,6 @@ impl ActiveSheet {
 pub struct PluginHost {
     send: Rc<SendFn>,
     panes: Rc<PanesFn>,
-    workspace: Option<Entity<Workspace>>,
-    agent_panes: Option<Rc<AgentPanesFn>>,
-    dispatch: Option<Rc<DispatchFn>>,
-    send_any: Option<Rc<SendAnyPaneFn>>,
-    reveal: Option<Rc<RevealPaneFn>>,
     open_sheet: Option<Rc<OpenSheetFn>>,
     close_sheet: Option<Rc<CloseSheetFn>>,
 }
@@ -194,11 +183,6 @@ impl PluginHost {
         Self {
             send: Rc::new(send),
             panes: Rc::new(panes),
-            workspace: None,
-            agent_panes: None,
-            dispatch: None,
-            send_any: None,
-            reveal: None,
             open_sheet: None,
             close_sheet: None,
         }
@@ -213,28 +197,6 @@ impl PluginHost {
         self.open_sheet = Some(Rc::new(open_sheet));
         self.close_sheet = Some(Rc::new(close_sheet));
         self
-    }
-
-    /// Attach workspace access and cross-tab agent dispatch/reveal capabilities
-    /// used by task-oriented panels such as the TODO board.
-    pub fn with_agent_tools(
-        mut self,
-        workspace: Entity<Workspace>,
-        agent_panes: impl Fn(i64, &App) -> Vec<AgentPaneInfo> + 'static,
-        dispatch: impl Fn(i64, &str, DispatchMode, String, &mut App) -> Result<u64, String> + 'static,
-        send_any: impl Fn(u64, &str, &mut App) -> Result<SendOutcome, String> + 'static,
-        reveal: impl Fn(u64, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.workspace = Some(workspace);
-        self.agent_panes = Some(Rc::new(agent_panes));
-        self.dispatch = Some(Rc::new(dispatch));
-        self.send_any = Some(Rc::new(send_any));
-        self.reveal = Some(Rc::new(reveal));
-        self
-    }
-
-    pub fn workspace(&self) -> Option<Entity<Workspace>> {
-        self.workspace.clone()
     }
 
     /// Write `text` into the focused pane of `project`.
@@ -258,53 +220,10 @@ impl PluginHost {
         (self.send)(project, Some(pane), text, cx)
     }
 
-    /// Write `text` into any live pane (across tabs or worktrees).
-    pub fn send_to_any_pane(
-        &self,
-        pane: u64,
-        text: &str,
-        cx: &mut App,
-    ) -> Result<SendOutcome, String> {
-        let Some(send_any) = &self.send_any else {
-            return Err("当前宿主不支持跨页签发送".to_string());
-        };
-        (send_any)(pane, text, cx)
-    }
-
     /// The panes `project` shows, in layout order. Empty when the host cannot
     /// list them, which leaves a panel on the focused pane alone.
     pub fn panes(&self, project: i64, cx: &App) -> Vec<PaneTarget> {
         (self.panes)(project, cx)
-    }
-
-    /// Live agent panes belonging to `board_id` and its worktrees, across all tabs.
-    pub fn agent_panes(&self, board_id: i64, cx: &App) -> Vec<AgentPaneInfo> {
-        self.agent_panes
-            .as_ref()
-            .map(|list| (list)(board_id, cx))
-            .unwrap_or_default()
-    }
-
-    /// Launch a new agent pane in `project_id`, wait for its prompt, and submit `prompt`.
-    pub fn dispatch_agent(
-        &self,
-        project_id: i64,
-        agent_id: &str,
-        mode: DispatchMode,
-        prompt: String,
-        cx: &mut App,
-    ) -> Result<u64, String> {
-        let Some(dispatch) = &self.dispatch else {
-            return Err("当前宿主不支持派发 Agent".to_string());
-        };
-        (dispatch)(project_id, agent_id, mode, prompt, cx)
-    }
-
-    /// Switch to the project/tab owning `pane` and focus its terminal.
-    pub fn reveal_pane(&self, pane: u64, window: &mut Window, cx: &mut App) {
-        if let Some(reveal) = &self.reveal {
-            (reveal)(pane, window, cx);
-        }
     }
 
     /// Present a full-window Pure Rust NSH sheet overlay (e.g. Diff Review).
@@ -405,11 +324,7 @@ impl PluginSpec {
 
 /// Every plugin, in title-bar order.
 pub fn specs() -> impl Iterator<Item = PluginSpec> {
-    [
-        PluginSpec::of::<git_log::GitLogPanel>(),
-        PluginSpec::of::<todo::TodoPanel>(),
-    ]
-    .into_iter()
+    [PluginSpec::of::<git_log::GitLogPanel>()].into_iter()
 }
 
 pub fn spec(id: &str) -> Option<PluginSpec> {

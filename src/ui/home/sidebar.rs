@@ -190,18 +190,28 @@ impl KumuApp {
                 .filter(|wt| wt.parent_id == Some(project.id) && root_seen.insert(wt.id))
                 .collect();
 
+            let summary = self
+                .todo_summaries
+                .get(&project.id)
+                .copied()
+                .unwrap_or_default();
+            let in_board_mode = self.active_todo_board.is_some();
+
             if let Some(branch) = self.project_branches.get(&project.id) {
-                let has_active_child = self.selected == Some(project.id)
-                    || children.iter().any(|wt| self.selected == Some(wt.id));
+                let has_active_child = !in_board_mode
+                    && (self.selected == Some(project.id)
+                        || children.iter().any(|wt| self.selected == Some(wt.id)));
                 project_rows.push(ProjectRowSnapshot {
                     id: project.id,
                     name: project.name.clone(),
                     path: project.path.clone(),
                     kind: ProjectRowKind::RepoHeader,
                     repo_name: None,
-                    active: false,
+                    active: self.active_todo_board == Some(project.id),
                     has_active_child,
                     unread: false,
+                    todo_count: summary.open_count,
+                    todo_attention: summary.needs_attention,
                 });
                 project_rows.push(ProjectRowSnapshot {
                     id: project.id,
@@ -209,9 +219,11 @@ impl KumuApp {
                     path: project.path.clone(),
                     kind: ProjectRowKind::MainWorktree,
                     repo_name: Some(project.name.clone()),
-                    active: self.selected == Some(project.id),
+                    active: !in_board_mode && self.selected == Some(project.id),
                     has_active_child: false,
                     unread: is_unread(project.id),
+                    todo_count: 0,
+                    todo_attention: false,
                 });
             } else {
                 project_rows.push(ProjectRowSnapshot {
@@ -220,9 +232,15 @@ impl KumuApp {
                     path: project.path.clone(),
                     kind: ProjectRowKind::PlainProject,
                     repo_name: None,
-                    active: self.selected == Some(project.id),
+                    active: if in_board_mode {
+                        self.active_todo_board == Some(project.id)
+                    } else {
+                        self.selected == Some(project.id)
+                    },
                     has_active_child: false,
                     unread: is_unread(project.id),
+                    todo_count: summary.open_count,
+                    todo_attention: summary.needs_attention,
                 });
             }
 
@@ -233,23 +251,37 @@ impl KumuApp {
                     path: worktree.path.clone(),
                     kind: ProjectRowKind::LinkedWorktree,
                     repo_name: Some(project.name.clone()),
-                    active: self.selected == Some(worktree.id),
+                    active: !in_board_mode && self.selected == Some(worktree.id),
                     has_active_child: false,
                     unread: is_unread(worktree.id),
+                    todo_count: 0,
+                    todo_attention: false,
                 });
             }
         }
         for project in projects {
             if root_seen.insert(project.id) {
+                let summary = self
+                    .todo_summaries
+                    .get(&project.id)
+                    .copied()
+                    .unwrap_or_default();
+                let in_board_mode = self.active_todo_board.is_some();
                 project_rows.push(ProjectRowSnapshot {
                     id: project.id,
                     name: project.name.clone(),
                     path: project.path.clone(),
                     kind: ProjectRowKind::PlainProject,
                     repo_name: None,
-                    active: self.selected == Some(project.id),
+                    active: if in_board_mode {
+                        self.active_todo_board == Some(project.id)
+                    } else {
+                        self.selected == Some(project.id)
+                    },
                     has_active_child: false,
                     unread: is_unread(project.id),
+                    todo_count: summary.open_count,
+                    todo_attention: summary.needs_attention,
                 });
             }
         }
@@ -298,11 +330,18 @@ impl KumuApp {
         match action {
             SidebarAction::AddProject => self.add_project(cx),
             SidebarAction::SelectProject(project_id) => {
+                self.active_todo_board = None;
+                self.active_todo_modal = None;
                 self.select_project(project_id, cx);
                 self.focus_terminal(window, cx);
                 cx.notify();
             }
+            SidebarAction::OpenProjectBoard(project_id) => {
+                self.open_todo_board(project_id, None, window, cx);
+            }
             SidebarAction::NewTerminal(project_id) => {
+                self.active_todo_board = None;
+                self.active_todo_modal = None;
                 self.add_terminal(Some(project_id), cx);
                 self.focus_terminal(window, cx);
                 cx.notify();
@@ -347,6 +386,8 @@ impl KumuApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.active_todo_board = None;
+        self.active_todo_modal = None;
         self.focus_pane_from_user(pane, cx);
         self.focus_terminal(window, cx);
         cx.notify();

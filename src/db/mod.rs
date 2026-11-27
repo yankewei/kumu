@@ -77,11 +77,36 @@ impl TodoStatus {
     }
 }
 
+/// One Agent / Session binding attached to a [`TodoItem`] (1:N).
+///
+/// `pane_id` points at a live terminal pane while running; when that pane
+/// closes, `pane_id` is cleared to `None` while `agent_id`, `agent_session_id`,
+/// and `project_id` remain so the session can be resumed later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoAgentLink {
+    pub id: i64,
+    pub todo_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i64>,
+    pub label: String,
+    pub awaiting_review: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// One task on a repository's TODO board.
 ///
 /// `project_id` always points at the root repository so worktrees share the
-/// same board. `pane_id` links the task to a live Agent pane; `agent_id` stays
-/// as history even after that pane closes.
+/// same board. `links` is the single source of truth for agent/session
+/// bindings; `pane_id`, `agent_id`, `agent_session_id`, and `awaiting_review`
+/// are derived from `links` for CLI/JSON compatibility.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
@@ -98,23 +123,26 @@ pub struct TodoItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
     pub awaiting_review: bool,
+    #[serde(default)]
+    pub links: Vec<TodoAgentLink>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
 }
 
-/// Partial update for [`Store::update_todo`]. `None` leaves a field untouched;
-/// double-Option fields distinguish "leave untouched" from "clear to NULL".
+/// Partial update for [`Store::update_todo`]. `None` leaves a field untouched.
+/// Agent/session bindings are managed exclusively via `todo_agent_links` APIs.
 #[derive(Clone, Debug, Default)]
 pub struct TodoPatch {
     pub title: Option<String>,
     pub description: Option<String>,
     pub status: Option<TodoStatus>,
-    pub pane_id: Option<Option<u64>>,
-    pub agent_id: Option<Option<String>>,
-    pub agent_session_id: Option<Option<String>>,
     pub awaiting_review: Option<bool>,
+    /// When set alongside `awaiting_review`, scopes the review flag update to
+    /// this specific caller pane's link so sibling agents on the same TODO are
+    /// not affected.
+    pub review_pane_id: Option<u64>,
 }
 
 pub struct Store {
@@ -635,13 +663,15 @@ mod tests {
         assert_eq!(store.todos(root).unwrap().len(), 1);
 
         // Bind to pane 7 and move to in_progress.
+        store
+            .add_todo_link(item.id, Some("claude"), None, Some(7), Some(root), "")
+            .unwrap()
+            .unwrap();
         let active = store
             .update_todo(
                 item.id,
                 &TodoPatch {
                     status: Some(TodoStatus::InProgress),
-                    pane_id: Some(Some(7)),
-                    agent_id: Some(Some("claude".into())),
                     ..Default::default()
                 },
             )
@@ -657,8 +687,8 @@ mod tests {
         assert_eq!(store.clear_pane_todos_review(7).unwrap(), vec![root]);
         assert!(!store.todo(item.id).unwrap().unwrap().awaiting_review);
 
-        // Unbinding a closed pane clears pane_id while preserving agent_id.
-        assert_eq!(store.unbind_pane_todos(7).unwrap(), vec![root]);
+        // Detaching a closed pane clears pane_id while preserving agent_id.
+        assert_eq!(store.detach_pane_links(7).unwrap(), vec![root]);
         let detached = store.todo(item.id).unwrap().unwrap();
         assert_eq!(detached.pane_id, None);
         assert_eq!(detached.agent_id.as_deref(), Some("claude"));

@@ -15,7 +15,7 @@ use gpui::{Context, EventEmitter, Global};
 
 pub use self::core::{NotificationSettings, SpawnedTerminal, WorkspaceCore, WorkspaceEvent};
 use crate::agent::launch::PaneLaunch;
-use crate::db::{Project, TodoItem, TodoPatch, TodoStatus};
+use crate::db::{Project, TodoAgentLink, TodoItem, TodoPatch, TodoStatus};
 use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors};
 use crate::theme;
 
@@ -215,6 +215,187 @@ impl Workspace {
         for event in events {
             cx.emit(event);
         }
+    }
+
+    /// Record the latest display title for TODO links bound to `pane_id`.
+    pub fn sync_pane_link_label(&self, pane_id: u64, label: &str, cx: &mut Context<Self>) {
+        let mut events = Vec::new();
+        self.lock()
+            .sync_pane_link_label(pane_id, label, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+    }
+
+    /// Create a TODO item and optional initial link atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_todo_with_link(
+        &self,
+        project_id: i64,
+        title: &str,
+        description: &str,
+        status: TodoStatus,
+        pane_id: Option<u64>,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        link_project_id: Option<i64>,
+        link_label: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<TodoItem> {
+        let mut events = Vec::new();
+        let item = self.lock().add_todo_with_link(
+            project_id,
+            title,
+            description,
+            status,
+            pane_id,
+            agent_id,
+            agent_session_id,
+            link_project_id,
+            link_label,
+            &mut events,
+        );
+        for event in events {
+            cx.emit(event);
+        }
+        item
+    }
+
+    /// Append or idempotently update an agent/session link on `todo_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_todo_link(
+        &self,
+        todo_id: i64,
+        agent_id: Option<&str>,
+        agent_session_id: Option<&str>,
+        pane_id: Option<u64>,
+        project_id: Option<i64>,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<TodoAgentLink> {
+        let mut events = Vec::new();
+        let link = self.lock().add_todo_link(
+            todo_id,
+            agent_id,
+            agent_session_id,
+            pane_id,
+            project_id,
+            label,
+            &mut events,
+        );
+        for event in events {
+            cx.emit(event);
+        }
+        link
+    }
+
+    /// Rebind an existing historical link to a freshly resumed live pane.
+    pub fn rebind_todo_link_pane(
+        &self,
+        link_id: i64,
+        pane_id: u64,
+        project_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut events = Vec::new();
+        let ok = self
+            .lock()
+            .rebind_todo_link_pane(link_id, pane_id, project_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Detach live `pane_id` from one link while preserving history.
+    pub fn detach_todo_link_pane(&self, link_id: i64, cx: &mut Context<Self>) -> bool {
+        let mut events = Vec::new();
+        let ok = self.lock().detach_todo_link_pane(link_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Detach a specific pane from a specific TODO item (CLI `--unbind`).
+    pub fn detach_todo_pane_link(
+        &self,
+        todo_id: i64,
+        pane_id: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut events = Vec::new();
+        let ok = self
+            .lock()
+            .detach_todo_pane_link(todo_id, pane_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Permanently remove one `todo_agent_links` entry.
+    pub fn remove_todo_link(&self, link_id: i64, cx: &mut Context<Self>) -> bool {
+        let mut events = Vec::new();
+        let ok = self.lock().remove_todo_link(link_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Clear `awaiting_review` on one specific `(todo_id, pane_id)` link.
+    pub fn clear_todo_pane_review(
+        &self,
+        todo_id: i64,
+        pane_id: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut events = Vec::new();
+        let ok = self
+            .lock()
+            .clear_todo_pane_review(todo_id, pane_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Clear `awaiting_review` on one specific link id.
+    pub fn clear_todo_link_review(&self, link_id: i64, cx: &mut Context<Self>) -> bool {
+        let mut events = Vec::new();
+        let ok = self.lock().clear_todo_link_review(link_id, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+        ok
+    }
+
+    /// Detach any persisted TODO link `pane_id` not present in `live_pane_ids`.
+    pub fn reconcile_todo_panes(&self, live_pane_ids: &[u64], cx: &mut Context<Self>) {
+        let mut events = Vec::new();
+        self.lock().reconcile_todo_panes(live_pane_ids, &mut events);
+        for event in events {
+            cx.emit(event);
+        }
+    }
+
+    /// Look up one link by id.
+    pub fn todo_link(&self, link_id: i64) -> Option<TodoAgentLink> {
+        self.lock().todo_link(link_id)
+    }
+
+    /// All TODO items currently bound to live `pane_id`.
+    pub fn todos_for_pane(&self, pane_id: u64) -> Vec<TodoItem> {
+        self.lock().todos_for_pane(pane_id)
+    }
+
+    /// Batched lookup of open `(todo_id, title)` badges for a set of panes.
+    pub fn open_todo_summaries_for_panes(
+        &self,
+        pane_ids: &[u64],
+    ) -> std::collections::HashMap<u64, Vec<(i64, String)>> {
+        self.lock().open_todo_summaries_for_panes(pane_ids)
     }
 
     /// The first project, creating the first-run one when the list is empty.

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::*;
 
-use super::KumuApp;
+use super::{AgentEntry, KumuApp};
 use crate::agent::launch::PaneLaunch;
 use crate::app::layout::{PaneDirection, PaneId, ProjectTabs, SplitAxis};
 use crate::term::KeyInput;
@@ -251,7 +251,9 @@ impl KumuApp {
                     }
                     if mine {
                         let caller = from.or(Some(self.focused.0));
-                        items.retain(|item| item.pane_id == caller);
+                        items.retain(|item| {
+                            caller.is_some_and(|c| item.links.iter().any(|l| l.pane_id == Some(c)))
+                        });
                     }
                     items
                 });
@@ -290,9 +292,19 @@ impl KumuApp {
                     } else {
                         (None, None, None)
                     };
+                    let link_project_id = pane_id
+                        .and_then(|p| self.pane_project(PaneId(p), cx))
+                        .or(Some(board_id));
+                    let link_label = pane_id
+                        .and_then(|p| {
+                            self.agent_status
+                                .get(&PaneId(p))
+                                .map(AgentEntry::display_title)
+                        })
+                        .unwrap_or_default();
                     self.workspace
                         .update(cx, |workspace, cx| {
-                            workspace.add_todo(
+                            workspace.add_todo_with_link(
                                 board_id,
                                 trimmed,
                                 description.trim(),
@@ -300,6 +312,8 @@ impl KumuApp {
                                 pane_id,
                                 agent_id.as_deref(),
                                 session_id.as_deref(),
+                                link_project_id,
+                                &link_label,
                                 cx,
                             )
                         })
@@ -327,12 +341,12 @@ impl KumuApp {
                         .ok_or_else(|| {
                             ControlError::new("unknownTodo", format!("todo #{id} not found"))
                         })?;
-                    let mut patch = crate::db::TodoPatch {
+                    let patch = crate::db::TodoPatch {
                         title: title.map(|t| t.trim().to_string()),
                         description: description.map(|d| d.trim().to_string()),
                         status,
                         awaiting_review,
-                        ..Default::default()
+                        review_pane_id: from.filter(|pid| self.control_owns(PaneId(*pid))),
                     };
                     if patch.title.as_deref().is_some_and(str::is_empty) {
                         return Err(ControlError::new(
@@ -341,21 +355,45 @@ impl KumuApp {
                         ));
                     }
                     if unbind {
-                        patch.pane_id = Some(None);
+                        let Some(caller_id) = from else {
+                            return Err(ControlError::new(
+                                "noPane",
+                                "cannot --unbind without KUMU_PANE; run from a Kumu terminal pane",
+                            ));
+                        };
+                        let caller = PaneId(caller_id);
+                        if self.control_owns(caller) {
+                            self.workspace.update(cx, |workspace, cx| {
+                                workspace.detach_todo_pane_link(id, caller.0, cx);
+                            });
+                        }
                     } else if bind
                         || (awaiting_review == Some(true)
-                            && existing.pane_id.is_none()
-                            && from.is_some())
+                            && from.is_some_and(|caller| {
+                                self.control_owns(PaneId(caller))
+                                    && !existing.links.iter().any(|l| l.pane_id == Some(caller))
+                            }))
                     {
                         let (pane_id, agent_id, session_id) = self.control_todo_binding(from);
-                        if pane_id.is_some() {
-                            patch.pane_id = Some(pane_id);
-                            if agent_id.is_some() {
-                                patch.agent_id = Some(agent_id);
-                            }
-                            if session_id.is_some() {
-                                patch.agent_session_id = Some(session_id);
-                            }
+                        if let Some(pid) = pane_id {
+                            let link_project_id =
+                                self.pane_project(PaneId(pid), cx).or(Some(board_id));
+                            let link_label = self
+                                .agent_status
+                                .get(&PaneId(pid))
+                                .map(AgentEntry::display_title)
+                                .unwrap_or_default();
+                            self.workspace.update(cx, |workspace, cx| {
+                                workspace.add_todo_link(
+                                    id,
+                                    agent_id.as_deref(),
+                                    session_id.as_deref(),
+                                    Some(pid),
+                                    link_project_id,
+                                    &link_label,
+                                    cx,
+                                );
+                            });
                         }
                     }
                     self.workspace
@@ -1036,7 +1074,7 @@ impl KumuApp {
             .unwrap_or(self.focused)
     }
 
-    fn control_owns(&self, pane: PaneId) -> bool {
+    pub(super) fn control_owns(&self, pane: PaneId) -> bool {
         self.panes.contains_key(&pane)
             || self
                 .tabs_by_project

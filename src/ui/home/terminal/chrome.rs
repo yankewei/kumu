@@ -30,6 +30,8 @@ pub(crate) struct PaneChromeSnapshot {
     pub(crate) can_zoom: bool,
     pub(crate) zoomed: bool,
     pub(crate) find: Option<FindBarSnapshot>,
+    /// TODO items currently bound to this live pane (`(todo_id, title)`).
+    pub(crate) linked_todos: Vec<(i64, String)>,
 }
 
 /// The pane header's label: what the program calls itself, or a placeholder
