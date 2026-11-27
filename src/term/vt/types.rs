@@ -288,3 +288,33 @@ pub struct TermNotification {
     pub title: String,
     pub body: String,
 }
+
+/// High-level state reported via the OSC 7501 Program Status Protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+    Clear,
+}
+
+/// What a blocked program needs from the user (`kind=` in OSC 7501).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramBlockKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+/// Aggregated OSC 7501 status emitted by a terminal after applying a report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermProgramStatus {
+    pub state: ProgramState,
+    pub kind: Option<ProgramBlockKind>,
+    pub app: String,
+    pub title: String,
+    pub progress: Option<u8>,
+    pub message: String,
+}

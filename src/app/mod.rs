@@ -322,6 +322,11 @@ impl Workspace {
         self.lock().terminal_label(terminal)
     }
 
+    /// Pane currently showing or owning `terminal`, if it is still live.
+    pub fn terminal_pane(&self, terminal: u64) -> Option<u64> {
+        self.lock().terminal_pane(terminal)
+    }
+
     pub fn terminal_wake_handled(&self, pane: u64) {
         self.lock().terminal_wake_handled(pane);
     }
@@ -388,6 +393,11 @@ impl Workspace {
     /// parked behind another project.
     pub fn terminal_for_pane(&self, pane: u64) -> Option<Term> {
         self.lock().terminal_for_pane(pane)
+    }
+
+    /// Clear retained OSC 7501 status records for `pane`'s live terminal.
+    pub fn reset_terminal_program_status(&self, pane: u64) {
+        self.lock().reset_terminal_program_status(pane);
     }
 
     /// Stop the process shown in `pane`, and any process parked for that pane.

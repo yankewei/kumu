@@ -110,6 +110,16 @@ pub(super) fn notification_message(
     })
 }
 
+/// Whether `body` matches one of the stock alert strings emitted by Kumu's own
+/// external CLI hooks (`--kumu-notify`), so OSC 7501 can suppress duplicate
+/// hook alerts without swallowing unrelated OSC 777 notifications.
+pub fn is_hook_notification_body(body: &str) -> bool {
+    matches!(
+        body.trim(),
+        "本轮任务已结束" | "任务执行失败" | "需要你确认操作权限" | "需要你输入、确认或选择"
+    )
+}
+
 fn agy_termination(payload: Option<&Value>) -> Option<&str> {
     payload
         .and_then(|value| value.get("terminationReason"))

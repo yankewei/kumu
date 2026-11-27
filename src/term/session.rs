@@ -14,8 +14,8 @@ use portable_pty::PtySize;
 use super::Hyperlink;
 use super::pty::{self, Pty};
 use super::vt::{
-    KeyInput, MAX_NOTIFICATIONS, MouseInput, MouseMods, SelectStep, Snapshot, TermColors,
-    TermNotification, Vt,
+    KeyInput, MAX_NOTIFICATIONS, MAX_PROGRAM_STATUSES, MouseInput, MouseMods, SelectStep, Snapshot,
+    TermColors, TermNotification, TermProgramStatus, Vt,
 };
 
 /// How long a content read waits for the terminal thread.
@@ -96,6 +96,7 @@ pub struct ScrollOutcome {
 struct Live {
     screen: Mutex<Snapshot>,
     notifications: Mutex<VecDeque<TermNotification>>,
+    program_statuses: Mutex<VecDeque<TermProgramStatus>>,
     clipboard: Mutex<Option<String>>,
     queued: AtomicBool,
     /// Monotonic counter bumped on every published snapshot, used by control
@@ -353,6 +354,9 @@ enum Msg {
         cell_h: u32,
     },
     Colors(TermColors),
+    /// Clear retained OSC 7501 records after an agent exits or switches inside
+    /// a shell pane so stale child records cannot leak into the next program.
+    ResetProgramStatus,
 }
 
 /// Sends shutdown when the last [`Term`] handle is dropped.
@@ -410,6 +414,7 @@ impl Term {
                 &command, &cwd_text, colors.fg, colors.bg,
             )),
             notifications: Mutex::new(VecDeque::new()),
+            program_statuses: Mutex::new(VecDeque::new()),
             clipboard: Mutex::new(None),
             queued: AtomicBool::new(false),
             frame_rev: AtomicU64::new(0),
@@ -489,6 +494,25 @@ impl Term {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
+    }
+
+    /// Consume the next aggregated OSC 7501 program status report, if any.
+    pub fn take_program_status(&self) -> Option<TermProgramStatus> {
+        self.live
+            .program_statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+
+    /// Clear any queued and retained OSC 7501 program status records.
+    pub fn reset_program_status(&self) {
+        self.live
+            .program_statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.inbox.send_control(Msg::ResetProgramStatus);
     }
 
     /// Consume the latest OSC clipboard write request, if any.
@@ -971,9 +995,12 @@ impl Running {
                     }
                     if self.vt.is_held() {
                         // A synchronized-output hold freezes the frame; still
-                        // deliver notifications and clipboard writes without
-                        // taking a redundant snapshot.
-                        if self.drain_notifications() | self.drain_clipboard() {
+                        // deliver notifications, OSC 7501 statuses, and
+                        // clipboard writes without taking a redundant snapshot.
+                        if self.drain_notifications()
+                            | self.drain_program_statuses()
+                            | self.drain_clipboard()
+                        {
                             self.live.wake_for_effect();
                         }
                     } else {
@@ -1216,6 +1243,14 @@ impl Running {
                     self.vt.set_colors(colors);
                     self.publish(false);
                 }
+                NextWork::Control(Msg::ResetProgramStatus) => {
+                    self.vt.clear_program_status();
+                    self.live
+                        .program_statuses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                }
                 NextWork::Eof => {
                     self.exited = true;
                     self.publish(true);
@@ -1248,6 +1283,23 @@ impl Running {
         any
     }
 
+    fn drain_program_statuses(&mut self) -> bool {
+        let mut any = false;
+        let mut pending = self
+            .live
+            .program_statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while let Some(status) = self.vt.take_program_status() {
+            if pending.len() == MAX_PROGRAM_STATUSES {
+                pending.pop_front();
+            }
+            pending.push_back(status);
+            any = true;
+        }
+        any
+    }
+
     fn drain_clipboard(&mut self) -> bool {
         let Some(text) = self.vt.take_clipboard_write() else {
             return false;
@@ -1262,13 +1314,14 @@ impl Running {
 
     fn publish(&mut self, force_wake: bool) {
         let got_notification = self.drain_notifications();
+        let got_program_status = self.drain_program_statuses();
         let got_clipboard = self.drain_clipboard();
         // A running find bar has to see new output and viewport scrolls; with
         // no needle this is a no-op.
         self.vt.search_feed();
         self.live.publish(
             self.vt.snapshot(&self.command, &self.cwd, self.exited),
-            force_wake || got_notification || got_clipboard,
+            force_wake || got_notification || got_program_status || got_clipboard,
         );
     }
 }

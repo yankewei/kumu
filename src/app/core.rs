@@ -12,7 +12,10 @@ use crate::agent::status::{
     STATUS_PREFIX, StatusSignal, TITLE_PREFIX, TITLE_PROMPT_PREFIX, clean_reported_title,
 };
 use crate::db::{Project, Store, TodoItem, TodoPatch, TodoStatus, db_path};
-use crate::term::{KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification};
+use crate::term::{
+    KeyInput, MouseInput, MouseMods, Snapshot, Term, TermColors, TermNotification,
+    TermProgramStatus,
+};
 
 /// Shared by the home and settings windows; changes apply immediately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +87,13 @@ pub enum WorkspaceEvent {
         project: i64,
         agent: String,
         signal: StatusSignal,
+    },
+    /// A terminal reported an aggregated OSC 7501 program status update.
+    ProgramStatus {
+        terminal: u64,
+        pane: u64,
+        project: i64,
+        status: TermProgramStatus,
     },
     /// An agent reported a session or first-prompt title on its silent OSC channel.
     AgentTitle {
@@ -660,6 +670,16 @@ impl WorkspaceCore {
                 });
             }
         }
+        while let Some(status) = term.take_program_status() {
+            if let Some(pane) = owning_pane {
+                pending_events.push(WorkspaceEvent::ProgramStatus {
+                    terminal: term_id,
+                    pane,
+                    project: project_id,
+                    status,
+                });
+            }
+        }
         if let Some(text) = term.take_clipboard_write() {
             pending_events.push(WorkspaceEvent::ClipboardWrite(text));
         }
@@ -890,6 +910,13 @@ impl WorkspaceCore {
             .unwrap_or_default()
     }
 
+    /// Pane currently showing or owning `terminal`, if it is still live.
+    pub fn terminal_pane(&self, terminal: u64) -> Option<u64> {
+        self.terms
+            .get(&terminal)
+            .and_then(|live| live.pane.or(live.parked_for))
+    }
+
     pub fn terminal_wake_handled(&self, pane: u64) {
         if let Some(live) = self.shown_term(pane) {
             live.term.wake_handled();
@@ -976,6 +1003,13 @@ impl WorkspaceCore {
     /// parked behind another project.
     pub fn terminal_for_pane(&self, pane: u64) -> Option<Term> {
         self.live_term_for_pane(pane).map(|live| live.term.clone())
+    }
+
+    /// Clear retained OSC 7501 status records for `pane`'s live terminal.
+    pub fn reset_terminal_program_status(&self, pane: u64) {
+        if let Some(live) = self.live_term_for_pane(pane) {
+            live.term.reset_program_status();
+        }
     }
 
     /// Stop the process shown in `pane`, and any process parked for that pane.

@@ -1,6 +1,7 @@
 //! libghostty-vt on one thread: bytes in, a cell grid out, query replies back.
 
 mod input;
+mod program_status;
 mod search;
 mod snapshot;
 #[cfg(test)]
@@ -16,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use ghostty_sys::*;
+pub(super) use program_status::MAX_PROGRAM_STATUSES;
 
 const SYNC_OUTPUT: GhosttyMode = 2026;
 const GRAPHEME_CLUSTER: GhosttyMode = 2027;
@@ -33,6 +35,8 @@ struct Shared {
     held_since: Option<Instant>,
     replies: Vec<u8>,
     notifications: VecDeque<TermNotification>,
+    program_status_table: program_status::ProgramStatusTable,
+    program_statuses: VecDeque<TermProgramStatus>,
     clipboard: Option<String>,
 }
 
@@ -218,6 +222,98 @@ unsafe extern "C" fn on_desktop_notification(
         title: text(notification.title),
         body: text(notification.body),
     });
+}
+
+// Ghostty invokes program status effects synchronously on the terminal thread,
+// after handling capability probe replies (`OSC 7501;?`) and base64 decoding.
+unsafe extern "C" fn on_program_status(
+    _term: GhosttyTerminal,
+    userdata: *mut c_void,
+    report: *const GhosttyTerminalProgramStatus,
+) {
+    if userdata.is_null() {
+        return;
+    }
+    let Some(report) = (unsafe { report.as_ref() }) else {
+        return;
+    };
+    let state = match report.state {
+        GHOSTTY_PROGRAM_STATUS_STATE_IDLE => ProgramState::Idle,
+        GHOSTTY_PROGRAM_STATUS_STATE_WORKING => ProgramState::Working,
+        GHOSTTY_PROGRAM_STATUS_STATE_DONE => ProgramState::Done,
+        GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED => ProgramState::Blocked,
+        GHOSTTY_PROGRAM_STATUS_STATE_ERROR => ProgramState::Error,
+        GHOSTTY_PROGRAM_STATUS_STATE_CLEAR => ProgramState::Clear,
+        _ => return,
+    };
+    let kind = match report.kind {
+        GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION => Some(ProgramBlockKind::Permission),
+        GHOSTTY_PROGRAM_STATUS_KIND_QUESTION => Some(ProgramBlockKind::Question),
+        GHOSTTY_PROGRAM_STATUS_KIND_AUTH => Some(ProgramBlockKind::Auth),
+        _ => None,
+    };
+    let progress = u8::try_from(report.progress).ok().filter(|&p| p <= 100);
+    let borrowed = |value: GhosttyString| -> String {
+        if value.ptr.is_null() || value.len == 0 {
+            return String::new();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len.min(4096)) };
+        let bytes = if value.len > 4096 {
+            utf8_prefix(bytes)
+        } else {
+            bytes
+        };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let id = borrowed(report.id);
+    let app = borrowed(report.app);
+    let title = borrowed(report.title);
+    let message = borrowed(report.message);
+    let shared = unsafe { &mut *(userdata as *mut Shared) };
+    let updates = shared
+        .program_status_table
+        .apply(program_status::ProgramStatusReport {
+            state,
+            kind,
+            progress,
+            id: &id,
+            app: &app,
+            title: &title,
+            message: &message,
+        });
+    for aggregated in updates {
+        if shared.program_statuses.len() == MAX_PROGRAM_STATUSES {
+            shared.program_statuses.pop_front();
+        }
+        shared.program_statuses.push_back(aggregated);
+    }
+}
+
+// Per Ghostty's OSC 7501 spec, a new primary shell prompt (OSC 133;A) drops
+// stale `working`, `blocked`, and `idle` records while keeping `done`/`error`.
+unsafe extern "C" fn on_semantic_prompt(
+    _term: GhosttyTerminal,
+    userdata: *mut c_void,
+    event: *const GhosttyTerminalSemanticPrompt,
+) {
+    if userdata.is_null() {
+        return;
+    }
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if event.kind != GHOSTTY_SEMANTIC_PROMPT_PROMPT_START
+        || event.prompt_kind != GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY
+    {
+        return;
+    }
+    let shared = unsafe { &mut *(userdata as *mut Shared) };
+    for aggregated in shared.program_status_table.clear_on_prompt_start() {
+        if shared.program_statuses.len() == MAX_PROGRAM_STATUSES {
+            shared.program_statuses.pop_front();
+        }
+        shared.program_statuses.push_back(aggregated);
+    }
 }
 
 fn mime_is_plain_text(mime: &str) -> bool {
@@ -497,6 +593,8 @@ impl Vt {
                 held_since: None,
                 replies: Vec::new(),
                 notifications: VecDeque::new(),
+                program_status_table: program_status::ProgramStatusTable::default(),
+                program_statuses: VecDeque::new(),
                 clipboard: None,
             })))
             .expect("Box::into_raw returned null");
@@ -520,6 +618,22 @@ impl Vt {
                 GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
                 std::mem::transmute::<GhosttyTerminalDesktopNotificationFn, *const c_void>(
                     notification,
+                ),
+            );
+            let program_status: GhosttyTerminalProgramStatusFn = Some(on_program_status);
+            ghostty_terminal_set(
+                term,
+                GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
+                std::mem::transmute::<GhosttyTerminalProgramStatusFn, *const c_void>(
+                    program_status,
+                ),
+            );
+            let semantic_prompt: GhosttyTerminalSemanticPromptFn = Some(on_semantic_prompt);
+            ghostty_terminal_set(
+                term,
+                GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
+                std::mem::transmute::<GhosttyTerminalSemanticPromptFn, *const c_void>(
+                    semantic_prompt,
                 ),
             );
             let clipboard_write: GhosttyTerminalClipboardWriteFn = Some(on_clipboard_write);
@@ -655,6 +769,18 @@ impl Vt {
 
     pub fn take_notification(&mut self) -> Option<TermNotification> {
         unsafe { (*self.shared.as_ptr()).notifications.pop_front() }
+    }
+
+    pub fn take_program_status(&mut self) -> Option<TermProgramStatus> {
+        unsafe { (*self.shared.as_ptr()).program_statuses.pop_front() }
+    }
+
+    /// Drop all retained OSC 7501 records and queued updates (e.g. after a
+    /// child agent exits inside a persistent shell pane).
+    pub fn clear_program_status(&mut self) {
+        let shared = unsafe { &mut *self.shared.as_ptr() };
+        shared.program_status_table.clear_all();
+        shared.program_statuses.clear();
     }
 
     pub fn take_clipboard_write(&mut self) -> Option<String> {

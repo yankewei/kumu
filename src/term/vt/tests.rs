@@ -552,3 +552,139 @@ fn osc52_and_kitty_clipboard_writes_decode_and_ignore_reads_and_clears() {
         "\x1b]5522;type=write:status=DONE:id=k1\x1b\\"
     );
 }
+
+#[test]
+fn osc7501_probe_echoes_terminator_and_replies_before_da1() {
+    let mut vt = Vt::new(40, 4);
+
+    // BEL probe followed immediately by DA1 in the same PTY write.
+    vt.write(b"\x1b]7501;?\x07\x1b[c");
+    let reply = String::from_utf8_lossy(&vt.take_replies()).into_owned();
+    let expected_bel =
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07";
+    assert!(
+        reply.starts_with(expected_bel),
+        "expected BEL probe reply before DA1, got {reply:?}"
+    );
+    let after_probe = &reply[expected_bel.len()..];
+    assert!(
+        after_probe.starts_with("\x1b[?") && after_probe.ends_with('c'),
+        "expected DA1 after 7501 probe reply, got {after_probe:?}"
+    );
+
+    // ST (`ESC \`) probe echoes ST.
+    vt.write(b"\x1b]7501;?\x1b\\");
+    let st_reply = String::from_utf8_lossy(&vt.take_replies()).into_owned();
+    assert_eq!(
+        st_reply,
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+    );
+}
+
+#[test]
+fn osc7501_reports_decode_aggregate_clear_subtrees_and_reset_on_ris() {
+    let mut vt = Vt::new(40, 4);
+
+    // Root working report with app=antigravity.
+    vt.write(b"\x1b]7501;state=working:app=antigravity\x07");
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Working,
+            kind: None,
+            app: "antigravity".into(),
+            title: String::new(),
+            progress: None,
+            message: String::new(),
+        })
+    );
+
+    // Child blocked report without app inherits "antigravity", decodes title & msg,
+    // and outranks root working.
+    // title="UGxhbg==" ("Plan"), msg="VHJ1c3QgdGhpcyBmb2xkZXI/" ("Trust this folder?")
+    vt.write(
+        b"\x1b]7501;state=blocked:kind=permission:id=agent/sub:progress=40:title=UGxhbg==:msg=VHJ1c3QgdGhpcyBmb2xkZXI/\x1b\\",
+    );
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Blocked,
+            kind: Some(ProgramBlockKind::Permission),
+            app: "antigravity".into(),
+            title: "Plan".into(),
+            progress: Some(40),
+            message: "Trust this folder?".into(),
+        })
+    );
+
+    // Clearing parent "agent" clears child "agent/sub", falling back to root working.
+    vt.write(b"\x1b]7501;state=clear:id=agent\x07");
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Working,
+            kind: None,
+            app: "antigravity".into(),
+            title: String::new(),
+            progress: None,
+            message: String::new(),
+        })
+    );
+
+    // Full terminal reset (RIS `ESC c`) clears all program status records.
+    vt.write(b"\x1bc");
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Clear,
+            kind: None,
+            app: "antigravity".into(),
+            title: String::new(),
+            progress: None,
+            message: String::new(),
+        })
+    );
+    assert_eq!(vt.take_program_status(), None);
+
+    // Explicit clear_program_status (invoked on shell agent exit/switch) drops
+    // stale child blocked records so the next agent starts clean.
+    vt.write(b"\x1b]7501;state=blocked:kind=permission:id=sub/prompt\x07");
+    assert!(vt.take_program_status().is_some());
+    vt.clear_program_status();
+    vt.write(b"\x1b]7501;state=working:app=codex\x07");
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Working,
+            kind: None,
+            app: "codex".into(),
+            title: String::new(),
+            progress: None,
+            message: String::new(),
+        })
+    );
+}
+
+#[test]
+fn osc133_prompt_start_clears_working_and_blocked_records_only() {
+    let mut vt = Vt::new(40, 4);
+    vt.write(b"\x1b]7501;state=blocked:kind=permission:id=sub:app=antigravity\x07");
+    vt.write(b"\x1b]7501;state=done:id=fin:app=codex\x07");
+    assert!(vt.take_program_status().is_some());
+    assert!(vt.take_program_status().is_some());
+
+    // OSC 133;A (primary prompt start) drops blocked/working/idle, keeps done/error.
+    vt.write(b"\x1b]133;A\x07");
+    assert_eq!(
+        vt.take_program_status(),
+        Some(TermProgramStatus {
+            state: ProgramState::Clear,
+            kind: None,
+            app: "antigravity".into(),
+            title: String::new(),
+            progress: None,
+            message: String::new(),
+        })
+    );
+    assert_eq!(vt.take_program_status(), None);
+}

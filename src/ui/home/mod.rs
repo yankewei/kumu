@@ -30,6 +30,7 @@ use crate::nsh_ui::agent_picker::ActiveAgentPicker;
 use crate::nsh_ui::command_palette::ActiveCommandPalette;
 use crate::nsh_ui::dialogs::ActiveDialog;
 use crate::nsh_ui::toast::{ToastItem, ToastOverlay};
+use crate::term::TermNotification;
 use crate::theme::KumuTheme;
 use crate::updates::Updater;
 use agents::{AgentEntry, agent_display_name};
@@ -162,6 +163,59 @@ pub struct KumuApp {
 }
 
 impl KumuApp {
+    pub(super) fn raise_attention(
+        &mut self,
+        terminal: u64,
+        project: i64,
+        notification: &TermNotification,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.global::<NotificationSettings>().enabled
+            || self.workspace.read(cx).notification_is_read(
+                terminal,
+                window.is_window_active().then_some(self.focused.0),
+            )
+        {
+            return;
+        }
+        let workspace = self.workspace.read(cx);
+        let Some(project_info) = workspace.project(project) else {
+            return;
+        };
+        if cx.global::<NotificationSettings>().sound {
+            window.play_system_bell();
+        }
+        let title = match workspace.terminal_label(terminal) {
+            label if label.is_empty() => project_info.name.clone(),
+            label => format!("{} · {}", project_info.name, label),
+        };
+        let message = match (notification.title.is_empty(), notification.body.is_empty()) {
+            (true, true) => "终端需要你的关注".to_string(),
+            (false, true) => notification.title.clone(),
+            (true, false) => notification.body.clone(),
+            (false, false) => format!("{}\n{}", notification.title, notification.body),
+        };
+        self.unread_notifications.insert(terminal, project);
+        if window.is_window_active() {
+            // Foreground window uses the GPUI-level NSH toast overlay above the home shell.
+            self.toast_overlay
+                .push(ToastItem::info(terminal.to_string(), Some(title), message).clickable(true));
+        } else {
+            // A background window posts only to Notification Center: one
+            // event should not surface as both a banner and a toast. The
+            // sidebar's unread marker is the in-app fallback when macOS
+            // declines delivery or kumu runs unbundled.
+            cx.show_system_notification(SystemNotification {
+                tag: terminal.to_string().into(),
+                title: title.into(),
+                body: message.into(),
+                actions: Vec::new(),
+            });
+        }
+        cx.notify();
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = cx.new(Workspace::new);
         let startup_error = workspace.update(cx, |workspace, _| workspace.take_startup_error());
@@ -181,51 +235,12 @@ impl KumuApp {
                 project,
                 notification,
             } => {
-                if !cx.global::<NotificationSettings>().enabled
-                    || this.workspace.read(cx).notification_is_read(
-                        *terminal,
-                        window.is_window_active().then_some(this.focused.0),
-                    )
+                if let Some(pane) = this.workspace.read(cx).terminal_pane(*terminal).map(PaneId)
+                    && this.suppresses_attention(pane, notification)
                 {
                     return;
                 }
-                let workspace = this.workspace.read(cx);
-                let Some(project_info) = workspace.project(*project) else {
-                    return;
-                };
-                if cx.global::<NotificationSettings>().sound {
-                    window.play_system_bell();
-                }
-                let title = match workspace.terminal_label(*terminal) {
-                    label if label.is_empty() => project_info.name.clone(),
-                    label => format!("{} · {}", project_info.name, label),
-                };
-                let message = match (notification.title.is_empty(), notification.body.is_empty()) {
-                    (true, true) => "终端需要你的关注".to_string(),
-                    (false, true) => notification.title.clone(),
-                    (true, false) => notification.body.clone(),
-                    (false, false) => format!("{}\n{}", notification.title, notification.body),
-                };
-                this.unread_notifications.insert(*terminal, *project);
-                let terminal = *terminal;
-                if window.is_window_active() {
-                    // Foreground window uses the GPUI-level NSH toast overlay above the home shell.
-                    this.toast_overlay.push(
-                        ToastItem::info(terminal.to_string(), Some(title), message).clickable(true),
-                    );
-                } else {
-                    // A background window posts only to Notification Center: one
-                    // event should not surface as both a banner and a toast. The
-                    // sidebar's unread marker is the in-app fallback when macOS
-                    // declines delivery or kumu runs unbundled.
-                    cx.show_system_notification(SystemNotification {
-                        tag: terminal.to_string().into(),
-                        title: title.into(),
-                        body: message.into(),
-                        actions: Vec::new(),
-                    });
-                }
-                cx.notify();
+                this.raise_attention(*terminal, *project, notification, window, cx);
             }
             WorkspaceEvent::PaneExited { pane, project } => {
                 let pane = PaneId(*pane);
@@ -271,9 +286,14 @@ impl KumuApp {
                 // restarts fresh comes back idle with no stale title.
                 if next.is_shell() {
                     this.agent_status.remove(&pane);
-                    this.workspace
-                        .update(cx, |workspace, cx| workspace.unbind_pane_todos(pane.0, cx));
+                    this.workspace.update(cx, |workspace, cx| {
+                        workspace.reset_terminal_program_status(pane.0);
+                        workspace.unbind_pane_todos(pane.0, cx);
+                    });
                 } else if let PaneLaunch::Agent { agent, .. } = &next {
+                    this.workspace
+                        .read(cx)
+                        .reset_terminal_program_status(pane.0);
                     this.agent_status
                         .insert(pane, AgentEntry::idle(agent.clone()));
                 }
@@ -342,18 +362,20 @@ impl KumuApp {
                 let session_changed = previous_session
                     .as_deref()
                     .is_some_and(|prev| prev != session);
-                if agent_changed || session_changed {
-                    entry.session_title = None;
-                    entry.prompt_title = None;
-                }
                 if agent_changed {
-                    // A different agent owns this pane now; the old state and
-                    // marker must not make the new agent's first report look
-                    // like a repeat.
-                    entry.state = None;
-                    entry.unseen = false;
+                    // A different agent owns this pane now; reset status and
+                    // authority state so the new agent starts clean.
+                    entry.switch_agent(agent.to_string());
+                    this.workspace
+                        .read(cx)
+                        .reset_terminal_program_status(pane.0);
+                } else {
+                    if session_changed {
+                        entry.session_title = None;
+                        entry.prompt_title = None;
+                    }
+                    entry.agent = agent.to_string();
                 }
-                entry.agent = agent.to_string();
                 this.sync_pane_agent_status(pane, cx);
                 this.workspace.update(cx, |workspace, cx| {
                     workspace.update_pane_todos_session(pane.0, agent, session, cx);
@@ -367,6 +389,14 @@ impl KumuApp {
                 signal,
             } => {
                 this.note_agent_status(PaneId(*pane), *project, agent, *signal, cx);
+            }
+            WorkspaceEvent::ProgramStatus {
+                terminal,
+                pane,
+                project,
+                status,
+            } => {
+                this.note_program_status(*terminal, PaneId(*pane), *project, status, window, cx);
             }
             WorkspaceEvent::AgentTitle {
                 pane,

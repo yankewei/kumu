@@ -19,5 +19,5 @@ mod registry;
 pub mod status;
 
 pub use config::{executable, installed, installed_with_shell_env};
-pub use registry::{AGENTS, id_for};
-pub use status::{AgentState, StatusSignal};
+pub use registry::{AGENTS, id_for, prefers_integration_status};
+pub use status::{AgentState, StatusSignal, StatusSource};
