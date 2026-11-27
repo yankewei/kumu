@@ -209,11 +209,21 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
         None => (
             InitialSettingsState {
                 dark: false,
+                terminal_theme: crate::theme::TerminalTheme::FollowApp,
+                terminal_swatches: super::build_terminal_swatches(
+                    &crate::theme::KumuTheme::load_bundled(),
+                ),
                 font_family: crate::theme::SYSTEM_FONT_FAMILY.to_string(),
                 font_size: crate::theme::DEFAULT_FONT_SIZE as u32,
                 system_fonts: vec![(
                     crate::theme::SYSTEM_FONT_LABEL.to_string(),
                     crate::theme::SYSTEM_FONT_FAMILY.to_string(),
+                )],
+                term_font_family: crate::fonts::TERM_FONT.to_string(),
+                term_font_size: crate::theme::DEFAULT_TERM_FONT_SIZE as u32,
+                terminal_fonts: vec![(
+                    format!("{}（内置）", crate::fonts::TERM_FONT),
+                    crate::fonts::TERM_FONT.to_string(),
                 )],
                 notifications_enabled: true,
                 notification_sound: true,
@@ -229,8 +239,11 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
     let page = signal(SettingsPage::Providers);
     let search_query = signal(String::new());
     let dark = signal(initial.dark);
+    let terminal_theme = signal(initial.terminal_theme);
     let font_family = signal(initial.font_family);
     let font_size = signal(initial.font_size);
+    let term_font_family = signal(initial.term_font_family);
+    let term_font_size = signal(initial.term_font_size);
     let notifications_enabled = signal(initial.notifications_enabled);
     let notification_sound = signal(initial.notification_sound);
     let auto_resume = signal(initial.auto_resume);
@@ -267,6 +280,22 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
             SelectItem::new(s.clone(), s)
         })
         .collect();
+    let term_font_items: Vec<SelectItem> = initial
+        .terminal_fonts
+        .into_iter()
+        .map(|(label, family)| SelectItem::new(family, label))
+        .collect();
+    let term_font_label_map: HashMap<String, String> = term_font_items
+        .iter()
+        .map(|item| (item.value.to_string(), item.title.to_string()))
+        .collect();
+    let term_font_size_items: Vec<SelectItem> = crate::theme::TERM_FONT_SIZES
+        .into_iter()
+        .map(|sz| {
+            let s = sz.to_string();
+            SelectItem::new(s.clone(), s)
+        })
+        .collect();
 
     if let Some(mut rx) = events_rx {
         spawn(async move {
@@ -276,10 +305,17 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
                         dark: is_dark,
                         font_family: fam,
                         font_size: sz,
+                        term_font_family: tfam,
+                        term_font_size: tsz,
                     } => {
                         dark.set(is_dark);
                         font_family.set(fam);
                         font_size.set(sz);
+                        term_font_family.set(tfam);
+                        term_font_size.set(tsz);
+                    }
+                    HostEvent::TerminalThemeChanged(term_theme) => {
+                        terminal_theme.set(term_theme);
                     }
                     HostEvent::UpdaterStatus(snapshot) => {
                         updater.set(snapshot);
@@ -353,8 +389,12 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
     };
     let general_state = GeneralPageState {
         dark,
+        terminal_theme,
+        terminal_swatches: Rc::new(initial.terminal_swatches),
         font_family,
         font_size,
+        term_font_family,
+        term_font_size,
         notifications_enabled,
         notification_sound,
         auto_resume,
@@ -363,6 +403,9 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
         font_items,
         font_label_map,
         font_size_items,
+        term_font_items,
+        term_font_label_map,
+        term_font_size_items,
         actions_tx: actions_tx.clone(),
     };
 

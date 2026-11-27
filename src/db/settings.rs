@@ -30,8 +30,17 @@ pub const SETTING_FONT: &str = "font_family";
 /// Setting key holding the UI font size chosen in settings, in px.
 pub const SETTING_FONT_SIZE: &str = "font_size";
 
+/// Setting key holding the terminal font family chosen in settings.
+pub const SETTING_TERM_FONT: &str = "terminal_font_family";
+
+/// Setting key holding the terminal font size chosen in settings, in px.
+pub const SETTING_TERM_FONT_SIZE: &str = "terminal_font_size";
+
 /// Setting key holding the last light/dark choice: `"light"` or `"dark"`.
 pub const SETTING_THEME_MODE: &str = "theme_mode";
+
+/// Setting key holding the independent terminal color preset id (e.g. `"follow"`, `"dark"`, `"tokyo_night"`).
+pub const SETTING_TERMINAL_THEME: &str = "terminal_theme";
 
 /// Whether terminal attention notifications are enabled (`"0"` disables them).
 pub const SETTING_NOTIFICATIONS: &str = "notifications";

@@ -484,8 +484,7 @@ impl Render for TerminalView {
         let colors = &theme.colors;
         let radius = px(theme.radius);
         let fg = colors.foreground;
-        let search_hit = colors.selection.opacity(0.55);
-        let search_active = colors.warning.opacity(0.55);
+        let (search_hit, search_active) = theme::term_search_colors(&theme::term_colors(cx));
         let drop_accent = colors.blue;
         let drop_tint = colors.blue.opacity(0.08);
         let drop_pill_bg = colors.popover;

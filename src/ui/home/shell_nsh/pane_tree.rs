@@ -126,6 +126,8 @@ fn render_pane_leaf(
             .px_3()
             .gap_2()
             .items_center()
+            .border_b_1()
+            .border_b_color(move || active_theme().border)
             .bg(move || {
                 if active {
                     active_theme().secondary.opacity(0.45)

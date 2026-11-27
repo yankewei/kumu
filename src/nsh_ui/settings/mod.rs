@@ -19,7 +19,8 @@ use super::toast::ToastItem;
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
 use crate::db;
-use crate::theme::{self, KumuTheme, ThemeMode};
+use crate::term::Rgb;
+use crate::theme::{self, ActiveTerminalTheme, KumuTheme, TerminalTheme, ThemeMode};
 use crate::updates::{ErrorKind, UpdateStatus, Updater};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,13 +86,48 @@ impl UpdateSnapshot {
     }
 }
 
+/// Precomputed `(bg, fg)` swatch colors for one [`TerminalTheme`] in both shell modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalThemeSwatch {
+    light_bg: Rgb,
+    light_fg: Rgb,
+    dark_bg: Rgb,
+    dark_fg: Rgb,
+}
+
+fn build_terminal_swatches(
+    kumu_theme: &KumuTheme,
+) -> std::collections::HashMap<TerminalTheme, TerminalThemeSwatch> {
+    TerminalTheme::ALL
+        .into_iter()
+        .map(|preset| {
+            let (light_bg, light_fg) = preset.preview_colors(kumu_theme, ThemeMode::Light);
+            let (dark_bg, dark_fg) = preset.preview_colors(kumu_theme, ThemeMode::Dark);
+            (
+                preset,
+                TerminalThemeSwatch {
+                    light_bg,
+                    light_fg,
+                    dark_bg,
+                    dark_fg,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Snapshot of host-owned state pushed to the NSH Settings view.
 #[derive(Clone, Debug)]
 struct InitialSettingsState {
     dark: bool,
+    terminal_theme: TerminalTheme,
+    terminal_swatches: std::collections::HashMap<TerminalTheme, TerminalThemeSwatch>,
     font_family: String,
     font_size: u32,
     system_fonts: Vec<(String, String)>,
+    term_font_family: String,
+    term_font_size: u32,
+    terminal_fonts: Vec<(String, String)>,
     notifications_enabled: bool,
     notification_sound: bool,
     auto_resume: bool,
@@ -106,7 +142,10 @@ enum HostEvent {
         dark: bool,
         font_family: String,
         font_size: u32,
+        term_font_family: String,
+        term_font_size: u32,
     },
+    TerminalThemeChanged(TerminalTheme),
     UpdaterStatus(UpdateSnapshot),
     AgentsProbed(Vec<(&'static str, bool, Result<integration::Status, String>)>),
     IntegrationBusy(Option<&'static str>),
@@ -130,8 +169,11 @@ enum HostEvent {
 enum SettingsAction {
     CloseWindow,
     SetDarkMode(bool),
+    SetTerminalTheme(TerminalTheme),
     SetFontFamily(String),
     SetFontSize(u32),
+    SetTermFontFamily(String),
+    SetTermFontSize(u32),
     SetNotifications(bool),
     SetNotificationSound(bool),
     SetAutoResume(bool),
@@ -161,6 +203,7 @@ pub struct SettingsWindow {
     next_toast_id: u64,
     integration_busy: Option<&'static str>,
     _theme_sub: Subscription,
+    _terminal_theme_sub: Subscription,
     _updater_sub: Subscription,
     _actions_task: Task<()>,
 }
@@ -184,12 +227,21 @@ impl SettingsWindow {
             .into_iter()
             .map(|(label, family)| (label.to_string(), family.to_string()))
             .collect();
+        let terminal_fonts = theme::terminal_fonts(cx)
+            .into_iter()
+            .map(|(label, family)| (label.to_string(), family.to_string()))
+            .collect();
         let notif = cx.global::<NotificationSettings>();
         let initial_state = InitialSettingsState {
             dark: kumu_theme.mode.is_dark(),
+            terminal_theme: theme::terminal_theme(cx),
+            terminal_swatches: build_terminal_swatches(kumu_theme),
             font_family: kumu_theme.font_family.to_string(),
             font_size: kumu_theme.font_size.round() as u32,
             system_fonts,
+            term_font_family: kumu_theme.mono_font_family.to_string(),
+            term_font_size: kumu_theme.mono_font_size.round() as u32,
+            terminal_fonts,
             notifications_enabled: notif.enabled,
             notification_sound: notif.sound,
             auto_resume: db::get_setting(db::SETTING_AUTO_RESUME).as_deref() != Some("0"),
@@ -229,6 +281,8 @@ impl SettingsWindow {
             let dark = kumu_theme.mode.is_dark();
             let font_family = kumu_theme.font_family.to_string();
             let font_size = kumu_theme.font_size.round() as u32;
+            let term_font_family = kumu_theme.mono_font_family.to_string();
+            let term_font_size = kumu_theme.mono_font_size.round() as u32;
             this.app_view.update(cx, |view, cx| {
                 view.set_theme(Some(mapped), cx);
                 view.set_appearance(mode, cx);
@@ -237,8 +291,16 @@ impl SettingsWindow {
                 dark,
                 font_family,
                 font_size,
+                term_font_family,
+                term_font_size,
             });
             cx.notify();
+        });
+
+        let terminal_theme_sub = cx.observe_global::<ActiveTerminalTheme>(|this: &mut Self, cx| {
+            let _ = this
+                .events_tx
+                .unbounded_send(HostEvent::TerminalThemeChanged(theme::terminal_theme(cx)));
         });
 
         let updater_sub = cx.observe(&updater, |this, updater, cx| {
@@ -291,6 +353,7 @@ impl SettingsWindow {
             next_toast_id: 1,
             integration_busy: None,
             _theme_sub: theme_sub,
+            _terminal_theme_sub: terminal_theme_sub,
             _updater_sub: updater_sub,
             _actions_task: actions_task,
         }
@@ -325,6 +388,15 @@ impl SettingsWindow {
                     cx,
                 );
             }
+            SettingsAction::SetTerminalTheme(terminal_theme) => {
+                if let Err(error) = theme::change_terminal_theme(terminal_theme, cx) {
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("终端外观已应用，但保存失败，重启后可能丢失：{error}"),
+                    ));
+                }
+            }
             SettingsAction::SetFontFamily(family) => {
                 if KumuTheme::global(cx).font_family.as_ref() == family.as_str() {
                     return;
@@ -344,6 +416,32 @@ impl SettingsWindow {
                     self.push_toast(ToastItem::error(key, format!("保存字号失败：{error}")));
                 }
                 theme::set_font_size(cx, size as f32);
+            }
+            SettingsAction::SetTermFontFamily(family) => {
+                if KumuTheme::global(cx).mono_font_family.as_ref() == family.as_str() {
+                    return;
+                }
+                if let Err(error) = db::set_setting(db::SETTING_TERM_FONT, &family) {
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("终端字体已应用，但保存失败，重启后可能丢失：{error}"),
+                    ));
+                }
+                theme::set_terminal_font_family(cx, &family);
+            }
+            SettingsAction::SetTermFontSize(size) => {
+                if (size as f32 - KumuTheme::global(cx).mono_font_size).abs() < 0.01 {
+                    return;
+                }
+                if let Err(error) = db::set_setting(db::SETTING_TERM_FONT_SIZE, &size.to_string()) {
+                    let key = self.next_toast_key();
+                    self.push_toast(ToastItem::error(
+                        key,
+                        format!("终端字号已应用，但保存失败，重启后可能丢失：{error}"),
+                    ));
+                }
+                theme::set_terminal_font_size(cx, size as f32);
             }
             SettingsAction::SetNotifications(enabled) => {
                 if let Err(error) =
@@ -518,25 +616,41 @@ mod tests {
     use super::*;
     use nsh_engine::EngineConfig;
 
+    fn test_initial_state() -> InitialSettingsState {
+        let bundled = KumuTheme::load_bundled();
+        InitialSettingsState {
+            dark: false,
+            terminal_theme: TerminalTheme::FollowApp,
+            terminal_swatches: build_terminal_swatches(&bundled),
+            font_family: crate::theme::SYSTEM_FONT_FAMILY.to_string(),
+            font_size: 16,
+            system_fonts: vec![
+                ("系统字体".to_string(), ".SystemUIFont".to_string()),
+                ("JetBrains Mono".to_string(), "JetBrains Mono".to_string()),
+            ],
+            term_font_family: crate::fonts::TERM_FONT.to_string(),
+            term_font_size: crate::theme::DEFAULT_TERM_FONT_SIZE as u32,
+            terminal_fonts: vec![
+                (
+                    format!("{}（内置）", crate::fonts::TERM_FONT),
+                    crate::fonts::TERM_FONT.to_string(),
+                ),
+                ("Menlo".to_string(), "Menlo".to_string()),
+            ],
+            notifications_enabled: true,
+            notification_sound: true,
+            auto_resume: true,
+            agent_args: std::collections::HashMap::new(),
+            updater: UpdateSnapshot::from_status(&UpdateStatus::Idle),
+        }
+    }
+
     #[test]
     fn settings_nsh_navigation_toggles_and_restart_dialog() {
         let (events_tx, events_rx) = unbounded::<HostEvent>();
         let (actions_tx, mut actions_rx) = unbounded::<SettingsAction>();
         let mount_id = MOUNTS.register(SettingsMount {
-            initial: InitialSettingsState {
-                dark: false,
-                font_family: crate::theme::SYSTEM_FONT_FAMILY.to_string(),
-                font_size: 16,
-                system_fonts: vec![
-                    ("系统字体".to_string(), ".SystemUIFont".to_string()),
-                    ("JetBrains Mono".to_string(), "JetBrains Mono".to_string()),
-                ],
-                notifications_enabled: true,
-                notification_sound: true,
-                auto_resume: true,
-                agent_args: std::collections::HashMap::new(),
-                updater: UpdateSnapshot::from_status(&UpdateStatus::Idle),
-            },
+            initial: test_initial_state(),
             events_rx,
             actions_tx,
         });
@@ -571,5 +685,68 @@ mod tests {
         app.press("重启更新").expect("open restart confirmation");
         app.wait_for("重启以完成更新")
             .expect("restart confirmation dialog opens");
+    }
+
+    #[test]
+    fn settings_nsh_terminal_theme_picker_syncs_both_ways() {
+        let (events_tx, events_rx) = unbounded::<HostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<SettingsAction>();
+        let mount_id = MOUNTS.register(SettingsMount {
+            initial: test_initial_state(),
+            events_rx,
+            actions_tx,
+        });
+
+        let root =
+            nsh_core::element::Root::new::<view::SettingsRoot>(move || view::SettingsRootProps {
+                mount_id: mount_id.into(),
+            });
+        let mut app =
+            nsh_testing::Headless::start(EngineConfig::new(root)).expect("start settings NSH");
+
+        app.wait_for("编码 Agent").expect("providers page renders");
+        app.press("通用").expect("switch to General tab");
+        app.wait_for("终端外观")
+            .expect("terminal theme row renders");
+        app.wait_for("跟随应用外观")
+            .expect("default terminal theme label renders");
+
+        // UI -> Host: selecting a preset updates the trigger and emits SetTerminalTheme.
+        app.press("终端外观").expect("open terminal theme picker");
+        app.wait_for("Tokyo Night")
+            .expect("terminal theme presets render");
+        app.press("Tokyo Night")
+            .expect("select Tokyo Night terminal theme");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(SettingsAction::SetTerminalTheme(TerminalTheme::TokyoNight))
+        );
+
+        // Host -> UI: external terminal theme updates reflect back into the picker.
+        events_tx
+            .unbounded_send(HostEvent::TerminalThemeChanged(
+                TerminalTheme::SolarizedLight,
+            ))
+            .expect("send terminal theme update");
+        app.wait_for("Solarized Light")
+            .expect("picker reflects host terminal theme update");
+
+        // Terminal font family & size pickers emit independent settings actions.
+        app.press("终端字体").expect("open terminal font picker");
+        app.wait_for("Menlo").expect("terminal font options render");
+        app.press("Menlo").expect("select Menlo terminal font");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(SettingsAction::SetTermFontFamily("Menlo".to_string()))
+        );
+
+        app.press("终端字号")
+            .expect("open terminal font size picker");
+        app.wait_for("15").expect("terminal font sizes render");
+        app.press("15").expect("select 15px terminal font size");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(SettingsAction::SetTermFontSize(15))
+        );
     }
 }

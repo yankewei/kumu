@@ -5,7 +5,7 @@ use futures::channel::mpsc::UnboundedSender;
 use nsh_base::{SelectEntry, SelectItem, SelectValue, input, select, theme as active_theme};
 use nsh_core::prelude::*;
 
-use super::{AgentStatusRow, SettingsAction, UpdateSnapshot};
+use super::{AgentStatusRow, SettingsAction, TerminalThemeSwatch, UpdateSnapshot};
 use crate::agent::{AGENTS, integration};
 use crate::nsh_ui::assets::{agent_logo, icon_svg};
 use crate::nsh_ui::components::{
@@ -13,6 +13,7 @@ use crate::nsh_ui::components::{
     section_card, section_title,
 };
 use crate::nsh_ui::theme::{TOKEN_ICON_TILE, kumu_color, text_xs_size};
+use crate::theme::TerminalTheme;
 
 pub(super) fn send_action(tx: &Option<UnboundedSender<SettingsAction>>, action: SettingsAction) {
     if let Some(tx) = tx {
@@ -32,8 +33,12 @@ pub(super) struct ProvidersPageState {
 #[derive(Clone)]
 pub(super) struct GeneralPageState {
     pub dark: Signal<bool>,
+    pub terminal_theme: Signal<TerminalTheme>,
+    pub terminal_swatches: Rc<HashMap<TerminalTheme, TerminalThemeSwatch>>,
     pub font_family: Signal<String>,
     pub font_size: Signal<u32>,
+    pub term_font_family: Signal<String>,
+    pub term_font_size: Signal<u32>,
     pub notifications_enabled: Signal<bool>,
     pub notification_sound: Signal<bool>,
     pub auto_resume: Signal<bool>,
@@ -42,6 +47,9 @@ pub(super) struct GeneralPageState {
     pub font_items: Vec<SelectItem>,
     pub font_label_map: HashMap<String, String>,
     pub font_size_items: Vec<SelectItem>,
+    pub term_font_items: Vec<SelectItem>,
+    pub term_font_label_map: HashMap<String, String>,
+    pub term_font_size_items: Vec<SelectItem>,
     pub actions_tx: Option<UnboundedSender<SettingsAction>>,
 }
 
@@ -281,11 +289,140 @@ fn settings_row(
     r
 }
 
+fn rgb_to_hex(rgb: crate::term::Rgb) -> u32 {
+    (u32::from(rgb.0) << 16) | (u32::from(rgb.1) << 8) | u32::from(rgb.2)
+}
+
+fn terminal_swatch_colors(
+    swatches: &HashMap<TerminalTheme, TerminalThemeSwatch>,
+    preset: TerminalTheme,
+) -> (AdaptiveColor, AdaptiveColor) {
+    match swatches.get(&preset) {
+        Some(swatch) => (
+            AdaptiveColor::rgb(rgb_to_hex(swatch.light_bg), rgb_to_hex(swatch.dark_bg)),
+            AdaptiveColor::rgb(rgb_to_hex(swatch.light_fg), rgb_to_hex(swatch.dark_fg)),
+        ),
+        None => (active_theme().background, active_theme().foreground),
+    }
+}
+
+fn terminal_swatch_badge(
+    bg: impl Fn() -> AdaptiveColor + 'static,
+    fg: impl Fn() -> AdaptiveColor + 'static,
+) -> View {
+    view()
+        .w(px(22.0))
+        .h(px(16.0))
+        .flex_shrink_0()
+        .rounded(px(3.0))
+        .border_1()
+        .border_color(move || active_theme().border)
+        .bg(bg)
+        .items_center()
+        .justify_center()
+        .child(
+            text("Aa")
+                .text_size(px(9.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg),
+        )
+}
+
+fn render_terminal_theme_picker(
+    terminal_theme: Signal<TerminalTheme>,
+    swatches: Rc<HashMap<TerminalTheme, TerminalThemeSwatch>>,
+    tx_term_theme: Option<UnboundedSender<SettingsAction>>,
+) -> AnyElement {
+    let items: Vec<SelectItem> = TerminalTheme::ALL
+        .into_iter()
+        .map(|preset| SelectItem::new(preset.id(), preset.label()))
+        .collect();
+
+    let trigger_swatches_bg = Rc::clone(&swatches);
+    let trigger_swatches_fg = Rc::clone(&swatches);
+    let trigger = view()
+        .w(px(192.0))
+        .h(px(28.0))
+        .px_2p5()
+        .rounded(move || active_theme().radius)
+        .border_1()
+        .border_color(move || active_theme().input)
+        .bg(move || active_theme().background)
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            view()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(terminal_swatch_badge(
+                    move || terminal_swatch_colors(&trigger_swatches_bg, terminal_theme.get()).0,
+                    move || terminal_swatch_colors(&trigger_swatches_fg, terminal_theme.get()).1,
+                ))
+                .child(
+                    text(move || terminal_theme.get().label())
+                        .flex_1()
+                        .min_w_0()
+                        .app_class("truncate")
+                        .text_size(text_xs_size)
+                        .text_color(move || active_theme().foreground),
+                ),
+        )
+        .child(
+            icon_svg("icons/chevron-down.svg", 13.0)
+                .text_color(move || active_theme().muted_foreground),
+        );
+
+    let item_swatches = Rc::clone(&swatches);
+    select()
+        .items(items)
+        .value(move || SelectValue::from(terminal_theme.get().id()))
+        .placeholder("选择终端外观")
+        .accessibility_label("终端外观")
+        .cover(false)
+        .offset(px(4.0))
+        .popup_class("bg-popover border border-border rounded-lg shadow-md overflow-hidden p-1")
+        .list_class("max-h-60")
+        .item_class(
+            "px-2.5 py-1.5 rounded text-xs text-popover-foreground focus:bg-accent selected:font-medium",
+        )
+        .render_item(move |entry: &SelectEntry| {
+            let preset = TerminalTheme::from_id(entry.value.as_ref()).unwrap_or_default();
+            let (bg, fg) = terminal_swatch_colors(&item_swatches, preset);
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(terminal_swatch_badge(move || bg, move || fg))
+                .child(
+                    text(entry.title.clone())
+                        .text_size(text_xs_size)
+                        .text_color(move || active_theme().popover_foreground),
+                )
+        })
+        .trigger(trigger)
+        .on_change(move |chosen: &Option<SharedString>| {
+            if let Some(raw) = chosen
+                && let Some(preset) = TerminalTheme::from_id(raw.as_ref())
+            {
+                terminal_theme.set(preset);
+                send_action(&tx_term_theme, SettingsAction::SetTerminalTheme(preset));
+            }
+        })
+        .into_element()
+}
+
 fn render_font_picker(
+    accessibility_label: &'static str,
     font_family: Signal<String>,
     font_items: Vec<SelectItem>,
     labels: HashMap<String, String>,
     tx_font: Option<UnboundedSender<SettingsAction>>,
+    build_action: fn(String) -> SettingsAction,
 ) -> AnyElement {
     let trigger = view()
         .w(px(192.0))
@@ -305,6 +442,8 @@ fn render_font_picker(
                 labels.get(&fam).cloned().unwrap_or(fam)
             })
             .flex_1()
+            .min_w_0()
+            .app_class("truncate")
             .text_size(text_xs_size)
             .text_color(move || active_theme().foreground),
         )
@@ -319,7 +458,7 @@ fn render_font_picker(
         .searchable(true)
         .search_placeholder("搜索字体…")
         .placeholder("选择字体")
-        .accessibility_label("界面字体")
+        .accessibility_label(accessibility_label)
         .cover(false)
         .offset(px(4.0))
         .popup_class("bg-popover border border-border rounded-lg shadow-md overflow-hidden p-1")
@@ -341,16 +480,18 @@ fn render_font_picker(
             if let Some(family) = chosen {
                 let fam = family.to_string();
                 font_family.set(fam.clone());
-                send_action(&tx_font, SettingsAction::SetFontFamily(fam));
+                send_action(&tx_font, build_action(fam));
             }
         })
         .into_element()
 }
 
 fn render_font_size_picker(
+    accessibility_label: &'static str,
     font_size: Signal<u32>,
     font_size_items: Vec<SelectItem>,
     tx_size: Option<UnboundedSender<SettingsAction>>,
+    build_action: fn(u32) -> SettingsAction,
 ) -> AnyElement {
     let trigger = view()
         .w(px(192.0))
@@ -379,7 +520,7 @@ fn render_font_size_picker(
         .items(font_size_items)
         .value(move || SelectValue::from(font_size.get().to_string()))
         .placeholder("选择字号")
-        .accessibility_label("界面字体大小")
+        .accessibility_label(accessibility_label)
         .cover(false)
         .offset(px(4.0))
         .popup_class("bg-popover border border-border rounded-lg shadow-md overflow-hidden p-1")
@@ -393,24 +534,21 @@ fn render_font_size_picker(
                 && let Ok(sz) = raw.parse::<u32>()
             {
                 font_size.set(sz);
-                send_action(&tx_size, SettingsAction::SetFontSize(sz));
+                send_action(&tx_size, build_action(sz));
             }
         })
         .into_element()
 }
 
-fn render_general_settings_card(state: &GeneralPageState) -> impl IntoElement {
-    let dark = state.dark;
-    let notifications_enabled = state.notifications_enabled;
-    let notification_sound = state.notification_sound;
-    let auto_resume = state.auto_resume;
+fn settings_section(title: &'static str) -> View {
+    section_card().child(view().mb_1().child(section_title(title)))
+}
 
+fn render_appearance_card(state: &GeneralPageState) -> impl IntoElement {
+    let dark = state.dark;
     let tx_dark = state.actions_tx.clone();
     let tx_font = state.actions_tx.clone();
     let tx_size = state.actions_tx.clone();
-    let tx_notif = state.actions_tx.clone();
-    let tx_sound = state.actions_tx.clone();
-    let tx_resume = state.actions_tx.clone();
 
     let dark_switch = kumu_switch_bare(move || dark.get())
         .accessibility_label("深色外观")
@@ -421,14 +559,100 @@ fn render_general_settings_card(state: &GeneralPageState) -> impl IntoElement {
         .into_element();
 
     let font_picker = render_font_picker(
+        "界面字体",
         state.font_family,
         state.font_items.clone(),
         state.font_label_map.clone(),
         tx_font,
+        SettingsAction::SetFontFamily,
     );
 
-    let font_size_picker =
-        render_font_size_picker(state.font_size, state.font_size_items.clone(), tx_size);
+    let font_size_picker = render_font_size_picker(
+        "界面字体大小",
+        state.font_size,
+        state.font_size_items.clone(),
+        tx_size,
+        SettingsAction::SetFontSize,
+    );
+
+    settings_section("外观")
+        .child(settings_row(
+            "深色外观",
+            "在亮色与暗色主题之间切换。",
+            dark_switch,
+            false,
+        ))
+        .child(settings_row(
+            "界面字体",
+            "选择应用的界面字体。",
+            font_picker,
+            false,
+        ))
+        .child(settings_row(
+            "界面字体大小",
+            "界面文字与间距的基础字号。",
+            font_size_picker,
+            true,
+        ))
+}
+
+fn render_terminal_card(state: &GeneralPageState) -> impl IntoElement {
+    let tx_term_theme = state.actions_tx.clone();
+    let tx_term_font = state.actions_tx.clone();
+    let tx_term_size = state.actions_tx.clone();
+
+    let terminal_theme_picker = render_terminal_theme_picker(
+        state.terminal_theme,
+        Rc::clone(&state.terminal_swatches),
+        tx_term_theme,
+    );
+
+    let term_font_picker = render_font_picker(
+        "终端字体",
+        state.term_font_family,
+        state.term_font_items.clone(),
+        state.term_font_label_map.clone(),
+        tx_term_font,
+        SettingsAction::SetTermFontFamily,
+    );
+
+    let term_font_size_picker = render_font_size_picker(
+        "终端字号",
+        state.term_font_size,
+        state.term_font_size_items.clone(),
+        tx_term_size,
+        SettingsAction::SetTermFontSize,
+    );
+
+    settings_section("终端")
+        .child(settings_row(
+            "终端外观",
+            "独立设置终端配色方案，可与产品外壳外观区分开。",
+            terminal_theme_picker,
+            false,
+        ))
+        .child(settings_row(
+            "终端字体",
+            "终端网格的渲染字体，建议选择等宽字体；缺失图标自动使用内置 Nerd 字体。",
+            term_font_picker,
+            false,
+        ))
+        .child(settings_row(
+            "终端字号",
+            "独立设置终端文字大小（px）。",
+            term_font_size_picker,
+            true,
+        ))
+}
+
+fn render_notifications_and_session_card(state: &GeneralPageState) -> impl IntoElement {
+    let notifications_enabled = state.notifications_enabled;
+    let notification_sound = state.notification_sound;
+    let auto_resume = state.auto_resume;
+
+    let tx_notif = state.actions_tx.clone();
+    let tx_sound = state.actions_tx.clone();
+    let tx_resume = state.actions_tx.clone();
 
     let notifications_switch = kumu_switch_bare(move || notifications_enabled.get())
         .accessibility_label("Agent 通知")
@@ -454,25 +678,7 @@ fn render_general_settings_card(state: &GeneralPageState) -> impl IntoElement {
         })
         .into_element();
 
-    section_card()
-        .child(settings_row(
-            "深色外观",
-            "在亮色与暗色主题之间切换。",
-            dark_switch,
-            false,
-        ))
-        .child(settings_row(
-            "界面字体",
-            "选择应用的界面字体。",
-            font_picker,
-            false,
-        ))
-        .child(settings_row(
-            "界面字体大小",
-            "界面文字与间距的基础字号。",
-            font_size_picker,
-            false,
-        ))
+    settings_section("通知与会话")
         .child(settings_row(
             "Agent 通知",
             "任务完成或需要输入、确认时提醒；应用在后台时发送系统通知。",
@@ -489,14 +695,17 @@ fn render_general_settings_card(state: &GeneralPageState) -> impl IntoElement {
             "恢复 Agent 会话",
             "启动时让 Agent 窗格回到上次的对话；关闭后只恢复窗格，以新对话开始。",
             auto_resume_switch,
-            false,
-        ))
-        .child(settings_row(
-            "本地数据",
-            "项目与终端布局保存在 ~/.kumu/kumu.db。",
-            pill("SQLite", PillTone::Neutral).into_element(),
             true,
         ))
+}
+
+fn render_storage_card() -> impl IntoElement {
+    settings_section("数据").child(settings_row(
+        "本地数据",
+        "项目与终端布局保存在 ~/.kumu/kumu.db。",
+        pill("SQLite", PillTone::Neutral).into_element(),
+        true,
+    ))
 }
 
 fn render_updates_card(
@@ -554,13 +763,19 @@ fn render_updates_card(
 }
 
 pub(super) fn render_general_cards(state: &GeneralPageState) -> impl IntoElement {
-    let general_card = render_general_settings_card(state);
+    let appearance_card = render_appearance_card(state);
+    let terminal_card = render_terminal_card(state);
+    let notifications_card = render_notifications_and_session_card(state);
+    let storage_card = render_storage_card();
     let updates_card =
         render_updates_card(state.updater, state.confirm_restart_open, &state.actions_tx);
 
     view()
         .flex_col()
         .gap_5()
-        .child(general_card)
+        .child(appearance_card)
+        .child(terminal_card)
+        .child(notifications_card)
+        .child(storage_card)
         .child(updates_card)
 }
