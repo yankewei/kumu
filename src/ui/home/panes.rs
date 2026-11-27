@@ -89,6 +89,18 @@ impl KumuApp {
     }
 
     pub(super) fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(modal) = &self.active_todo_modal {
+            modal.app_view.read(cx).focus_handle(cx).focus(window, cx);
+            return;
+        }
+        if self.active_todo_board.is_some() {
+            self.shell_nsh
+                .app_view
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+            return;
+        }
         if self
             .selected
             .and_then(|project| self.active_tab(project))

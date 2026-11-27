@@ -449,11 +449,20 @@ impl KumuApp {
             return;
         }
         let selected_removed = self.selected.is_some_and(|id| removed.contains(&id));
+        if self
+            .active_todo_board
+            .is_some_and(|board_id| removed.contains(&board_id))
+        {
+            self.active_todo_board = None;
+            self.active_todo_modal = None;
+        }
         for id in &removed {
             if let Some(tabs) = self.tabs_by_project.remove(id) {
                 for pane in tabs.panes() {
-                    self.workspace
-                        .update(cx, |workspace, _| workspace.drop_terminal(pane.0));
+                    self.workspace.update(cx, |workspace, cx| {
+                        workspace.drop_terminal(pane.0);
+                        workspace.unbind_pane_todos(pane.0, cx);
+                    });
                     self.panes.remove(&pane);
                     self.native_registry.unregister_pane(pane.0);
                     self.launches.remove(&pane);

@@ -43,6 +43,8 @@ pub enum TerminalEvent {
     Interacted,
     /// Pane header metadata or find-bar state changed; refresh the NSH shell.
     ChromeChanged,
+    /// User right-clicked inside the terminal grid (without Shift bypass).
+    ContextMenu { position: Point<Pixels> },
 }
 
 /// Inset around the cell grid, matching the padded look of a pane TUI.
@@ -251,6 +253,7 @@ impl TerminalView {
                 .find
                 .as_ref()
                 .map(|bar| find_bar_snapshot(&self.snapshot, &bar.sent, bar.focus_nonce)),
+            linked_todos: Vec::new(),
         }
     }
 
@@ -582,7 +585,13 @@ impl Render for TerminalView {
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     this.focus.focus(window, cx);
                     cx.emit(TerminalEvent::Activated);
-                    this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                    if ev.modifiers.shift {
+                        this.press_mouse(ev.button, ev.position, &ev.modifiers, cx);
+                    } else {
+                        cx.emit(TerminalEvent::ContextMenu {
+                            position: ev.position,
+                        });
+                    }
                 }),
             )
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {

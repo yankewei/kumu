@@ -114,7 +114,7 @@ Rust 侧仅需在 `src/term/vt/program_status.rs` 维护轻量状态表 `Program
 4. **`src/app/core.rs`**：
    - 新增 `WorkspaceEvent::ProgramStatus { terminal, pane, project, status }` 与 `terminal_pane(terminal)` 查询方法，保持 `WorkspaceCore` 不依赖 UI 侧进程树状态。
    - `drain_terminal` 消费 `term.take_program_status()` 并原样发出 `WorkspaceEvent::ProgramStatus`。
-5. **`src/ui/home/agents.rs` & `src/ui/home/mod.rs` & `src/plugins/todo/mod.rs`**：
+5. **`src/ui/home/agents.rs` & `src/ui/home/mod.rs`**（原 `src/plugins/todo/mod.rs` 已退役并迁移至 `src/ui/home/todo_board/` 与 `todo_agent_links`）：
    - **非 Agent 普通命令过滤与防劫持（在 UI 层统一判定）**：
      - 若 `status.app` 非空：必须经 `id_for(&status.app)` 命中已知 Agent，否则直接忽略（防止 `cargo`/`terraform`/`brew` 等子命令误写 Agent 状态；如用户使用自定义 `app` 名称例如 Pi `piConfigName`，需在 `src/agent/registry.rs` 登记别名或继续使用 Kumu 原生 Pi 扩展）；且已由 `launches` 启动为指定 Agent 的窗格（或 shell 窗格中处于活跃态的 Agent）不允许被嵌套子程序的其他 `app` 切换 Agent。
      - 若 `status.app` 为空：仅当窗格以 Agent 启动（`launches` 为 `PaneLaunch::Agent`）或已在 `agent_status` 中（由进程树 watcher 或 `Session` 识别）时接收。
@@ -123,7 +123,7 @@ Rust 侧仅需在 `src/term/vt/program_status.rs` 维护轻量状态表 `Program
      - **OSC 7501 优先组（Codex / Claude Code / Antigravity CLI / Grok 等）**：`OSC 7501 > Hooks`。仅当收到**非 `Clear` 且带明确 `app`** 的 OSC 7501 状态时置位 `osc7501_active = true`（`Clear` 或匿名空 `app` 上报不建立权威，防止误伤 Cursor CLI 等纯 Hook Agent）；权威生效后忽略同窗格后续来自 `OSC 777` 的 `kumu-status:` 以及匹配 Kumu 标准 Hook 文案的重复文本通知（保留 `kumu-session:`、`kumu-title:` 及非 Hook 自定义通知）。
      - 当 Agent 退出回 shell（移除 `AgentEntry`）或同一 shell 窗格切换为其他 Agent 时，权威标记与终端内 `ProgramStatusTable` 同步重置。
    - **状态映射与提醒联动**：
-     - `Working` → `Running`、`Blocked` → `Waiting`、`Done` → `Completed`、`Error` → `Failed`、`Idle | Clear` → `Idle`；复用现有 `unseen` 与 TODO `awaiting_review` 联动（`plugins/todo` 同步订阅 `ProgramStatus`）。
+     - `Working` → `Running`、`Blocked` → `Waiting`、`Done` → `Completed`、`Error` → `Failed`、`Idle | Clear` → `Idle`；复用现有 `unseen` 与 TODO `awaiting_review` 联动（通过 `todo_agent_links` 按窗格更新）。
      - 使用 `(state, kind, blocked prompt)` 跃迁键判断是否触发提醒（`Blocked` 的 `kind` 或提示内容变化会触发新提醒，同一提示的进度跳动不刷屏）；复用 `KumuApp::raise_attention` 发送提醒（通知标题为 `项目 · 终端标签` 以防跨窗格伪装，正文前缀为 Agent 显示名与可选记录 `title`，正文优先取清洗后的 `msg`，为空时回退中文默认文案；复用 2 秒去重）。
 
 ### 4.4 涉及文件清单
@@ -141,7 +141,7 @@ Rust 侧仅需在 `src/term/vt/program_status.rs` 维护轻量状态表 `Program
   - `src/app/mod.rs`
   - `src/ui/home/mod.rs`
   - `src/ui/home/agents.rs`
-  - `src/plugins/todo/mod.rs`
+  - `src/plugins/todo/mod.rs`（历史记录，已在 PR #53 迁移至 `src/ui/home/todo_board/`）
 
 ## 5. 验证计划
 

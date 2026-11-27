@@ -18,6 +18,7 @@ mod sprites;
 mod tabs;
 mod tabs_nsh;
 mod terminal;
+mod todo_board;
 mod workspace;
 
 use std::collections::HashMap;
@@ -39,9 +40,10 @@ use native_host::NativeViewRegistry;
 use plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH, PLUGIN_WIDTH};
 use shell_nsh::{
     CenterModeSnapshot, HomeShellAction, HomeShellSnapshot, LayoutNodeSnapshot, NshHomeShell,
-    PluginPanelSnapshot,
+    PluginPanelSnapshot, TerminalContextAction, TerminalContextMenuRequest,
 };
 pub(crate) use terminal::TerminalView;
+use todo_board::{ActiveTodoModal, TodoBoardSummary};
 
 /// Whether panes come back with the conversation they were running.
 fn auto_resume_enabled() -> bool {
@@ -155,6 +157,20 @@ pub struct KumuApp {
     active_agent_picker: Option<ActiveAgentPicker>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
     pub(super) active_sheet: Option<crate::plugins::ActiveSheet>,
+    /// Root repository board currently shown in the main content area (`None` = terminals).
+    active_todo_board: Option<i64>,
+    /// Full-window Pure Rust NSH overlay for TODO Create / Jira-style Detail modals.
+    active_todo_modal: Option<ActiveTodoModal>,
+    /// Cached per-root-board TODO counts & attention flags for the sidebar.
+    todo_summaries: HashMap<i64, TodoBoardSummary>,
+    /// Cached installed `(agent_id, display_name)` list so board snapshots never
+    /// probe the filesystem on every render frame.
+    installed_agents_cache: Vec<(String, String)>,
+    /// Cached default agent id for one-click TODO dispatch so board snapshots
+    /// never open a fresh SQLite connection on every render frame.
+    todo_default_agent_cache: Option<String>,
+    /// Monotonically incremented on `⌘F` while the TODO board is active to focus search.
+    todo_search_focus_nonce: u64,
     /// Syncs KumuTheme updates into `shell_nsh` and the NSH overlays.
     _nsh_theme_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
@@ -224,7 +240,11 @@ impl KumuApp {
         // Only what the home view itself draws. A terminal frame is the pane's
         // own, subscribed inside [`TerminalView`].
         cx.subscribe_in(&workspace, window, |this, _, ev, window, cx| match ev {
-            WorkspaceEvent::Changed => cx.notify(),
+            WorkspaceEvent::Changed => {
+                this.refresh_all_todo_summaries(cx);
+                this.sync_active_todo_modal(cx);
+                cx.notify();
+            }
             WorkspaceEvent::Frame(_) => {}
             WorkspaceEvent::Failed(message) => {
                 this.store_error = Some(message.clone());
@@ -417,7 +437,11 @@ impl KumuApp {
             WorkspaceEvent::ClipboardWrite(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
-            WorkspaceEvent::TodosChanged(_) => cx.notify(),
+            WorkspaceEvent::TodosChanged(board_id) => {
+                this.refresh_todo_summary(*board_id, cx);
+                this.sync_active_todo_modal(cx);
+                cx.notify();
+            }
         })
         .detach();
 
@@ -529,6 +553,9 @@ impl KumuApp {
             if let Some(picker) = &app.active_agent_picker {
                 picker.sync_theme(&theme, cx);
             }
+            if let Some(modal) = &app.active_todo_modal {
+                modal.sync_theme(&theme, cx);
+            }
         });
         let window_focus = cx.focus_handle();
 
@@ -571,15 +598,24 @@ impl KumuApp {
             active_dialog: None,
             active_agent_picker: None,
             active_sheet: None,
+            active_todo_board: None,
+            active_todo_modal: None,
+            todo_summaries: HashMap::new(),
+            installed_agents_cache: Vec::new(),
+            todo_default_agent_cache: None,
+            todo_search_focus_nonce: 0,
             _nsh_theme_sub: nsh_theme_sub,
             control: None,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
         }
+        app.reconcile_todo_panes(cx);
+        app.refresh_todo_agent_cache();
         app.start_control(cx);
         app.start_shell_agent_watcher(cx);
         app.start_project_branch_watcher(cx);
+        app.refresh_all_todo_summaries(cx);
         app.focus_terminal(window, cx);
         app.sync_pane_chrome(cx);
         let shell_snap = app.build_shell_snapshot(cx);
@@ -607,22 +643,36 @@ impl KumuApp {
         let has_projects = !self.workspace.read(cx).projects().is_empty();
         let active_tab = self.selected.and_then(|project| self.active_tab(project));
         let zoomed = self.active_zoomed_pane();
-        let (center, pane_chrome) = match active_tab {
-            Some(tab) if !tab.layout.panes().is_empty() => {
-                let mut chrome = HashMap::new();
-                for pane_id in tab.layout.panes() {
-                    if let Some(view) = self.panes.get(&pane_id) {
-                        chrome.insert(pane_id, view.read(cx).chrome_snapshot());
+        let (center, pane_chrome) = if let Some(board_id) = self.active_todo_board {
+            (
+                CenterModeSnapshot::TodoBoard(self.build_todo_board_snapshot(board_id, cx)),
+                HashMap::new(),
+            )
+        } else {
+            match active_tab {
+                Some(tab) if !tab.layout.panes().is_empty() => {
+                    let ws = self.workspace.read(cx);
+                    let visible_panes = tab.layout.panes();
+                    let pane_raw_ids: Vec<u64> = visible_panes.iter().map(|p| p.0).collect();
+                    let mut linked_by_pane = ws.open_todo_summaries_for_panes(&pane_raw_ids);
+                    let mut chrome = HashMap::new();
+                    for pane_id in visible_panes {
+                        if let Some(view) = self.panes.get(&pane_id) {
+                            let mut snap = view.read(cx).chrome_snapshot();
+                            snap.linked_todos =
+                                linked_by_pane.remove(&pane_id.0).unwrap_or_default();
+                            chrome.insert(pane_id, snap);
+                        }
                     }
+                    let layout = match zoomed {
+                        Some(pane_id) => LayoutNodeSnapshot::Leaf(pane_id),
+                        None => self.build_layout_snapshot(&tab.layout),
+                    };
+                    (CenterModeSnapshot::Panes(layout), chrome)
                 }
-                let layout = match zoomed {
-                    Some(pane_id) => LayoutNodeSnapshot::Leaf(pane_id),
-                    None => self.build_layout_snapshot(&tab.layout),
-                };
-                (CenterModeSnapshot::Panes(layout), chrome)
+                _ if has_projects => (CenterModeSnapshot::EmptyTerminals, HashMap::new()),
+                _ => (CenterModeSnapshot::EmptyProjects, HashMap::new()),
             }
-            _ if has_projects => (CenterModeSnapshot::EmptyTerminals, HashMap::new()),
-            _ => (CenterModeSnapshot::EmptyProjects, HashMap::new()),
         };
 
         let open_plugin =
@@ -656,6 +706,7 @@ impl KumuApp {
         match action {
             HomeShellAction::Sidebar(a) => self.handle_sidebar_action(a, window, cx),
             HomeShellAction::TabBar(a) => self.handle_tab_bar_action(a, window, cx),
+            HomeShellAction::TodoBoard(a) => self.handle_todo_board_action(a, window, cx),
             HomeShellAction::DismissStoreError => {
                 self.store_error = None;
                 cx.notify();
@@ -664,6 +715,11 @@ impl KumuApp {
                 self.add_terminal(None, cx);
                 self.focus_terminal(window, cx);
                 cx.notify();
+            }
+            HomeShellAction::EmptyOpenTodoBoard => {
+                if let Some(project) = self.selected {
+                    self.open_todo_board(project, None, window, cx);
+                }
             }
             HomeShellAction::EmptyAddProject => {
                 self.add_project(cx);
@@ -720,6 +776,14 @@ impl KumuApp {
             HomeShellAction::OpenAgentPicker { pane, anchor } => {
                 self.open_agent_picker(pane, anchor, window, cx);
             }
+            HomeShellAction::OpenTodoFromPane { pane, todo_id } => {
+                if let Some(project_id) = self.pane_project(pane, cx).or(self.selected) {
+                    self.open_todo_board(project_id, Some(todo_id), window, cx);
+                }
+            }
+            HomeShellAction::TerminalContextMenu { pane, action } => {
+                self.handle_terminal_context_action(pane, action, window, cx);
+            }
             HomeShellAction::FindChange { pane, needle } => {
                 if let Some(view) = self.panes.get(&pane).cloned() {
                     view.update(cx, |v, cx| v.set_find_needle(needle, cx));
@@ -733,6 +797,155 @@ impl KumuApp {
             HomeShellAction::FindClose(pane) => {
                 if let Some(view) = self.panes.get(&pane).cloned() {
                     view.update(cx, |v, cx| v.close_find(window, cx));
+                }
+            }
+        }
+    }
+
+    fn open_terminal_context_menu(
+        &mut self,
+        pane: PaneId,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = self.pane_project(pane, cx).or(self.selected) else {
+            return;
+        };
+        let ws = self.workspace.read(cx);
+        let board_id = ws.board_project_id(project_id);
+        let linked_todos: Vec<(i64, String)> = ws
+            .todos_for_pane(pane.0)
+            .into_iter()
+            .map(|t| (t.id, t.title))
+            .collect();
+        let candidate_todos: Vec<(i64, String)> = ws
+            .todos_for_project(board_id)
+            .into_iter()
+            .filter(|t| t.status != crate::db::TodoStatus::Done)
+            .take(12)
+            .map(|t| (t.id, t.title))
+            .collect();
+        let x = f32::from(position.x).max(0.0);
+        let y = (f32::from(position.y) - crate::ui::titlebar::TITLE_BAR_HEIGHT).max(0.0);
+        self.shell_nsh
+            .open_terminal_context_menu(TerminalContextMenuRequest {
+                pane,
+                x,
+                y,
+                linked_todos,
+                candidate_todos,
+            });
+    }
+
+    fn handle_terminal_context_action(
+        &mut self,
+        pane: PaneId,
+        action: TerminalContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            TerminalContextAction::Copy => {
+                if let Some(view) = self.panes.get(&pane).cloned() {
+                    view.update(cx, |v, cx| {
+                        v.copy(cx);
+                    });
+                }
+            }
+            TerminalContextAction::Paste => {
+                if let Some(view) = self.panes.get(&pane).cloned() {
+                    view.update(cx, |v, cx| v.paste_from_clipboard(cx));
+                }
+            }
+            TerminalContextAction::SplitRight => self.split_pane(pane, SplitAxis::Horizontal, cx),
+            TerminalContextAction::SplitDown => self.split_pane(pane, SplitAxis::Vertical, cx),
+            TerminalContextAction::OpenTodo(todo_id) => {
+                if let Some(project_id) = self.pane_project(pane, cx).or(self.selected) {
+                    self.open_todo_board(project_id, Some(todo_id), window, cx);
+                }
+            }
+            TerminalContextAction::CompleteTodo(todo_id) => {
+                self.workspace.update(cx, |ws, cx| {
+                    ws.update_todo(
+                        todo_id,
+                        &crate::db::TodoPatch {
+                            status: Some(crate::db::TodoStatus::Done),
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                });
+            }
+            TerminalContextAction::DetachTodo(todo_id) => {
+                self.workspace.update(cx, |ws, cx| {
+                    ws.detach_todo_pane_link(todo_id, pane.0, cx);
+                });
+            }
+            TerminalContextAction::LinkTodo(todo_id) => {
+                let (agent_id, session_id) = match self.launches.get(&pane) {
+                    Some(PaneLaunch::Agent { agent, session }) => {
+                        (Some(agent.clone()), session.clone())
+                    }
+                    _ => (self.agent_status.get(&pane).map(|e| e.agent.clone()), None),
+                };
+                let project_id = self.pane_project(pane, cx).or(self.selected);
+                let label = self
+                    .agent_status
+                    .get(&pane)
+                    .map(AgentEntry::display_title)
+                    .unwrap_or_default();
+                self.workspace.update(cx, |ws, cx| {
+                    ws.add_todo_link(
+                        todo_id,
+                        agent_id.as_deref(),
+                        session_id.as_deref(),
+                        Some(pane.0),
+                        project_id,
+                        &label,
+                        cx,
+                    );
+                    ws.update_todo(
+                        todo_id,
+                        &crate::db::TodoPatch {
+                            status: Some(crate::db::TodoStatus::InProgress),
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                });
+            }
+            TerminalContextAction::CreateAndLinkTodo => {
+                let Some(project_id) = self.pane_project(pane, cx).or(self.selected) else {
+                    return;
+                };
+                let (agent_id, session_id) = match self.launches.get(&pane) {
+                    Some(PaneLaunch::Agent { agent, session }) => {
+                        (Some(agent.clone()), session.clone())
+                    }
+                    _ => (self.agent_status.get(&pane).map(|e| e.agent.clone()), None),
+                };
+                let label = self
+                    .agent_status
+                    .get(&pane)
+                    .map(AgentEntry::display_title)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "终端任务".to_string());
+                let created = self.workspace.update(cx, |ws, cx| {
+                    ws.add_todo_with_link(
+                        project_id,
+                        &label,
+                        "",
+                        crate::db::TodoStatus::InProgress,
+                        Some(pane.0),
+                        agent_id.as_deref(),
+                        session_id.as_deref(),
+                        Some(project_id),
+                        &label,
+                        cx,
+                    )
+                });
+                if let Some(item) = created {
+                    self.open_todo_board(project_id, Some(item.id), window, cx);
                 }
             }
         }
@@ -808,6 +1021,24 @@ impl KumuApp {
                     }))
                     .child(dialog.app_view.clone())
             }))
+            .children(self.active_todo_modal.as_ref().map(|modal| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if ev.keystroke.key == "escape"
+                            && this
+                                .active_todo_modal
+                                .as_ref()
+                                .is_none_or(|modal| !modal.request_close())
+                        {
+                            this.active_todo_modal = None;
+                            this.focus_terminal(window, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .child(modal.app_view.clone())
+            }))
             .children(self.active_agent_picker.as_ref().map(|picker| {
                 div()
                     .absolute()
@@ -835,6 +1066,8 @@ impl Render for KumuApp {
             && self.active_dialog.is_none()
             && self.active_agent_picker.is_none()
             && self.active_sheet.is_none()
+            && self.active_todo_modal.is_none()
+            && self.active_todo_board.is_none()
             && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()
         {

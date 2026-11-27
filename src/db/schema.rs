@@ -12,7 +12,7 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in `PRAGMA user_version`. Bump it with a new
 /// `migrate_vN` step; opening an older database applies the steps it is
 /// missing exactly once.
-pub(super) const SCHEMA_VERSION: i64 = 7;
+pub(super) const SCHEMA_VERSION: i64 = 8;
 
 impl Store {
     pub(super) fn init(&mut self) -> Result<(), OpenError> {
@@ -48,7 +48,9 @@ impl Store {
             Self::migrate_v6_conn(&transaction)?;
         }
         // Version 7 previously added external issue tracker columns to `todos`.
-        // Keep SCHEMA_VERSION at 7 so existing v7 databases continue to open.
+        if version < 8 {
+            Self::migrate_v8_conn(&transaction)?;
+        }
         if version < SCHEMA_VERSION {
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -244,6 +246,55 @@ impl Store {
                 ON todos(project_id, status, position, id);
             CREATE INDEX IF NOT EXISTS todos_pane
                 ON todos(pane_id) WHERE pane_id IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
+    /// 1:N agent & session bindings per TODO item.
+    ///
+    /// `todo_agent_links` becomes the single source of truth for agent/session
+    /// bindings; legacy columns on `todos` remain read-only snapshots for
+    /// backwards safety. `agent_id` is nullable to preserve legacy shell-only
+    /// bindings (`kumu todo add --bind` on a plain shell pane).
+    fn migrate_v8_conn(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS todo_agent_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+                agent_id TEXT,
+                agent_session_id TEXT,
+                pane_id INTEGER,
+                project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+                label TEXT NOT NULL DEFAULT '',
+                awaiting_review INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS todo_agent_links_todo
+                ON todo_agent_links(todo_id, id);
+            CREATE INDEX IF NOT EXISTS todo_agent_links_pane
+                ON todo_agent_links(pane_id) WHERE pane_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS todo_agent_links_todo_session
+                ON todo_agent_links(todo_id, agent_session_id)
+                WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
+            INSERT INTO todo_agent_links (
+                todo_id, agent_id, agent_session_id, pane_id, project_id,
+                label, awaiting_review, created_at, updated_at
+            )
+            SELECT
+                id,
+                NULLIF(agent_id, ''),
+                NULLIF(agent_session_id, ''),
+                pane_id,
+                project_id,
+                '',
+                CASE WHEN status = 'in_progress' THEN awaiting_review ELSE 0 END,
+                created_at,
+                updated_at
+            FROM todos
+            WHERE pane_id IS NOT NULL
+               OR (agent_id IS NOT NULL AND agent_id != '')
+               OR (agent_session_id IS NOT NULL AND agent_session_id != '');",
         )?;
         Ok(())
     }

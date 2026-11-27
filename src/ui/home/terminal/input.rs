@@ -101,7 +101,7 @@ impl TerminalView {
 
     /// Copy the current selection. The text lives on the session thread, so the
     /// read happens on a background task instead of blocking event dispatch.
-    pub(super) fn copy(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(in crate::ui::home) fn copy(&mut self, cx: &mut Context<Self>) -> bool {
         if self.project.is_none() {
             return false;
         }
@@ -121,6 +121,10 @@ impl TerminalView {
         })
         .detach();
         true
+    }
+
+    pub(in crate::ui::home) fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        self.paste(cx);
     }
 
     pub(super) fn paste(&mut self, cx: &mut Context<Self>) {

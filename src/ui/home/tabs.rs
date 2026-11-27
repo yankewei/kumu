@@ -477,6 +477,9 @@ impl KumuApp {
             TabBarAction::PromptRename { project_id, tab_id } => {
                 self.prompt_rename_tab(project_id, tab_id, window, cx);
             }
+            TabBarAction::OpenProjectBoard(project_id) => {
+                self.open_todo_board(project_id, None, window, cx);
+            }
         }
     }
 }

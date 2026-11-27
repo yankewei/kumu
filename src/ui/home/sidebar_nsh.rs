@@ -28,6 +28,10 @@ pub(super) struct ProjectRowSnapshot {
     /// True on a `RepoHeader` when its main or any linked worktree is selected.
     pub(super) has_active_child: bool,
     pub(super) unread: bool,
+    /// Open TODO count for root `RepoHeader` / `PlainProject` rows.
+    pub(super) todo_count: usize,
+    /// True when any linked Agent on this board needs human attention.
+    pub(super) todo_attention: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +66,7 @@ pub(super) struct SidebarSnapshot {
 pub(super) enum SidebarAction {
     AddProject,
     SelectProject(i64),
+    OpenProjectBoard(i64),
     NewTerminal(i64),
     PromptCreateWorktree(i64),
     PromptOpenWorktree(i64),
@@ -247,6 +252,15 @@ pub(super) mod view {
         let kind = project.kind;
 
         let mut items = Vec::new();
+        if matches!(
+            kind,
+            ProjectRowKind::PlainProject | ProjectRowKind::RepoHeader
+        ) {
+            let tx_board = tx.clone();
+            items.push(MenuItem::new("打开 TODO 看板").on_select(move || {
+                send(&tx_board, SidebarAction::OpenProjectBoard(project_id));
+            }));
+        }
         if kind != ProjectRowKind::RepoHeader {
             let tx = tx.clone();
             items.push(MenuItem::new("新建终端").on_select(move || {
@@ -643,7 +657,13 @@ pub(super) mod view {
                     .pl(px(if is_worktree { 22.0 } else { 6.0 }))
                     .pr_1()
                     .gap_1p5()
-                    .on_press(move || send(&tx_sel, SidebarAction::SelectProject(id)))
+                    .on_press(move || {
+                        if is_header {
+                            send(&tx_sel, SidebarAction::OpenProjectBoard(id));
+                        } else {
+                            send(&tx_sel, SidebarAction::SelectProject(id));
+                        }
+                    })
                     .on_context_menu(move |ev: &ContextMenuEvent| {
                         let items = project_context_menu(tx_ctx.clone(), &ctx_proj);
                         drop(popup_menu_at(items, ev.page_position));
@@ -663,6 +683,40 @@ pub(super) mod view {
                             })
                             .text_color(text_fg),
                     );
+
+                if is_header && project.todo_attention {
+                    project_button = project_button.child(
+                        view()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .flex_shrink_0()
+                            .rounded(px(3.0))
+                            .bg(warning_color),
+                    );
+                }
+                if is_header && project.todo_count > 0 {
+                    let count_str = project.todo_count.to_string();
+                    project_button = project_button.child(
+                        view()
+                            .px_1p5()
+                            .py_0p5()
+                            .flex_shrink_0()
+                            .rounded(px(999.0))
+                            .bg(move || {
+                                if active {
+                                    active_theme().background
+                                } else {
+                                    link_color().opacity(0.14)
+                                }
+                            })
+                            .child(
+                                text(count_str)
+                                    .text_size(text_xs_size)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(link_color),
+                            ),
+                    );
+                }
 
                 if project.unread {
                     project_button = project_button.child(
@@ -894,6 +948,8 @@ mod tests {
                     active: false,
                     has_active_child: true,
                     unread: false,
+                    todo_count: 2,
+                    todo_attention: false,
                 },
                 ProjectRowSnapshot {
                     id: 7,
@@ -904,6 +960,8 @@ mod tests {
                     active: true,
                     has_active_child: false,
                     unread: false,
+                    todo_count: 0,
+                    todo_attention: false,
                 },
             ],
             agents: vec![],
@@ -946,6 +1004,8 @@ mod tests {
                         active: false,
                         has_active_child: true,
                         unread: false,
+                        todo_count: 2,
+                        todo_attention: false,
                     },
                     ProjectRowSnapshot {
                         id: 7,
@@ -956,6 +1016,8 @@ mod tests {
                         active: true,
                         has_active_child: false,
                         unread: false,
+                        todo_count: 0,
+                        todo_attention: false,
                     },
                 ],
                 agents: vec![AgentRowSnapshot {
