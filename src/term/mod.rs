@@ -14,8 +14,9 @@ mod vt;
 pub use pty::SESSION_TOKEN_ENV;
 pub use session::Term;
 pub use vt::{
-    Cell, CursorShape, Hyperlink, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods, Rgb,
-    SelectStep, Snapshot, TermColors, TermNotification,
+    Cell, CursorShape, Hyperlink, KeyInput, MouseAction, MouseButton, MouseInput, MouseMods,
+    ProgramBlockKind, ProgramState, Rgb, SelectStep, Snapshot, TermColors, TermNotification,
+    TermProgramStatus,
 };
 
 /// The user's login shell: `$SHELL`, falling back to `/bin/sh`.

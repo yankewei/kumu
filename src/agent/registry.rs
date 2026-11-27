@@ -65,12 +65,58 @@ pub const AGENTS: [AgentDef; 8] = [
 
 /// The registry id behind a name an agent reported about itself.
 ///
-/// Hooks pass the lowercase id (`--kumu-notify codex`), while the in-process
-/// plugins use the display name ("OpenCode"). Both mean the same agent, so the
-/// pane can tell which spec the session belongs to.
+/// Hooks pass the lowercase id (`--kumu-notify codex`), in-process plugins use
+/// the display name ("OpenCode"), and OSC 7501 uses stable app identifiers
+/// (`claude-code`, `antigravity`, `cursor-agent`).
 pub fn id_for(name: &str) -> Option<&'static str> {
-    AGENTS
-        .iter()
-        .find(|agent| agent.id.eq_ignore_ascii_case(name) || agent.name.eq_ignore_ascii_case(name))
-        .map(|agent| agent.id)
+    let trimmed = name.trim();
+    if let Some(agent) = AGENTS.iter().find(|agent| {
+        agent.id.eq_ignore_ascii_case(trimmed) || agent.name.eq_ignore_ascii_case(trimmed)
+    }) {
+        return Some(agent.id);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "claude-code" | "claude_code" => Some("claude"),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some("agy"),
+        "cursor-agent" | "cursor_agent" | "cursor-cli" | "cursor_cli" => Some("cursor"),
+        "oh-my-pi" | "oh_my_pi" => Some("omp"),
+        "grok-build" | "grok_build" => Some("grok"),
+        "pi-coding-agent" => Some("pi"),
+        _ => None,
+    }
+}
+
+/// Whether Kumu's native in-process extension for `id` should remain
+/// authoritative over OSC 7501 when both are active on the same pane.
+///
+/// OpenCode, Pi, and Oh My Pi ship full lifecycle extensions in Kumu; external
+/// hook-based CLIs (Codex, Claude Code, Antigravity CLI, Grok) prefer OSC 7501.
+pub fn prefers_integration_status(id: &str) -> bool {
+    matches!(id, "opencode" | "pi" | "omp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_for_resolves_osc7501_app_aliases_and_rejects_non_agents() {
+        assert_eq!(id_for("codex"), Some("codex"));
+        assert_eq!(id_for("antigravity"), Some("agy"));
+        assert_eq!(id_for("antigravity-cli"), Some("agy"));
+        assert_eq!(id_for("claude-code"), Some("claude"));
+        assert_eq!(id_for("cursor-agent"), Some("cursor"));
+        assert_eq!(id_for("oh-my-pi"), Some("omp"));
+        assert_eq!(id_for("grok-build"), Some("grok"));
+        assert_eq!(id_for("pi-coding-agent"), Some("pi"));
+        assert_eq!(id_for("cargo"), None);
+        assert_eq!(id_for("terraform"), None);
+
+        assert!(prefers_integration_status("opencode"));
+        assert!(prefers_integration_status("pi"));
+        assert!(prefers_integration_status("omp"));
+        assert!(!prefers_integration_status("codex"));
+        assert!(!prefers_integration_status("claude"));
+        assert!(!prefers_integration_status("agy"));
+    }
 }

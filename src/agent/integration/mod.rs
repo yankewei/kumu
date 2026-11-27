@@ -11,7 +11,7 @@ use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::CstRootNode;
 use serde_json::Value;
 
-pub use cli::run_cli;
+pub use cli::{is_hook_notification_body, run_cli};
 use hooks::{
     agy_hooks_status, cursor_events, cursor_hook, hook_groups, hooks_status, temporary_path,
     update_hook_file,

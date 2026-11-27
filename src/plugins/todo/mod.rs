@@ -361,6 +361,7 @@ impl Plugin for TodoPanel {
                 }
                 WorkspaceEvent::Changed
                 | WorkspaceEvent::AgentStatus { .. }
+                | WorkspaceEvent::ProgramStatus { .. }
                 | WorkspaceEvent::AgentTitle { .. }
                 | WorkspaceEvent::AgentExited { .. }
                 | WorkspaceEvent::PaneExited { .. }

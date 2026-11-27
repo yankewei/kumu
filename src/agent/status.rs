@@ -71,6 +71,15 @@ impl AgentState {
     }
 }
 
+/// Which transport reported an agent status update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusSource {
+    /// Terminal-native OSC 7501 Program Status Protocol.
+    Osc7501,
+    /// Kumu's registered external hooks or in-process extensions (`OSC 777`).
+    Integration,
+}
+
 /// Wire-level status signal sent on `kumu-status:`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusSignal {
