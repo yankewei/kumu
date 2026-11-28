@@ -555,9 +555,11 @@ mod view {
                     .child(
                         body_text("还没有终端").text_color(move || active_theme().muted_foreground),
                     )
-                    .child(kumu_button("新建终端", ButtonVariant::Ghost).on_press(move || {
-                        send(&tx_c, HomeShellAction::EmptyAddTerminal);
-                    }))
+                    .child(
+                        kumu_button("新建终端", ButtonVariant::Ghost).on_press(move || {
+                            send(&tx_c, HomeShellAction::EmptyAddTerminal);
+                        }),
+                    )
                     .into_element(),
                 CenterModeSnapshot::EmptyProjects => view()
                     .flex_col()
