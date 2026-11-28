@@ -51,8 +51,8 @@ mod view {
     use nsh_core::prelude::*;
 
     use super::{AgentPickerAnchor, AgentPickerItem, AgentPickerOutcome, MOUNTS};
-    use crate::nsh_ui::assets::{asset_src, icon_svg};
-    use crate::nsh_ui::components::{ControlTone, kumu_list_button};
+    use crate::nsh_ui::assets::icon_svg;
+    use crate::nsh_ui::components::{ControlTone, kumu_agent_logo, kumu_list_button};
     use crate::nsh_ui::theme::text_xs_size;
     use crate::ui::titlebar::TITLE_BAR_HEIGHT;
 
@@ -70,51 +70,6 @@ mod view {
         }
     }
 
-    /// Each agent's accent, used for its glyph and the tile behind it so the
-    /// monochrome brand marks still read as distinct, colored choices.
-    fn agent_accent(id: &str) -> AdaptiveColor {
-        match id {
-            "opencode" => AdaptiveColor::rgb(0x475569, 0x94a3b8),
-            "omp" => AdaptiveColor::rgb(0xd97706, 0xfbbf24),
-            "codex" => AdaptiveColor::rgb(0x0d8a6a, 0x34d399),
-            "claude" => AdaptiveColor::rgb(0xc26144, 0xf0936e),
-            "pi" => AdaptiveColor::rgb(0x7c3aed, 0xa78bfa),
-            "cursor" => AdaptiveColor::rgb(0x4f46e5, 0x818cf8),
-            "grok" => AdaptiveColor::rgb(0x0f172a, 0xcbd5e1),
-            "agy" => AdaptiveColor::rgb(0x6366f1, 0x93c5fd),
-            _ => AdaptiveColor::rgb(0x64748b, 0x94a3b8),
-        }
-    }
-
-    fn agent_logo(item: &AgentPickerItem) -> AnyElement {
-        let accent = agent_accent(&item.id);
-        let glyph: AnyElement = match item.logo {
-            Some(path) if path.ends_with(".svg") => icon_svg(path, 14.0)
-                .text_color(move || accent)
-                .into_element(),
-            Some(path) => image(asset_src(path))
-                .w(px(14.0))
-                .h(px(14.0))
-                .flex_shrink_0()
-                .into_element(),
-            None => icon_svg("icons/bot.svg", 14.0)
-                .text_color(move || accent)
-                .into_element(),
-        };
-        view()
-            .flex_shrink_0()
-            .w(px(20.0))
-            .h(px(20.0))
-            .items_center()
-            .justify_center()
-            .rounded(px(6.0))
-            .bg(move || accent.opacity(0.16))
-            .border_1()
-            .border_color(move || accent.opacity(0.35))
-            .child(glyph)
-            .into_element()
-    }
-
     fn render_row(
         item: &AgentPickerItem,
         tx: &Option<UnboundedSender<AgentPickerOutcome>>,
@@ -128,7 +83,7 @@ mod view {
             .px_2()
             .gap_2()
             .on_press(move || send(&tx_row, AgentPickerOutcome::Selected(id.clone())))
-            .child(agent_logo(item))
+            .child(kumu_agent_logo(&item.id, item.logo))
             .child(
                 text(item.name.clone())
                     .flex_1()

@@ -13,7 +13,7 @@ Kumu 具备多窗格终端、编码 Agent 接入（通知 / MCP / Skills）、�
 
 设计原则（对齐 `nsh-design-guides`）：
 - **行动优先，不做 PPT**：每一步提供真实动作与明确副作用说明，状态实时反馈；
-- **不打扰老用户、随时可重开**：仅全新初始化工作区自动弹出；`Esc` 仅本次关闭，只有点击「跳过，不再自动显示」或「完成引导」才写入 `onboarding_done = "1"`；随时可通过 `⌘K` 或设置页重开；
+- **不打扰老用户、随时可重开**：仅全新初始化工作区自动弹出；`Esc` / 点击遮罩 / 右上角关闭仅本次关闭，点击「跳过，不再显示」、「完成引导」或第 4 步「预览示例 Artifact」写入 `onboarding_done = "1"`；随时可通过 `⌘K` 或设置页重开；
 - **零运行时负担**：作为一次性向导 overlay（`ActiveOnboarding`），仅打开时挂载，关闭后零渲染与输入开销；不与 `active_dialog` / `active_sheet` 叠层；
 - **纯状态机 + NSH 双向通道**：参考 `SettingsWindow` 的 `HostEvent` + `Action` 双向通道模式，流程状态抽成纯 Rust `OnboardingState`（便于直接单元测试），NSH 视图只负责渲染和事件转发，全量使用 `nsh_ui::components` 与 `active_theme()` 语义 token。
 
@@ -33,8 +33,8 @@ Kumu 具备多窗格终端、编码 Agent 接入（通知 / MCP / Skills）、�
 - `KumuApp::new` 读取该判定，仅当为 `true` 时在主窗口就绪后自动弹出 `ActiveOnboarding`。
 
 ### 2.2 退出与持久化语义
-- 按 `Esc` 或点击右上角关闭按钮：仅本次关闭，不写 `onboarding_done`；
-- 点击左下角 **「跳过，不再自动显示」** 或第 4 步 **「完成引导」**：写入 `SETTING_ONBOARDING_DONE = "1"` 后关闭，焦点归还终端。
+- 按 `Esc`、点击遮罩空白处或右上角关闭按钮：仅本次关闭，不写 `onboarding_done`；
+- 点击左下角 **「跳过，不再显示」**、第 4 步 **「完成引导」** 或 **「预览示例 Artifact」**：写入 `SETTING_ONBOARDING_DONE = "1"` 后关闭（非预览场景归还终端焦点）。
 
 ### 2.3 重开入口
 - **`⌘K` 命令面板**：新增 `PaletteTarget::OpenOnboarding`（在 `build_palette_items` 构造条目、`execute_palette_target` 中调用 `self.open_onboarding(window, cx)`）；
@@ -44,7 +44,7 @@ Kumu 具备多窗格终端、编码 Agent 接入（通知 / MCP / Skills）、�
 
 ## 3. 4 步交互流详细设计
 
-居中卡片宽度 `560px`，最大高度 `min(620px, 82% 窗口高)`，中部内容区使用 `scroll()` 独立滚动；顶部 4 步进度条 + 右上角关闭按钮；底部固定操作栏（左：「跳过，不再自动显示」；右：「上一步」+ 主按钮「下一步 / 完成引导」）。
+居中卡片宽度 `580px`、圆角 `12px` 带阴影（`shadow_lg`），中部内容区使用 `scroll()` 独立滚动；顶部 4 步进度条（区分已完成 `✓` / 当前步 / 待完成）+ 右上角关闭按钮；底部固定操作栏（左：「跳过，不再显示」；右：「上一步」+ 主按钮「下一步 / 完成引导」，且每屏保证唯一 Primary CTA）。
 
 ### 第 1 步：接入本机编码 Agent（通知 + MCP + Skills）
 - **后台探测**：打开引导时通过 `background_executor` 调用 `agent::installed_with_shell_env` 与 `integration::detailed_status`，实时推送 `HostEvent::AgentsProbed`。
@@ -65,23 +65,23 @@ Kumu 具备多窗格终端、编码 Agent 接入（通知 / MCP / Skills）、�
 
 ### 第 3 步：选择项目并打开第一个 Agent 窗格
 - **异步闭环**：展示当前项目名称与路径；点击 **「选择项目目录」** 调用 `add_project`，在 `finish_add_project` / `select_project` 中推送 `HostEvent::ProjectChanged { name, path }` 实时更新卡片显示。
-- **打开 Agent 窗格**：列出本机已安装的 Agent 单选；点击 **「打开 Agent 窗格」** 时先 `ensure_project_layout` 确保目标项目存在布局，再拆分/启动该 Agent 窗格，并将成功或失败结果通过 `HostEvent::PaneCreated(Result<String, String>)` 回显到卡片内。未安装任何 Agent 时禁用该按钮并提示可直接进入下一步。
+- **打开 Agent 窗格**：列出本机已安装的 Agent 单选（带官方 Logo）；点击 **「在当前项目打开 Agent 窗格」** 时先 `ensure_project_layout` 确保目标项目存在布局，再拆分/启动该 Agent 窗格，并将成功或失败结果以带语义色的 `FeedbackMessage` 回显到卡片内（创建后按钮切换为「再打开一个 Agent 窗格」避免误触重复拆屏）。未安装任何 Agent 时提示可直接进入下一步。
 
 ### 第 4 步：体验 Artifacts 可视化阅读（零磁盘副作用）
 - **设计取舍**：不向用户项目写入 `.kumu/artifacts`（避免修改 `.kumu/.gitignore`、避免在抽屉出现「未关联」分组、也不要求必须先选中项目）。
 - **核心动作**：
-  - **「预览示例 Artifact」**：先关闭引导（不与 `active_sheet` 叠层，不写入 `onboarding_done` 或由用户决定完成），直接用内置 Markdown 文本《Kumu 快速上手指南》（含 `⌘K` / `⌘D` / `⌘,` 快捷键与推荐提示词）打开 `ArtifactReadingSheet` 预览页；
+  - **「预览示例 Artifact」**：写入 `onboarding_done = "1"` 并关闭引导（不与 `active_sheet` 叠层，不抢终端焦点），直接用内置 Markdown 文本《Kumu 快速上手指南》（含 `⌘K` / `⌘D` / `⌘,` 快捷键与推荐提示词）打开 `ArtifactReadingSheet` 预览页；
   - 底部主按钮：**「完成引导」**（写入 `onboarding_done = "1"` 并关闭弹窗，焦点归还活动终端）。
 
 ---
 
 ## 4. Overlay 生命周期与 Modal 集成
 
-1. **Modal Guard**（[src/ui/home/shortcuts.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-feat-artifact-rendering/src/ui/home/shortcuts.rs)）：`has_modal` / 快捷键拦截条件加入 `self.active_onboarding.is_some()`，防止 `⌘K`、`⌘D`、`⌘,` 等穿透到底层工作区；
-2. **Focus 归还**（[src/ui/home/mod.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-feat-artifact-rendering/src/ui/home/mod.rs)）：`pending_focus` 条件排除 `self.active_onboarding.is_some()`，关闭引导时调用 `focus_terminal` 归还终端焦点；
-3. **主题同步**（[src/ui/home/mod.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-feat-artifact-rendering/src/ui/home/mod.rs)）：主题变更分支同步调用 `onboarding.sync_theme(theme, cx)`；
-4. **Z-Order 与互斥**：打开 `active_onboarding` 时关闭 `active_palette` / `active_picker`；第 4 步打开 `ArtifactReadingSheet` 前先关闭 `active_onboarding`；
-5. **键盘唯一入口**：`Esc` 仅在 NSH 根容器处理一次（宿主 modal guard 放行给 overlay 自身处理，不重复关闭）；`Tab` / `Shift+Tab` 走 NSH 默认焦点顺序，`Enter` / `Space` 激活当前焦点控件，不全局劫持 `Enter`。
+1. **Modal Guard**（[src/ui/home/shortcuts.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-bugfix-optimize-onboarding/src/ui/home/shortcuts.rs)）：`has_modal` / 快捷键拦截条件加入 `self.active_onboarding.is_some()`，防止 `⌘K`、`⌘D`、`⌘,` 等穿透到底层工作区；`pane_is_attended` 同步排除 `active_onboarding`，避免遮挡期间误清底层 Agent 的 `unseen` 标记；
+2. **Focus 归还**（[src/ui/home/mod.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-bugfix-optimize-onboarding/src/ui/home/mod.rs)）：`pending_focus` 条件排除 `self.active_onboarding.is_some()`，关闭引导时调用 `focus_terminal` 归还终端焦点；
+3. **主题同步**（[src/ui/home/mod.rs](file:///Users/yankewei/Documents/github/kumu-one/kumu-bugfix-optimize-onboarding/src/ui/home/mod.rs)）：主题变更分支同步调用 `onboarding.sync_theme(theme, cx)`；同时订阅全局 `NotificationSettings` 变更，保持与设置页实时同步；
+4. **Z-Order 与互斥**：打开 `active_onboarding` 时关闭 `active_palette` / `active_picker` / `active_dialog`；第 4 步打开 `ArtifactReadingSheet` 前先关闭 `active_onboarding`；
+5. **键盘唯一入口**：`Esc` 统一在宿主侧 `src/ui/home/shortcuts.rs` 捕获阶段处理一次（不重复在 NSH 根节点监听），确保未聚焦 overlay 内部控件时也能可靠关闭；`Tab` / `Shift+Tab` 走 NSH 默认焦点顺序，`Enter` / `Space` 激活当前焦点控件，不全局劫持 `Enter`。
 
 ---
 

@@ -166,6 +166,8 @@ pub struct KumuApp {
     _nsh_theme_sub: Subscription,
     /// Listens for cross-window requests from Settings to reopen onboarding.
     _onboarding_req_sub: Subscription,
+    /// Keeps notification settings in sync across Settings and onboarding.
+    _notification_settings_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
     control: Option<crate::control::ControlHandle>,
@@ -427,8 +429,21 @@ impl KumuApp {
         })
         .detach();
 
-        cx.observe_global::<NotificationSettings>(|_, cx| cx.notify())
-            .detach();
+        let notification_settings_sub =
+            cx.observe_global::<NotificationSettings>(|app: &mut Self, cx| {
+                let (enabled, sound) = {
+                    let notif = cx.global::<NotificationSettings>();
+                    (notif.enabled, notif.sound)
+                };
+                if let Some(state) = app.onboarding_state.as_mut()
+                    && (state.notifications_enabled != enabled || state.notification_sound != sound)
+                {
+                    state.notifications_enabled = enabled;
+                    state.notification_sound = sound;
+                    app.push_onboarding_state();
+                }
+                cx.notify();
+            });
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             cx.notify();
@@ -592,6 +607,7 @@ impl KumuApp {
             onboarding_state: None,
             _nsh_theme_sub: nsh_theme_sub,
             _onboarding_req_sub: onboarding_req_sub,
+            _notification_settings_sub: notification_settings_sub,
             control: None,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
