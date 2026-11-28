@@ -12,6 +12,7 @@
 
 mod cli;
 mod cli_artifact;
+pub mod cli_install;
 mod cli_integration;
 mod cli_pane;
 mod mcp;
@@ -556,5 +557,14 @@ mod tests {
             parse_pane_scroll(&s(&["up", "23", "--lines", "501"])),
             ScrollParse::Error(_)
         ));
+    }
+
+    #[test]
+    fn cli_handles_help_and_version_without_launching_gui() {
+        assert_eq!(cli::dispatch_cli("--help", &[]), Some(0));
+        assert_eq!(cli::dispatch_cli("-h", &[]), Some(0));
+        assert_eq!(cli::dispatch_cli("--version", &[]), Some(0));
+        assert_eq!(cli::dispatch_cli("-V", &[]), Some(0));
+        assert_eq!(cli::dispatch_cli("unknown-arg", &[]), None);
     }
 }

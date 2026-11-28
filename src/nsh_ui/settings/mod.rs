@@ -18,6 +18,7 @@ use super::theme::{appearance, nsh_theme};
 use super::toast::ToastItem;
 use crate::agent::{AGENTS, integration};
 use crate::app::NotificationSettings;
+use crate::control::cli_install::{self, CliInstallError, CliInstallStatus};
 use crate::db;
 use crate::term::Rgb;
 use crate::theme::{self, ActiveTerminalTheme, KumuTheme, TerminalTheme, ThemeMode};
@@ -158,6 +159,8 @@ enum HostEvent {
         sound: bool,
     },
     AutoResume(bool),
+    CliStatus(CliInstallStatus),
+    CliBusy(bool),
     ShowUpdates {
         prompt_restart: bool,
     },
@@ -179,6 +182,8 @@ enum SettingsAction {
     SetAutoResume(bool),
     SetAgentArgs { agent: &'static str, args: String },
     ToggleIntegration { agent: &'static str, remove: bool },
+    InstallCli,
+    UninstallCli,
     UpdatePrimaryAction,
     ConfirmRestartUpdate,
     OpenReleasePage,
@@ -203,6 +208,7 @@ pub struct SettingsWindow {
     events_tx: UnboundedSender<HostEvent>,
     next_toast_id: u64,
     integration_busy: Option<&'static str>,
+    cli_busy: bool,
     _theme_sub: Subscription,
     _terminal_theme_sub: Subscription,
     _notif_sub: Subscription,
@@ -325,13 +331,13 @@ impl SettingsWindow {
             ));
         });
 
-        // Probe agent executables and hook/extension registrations off the UI thread.
+        // Probe agent executables, hook/extension registrations, and CLI symlink off the UI thread.
         let probe_tx = events_tx.clone();
         cx.spawn(async move |_, cx| {
-            let results = cx
+            let (results, cli_status) = cx
                 .background_executor()
                 .spawn(async move {
-                    AGENTS
+                    let agents = AGENTS
                         .iter()
                         .map(|agent| {
                             let is_installed = crate::agent::installed_with_shell_env(agent.id);
@@ -339,10 +345,13 @@ impl SettingsWindow {
                                 integration::status(agent.id).map_err(|error| error.to_string());
                             (agent.id, is_installed, status)
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    let cli = cli_install::status();
+                    (agents, cli)
                 })
                 .await;
             let _ = probe_tx.unbounded_send(HostEvent::AgentsProbed(results));
+            let _ = probe_tx.unbounded_send(HostEvent::CliStatus(cli_status));
         })
         .detach();
 
@@ -364,6 +373,7 @@ impl SettingsWindow {
             events_tx,
             next_toast_id: 1,
             integration_busy: None,
+            cli_busy: false,
             _theme_sub: theme_sub,
             _terminal_theme_sub: terminal_theme_sub,
             _notif_sub: notif_sub,
@@ -525,6 +535,12 @@ impl SettingsWindow {
             SettingsAction::ToggleIntegration { agent, remove } => {
                 self.change_integration(agent, remove, window, cx);
             }
+            SettingsAction::InstallCli => {
+                self.change_cli_install(false, cx);
+            }
+            SettingsAction::UninstallCli => {
+                self.change_cli_install(true, cx);
+            }
             SettingsAction::UpdatePrimaryAction => match self.updater.read(cx).status().clone() {
                 UpdateStatus::Available(_) => {
                     self.updater
@@ -612,6 +628,65 @@ impl SettingsWindow {
         let _ = self
             .events_tx
             .unbounded_send(HostEvent::ShowUpdates { prompt_restart });
+    }
+
+    /// Re-probe CLI installation status after an external trigger (e.g. menu bar or palette).
+    pub fn refresh_cli_status(&mut self, cx: &mut Context<Self>) {
+        let tx = self.events_tx.clone();
+        cx.spawn(async move |_, cx| {
+            let status = cx
+                .background_executor()
+                .spawn(async move { cli_install::status() })
+                .await;
+            let _ = tx.unbounded_send(HostEvent::CliStatus(status));
+        })
+        .detach();
+    }
+
+    fn change_cli_install(&mut self, uninstall: bool, cx: &mut Context<Self>) {
+        if self.cli_busy {
+            return;
+        }
+        self.cli_busy = true;
+        let _ = self.events_tx.unbounded_send(HostEvent::CliBusy(true));
+
+        let work = cx.background_executor().spawn(async move {
+            let result = if uninstall {
+                cli_install::uninstall()
+            } else {
+                cli_install::install()
+            };
+            let status = cli_install::status();
+            (result, status)
+        });
+        cx.spawn(async move |this, cx| {
+            let (result, status) = work.await;
+            let _ = this.update(cx, |this, _cx| {
+                this.cli_busy = false;
+                let _ = this.events_tx.unbounded_send(HostEvent::CliBusy(false));
+                let _ = this.events_tx.unbounded_send(HostEvent::CliStatus(status));
+                let key = this.next_toast_key();
+                match result {
+                    Ok(path) => {
+                        let msg = if uninstall {
+                            format!("已移除 {}。", path.display())
+                        } else {
+                            format!("已安装 kumu 命令到 {}。", path.display())
+                        };
+                        this.push_toast(ToastItem::success(key, msg));
+                    }
+                    Err(CliInstallError::Canceled) => {}
+                    Err(error) => {
+                        let action = if uninstall { "卸载" } else { "安装" };
+                        this.push_toast(ToastItem::error(
+                            key,
+                            format!("{action} kumu 命令失败：{error}"),
+                        ));
+                    }
+                }
+            });
+        })
+        .detach();
     }
 }
 
@@ -767,6 +842,51 @@ mod tests {
         assert_eq!(
             actions_rx.try_recv().ok(),
             Some(SettingsAction::SetTermFontSize(15))
+        );
+    }
+
+    #[test]
+    fn settings_nsh_cli_install_card_emits_install_and_uninstall_actions() {
+        let (events_tx, events_rx) = unbounded::<HostEvent>();
+        let (actions_tx, mut actions_rx) = unbounded::<SettingsAction>();
+        let mount_id = MOUNTS.register(SettingsMount {
+            initial: test_initial_state(),
+            events_rx,
+            actions_tx,
+        });
+
+        let root =
+            nsh_core::element::Root::new::<view::SettingsRoot>(move || view::SettingsRootProps {
+                mount_id: mount_id.into(),
+            });
+        let mut app =
+            nsh_testing::Headless::start(EngineConfig::new(root)).expect("start settings NSH");
+
+        app.wait_for("编码 Agent").expect("providers page renders");
+        app.press("通用").expect("switch to General tab");
+        app.wait_for("命令行工具").expect("cli card renders");
+
+        events_tx
+            .unbounded_send(HostEvent::CliStatus(CliInstallStatus::NotInstalled {
+                target_dir: std::path::PathBuf::from("/opt/homebrew/bin"),
+                requires_admin: false,
+            }))
+            .expect("send not installed");
+        app.wait_for("将 kumu 命令链接到 /opt/homebrew/bin/kumu，方便在任意终端控制窗格。")
+            .expect("install target renders");
+        app.press("安装").expect("press install button");
+        assert_eq!(actions_rx.try_recv().ok(), Some(SettingsAction::InstallCli));
+
+        events_tx
+            .unbounded_send(HostEvent::CliStatus(CliInstallStatus::Installed {
+                link_path: std::path::PathBuf::from("/opt/homebrew/bin/kumu"),
+            }))
+            .expect("send installed");
+        app.wait_for("已安装").expect("installed pill renders");
+        app.press("卸载").expect("press uninstall button");
+        assert_eq!(
+            actions_rx.try_recv().ok(),
+            Some(SettingsAction::UninstallCli)
         );
     }
 }

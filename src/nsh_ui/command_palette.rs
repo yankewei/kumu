@@ -57,6 +57,7 @@ pub enum PaletteTarget {
     TogglePlugin(&'static str),
     ToggleSidebar,
     ToggleTheme,
+    InstallCli,
     OpenSettings,
     OpenOnboarding,
 }

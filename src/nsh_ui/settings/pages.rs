@@ -7,6 +7,7 @@ use nsh_core::prelude::*;
 
 use super::{AgentStatusRow, SettingsAction, TerminalThemeSwatch, UpdateSnapshot};
 use crate::agent::{AGENTS, integration};
+use crate::control::cli_install::CliInstallStatus;
 use crate::nsh_ui::assets::{agent_logo, icon_svg};
 use crate::nsh_ui::components::{
     ButtonVariant, PillTone, kumu_button, kumu_switch_bare, meta_text, pill, row_title,
@@ -42,6 +43,8 @@ pub(super) struct GeneralPageState {
     pub notifications_enabled: Signal<bool>,
     pub notification_sound: Signal<bool>,
     pub auto_resume: Signal<bool>,
+    pub cli_status: Signal<Option<CliInstallStatus>>,
+    pub cli_busy: Signal<bool>,
     pub updater: Signal<UpdateSnapshot>,
     pub confirm_restart_open: Signal<bool>,
     pub font_items: Vec<SelectItem>,
@@ -710,6 +713,109 @@ fn render_notifications_and_session_card(state: &GeneralPageState) -> impl IntoE
         ))
 }
 
+fn render_cli_card(state: &GeneralPageState) -> impl IntoElement {
+    let cli_status = state.cli_status;
+    let cli_busy = state.cli_busy;
+    let actions_tx = state.actions_tx.clone();
+
+    settings_section("命令行工具").child(dynamic(move || {
+        let status = cli_status.get();
+        let busy = cli_busy.get();
+        let tx = actions_tx.clone();
+
+        let (badge, desc, button) = match status {
+            None => (
+                None,
+                "正在检测 kumu 命令安装状态…".to_string(),
+                Some(("检测中…", ButtonVariant::Outline, true, None)),
+            ),
+            Some(CliInstallStatus::Installed { link_path }) => (
+                Some((PillTone::Accent, "已安装")),
+                format!("已链接到 {}，可在任意终端控制窗格。", link_path.display()),
+                Some((
+                    if busy { "处理中…" } else { "卸载" },
+                    ButtonVariant::Ghost,
+                    busy,
+                    Some(SettingsAction::UninstallCli),
+                )),
+            ),
+            Some(CliInstallStatus::NeedsUpdate { link_path, .. }) => (
+                Some((PillTone::Neutral, "需更新")),
+                format!("{} 指向旧路径，点击更新为当前应用。", link_path.display()),
+                Some((
+                    if busy { "处理中…" } else { "更新链接" },
+                    ButtonVariant::Outline,
+                    busy,
+                    Some(SettingsAction::InstallCli),
+                )),
+            ),
+            Some(CliInstallStatus::Conflict { path }) => (
+                Some((PillTone::Neutral, "有冲突")),
+                format!("{} 已被其他程序占用，未自动覆盖。", path.display()),
+                None,
+            ),
+            Some(CliInstallStatus::NotInstalled {
+                target_dir,
+                requires_admin,
+            }) => {
+                let target = target_dir.join("kumu");
+                let desc = if requires_admin {
+                    format!(
+                        "将 kumu 命令链接到 {}（需要管理员授权），方便在任意终端控制窗格。",
+                        target.display()
+                    )
+                } else {
+                    format!(
+                        "将 kumu 命令链接到 {}，方便在任意终端控制窗格。",
+                        target.display()
+                    )
+                };
+                (
+                    None,
+                    desc,
+                    Some((
+                        if busy { "处理中…" } else { "安装" },
+                        ButtonVariant::Outline,
+                        busy,
+                        Some(SettingsAction::InstallCli),
+                    )),
+                )
+            }
+        };
+
+        let mut title_line = view()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .child(row_title("kumu 命令"));
+        if let Some((tone, label)) = badge {
+            title_line = title_line.child(pill(label, tone));
+        }
+
+        let mut row = view().flex_row().items_center().gap_6().py_3().child(
+            view()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(title_line)
+                .child(view().mt_0p5().child(meta_text(desc))),
+        );
+
+        if let Some((label, variant, disabled, action)) = button {
+            let btn = kumu_button(label, variant)
+                .disabled(disabled)
+                .on_press(move || {
+                    if let Some(action) = action.clone() {
+                        send_action(&tx, action);
+                    }
+                });
+            row = row.child(btn);
+        }
+
+        row
+    }))
+}
+
 fn render_storage_card() -> impl IntoElement {
     settings_section("数据").child(settings_row(
         "本地数据",
@@ -777,6 +883,7 @@ pub(super) fn render_general_cards(state: &GeneralPageState) -> impl IntoElement
     let appearance_card = render_appearance_card(state);
     let terminal_card = render_terminal_card(state);
     let notifications_card = render_notifications_and_session_card(state);
+    let cli_card = render_cli_card(state);
     let storage_card = render_storage_card();
     let updates_card =
         render_updates_card(state.updater, state.confirm_restart_open, &state.actions_tx);
@@ -787,6 +894,7 @@ pub(super) fn render_general_cards(state: &GeneralPageState) -> impl IntoElement
         .child(appearance_card)
         .child(terminal_card)
         .child(notifications_card)
+        .child(cli_card)
         .child(storage_card)
         .child(updates_card)
 }

@@ -25,12 +25,24 @@ pub fn run_cli() -> Option<i32> {
     let mut args = std::env::args().skip(1);
     let first = args.next()?;
     let rest: Vec<String> = args.collect();
-    match first.as_str() {
-        "panes" => Some(panes_cli(&rest)),
-        "pane" => Some(pane_cli(&rest)),
-        "artifact" => Some(super::cli_artifact::artifact_cli(&rest)),
-        "integration" => Some(super::cli_integration::integration_cli(&rest)),
-        "mcp" => Some(super::mcp::mcp_cli(&rest)),
+    dispatch_cli(&first, &rest)
+}
+
+pub(super) fn dispatch_cli(first: &str, rest: &[String]) -> Option<i32> {
+    match first {
+        "panes" => Some(panes_cli(rest)),
+        "pane" => Some(pane_cli(rest)),
+        "artifact" => Some(super::cli_artifact::artifact_cli(rest)),
+        "integration" => Some(super::cli_integration::integration_cli(rest)),
+        "mcp" => Some(super::mcp::mcp_cli(rest)),
+        "-h" | "--help" | "help" => {
+            println!("{USAGE}");
+            Some(0)
+        }
+        "-V" | "--version" | "version" => {
+            println!("kumu {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
         _ => None,
     }
 }

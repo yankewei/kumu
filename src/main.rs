@@ -47,6 +47,8 @@ mod window_state;
 use gpui::*;
 use ui::KumuApp;
 
+gpui::actions!(kumu, [OpenSettings, InstallCli, Quit]);
+
 fn main() {
     if let Some(code) = agent::integration::run_cli().or_else(control::run_cli) {
         std::process::exit(code);
@@ -74,12 +76,54 @@ fn main() {
     app.run(move |cx| {
         ui::init(cx);
         cx.set_app_identity("com.yankewei.kumu", "Kumu");
+        install_app_menus(cx);
         fonts::install(cx);
         dock_icon::install();
         theme::load_kumu_themes(cx);
         cx.spawn(async move |cx| cx.update(open_main_window))
             .detach();
     });
+}
+
+fn with_main_window(cx: &mut App, action: impl FnOnce(&mut KumuApp, &mut Context<KumuApp>)) {
+    let alive = cx
+        .try_global::<MainWindow>()
+        .and_then(|m| m.0)
+        .is_some_and(|handle| cx.windows().contains(&handle));
+    if !alive {
+        open_main_window(cx);
+    }
+    if let Some(handle) = cx.try_global::<MainWindow>().and_then(|m| m.0)
+        && cx.windows().contains(&handle)
+    {
+        let _ = handle.update(cx, |view, _, cx| {
+            if let Ok(app) = view.downcast::<KumuApp>() {
+                app.update(cx, action);
+            }
+        });
+    }
+}
+
+fn install_app_menus(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &OpenSettings, cx| {
+        with_main_window(cx, |app, cx| app.open_settings_window(cx));
+    });
+    cx.on_action(|_: &InstallCli, cx| {
+        with_main_window(cx, |app, cx| app.install_cli(cx));
+    });
+    cx.set_menus(vec![Menu {
+        name: "Kumu".into(),
+        items: vec![
+            MenuItem::action("设置…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("安装「kumu」命令行工具…", InstallCli),
+            MenuItem::separator(),
+            MenuItem::action("退出 Kumu", Quit),
+        ],
+        disabled: false,
+    }]);
 }
 
 struct MainWindow(Option<AnyWindowHandle>);

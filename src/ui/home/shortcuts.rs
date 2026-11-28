@@ -776,6 +776,18 @@ impl KumuApp {
 
         items.push(PaletteItem {
             section: PaletteSection::Actions,
+            title: "安装「kumu」命令行工具".into(),
+            subtitle: Some("将 kumu 链接到 PATH，方便在任意终端控制窗格".into()),
+            keywords: "install cli command path kumu 命令行 工具".into(),
+            icon: PaletteIcon::Svg("icons/square-terminal.svg"),
+            agent_state: None,
+            badge: None,
+            shortcut: None,
+            target: PaletteTarget::InstallCli,
+        });
+
+        items.push(PaletteItem {
+            section: PaletteSection::Actions,
             title: "打开设置".into(),
             subtitle: None,
             keywords: "settings preferences config".into(),
@@ -860,6 +872,10 @@ impl KumuApp {
             }
             PaletteTarget::ToggleTheme => {
                 self.toggle_theme_mode(window, cx);
+                self.focus_terminal(window, cx);
+            }
+            PaletteTarget::InstallCli => {
+                self.install_cli(cx);
                 self.focus_terminal(window, cx);
             }
             PaletteTarget::OpenSettings => {

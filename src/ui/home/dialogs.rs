@@ -487,6 +487,48 @@ impl KumuApp {
         cx.notify();
     }
 
+    pub(crate) fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(false, cx);
+    }
+
+    /// Install or update the `kumu` CLI symlink on PATH and report the result
+    /// via a toast in the main window (also refreshing Settings if open).
+    pub(crate) fn install_cli(&mut self, cx: &mut Context<Self>) {
+        let work = cx
+            .background_executor()
+            .spawn(async move { crate::control::cli_install::install() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(path) => {
+                        this.toast_overlay
+                            .push(crate::nsh_ui::toast::ToastItem::success(
+                                "cli-install",
+                                format!("已安装 kumu 命令到 {}。", path.display()),
+                            ));
+                    }
+                    Err(crate::control::cli_install::CliInstallError::Canceled) => {}
+                    Err(error) => {
+                        this.toast_overlay
+                            .push(crate::nsh_ui::toast::ToastItem::error(
+                                "cli-install",
+                                format!("安装 kumu 命令失败：{error}"),
+                            ));
+                    }
+                }
+                if let Some(handle) = &this.settings_window {
+                    let _ = handle.update(cx, |view, _, cx| {
+                        if let Ok(settings) = view.downcast::<SettingsWindow>() {
+                            settings.update(cx, |settings, cx| settings.refresh_cli_status(cx));
+                        }
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Focus the settings window if it's open, else open a new one.
     pub(super) fn open_settings(&mut self, show_updates: bool, cx: &mut Context<Self>) {
         let activate = |view: AnyView, window: &mut Window, cx: &mut App| {

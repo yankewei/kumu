@@ -15,6 +15,7 @@ use super::{
     UpdateSnapshot,
 };
 use crate::agent::AGENTS;
+use crate::control::cli_install::CliInstallStatus;
 use crate::nsh_ui::assets::icon_svg;
 use crate::nsh_ui::components::{ButtonVariant, kumu_button, meta_text, section_title};
 use crate::nsh_ui::theme::text_xs_size;
@@ -259,6 +260,8 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
             .collect(),
     );
     let integration_busy = signal(Option::<&'static str>::None);
+    let cli_status = signal(Option::<CliInstallStatus>::None);
+    let cli_busy = signal(false);
     let confirm_restart_open = signal(false);
     let (toast_tx, toast_rx) = futures::channel::mpsc::unbounded();
 
@@ -353,6 +356,12 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
                     HostEvent::AutoResume(enabled) => {
                         auto_resume.set(enabled);
                     }
+                    HostEvent::CliStatus(status) => {
+                        cli_status.set(Some(status));
+                    }
+                    HostEvent::CliBusy(busy) => {
+                        cli_busy.set(busy);
+                    }
                     HostEvent::ShowUpdates { prompt_restart } => {
                         page.set(SettingsPage::General);
                         search_query.set(String::new());
@@ -398,6 +407,8 @@ pub fn SettingsRoot(props: SettingsRootProps) -> impl IntoElement {
         notifications_enabled,
         notification_sound,
         auto_resume,
+        cli_status,
+        cli_busy,
         updater,
         confirm_restart_open,
         font_items,
