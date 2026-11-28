@@ -94,6 +94,50 @@ impl OnboardingStep {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedbackMessage {
+    pub tone: FeedbackTone,
+    pub text: String,
+}
+
+impl FeedbackMessage {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            tone: FeedbackTone::Info,
+            text: text.into(),
+        }
+    }
+
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            tone: FeedbackTone::Success,
+            text: text.into(),
+        }
+    }
+
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            tone: FeedbackTone::Warning,
+            text: text.into(),
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            tone: FeedbackTone::Error,
+            text: text.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnboardingAgentRow {
     pub id: &'static str,
@@ -101,7 +145,7 @@ pub struct OnboardingAgentRow {
     pub logo: Option<&'static str>,
     pub installed: bool,
     pub detail: IntegrationDetail,
-    pub last_feedback: Option<String>,
+    pub last_feedback: Option<FeedbackMessage>,
 }
 
 impl OnboardingAgentRow {
@@ -114,25 +158,6 @@ impl OnboardingAgentRow {
         let skills_ok = matches!(self.detail.skills, Ok(Status::Registered));
         notify_ok && mcp_ok && skills_ok
     }
-
-    pub fn status_summary(&self) -> String {
-        let notify = status_label(&self.detail.notify);
-        let mcp = match &self.detail.mcp {
-            McpState::Supported(res) => status_label(res),
-            McpState::ExtensionPartial => "扩展内置",
-        };
-        let skills = status_label(&self.detail.skills);
-        format!("通知:{notify} · MCP:{mcp} · Skills:{skills}")
-    }
-}
-
-fn status_label(res: &Result<Status, String>) -> &'static str {
-    match res {
-        Ok(Status::Registered) => "已接入",
-        Ok(Status::NeedsRepair) => "待修复",
-        Ok(Status::Missing) => "未接入",
-        Err(_) => "异常",
-    }
 }
 
 /// Pure-Rust state machine for the 4-step onboarding wizard.
@@ -144,11 +169,13 @@ pub struct OnboardingState {
     pub agents: Vec<OnboardingAgentRow>,
     pub notifications_enabled: bool,
     pub notification_sound: bool,
-    pub notification_feedback: Option<String>,
+    pub visited_notifications: bool,
+    pub notification_feedback: Option<FeedbackMessage>,
     pub project_name: Option<String>,
     pub project_path: Option<String>,
     pub selected_agent: Option<&'static str>,
-    pub pane_feedback: Option<Result<String, String>>,
+    pub created_pane_agent: Option<&'static str>,
+    pub pane_feedback: Option<FeedbackMessage>,
 }
 
 impl OnboardingState {
@@ -184,10 +211,12 @@ impl OnboardingState {
             agents,
             notifications_enabled,
             notification_sound,
+            visited_notifications: false,
             notification_feedback: None,
             project_name,
             project_path,
             selected_agent: None,
+            created_pane_agent: None,
             pane_feedback: None,
         }
     }
@@ -196,9 +225,32 @@ impl OnboardingState {
         self.agents.iter().filter(|a| a.installed).collect()
     }
 
+    pub fn set_step(&mut self, step: OnboardingStep) {
+        if step == OnboardingStep::Notifications {
+            self.visited_notifications = true;
+        }
+        self.step = step;
+    }
+
+    pub fn step_completed(&self, step: OnboardingStep) -> bool {
+        match step {
+            OnboardingStep::Agents => {
+                let installed = self.installed_agents();
+                !self.probing
+                    && !installed.is_empty()
+                    && installed.iter().all(|a| a.is_fully_registered())
+            }
+            OnboardingStep::Notifications => {
+                self.visited_notifications && self.step != OnboardingStep::Notifications
+            }
+            OnboardingStep::Workspace => self.created_pane_agent.is_some(),
+            OnboardingStep::Artifacts => false,
+        }
+    }
+
     pub fn next_step(&mut self) -> bool {
         if let Some(next) = self.step.next() {
-            self.step = next;
+            self.set_step(next);
             true
         } else {
             false
@@ -207,7 +259,7 @@ impl OnboardingState {
 
     pub fn prev_step(&mut self) -> bool {
         if let Some(prev) = self.step.prev() {
-            self.step = prev;
+            self.set_step(prev);
             true
         } else {
             false
@@ -245,12 +297,12 @@ impl OnboardingState {
     }
 }
 
-pub fn summarize_outcome(agent: &str, outcome: &ComponentOutcome) -> String {
+pub fn summarize_outcome(agent: &str, outcome: &ComponentOutcome) -> FeedbackMessage {
     if outcome.is_ok() {
         if agent == "codex" {
-            return "接入完成；重启 Codex 后请在 /hooks 中审查并信任。".into();
+            return FeedbackMessage::success("接入完成；重启 Codex 后请在 /hooks 中审查并信任。");
         }
-        return "接入完成；请重新启动对应 Agent。".into();
+        return FeedbackMessage::success("接入完成；请重新启动对应 Agent。");
     }
     let mut parts = Vec::new();
     if let Err(err) = &outcome.notify {
@@ -262,7 +314,13 @@ pub fn summarize_outcome(agent: &str, outcome: &ComponentOutcome) -> String {
     if let Err(err) = &outcome.skills {
         parts.push(format!("Skills 失败({err})"));
     }
-    format!("部分失败：{}", parts.join("；"))
+    let any_ok =
+        outcome.notify.is_ok() || matches!(outcome.mcp, Some(Ok(()))) || outcome.skills.is_ok();
+    if any_ok {
+        FeedbackMessage::warning(format!("部分失败：{}", parts.join("；")))
+    } else {
+        FeedbackMessage::error(format!("接入失败：{}", parts.join("；")))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -301,15 +359,22 @@ static MOUNTS: MountRegistry<OnboardingMount> = MountRegistry::new();
 mod view {
     use futures::StreamExt;
     use futures::channel::mpsc::UnboundedSender;
-    use nsh_base::theme as active_theme;
+    use nsh_base::{button, theme as active_theme};
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{MOUNTS, OnboardingAction, OnboardingHostEvent, OnboardingState, OnboardingStep};
-    use crate::nsh_ui::components::{
-        ButtonVariant, PillTone, body_text, kumu_button, kumu_switch_bare, meta_text, pill,
-        row_title, section_title,
+    use super::{
+        FeedbackMessage, FeedbackTone, MOUNTS, OnboardingAction, OnboardingAgentRow,
+        OnboardingHostEvent, OnboardingState, OnboardingStep,
     };
+    use crate::agent::integration::{McpState, Status};
+    use crate::nsh_ui::components::{
+        ButtonVariant, PillTone, body_text, kumu_agent_logo, kumu_button, kumu_switch_bare,
+        meta_text, pill, row_title, section_title,
+    };
+    use crate::nsh_ui::theme::{success_color, text_xs_size, warning_color};
+
+    const STEPPER_TRANSITION_MS: f32 = 120.0;
 
     #[derive(Clone, Debug, PartialEq, Props)]
     pub(super) struct OnboardingRootProps {
@@ -319,6 +384,130 @@ mod view {
     fn send(tx: &Option<UnboundedSender<OnboardingAction>>, action: OnboardingAction) {
         if let Some(tx) = tx {
             let _ = tx.unbounded_send(action);
+        }
+    }
+
+    fn step1_needs_primary_install(state: &OnboardingState) -> bool {
+        if state.step != OnboardingStep::Agents || state.probing {
+            return false;
+        }
+        let installed = state.installed_agents();
+        !installed.is_empty() && !installed.iter().all(|a| a.is_fully_registered())
+    }
+
+    fn render_feedback_banner(msg: FeedbackMessage) -> AnyElement {
+        let tone_color: fn() -> AdaptiveColor = match msg.tone {
+            FeedbackTone::Success => success_color,
+            FeedbackTone::Warning => warning_color,
+            FeedbackTone::Error => || active_theme().destructive,
+            FeedbackTone::Info => || active_theme().muted_foreground,
+        };
+        let text_color: fn() -> AdaptiveColor = match msg.tone {
+            FeedbackTone::Info => || active_theme().muted_foreground,
+            _ => tone_color,
+        };
+        view()
+            .w_full()
+            .px_2p5()
+            .py_1p5()
+            .rounded(px(6.0))
+            .bg(move || tone_color().opacity(0.10))
+            .border_1()
+            .border_color(move || tone_color().opacity(0.28))
+            .child(
+                text(msg.text)
+                    .text_size(text_xs_size)
+                    .text_color(text_color),
+            )
+            .into_element()
+    }
+
+    fn component_badge(label: &'static str, status: &Result<Status, String>) -> AnyElement {
+        let (tone_color, suffix): (fn() -> AdaptiveColor, &'static str) = match status {
+            Ok(Status::Registered) => (success_color, "✓"),
+            Ok(Status::NeedsRepair) => (warning_color, "!"),
+            Ok(Status::Missing) => (|| active_theme().muted_foreground, "·"),
+            Err(_) => (|| active_theme().destructive, "×"),
+        };
+        view()
+            .flex_row()
+            .items_center()
+            .px_1p5()
+            .py_0p5()
+            .rounded(px(4.0))
+            .bg(move || tone_color().opacity(0.12))
+            .child(
+                text(format!("{label} {suffix}"))
+                    .text_size(text_xs_size)
+                    .text_color(tone_color),
+            )
+            .into_element()
+    }
+
+    fn mcp_badge(mcp: &McpState) -> AnyElement {
+        match mcp {
+            McpState::Supported(res) => component_badge("MCP", res),
+            McpState::ExtensionPartial => view()
+                .flex_row()
+                .items_center()
+                .px_1p5()
+                .py_0p5()
+                .rounded(px(4.0))
+                .bg(move || success_color().opacity(0.12))
+                .child(
+                    text("MCP 内置")
+                        .text_size(text_xs_size)
+                        .text_color(success_color),
+                )
+                .into_element(),
+        }
+    }
+
+    fn agent_choice_button(
+        row: &OnboardingAgentRow,
+        selected: bool,
+        tx: Option<UnboundedSender<OnboardingAction>>,
+    ) -> AnyElement {
+        let id = row.id;
+        let base = button()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .py_1()
+            .rounded(move || active_theme().radius)
+            .border_1()
+            .border_color(move || active_theme().border)
+            .active(|s| s.opacity(0.75))
+            .focus_visible(|s| {
+                s.outline(px(2.0))
+                    .outline_color(move || active_theme().ring)
+            })
+            .when(!reduce_motion(), |s| {
+                s.transition_colors().duration(STEPPER_TRANSITION_MS)
+            })
+            .hover(|s| s.bg(move || active_theme().accent))
+            .on_press(move || send(&tx, OnboardingAction::SelectAgent(id)))
+            .child(kumu_agent_logo(row.id, row.logo));
+
+        if selected {
+            base.bg(move || active_theme().secondary)
+                .child(
+                    text(row.name)
+                        .text_size(text_xs_size)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || active_theme().secondary_foreground),
+                )
+                .into_element()
+        } else {
+            base.bg(move || active_theme().background)
+                .child(
+                    text(row.name)
+                        .text_size(text_xs_size)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || active_theme().foreground),
+                )
+                .into_element()
         }
     }
 
@@ -342,6 +531,7 @@ mod view {
             });
         }
 
+        let tx_backdrop = tx.clone();
         let tx_close = tx.clone();
         let tx_skip = tx.clone();
         let tx_prev = tx.clone();
@@ -377,17 +567,59 @@ mod view {
                 .into_iter()
                 .map(move |step| {
                     let tx_step = tx_steps.clone();
-                    let label = format!("{}. {}", step.index() + 1, step.label());
-                    kumu_button(label, ButtonVariant::Ghost)
-                        .flex_1()
-                        .bg(move || {
-                            if state.get().step == step {
-                                active_theme().accent
-                            } else {
-                                active_theme().muted
-                            }
-                        })
-                        .on_press(move || send(&tx_step, OnboardingAction::GoToStep(step)))
+                    let step_num = step.index() + 1;
+                    let step_label = step.label();
+                    dynamic(move || {
+                        let tx_click = tx_step.clone();
+                        let s = state.get();
+                        let is_active = s.step == step;
+                        let is_done = s.step_completed(step);
+                        let label = if is_done {
+                            format!("✓ {step_label}")
+                        } else {
+                            format!("{step_num}. {step_label}")
+                        };
+                        let mut label_el = text(label).text_size(text_xs_size);
+                        if is_active {
+                            label_el = label_el
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || active_theme().foreground);
+                        } else if is_done {
+                            label_el = label_el.text_color(success_color);
+                        } else {
+                            label_el = label_el.text_color(move || active_theme().muted_foreground);
+                        }
+                        let mut btn = button()
+                            .flex_1()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .px_2()
+                            .py_1()
+                            .rounded(move || active_theme().radius)
+                            .border_1()
+                            .border_color(move || {
+                                if is_active {
+                                    active_theme().border
+                                } else {
+                                    AdaptiveColor::TRANSPARENT
+                                }
+                            })
+                            .bg(move || {
+                                if is_active {
+                                    active_theme().accent
+                                } else {
+                                    active_theme().muted
+                                }
+                            })
+                            .hover(|s| s.bg(move || active_theme().accent))
+                            .when(!reduce_motion(), |s| {
+                                s.transition_colors().duration(STEPPER_TRANSITION_MS)
+                            })
+                            .on_press(move || send(&tx_click, OnboardingAction::GoToStep(step)));
+                        btn = btn.child(label_el);
+                        btn.into_element()
+                    })
                 })
                 .collect::<Vec<_>>(),
         );
@@ -406,7 +638,7 @@ mod view {
             .border_t_1()
             .border_color(move || active_theme().border)
             .child(
-                kumu_button("跳过，不再自动显示", ButtonVariant::Ghost).on_press(move || {
+                kumu_button("跳过，不再显示", ButtonVariant::Ghost).on_press(move || {
                     send(&tx_skip, OnboardingAction::SkipForever);
                 }),
             )
@@ -426,9 +658,15 @@ mod view {
                     }))
                     .child(dynamic(move || {
                         let tx_next = tx_next.clone();
-                        let is_last = state.get().step == OnboardingStep::Artifacts;
+                        let s = state.get();
+                        let is_last = s.step == OnboardingStep::Artifacts;
                         let label = if is_last { "完成引导" } else { "下一步" };
-                        kumu_button(label, ButtonVariant::Primary)
+                        let variant = if step1_needs_primary_install(&s) {
+                            ButtonVariant::Outline
+                        } else {
+                            ButtonVariant::Primary
+                        };
+                        kumu_button(label, variant)
                             .on_press(move || {
                                 send(
                                     &tx_next,
@@ -445,13 +683,14 @@ mod view {
 
         let card = view()
             .flex_col()
-            .w(px(560.0))
+            .w(px(580.0))
             .p_5()
             .gap_3()
-            .rounded(px(10.0))
+            .rounded(px(12.0))
             .bg(move || active_theme().popover)
             .border_1()
             .border_color(move || active_theme().border)
+            .shadow_lg()
             .role(AccessibilityRole::Dialog)
             .child(header)
             .child(stepper)
@@ -459,11 +698,25 @@ mod view {
             .child(footer);
 
         view()
-            .size_full()
-            .flex_col()
+            .relative()
+            .flex_1()
+            .w_full()
+            .h_full()
             .items_center()
             .justify_center()
-            .bg(move || active_theme().foreground.opacity(0.36))
+            .font_family(move || {
+                active_theme()
+                    .font_sans
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
+            })
+            .child(
+                view()
+                    .absolute()
+                    .inset(px(0.0))
+                    .app_class("bg-black/35")
+                    .on_press(move || send(&tx_backdrop, OnboardingAction::DismissOnce)),
+            )
             .child(card)
     }
 
@@ -540,7 +793,11 @@ mod view {
                         } else {
                             "一键接入全部已安装 Agent"
                         },
-                        ButtonVariant::Primary,
+                        if all_done {
+                            ButtonVariant::Default
+                        } else {
+                            ButtonVariant::Primary
+                        },
                     )
                     .disabled(state.busy)
                     .on_press(move || send(&tx_all, OnboardingAction::InstallAllDetected)),
@@ -556,11 +813,10 @@ mod view {
             let tx_one = tx.clone();
             let id = row.id;
             let done = row.is_fully_registered();
-            let summary = row.status_summary();
             let feedback = row.last_feedback.clone();
             let mut item = view()
                 .flex_col()
-                .gap_1()
+                .gap_1p5()
                 .p_2p5()
                 .rounded(px(8.0))
                 .border_1()
@@ -570,26 +826,45 @@ mod view {
                         .flex_row()
                         .items_center()
                         .justify_between()
+                        .gap_2()
                         .child(
                             view()
-                                .flex_col()
-                                .gap_0p5()
+                                .flex_row()
+                                .items_center()
+                                .gap_2p5()
+                                .child(kumu_agent_logo(row.id, row.logo))
                                 .child(
                                     view()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .child(row_title(row.name))
-                                        .child(pill(
-                                            if done { "就绪" } else { "待接入" },
-                                            if done {
-                                                PillTone::Accent
-                                            } else {
-                                                PillTone::Neutral
-                                            },
-                                        )),
-                                )
-                                .child(meta_text(summary)),
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(row_title(row.name))
+                                                .child(pill(
+                                                    if done { "就绪" } else { "待接入" },
+                                                    if done {
+                                                        PillTone::Accent
+                                                    } else {
+                                                        PillTone::Neutral
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(component_badge("通知", &row.detail.notify))
+                                                .child(mcp_badge(&row.detail.mcp))
+                                                .child(component_badge(
+                                                    "Skills",
+                                                    &row.detail.skills,
+                                                )),
+                                        ),
+                                ),
                         )
                         .child(
                             kumu_button(
@@ -601,7 +876,7 @@ mod view {
                         ),
                 );
             if let Some(msg) = feedback {
-                item = item.child(meta_text(msg));
+                item = item.child(render_feedback_banner(msg));
             }
             col = col.child(item);
         }
@@ -620,6 +895,26 @@ mod view {
 
         let enabled = state.notifications_enabled;
         let sound = state.notification_sound;
+
+        let sound_row = view()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .when(!enabled, |s| s.opacity(0.5))
+            .child(
+                view()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(row_title("播放提示音"))
+                    .child(meta_text("收到需要关注的事件时播放系统提示音")),
+            )
+            .child(
+                kumu_switch_bare(move || sound)
+                    .disabled(!enabled)
+                    .on_change(move |checked: &bool| {
+                        send(&tx_sound, OnboardingAction::SetNotificationSound(*checked));
+                    }),
+            );
 
         let mut col = view()
             .flex_col()
@@ -647,26 +942,16 @@ mod view {
                                     .child(row_title("启用 Agent 通知"))
                                     .child(meta_text("关闭后仅保留侧栏状态，不弹通知")),
                             )
-                            .child(kumu_switch_bare(move || enabled).on_change(move |checked: &bool| {
-                                send(&tx_enable, OnboardingAction::SetNotificationsEnabled(*checked));
-                            })),
+                            .child(kumu_switch_bare(move || enabled).on_change(
+                                move |checked: &bool| {
+                                    send(
+                                        &tx_enable,
+                                        OnboardingAction::SetNotificationsEnabled(*checked),
+                                    );
+                                },
+                            )),
                     )
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                view()
-                                    .flex_col()
-                                    .gap_0p5()
-                                    .child(row_title("播放提示音"))
-                                    .child(meta_text("收到需要关注的事件时播放系统提示音")),
-                            )
-                            .child(kumu_switch_bare(move || sound).on_change(move |checked: &bool| {
-                                send(&tx_sound, OnboardingAction::SetNotificationSound(*checked));
-                            })),
-                    ),
+                    .child(sound_row),
             )
             .child(
                 view()
@@ -687,7 +972,7 @@ mod view {
             ));
 
         if let Some(msg) = state.notification_feedback {
-            col = col.child(meta_text(msg));
+            col = col.child(render_feedback_banner(msg));
         }
 
         col.into_element()
@@ -706,6 +991,7 @@ mod view {
             .cloned()
             .collect();
         let selected = state.selected_agent;
+        let already_created = state.created_pane_agent.is_some();
 
         let project_title = state
             .project_name
@@ -751,21 +1037,14 @@ mod view {
         } else {
             let mut choices = view().flex_row().flex_wrap().gap_1p5();
             for row in &installed {
-                let id = row.id;
-                let tx_sel = tx.clone();
-                let is_selected = selected == Some(id);
-                choices = choices.child(
-                    kumu_button(
-                        row.name,
-                        if is_selected {
-                            ButtonVariant::Default
-                        } else {
-                            ButtonVariant::Outline
-                        },
-                    )
-                    .on_press(move || send(&tx_sel, OnboardingAction::SelectAgent(id))),
-                );
+                let is_selected = selected == Some(row.id);
+                choices = choices.child(agent_choice_button(row, is_selected, tx.clone()));
             }
+            let (open_label, open_variant) = if already_created {
+                ("再打开一个 Agent 窗格", ButtonVariant::Outline)
+            } else {
+                ("在当前项目打开 Agent 窗格", ButtonVariant::Default)
+            };
             col = col
                 .child(
                     view()
@@ -775,7 +1054,7 @@ mod view {
                         .child(choices),
                 )
                 .child(
-                    kumu_button("在当前项目打开 Agent 窗格", ButtonVariant::Default)
+                    kumu_button(open_label, open_variant)
                         .disabled(selected.is_none())
                         .on_press(move || {
                             if let Some(id) = selected {
@@ -786,11 +1065,7 @@ mod view {
         }
 
         if let Some(feedback) = state.pane_feedback {
-            let text = match feedback {
-                Ok(msg) => msg,
-                Err(err) => format!("创建失败：{err}"),
-            };
-            col = col.child(meta_text(text));
+            col = col.child(render_feedback_banner(feedback));
         }
 
         col.into_element()
@@ -831,9 +1106,16 @@ mod view {
 
 /// Live NSH onboarding wizard overlay owned by `KumuApp`.
 pub struct ActiveOnboarding {
+    mount_id: u64,
     view: Entity<AppView>,
     events_tx: UnboundedSender<OnboardingHostEvent>,
     _task: Task<()>,
+}
+
+impl Drop for ActiveOnboarding {
+    fn drop(&mut self) {
+        let _ = MOUNTS.take(self.mount_id);
+    }
 }
 
 impl ActiveOnboarding {
@@ -885,6 +1167,7 @@ impl ActiveOnboarding {
         });
 
         Self {
+            mount_id,
             view,
             events_tx,
             _task: task,
@@ -925,13 +1208,20 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_state_steps_probe_and_partial_failure_summary() {
+    fn onboarding_state_steps_probe_feedback_and_completion() {
         let mut state = OnboardingState::new(true, true, None, None);
         assert_eq!(state.step, OnboardingStep::Agents);
+        assert!(!state.step_completed(OnboardingStep::Agents));
+        assert!(!state.step_completed(OnboardingStep::Workspace));
         assert!(!state.prev_step());
+        // Jumping over Notifications without visiting it must not mark it completed.
+        state.set_step(OnboardingStep::Workspace);
+        assert!(!state.step_completed(OnboardingStep::Notifications));
+        state.set_step(OnboardingStep::Agents);
         assert!(state.next_step());
         assert_eq!(state.step, OnboardingStep::Notifications);
         assert!(state.next_step());
+        assert!(state.step_completed(OnboardingStep::Notifications));
         assert!(state.next_step());
         assert_eq!(state.step, OnboardingStep::Artifacts);
         assert!(!state.next_step());
@@ -948,6 +1238,7 @@ mod tests {
         assert!(!state.probing);
         assert_eq!(state.installed_agents().len(), 1);
         assert_eq!(state.selected_agent, Some("codex"));
+        assert!(!state.step_completed(OnboardingStep::Agents));
 
         let partial = ComponentOutcome {
             notify: Ok(()),
@@ -964,12 +1255,33 @@ mod tests {
             },
         );
         let codex = state.agents.iter().find(|a| a.id == "codex").unwrap();
-        assert!(
-            codex
-                .last_feedback
-                .as_deref()
-                .unwrap_or("")
-                .contains("Skills 失败(occupied)")
+        let fb = codex.last_feedback.as_ref().expect("partial feedback");
+        assert_eq!(fb.tone, FeedbackTone::Warning);
+        assert!(fb.text.contains("Skills 失败(occupied)"));
+        assert!(!state.step_completed(OnboardingStep::Agents));
+
+        let ok = ComponentOutcome {
+            notify: Ok(()),
+            mcp: Some(Ok(())),
+            skills: Ok(()),
+        };
+        state.apply_agent_outcome(
+            "codex",
+            &ok,
+            IntegrationDetail {
+                notify: Ok(Status::Registered),
+                mcp: McpState::Supported(Ok(Status::Registered)),
+                skills: Ok(Status::Registered),
+            },
         );
+        let codex = state.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(
+            codex.last_feedback.as_ref().map(|m| m.tone),
+            Some(FeedbackTone::Success)
+        );
+        assert!(state.step_completed(OnboardingStep::Agents));
+
+        state.created_pane_agent = Some("codex");
+        assert!(state.step_completed(OnboardingStep::Workspace));
     }
 }

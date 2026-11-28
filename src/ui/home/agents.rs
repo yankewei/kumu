@@ -597,6 +597,7 @@ impl KumuApp {
             && self.active_dialog.is_none()
             && self.active_palette.is_none()
             && self.active_agent_picker.is_none()
+            && self.active_onboarding.is_none()
             && self.pane_is_visible(pane)
             && self
                 .active_zoomed_pane()
@@ -737,6 +738,10 @@ impl KumuApp {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agents_formal_verify.rs"]
+mod formal_verify;
 
 #[cfg(test)]
 mod tests {

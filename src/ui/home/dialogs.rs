@@ -605,17 +605,23 @@ impl KumuApp {
         cx.notify();
     }
 
+    fn clear_onboarding(&mut self, mark_done: bool) {
+        if mark_done
+            && let Err(err) = crate::db::set_setting(crate::db::SETTING_ONBOARDING_DONE, "1")
+        {
+            eprintln!("[onboarding] failed to persist onboarding_done: {err}");
+        }
+        self.active_onboarding = None;
+        self.onboarding_state = None;
+    }
+
     pub(super) fn dismiss_onboarding(
         &mut self,
         mark_done: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if mark_done {
-            let _ = crate::db::set_setting(crate::db::SETTING_ONBOARDING_DONE, "1");
-        }
-        self.active_onboarding = None;
-        self.onboarding_state = None;
+        self.clear_onboarding(mark_done);
         self.focus_terminal(window, cx);
         cx.notify();
     }
@@ -631,7 +637,7 @@ impl KumuApp {
         }
     }
 
-    fn push_onboarding_state(&self) {
+    pub(super) fn push_onboarding_state(&self) {
         if let (Some(overlay), Some(state)) = (&self.active_onboarding, &self.onboarding_state) {
             overlay.push_state(state.clone());
         }
@@ -653,7 +659,7 @@ impl KumuApp {
         cx: &mut Context<Self>,
     ) {
         use crate::nsh_ui::onboarding::{
-            ONBOARDING_SAMPLE_MARKDOWN, ONBOARDING_SAMPLE_TITLE, OnboardingAction,
+            FeedbackMessage, ONBOARDING_SAMPLE_MARKDOWN, ONBOARDING_SAMPLE_TITLE, OnboardingAction,
         };
 
         match action {
@@ -671,7 +677,7 @@ impl KumuApp {
             }
             OnboardingAction::GoToStep(step) => {
                 if let Some(state) = self.onboarding_state.as_mut() {
-                    state.step = step;
+                    state.set_step(step);
                     self.push_onboarding_state();
                 }
             }
@@ -700,18 +706,19 @@ impl KumuApp {
                 );
                 if let Err(err) = result {
                     if let Some(state) = self.onboarding_state.as_mut() {
-                        state.notification_feedback = Some(format!("保存通知设置失败：{err}"));
+                        state.notification_feedback =
+                            Some(FeedbackMessage::error(format!("保存通知设置失败：{err}")));
                         self.push_onboarding_state();
                     }
                     return;
                 }
-                let sound = cx.global::<crate::app::NotificationSettings>().sound;
-                cx.set_global(crate::app::NotificationSettings { enabled, sound });
                 if let Some(state) = self.onboarding_state.as_mut() {
                     state.notifications_enabled = enabled;
                     state.notification_feedback = None;
-                    self.push_onboarding_state();
                 }
+                let sound = cx.global::<crate::app::NotificationSettings>().sound;
+                cx.set_global(crate::app::NotificationSettings { enabled, sound });
+                self.push_onboarding_state();
             }
             OnboardingAction::SetNotificationSound(sound) => {
                 let result = crate::db::set_setting(
@@ -720,18 +727,19 @@ impl KumuApp {
                 );
                 if let Err(err) = result {
                     if let Some(state) = self.onboarding_state.as_mut() {
-                        state.notification_feedback = Some(format!("保存提示音设置失败：{err}"));
+                        state.notification_feedback =
+                            Some(FeedbackMessage::error(format!("保存提示音设置失败：{err}")));
                         self.push_onboarding_state();
                     }
                     return;
                 }
-                let enabled = cx.global::<crate::app::NotificationSettings>().enabled;
-                cx.set_global(crate::app::NotificationSettings { enabled, sound });
                 if let Some(state) = self.onboarding_state.as_mut() {
                     state.notification_sound = sound;
                     state.notification_feedback = None;
-                    self.push_onboarding_state();
                 }
+                let enabled = cx.global::<crate::app::NotificationSettings>().enabled;
+                cx.set_global(crate::app::NotificationSettings { enabled, sound });
+                self.push_onboarding_state();
             }
             OnboardingAction::SendTestNotification => {
                 if cx.global::<crate::app::NotificationSettings>().sound {
@@ -744,10 +752,9 @@ impl KumuApp {
                     actions: Vec::new(),
                 });
                 if let Some(state) = self.onboarding_state.as_mut() {
-                    state.notification_feedback = Some(
-                        "已发送测试通知。如未看到系统横幅，请点击右侧打开系统通知设置检查权限。"
-                            .into(),
-                    );
+                    state.notification_feedback = Some(FeedbackMessage::info(
+                        "已发送测试通知。如未看到系统横幅，请点击右侧打开系统通知设置检查权限。",
+                    ));
                     self.push_onboarding_state();
                 }
             }
@@ -768,14 +775,22 @@ impl KumuApp {
             OnboardingAction::OpenAgentPane(id) => {
                 let outcome = self.open_onboarding_agent_pane(id, cx);
                 if let Some(state) = self.onboarding_state.as_mut() {
-                    state.pane_feedback = Some(outcome);
+                    match outcome {
+                        Ok(msg) => {
+                            state.created_pane_agent = Some(id);
+                            state.pane_feedback = Some(FeedbackMessage::success(msg));
+                        }
+                        Err(err) => {
+                            state.pane_feedback =
+                                Some(FeedbackMessage::error(format!("创建失败：{err}")));
+                        }
+                    }
                     self.push_onboarding_state();
                 }
             }
             OnboardingAction::PreviewSampleArtifact => {
-                // Close onboarding before opening the reading sheet to avoid stacked modals.
-                self.active_onboarding = None;
-                self.onboarding_state = None;
+                // Close onboarding (marking done) before opening the reading sheet to avoid stacked modals.
+                self.clear_onboarding(true);
                 let home = cx.entity().downgrade();
                 let on_close: std::rc::Rc<crate::plugins::artifacts::CloseFn> =
                     std::rc::Rc::new(move |window, cx| {
@@ -810,6 +825,12 @@ impl KumuApp {
         }
         cx.spawn(async move |this, cx| {
             for agent in targets {
+                let still_open = this
+                    .update(cx, |app, _| app.active_onboarding.is_some())
+                    .unwrap_or(false);
+                if !still_open {
+                    return;
+                }
                 let (outcome, detail) = cx
                     .background_executor()
                     .spawn(async move {
