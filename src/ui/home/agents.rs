@@ -740,6 +740,10 @@ impl KumuApp {
 }
 
 #[cfg(test)]
+#[path = "agents_formal_verify.rs"]
+mod formal_verify;
+
+#[cfg(test)]
 mod tests {
     use super::{
         AgentEntry, Osc7501AlertKey, accepts_status, osc7501_attention_notification,
