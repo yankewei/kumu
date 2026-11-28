@@ -28,6 +28,7 @@
 
 mod agent;
 mod app;
+mod artifacts;
 mod assets;
 mod control;
 mod db;

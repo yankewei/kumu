@@ -6,6 +6,7 @@ use futures::StreamExt;
 use gpui::*;
 
 use super::KumuApp;
+use super::agents::AgentEntry;
 use crate::agent::launch::PaneLaunch;
 use crate::app::layout::{PaneDirection, PaneId, ProjectTabs, SplitAxis};
 use crate::term::KeyInput;
@@ -23,18 +24,25 @@ impl KumuApp {
     /// neighbours ("what is on the terminal to my right"). The accept loop
     /// forwards here so every answer comes from the thread that owns the
     /// workspace.
-    pub(super) fn start_control(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(command) = rx.next().await {
-                let _ = this.update(cx, |app, cx| app.handle_control_command(command, cx));
+                let _ = this.update_in(cx, |app, window, cx| {
+                    app.handle_control_command(command, window, cx)
+                });
             }
         })
         .detach();
         self.control = crate::control::start(tx);
     }
 
-    fn handle_control_command(&mut self, command: crate::control::Command, cx: &mut Context<Self>) {
+    fn handle_control_command(
+        &mut self,
+        command: crate::control::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::control::{
             Command, ControlError, MAX_SCROLL_LINES, PaneContent, ScrollDirection, ScrollResult,
             SendResult,
@@ -238,7 +246,158 @@ impl KumuApp {
                 cancelled,
                 reply,
             } => self.control_wait(target, from, timeout_secs, next, cancelled, reply, cx),
+            Command::ArtifactPublished {
+                from,
+                project_path,
+                artifact,
+                reply,
+            } => {
+                let _ =
+                    reply.send(self.control_artifact_published(from, &project_path, &artifact, cx));
+            }
+            Command::ArtifactOpen {
+                from,
+                project_path,
+                artifact,
+                reply,
+            } => {
+                let _ = reply.send(self.control_artifact_open(
+                    from,
+                    &project_path,
+                    &artifact,
+                    window,
+                    cx,
+                ));
+            }
         }
+    }
+
+    fn control_project(&self, project_path: &str, cx: &App) -> Option<i64> {
+        let target = std::fs::canonicalize(project_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(project_path));
+        self.workspace
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|project| {
+                std::fs::canonicalize(&project.path)
+                    .map(|path| path == target)
+                    .unwrap_or_else(|_| std::path::Path::new(&project.path) == target)
+            })
+            .map(|project| project.id)
+    }
+
+    fn control_artifact_published(
+        &mut self,
+        from: Option<u64>,
+        project_path: &str,
+        artifact_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::control::ArtifactNotifyResult, crate::control::ControlError> {
+        use crate::control::{ArtifactNotifyResult, ControlError};
+
+        if let Some(from) = from {
+            self.pane_tab(PaneId(from)).ok_or_else(|| {
+                ControlError::new("paneGone", format!("pane {from} is not running"))
+            })?;
+        }
+        let project = self.control_project(project_path, cx).ok_or_else(|| {
+            ControlError::new(
+                "projectNotOpen",
+                format!("project {project_path} is not open in Kumu"),
+            )
+        })?;
+        let path = self
+            .workspace
+            .read(cx)
+            .project(project)
+            .map(|project| project.path.clone())
+            .unwrap_or_else(|| project_path.to_string());
+        if crate::artifacts::find(std::path::Path::new(&path), artifact_id).is_none() {
+            return Err(ControlError::new(
+                "artifactGone",
+                format!("artifact {artifact_id} does not exist"),
+            ));
+        }
+        let visible = self.open_plugin == Some(crate::plugins::artifacts::ID)
+            && self.selected == Some(project);
+        if visible {
+            if let Some(view) = self
+                .plugin_views
+                .get(crate::plugins::artifacts::ID)
+                .cloned()
+                && let Ok(panel) = view.downcast::<crate::plugins::artifacts::ArtifactsPanel>()
+            {
+                panel.update(cx, |panel, cx| panel.refresh_now(cx));
+            }
+        } else {
+            self.artifact_unread.insert(project);
+        }
+        cx.notify();
+        Ok(ArtifactNotifyResult::default())
+    }
+
+    fn control_artifact_open(
+        &mut self,
+        from: Option<u64>,
+        project_path: &str,
+        artifact_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::control::ArtifactNotifyResult, crate::control::ControlError> {
+        use crate::control::{ArtifactNotifyResult, ControlError};
+
+        if let Some(from) = from {
+            self.pane_tab(PaneId(from)).ok_or_else(|| {
+                ControlError::new("paneGone", format!("pane {from} is not running"))
+            })?;
+        }
+        let project = self.control_project(project_path, cx).ok_or_else(|| {
+            ControlError::new(
+                "projectNotOpen",
+                format!("project {project_path} is not open in Kumu"),
+            )
+        })?;
+        if self.selected != Some(project) {
+            self.select_project(project, cx);
+        }
+        let Some(project_path) = self
+            .workspace
+            .read(cx)
+            .project(project)
+            .map(|project| std::path::PathBuf::from(&project.path))
+        else {
+            return Err(ControlError::new(
+                "projectNotOpen",
+                format!("project {project_path} is not open in Kumu"),
+            ));
+        };
+        let Some(artifact) = crate::artifacts::find(&project_path, artifact_id) else {
+            return Err(ControlError::new(
+                "artifactGone",
+                format!("artifact {artifact_id} does not exist"),
+            ));
+        };
+        let home = cx.entity().downgrade();
+        let on_close: std::rc::Rc<crate::plugins::artifacts::CloseFn> =
+            std::rc::Rc::new(move |window, cx| {
+                let _ = home.update(cx, |app, cx| {
+                    app.active_sheet = None;
+                    app.focus_terminal(window, cx);
+                    cx.notify();
+                });
+            });
+        self.active_sheet = Some(crate::plugins::artifacts::reading_sheet(
+            project_path,
+            artifact,
+            on_close,
+            window,
+            cx,
+        ));
+        self.artifact_unread.remove(&project);
+        window.activate_window();
+        cx.notify();
+        Ok(ArtifactNotifyResult { opened: true })
     }
 
     /// Start an agent in a new pane beside `from` (or the focused pane). The
@@ -760,27 +919,46 @@ impl KumuApp {
     ) -> Option<crate::control::PaneSummary> {
         use crate::control::PaneSummary;
 
-        let project = self.pane_project(pane, cx)?;
+        let (project, tab_index) = self.pane_tab(pane)?;
         let workspace = self.workspace.read(cx);
         let term = workspace.terminal_for_pane(pane.0)?;
         let snapshot = term.snapshot();
+        let tab_name = self
+            .tabs_by_project
+            .get(&project)
+            .map(|tabs| Self::tab_name(tabs, tab_index))
+            .unwrap_or_default();
+        // A shell pane may have adopted an agent the user started by hand. The
+        // launch map and status entry know it even though the PTY is a shell;
+        // `pane send` still refuses that pane on its own.
+        let agent = self
+            .agent_status
+            .get(&pane)
+            .map(|entry| entry.agent.clone())
+            .or_else(|| self.pane_agent_id(pane));
+        let title = self
+            .agent_status
+            .get(&pane)
+            .map(AgentEntry::display_title)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| snapshot.label());
+        let agent_session_id = match self.launches.get(&pane) {
+            Some(PaneLaunch::Agent { session, .. }) => session.clone(),
+            _ => None,
+        };
         Some(PaneSummary {
             id: pane.0,
             project,
             project_name: workspace.project(project)?.name.clone(),
-            title: snapshot.label(),
+            title,
             command: snapshot.command.clone(),
             cwd: snapshot.cwd.clone(),
-            agent: match self.launches.get(&pane) {
-                Some(PaneLaunch::Agent { agent, .. })
-                    if workspace.pane_is_shell(pane.0) == Some(false) =>
-                {
-                    Some(agent.clone())
-                }
-                _ => None,
-            },
+            agent,
             focused: self.focused == pane,
             selected: self.selected == Some(project),
+            project_path: workspace.project(project)?.path.clone(),
+            agent_session_id,
+            tab_name,
             cols: snapshot
                 .cells
                 .first()

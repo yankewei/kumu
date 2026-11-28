@@ -28,6 +28,7 @@ pub fn run_cli() -> Option<i32> {
     match first.as_str() {
         "panes" => Some(panes_cli(&rest)),
         "pane" => Some(pane_cli(&rest)),
+        "artifact" => Some(super::cli_artifact::artifact_cli(&rest)),
         _ => None,
     }
 }
@@ -41,6 +42,7 @@ usage:
   kumu pane send <TARGET> <TEXT...> [--no-enter] [--json]
   kumu pane wait <TARGET> [--timeout SECS] [--next] [--json]
   kumu pane close <TARGET> [--self] [--json]
+  kumu artifact <publish|list|path|open|remove> ...   (see kumu artifact --help)
 
 TARGET is a pane id, left/right/up/down (relative to $KUMU_PANE), or focused
 (the default). --history N reads N scrollback rows; --tail N keeps the last N

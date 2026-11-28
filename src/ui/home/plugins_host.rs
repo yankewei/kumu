@@ -95,6 +95,10 @@ impl KumuApp {
                     }
                 });
                 let state = agent_entry.and_then(|entry| entry.state);
+                let agent_session_id = match self.launches.get(&pane) {
+                    Some(PaneLaunch::Agent { session, .. }) => session.clone(),
+                    _ => None,
+                };
                 let title = agent_entry
                     .map(AgentEntry::display_title)
                     .filter(|label| !label.is_empty())
@@ -112,6 +116,7 @@ impl KumuApp {
                     tab_name: tab_name.clone(),
                     title,
                     agent,
+                    agent_session_id,
                     state,
                     focused: pane == focused,
                 }
@@ -243,6 +248,11 @@ impl KumuApp {
             self.begin_panel_resize_defer(cx);
         }
         self.open_plugin = Some(spec.id);
+        if spec.id == crate::plugins::artifacts::ID
+            && let Some(project) = self.selected
+        {
+            self.artifact_unread.remove(&project);
+        }
         self.plugin_views
             .retain(|id, _| Some(*id) == self.open_plugin);
         if let Some(existing) = self.plugin_views.get(spec.id).cloned() {
@@ -267,6 +277,11 @@ impl KumuApp {
     pub(super) fn sync_plugin_project(&mut self, cx: &mut Context<Self>) {
         if self.open_plugin.is_none() {
             return;
+        }
+        if self.open_plugin == Some(crate::plugins::artifacts::ID)
+            && let Some(project) = self.plugin_project(cx)
+        {
+            self.artifact_unread.remove(&project.id);
         }
         let home = cx.entity().downgrade();
         (**cx).defer(move |cx| {
@@ -307,8 +322,13 @@ impl KumuApp {
         let icon = spec.icon;
         let plugin_id = spec.id;
         let plugin_title = spec.title;
-        let button = div()
+        let unread = spec.id == crate::plugins::artifacts::ID
+            && self
+                .plugin_project(cx)
+                .is_some_and(|project| self.artifact_unread.contains(&project.id));
+        let mut button = div()
             .id(SharedString::from(format!("plugin-toggle-{}", spec.id)))
+            .relative()
             .flex()
             .items_center()
             .justify_center()
@@ -337,6 +357,17 @@ impl KumuApp {
                 this.toggle_plugin(spec.clone(), window, cx);
             }))
             .child(svg().path(icon).size(px(14.)).text_color(foreground));
+        if unread && !active {
+            button = button.child(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .right(px(3.))
+                    .size(px(5.))
+                    .rounded(px(3.))
+                    .bg(colors.link),
+            );
+        }
 
         let mut wrapper = div().relative().child(button);
         if hovered {

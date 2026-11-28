@@ -9,6 +9,7 @@
 //! project is selected. A panel that polls a repository can keep itself
 //! current without the workspace knowing anything about it.
 
+pub mod artifacts;
 mod git_log;
 
 use std::path::PathBuf;
@@ -44,6 +45,9 @@ pub struct PaneTarget {
     pub title: String,
     /// The registry id when the pane runs an agent (`codex`, `claude`, etc.).
     pub agent: Option<String>,
+    /// The agent conversation id, when the agent reported one. Artifacts use
+    /// it to group by session rather than by the pane that happened to publish.
+    pub agent_session_id: Option<String>,
     /// Live agent state (`Working`, `Waiting`, `Idle`), when known.
     pub state: Option<AgentState>,
     /// The pane the project had focused when the panel asked.
@@ -297,7 +301,11 @@ impl PluginSpec {
 
 /// Every plugin, in title-bar order.
 pub fn specs() -> impl Iterator<Item = PluginSpec> {
-    [PluginSpec::of::<git_log::GitLogPanel>()].into_iter()
+    [
+        PluginSpec::of::<git_log::GitLogPanel>(),
+        PluginSpec::of::<artifacts::ArtifactsPanel>(),
+    ]
+    .into_iter()
 }
 
 pub fn spec(id: &str) -> Option<PluginSpec> {

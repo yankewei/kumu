@@ -421,6 +421,26 @@ fn ask(commands: &UnboundedSender<Command>, request: Request) -> Result<Value, C
             }
             result
         }
+        Request::ArtifactPublished {
+            from,
+            project_path,
+            artifact,
+        } => exchange(commands, |reply| Command::ArtifactPublished {
+            from,
+            project_path,
+            artifact,
+            reply,
+        }),
+        Request::ArtifactOpen {
+            from,
+            project_path,
+            artifact,
+        } => exchange(commands, |reply| Command::ArtifactOpen {
+            from,
+            project_path,
+            artifact,
+            reply,
+        }),
     }
 }
 

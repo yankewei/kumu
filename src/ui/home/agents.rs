@@ -319,7 +319,7 @@ impl KumuApp {
     }
 
     /// The agent id a pane was launched with, or `None` for a shell.
-    fn pane_agent_id(&self, pane: PaneId) -> Option<String> {
+    pub(super) fn pane_agent_id(&self, pane: PaneId) -> Option<String> {
         match self.launches.get(&pane) {
             Some(PaneLaunch::Agent { agent, .. }) => Some(agent.clone()),
             _ => None,

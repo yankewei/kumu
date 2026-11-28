@@ -20,7 +20,7 @@ mod tabs_nsh;
 mod terminal;
 mod workspace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::agent::status::clean_osc_title;
@@ -80,6 +80,8 @@ pub struct KumuApp {
     /// Terminals that requested attention while unattended, mapped to their
     /// project for the sidebar marker.
     unread_notifications: HashMap<u64, i64>,
+    /// Projects whose Artifacts drawer has not seen the latest publish.
+    artifact_unread: HashSet<i64>,
     /// Whether the home window currently has keyboard focus. A status change
     /// while it does not still becomes an unseen marker until the pane is
     /// clicked.
@@ -535,6 +537,7 @@ impl KumuApp {
             settings_window: None,
             selected: None,
             unread_notifications: HashMap::new(),
+            artifact_unread: HashSet::new(),
             window_active: window.is_window_active(),
             agent_status: HashMap::new(),
             project_branches: HashMap::new(),
@@ -574,7 +577,7 @@ impl KumuApp {
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
         }
-        app.start_control(cx);
+        app.start_control(window, cx);
         app.start_shell_agent_watcher(cx);
         app.start_project_branch_watcher(cx);
         app.focus_terminal(window, cx);

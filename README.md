@@ -76,6 +76,7 @@ Kumu 向每个窗格注入 <code>KUMU_APP_BINARY</code> 与 <code>KUMU_PANE</cod
 </table>
 
 - **Git 历史、分支总览与 Diff 行级审查** — 右上角打开 Git 面板查看当前分支、相对默认分支（`main`/`master`）的整条分支 Diff 总览、提交历史（支持搜索与悬停看完整信息）及工作区改动 diff；在 diff 任意行点 `+` 写审查意见，指定目标窗格后连同文件、行号与上下文一键发给 Agent（未发出的草稿自动保留，补丁变更时提示重新读取；焦点在普通 shell 时仅粘贴不执行）。
+- **Agent Artifacts** — 让 Agent 把方案、报告或 HTML 原型发布到项目的 `.kumu/artifacts`，右侧 Artifacts 抽屉按会话分组展示；Markdown 原生渲染，HTML 在内嵌 WebView 中直接打开。发布自动关联当前窗格与 Agent 会话，任何会话都能打开项目的全部 artifacts。
 - **原生 Git Worktree 全生命周期管理** — 在 Git 仓库右键按分支创建或导入同级 `<仓库>-<分支>` worktree；任务完成后可选择「从列表移除（保留目录）」或「删除 worktree（带未提交改动检查并清理磁盘目录）」。
 - **自动接管、会话恢复与自定义启动参数** — 无论是通过窗格按钮新建，还是在普通 shell 里手动输入 `claude`、`codex`、`opencode`、`agy` 等命令启动，Kumu 都会自动识别并在下次打开应用时按原 CLI 语法接回同一段对话；可在 **设置 → 服务商 → 编码 Agent** 为各已安装 Agent 配置默认启动参数。
 - **高性能原生架构** — 使用 Rust + Pure Rust NSH + GPUI 构建原生界面，内嵌 Ghostty (`libghostty`) 终端渲染引擎，轻快流畅、无 Electron 开销。
@@ -114,7 +115,7 @@ Kumu 目前提供 **Apple Silicon Mac** 安装包，系统要求 **macOS 11** �
 
 ### 安装配套 Agent Skills（推荐）
 
-让你的编码 Agent 原生学会操作 Kumu 窗格：
+让你的编码 Agent 原生学会操作 Kumu 窗格和发布 artifacts：
 
 ```sh
 npx skills add yankewei/kumu
@@ -143,6 +144,23 @@ npx skills add yankewei/kumu
 - 窗格目标支持 `left` / `right` / `up` / `down`（相对当前窗格）、`focused`、`current` 或 `panes` 中的数字 id。
 - `pane split` 支持向右（`right`）或向下（`down`），新建时保持原窗格键盘焦点不变，`--prompt` 会等待新 Agent 画出输入框后自动发送。
 - `pane send` 仅允许发送给 Agent 窗格，普通 shell 窗格会拒绝（防止误执行命令）；更多参数与边界说明见 [`kumu-panes`](skills/kumu-panes/SKILL.md)。
+
+### Agent Artifacts
+
+在 Kumu 窗格里把方案、报告或 HTML 原型发布成可视化 artifact：
+
+```sh
+"$KUMU_APP_BINARY" artifact publish ./plan.md --title "登录页重构方案"
+"$KUMU_APP_BINARY" artifact publish ./mockup.html --title "交互原型" --open
+cat report.md | "$KUMU_APP_BINARY" artifact publish - --title "排查报告"
+"$KUMU_APP_BINARY" artifact list
+```
+
+- 内容快照写入 `<项目>/.kumu/artifacts/<id>/`，`.kumu/.gitignore` 默认忽略，不上传；
+- 自动记录发布窗格、Agent 与会话 id，右侧 **Artifacts** 抽屉按会话分组展示，任意会话都可打开；
+- Markdown / 纯文本原生渲染，HTML 在内嵌 WebView 中直接打开，外链交给系统浏览器；
+- 迭代同一份产物用 `--replace <id>`；不在 Kumu 窗格内时仍可发布，归入「未关联」；
+- 完整用法见 [`kumu-artifacts`](skills/kumu-artifacts/SKILL.md)。
 
 ---
 
