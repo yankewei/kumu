@@ -1,4 +1,84 @@
+import { execFileSync } from "node:child_process";
 import { notify, notifyStatus, notifyTitle } from "./notify.js";
+
+function registerKumuTools(pi) {
+  if (typeof pi?.registerTool !== "function") return;
+  const bin = () => process.env.KUMU_APP_BINARY || "kumu";
+  const runKumu = (args, input) =>
+    execFileSync(bin(), args, {
+      encoding: "utf8",
+      input,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+
+  try {
+    pi.registerTool({
+      name: "kumu_artifact_publish",
+      label: "Publish Kumu Artifact",
+      description:
+        "Publish a Markdown, HTML, or text artifact into Kumu's Artifacts drawer and render it in-app.",
+      parameters: {
+        type: "object",
+        properties: {
+          content: { type: "string", description: "Raw Markdown/HTML/text content to publish directly." },
+          file: { type: "string", description: "Local file or directory path to publish." },
+          title: { type: "string", description: "Title shown in Kumu's Artifacts drawer." },
+          kind: { type: "string", enum: ["auto", "markdown", "html", "text"] },
+          replace: { type: "string", description: "Existing artifact id to update in place." },
+          open: { type: "boolean", description: "Open in Kumu immediately (default true)." },
+        },
+      },
+      async execute(_toolCallId, params = {}) {
+        const args = ["artifact", "publish"];
+        const useContent = typeof params.content === "string" && params.content.length > 0;
+        if (useContent) {
+          args.push("-");
+        } else if (typeof params.file === "string" && params.file.length > 0) {
+          args.push(params.file);
+        } else {
+          return { content: [{ type: "text", text: "Provide either 'content' or 'file'." }], isError: true };
+        }
+        if (params.title) args.push("--title", String(params.title));
+        if (params.kind) args.push("--kind", String(params.kind));
+        if (params.replace) args.push("--replace", String(params.replace));
+        if (params.open !== false) args.push("--open");
+        args.push("--json");
+        try {
+          const out = runKumu(args, useContent ? params.content : undefined);
+          return { content: [{ type: "text", text: out }] };
+        } catch (err) {
+          const msg = err?.stderr?.toString?.() || err?.message || String(err);
+          return { content: [{ type: "text", text: msg }], isError: true };
+        }
+      },
+    });
+
+    pi.registerTool({
+      name: "kumu_artifact_list",
+      label: "List Kumu Artifacts",
+      description: "List artifacts stored in the current project's Kumu Artifacts drawer.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", minimum: 1 },
+        },
+      },
+      async execute(_toolCallId, params = {}) {
+        const args = ["artifact", "list", "--json"];
+        if (params.limit) args.push("--limit", String(params.limit));
+        try {
+          const out = runKumu(args);
+          return { content: [{ type: "text", text: out }] };
+        } catch (err) {
+          const msg = err?.stderr?.toString?.() || err?.message || String(err);
+          return { content: [{ type: "text", text: msg }], isError: true };
+        }
+      },
+    });
+  } catch {
+    // Ignore host tool-registration API differences so notifications never break.
+  }
+}
 
 // Pi and Oh My Pi share this module. OMP exposes ctx.agent; Pi does not, which
 // also distinguishes them when either is started from a Kumu shell session.
@@ -34,6 +114,7 @@ function messageText(message) {
 
 export default function (pi) {
   if (process.env.KUMU_TERMINAL !== "1") return;
+  registerKumuTools(pi);
 
   let piBusy = false;
   let piStopReason;

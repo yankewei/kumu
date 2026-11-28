@@ -2,6 +2,7 @@
 
 mod cli;
 mod hooks;
+mod mcp;
 
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
@@ -12,6 +13,9 @@ use jsonc_parser::cst::CstRootNode;
 use serde_json::Value;
 
 pub use cli::{is_hook_notification_body, run_cli};
+pub use mcp::{
+    install_mcp, mcp_agents, mcp_status, mcp_wrapper_path, supports_mcp, uninstall_mcp,
+};
 use hooks::{
     agy_hooks_status, cursor_events, cursor_hook, hook_groups, hooks_status, temporary_path,
     update_hook_file,
@@ -153,7 +157,7 @@ pub fn status(agent: &str) -> io::Result<Status> {
         let value = root
             .to_serde_value()
             .ok_or_else(|| io::Error::other("无效的 Agent 配置"))?;
-        return Ok(if agent == "cursor" {
+        let hook_state = if agent == "cursor" {
             let install: Vec<(&'static str, Value)> = cursor_events()
                 .into_iter()
                 .map(|(event, kind)| (event, cursor_hook(kind)))
@@ -163,7 +167,14 @@ pub fn status(agent: &str) -> io::Result<Status> {
             agy_hooks_status(&value)
         } else {
             hooks_status(&value, &hook_groups(agent), true)
-        });
+        };
+        if hook_state == Status::Registered
+            && supports_mcp(agent)
+            && !matches!(mcp_status(agent), Ok(Status::Registered))
+        {
+            return Ok(Status::NeedsRepair);
+        }
+        return Ok(hook_state);
     }
     let target = paths.assets.join("extension");
     match std::fs::symlink_metadata(&paths.registration) {
@@ -186,7 +197,8 @@ pub fn status(agent: &str) -> io::Result<Status> {
                         .as_deref()
                         == Some(expected.as_str())
                 });
-            Ok(if current {
+            let mcp_ok = !supports_mcp(agent) || matches!(mcp_status(agent), Ok(Status::Registered));
+            Ok(if current && mcp_ok {
                 Status::Registered
             } else {
                 Status::NeedsRepair
@@ -206,7 +218,11 @@ pub fn status(agent: &str) -> io::Result<Status> {
 pub fn install(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
     if is_hook_agent(agent) {
-        return update_hook_file(&paths.registration, agent, false);
+        update_hook_file(&paths.registration, agent, false)?;
+        if supports_mcp(agent) {
+            install_mcp(agent)?;
+        }
+        return Ok(());
     }
     write_assets(&paths, agent)?;
     register_link(
@@ -214,6 +230,9 @@ pub fn install(agent: &str) -> io::Result<()> {
         &paths.assets.join("extension"),
         &paths.managed,
     )?;
+    if supports_mcp(agent) {
+        install_mcp(agent)?;
+    }
     Ok(())
 }
 
@@ -260,6 +279,7 @@ fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
 /// step); Codex is left for the Settings UI because changing `hooks.json`
 /// requires re-trusting in `/hooks`.
 pub fn refresh_installed() {
+    mcp::refresh_mcp_wrapper();
     refresh_native();
     for agent in ["claude", "agy"] {
         if matches!(status(agent), Ok(Status::NeedsRepair))
@@ -308,6 +328,9 @@ fn refresh_registered(paths: &Paths, agent: &str) -> io::Result<()> {
 
 pub fn uninstall(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
+    if supports_mcp(agent) {
+        let _ = uninstall_mcp(agent);
+    }
     if is_hook_agent(agent) {
         update_hook_file(&paths.registration, agent, true)?;
         // Grok's file is Kumu-owned (`~/.grok/hooks/kumu-notifications.json`):

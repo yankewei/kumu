@@ -69,7 +69,7 @@ pub(super) fn render_providers_card(state: ProvidersPageState) -> impl IntoEleme
                 .gap_1()
                 .child(section_title("编码 Agent"))
                 .child(meta_text(
-                    "开启通知会注册到 Agent 的配置或扩展目录；可为已安装的 Agent 配置默认启动参数（新建窗格生效）。",
+                    "开启接入会注册 Agent 通知与 Kumu MCP 工具（Artifact 渲染、窗格协作）；可为已安装的 Agent 配置默认启动参数（新建窗格生效）。",
                 )),
         )
         .child(dynamic(move || {

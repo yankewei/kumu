@@ -491,7 +491,7 @@ fn remove(args: &[String]) -> i32 {
     }
 }
 
-fn artifact_from_path(target: &str) -> Option<(PathBuf, String)> {
+pub(super) fn artifact_from_path(target: &str) -> Option<(PathBuf, String)> {
     let path = std::fs::canonicalize(target).ok()?;
     let start = if path.is_dir() {
         path.as_path()
@@ -517,7 +517,7 @@ fn artifact_from_path(target: &str) -> Option<(PathBuf, String)> {
     None
 }
 
-fn resolve_root(project: Option<&Path>) -> Result<PathBuf, String> {
+pub(super) fn resolve_root(project: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(pane) = caller_pane().and_then(control_pane)
         && project.is_none()
         && !pane.project_path.is_empty()
@@ -530,13 +530,13 @@ fn resolve_root(project: Option<&Path>) -> Result<PathBuf, String> {
     artifacts::resolve_project_root(&cwd, project).map_err(|error| error.to_string())
 }
 
-fn control_pane(pane: u64) -> Option<PaneSummary> {
+pub(super) fn control_pane(pane: u64) -> Option<PaneSummary> {
     let value = call(&Request::Panes).ok()?;
     let panes: Vec<PaneSummary> = serde_json::from_value(value.get("panes")?.clone()).ok()?;
     panes.into_iter().find(|candidate| candidate.id == pane)
 }
 
-fn notify_app(request: Request, required: bool) -> Result<ArtifactNotifyResult, String> {
+pub(super) fn notify_app(request: Request, required: bool) -> Result<ArtifactNotifyResult, String> {
     match call(&request) {
         Ok(value) => serde_json::from_value(value).map_err(|error| error.to_string()),
         Err(error) if !required && error.contains("cannot reach kumu") => {
@@ -546,7 +546,7 @@ fn notify_app(request: Request, required: bool) -> Result<ArtifactNotifyResult, 
     }
 }
 
-fn artifact_json(artifact: &Artifact) -> serde_json::Value {
+pub(super) fn artifact_json(artifact: &Artifact) -> serde_json::Value {
     json!({
         "id": artifact.id(),
         "title": artifact.meta.title,

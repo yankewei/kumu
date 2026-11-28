@@ -13,6 +13,7 @@
 mod cli;
 mod cli_artifact;
 mod cli_pane;
+mod mcp;
 mod protocol;
 mod server;
 
