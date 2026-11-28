@@ -2,7 +2,7 @@
 
 Kumu 不改写用户的 Agent 启动命令，不添加 `-c`、`--settings` 或 `--extension`，不替换 PATH、ZDOTDIR 或 shell 启动文件。
 
-在 **设置 → 服务商 → 编码 Agent** 对已安装的 Agent 点击 **开启通知**，把通知处理器注册到 Agent 自己的持久配置或自动发现目录，然后重新启动 Agent。之后使用普通命令、绝对路径、别名或自定义脚本启动，均不要求额外的通知参数。已开启时同一位置显示 **关闭通知**。
+在 **设置 → 服务商 → 编码 Agent** 对已安装的 Agent 点击开启，或直接运行 `kumu integration install [agent]`，会把通知处理器（Hooks / 原生扩展）、Kumu MCP 与内嵌 Skills 一并注册到 Agent 的配置或自动发现目录，然后重新启动 Agent。之后使用普通命令、绝对路径、别名或自定义脚本启动，均不要求额外的启动参数。状态诊断可运行 `kumu integration status`；完整集成设计见 [docs/agent-integration-cli.md](agent-integration-cli.md)。
 
 未安装的 Agent 只显示“未安装”，没有任何通知操作：注册文件只有对应 Agent 的进程才会加载，为一个不存在的 CLI 预写配置既不会生效，也会让状态变成没有覆盖的声明。安装 CLI 后，这一行才会出现 **开启通知**。
 

@@ -147,7 +147,13 @@ fn status_cli(args: &[String]) -> i32 {
             row["status"].as_str().unwrap_or("")
         );
     }
+    println!("\nTip: run 'kumu integration status' to inspect notify, MCP, and skills together.");
     0
+}
+
+fn in_kumu_terminal() -> bool {
+    std::env::var("KUMU_TERMINAL").as_deref() == Ok("1")
+        || std::env::var_os("KUMU_PANE").is_some_and(|v| !v.is_empty())
 }
 
 /// Run the stdio NDJSON MCP loop until EOF on stdin.
@@ -196,6 +202,10 @@ fn serve_stdio() -> i32 {
 ///
 /// Returns `None` for notifications (messages without `id`).
 pub(crate) fn handle_json_line(raw: &str) -> Option<Value> {
+    handle_json_line_with_env(raw, in_kumu_terminal())
+}
+
+fn handle_json_line_with_env(raw: &str, in_kumu: bool) -> Option<Value> {
     let parsed: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(error) => {
@@ -240,20 +250,33 @@ pub(crate) fn handle_json_line(raw: &str) -> Option<Value> {
     };
 
     // Notifications (no `id`) never receive a JSON-RPC response.
-    let Some(id) = id else {
-        return None;
-    };
+    let id = id?;
 
     let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
 
     match method {
-        "initialize" => Some(jsonrpc_ok(id, handle_initialize(&params))),
+        "initialize" => Some(jsonrpc_ok(id, handle_initialize(&params, in_kumu))),
         "ping" => Some(jsonrpc_ok(id, json!({}))),
-        "tools/list" => Some(jsonrpc_ok(id, json!({ "tools": tool_definitions() }))),
-        "tools/call" => match handle_tools_call(&params) {
-            Ok(result) => Some(jsonrpc_ok(id, result)),
-            Err((code, message)) => Some(jsonrpc_error(id, code, &message)),
-        },
+        "tools/list" => {
+            let tools = if in_kumu {
+                Value::Array(tool_definitions())
+            } else {
+                json!([])
+            };
+            Some(jsonrpc_ok(id, json!({ "tools": tools })))
+        }
+        "tools/call" => {
+            if !in_kumu {
+                return Some(jsonrpc_ok(
+                    id,
+                    tool_err("Kumu MCP tools are only available inside a Kumu terminal pane."),
+                ));
+            }
+            match handle_tools_call(&params) {
+                Ok(result) => Some(jsonrpc_ok(id, result)),
+                Err((code, message)) => Some(jsonrpc_error(id, code, &message)),
+            }
+        }
         other => Some(jsonrpc_error(
             id,
             -32601,
@@ -262,13 +285,13 @@ pub(crate) fn handle_json_line(raw: &str) -> Option<Value> {
     }
 }
 
-fn handle_initialize(params: &Value) -> Value {
+fn handle_initialize(params: &Value, in_kumu: bool) -> Value {
     let requested = params.get("protocolVersion").and_then(Value::as_str);
     let negotiated = requested
         .filter(|v| SUPPORTED_VERSIONS.contains(v))
         .unwrap_or(LATEST_PROTOCOL_VERSION);
 
-    json!({
+    let mut result = json!({
         "protocolVersion": negotiated,
         "capabilities": {
             "tools": {
@@ -279,9 +302,14 @@ fn handle_initialize(params: &Value) -> Value {
             "name": "kumu",
             "title": "Kumu",
             "version": env!("CARGO_PKG_VERSION")
-        },
-        "instructions": "Kumu exposes tools to publish and view rich Markdown/HTML artifacts in the user's Kumu workspace, and to coordinate sibling agent terminal panes."
-    })
+        }
+    });
+    if in_kumu {
+        result["instructions"] = json!(
+            "Kumu exposes tools to publish and view rich Markdown/HTML artifacts in the user's Kumu workspace, and to coordinate sibling agent terminal panes."
+        );
+    }
+    result
 }
 
 fn jsonrpc_ok(id: Value, result: Value) -> Value {
@@ -1143,8 +1171,11 @@ mod tests {
     #[test]
     fn dual_era_supports_stateless_calls_and_legacy_initialize() {
         // Modern 2026-07-28 client: calls tools/list directly without initialize.
-        let list = handle_json_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-            .expect("tools/list reply");
+        let list = handle_json_line_with_env(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            true,
+        )
+        .expect("tools/list reply");
         let tools = list["result"]["tools"].as_array().expect("tools array");
         assert!(tools.len() >= 11);
         for tool in tools {
@@ -1154,19 +1185,49 @@ mod tests {
         }
 
         // Legacy client: negotiates 2025-11-25 via initialize, notification produces no reply.
-        let init = handle_json_line(
+        let init = handle_json_line_with_env(
             r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            true,
         )
         .expect("init reply");
         assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        assert!(init["result"].get("instructions").is_some());
         assert!(
-            handle_json_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none()
+            handle_json_line_with_env(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                true
+            )
+            .is_none()
         );
 
         // Batching is rejected per MCP 2025-06-18+.
-        let batch = handle_json_line(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#)
+        let batch = handle_json_line_with_env(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, true)
             .expect("batch error");
         assert_eq!(batch["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn non_kumu_environment_silences_mcp_tools_and_instructions() {
+        let init = handle_json_line_with_env(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
+            false,
+        )
+        .expect("init reply");
+        assert!(init["result"].get("instructions").is_none());
+
+        let list = handle_json_line_with_env(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            false,
+        )
+        .expect("tools/list reply");
+        assert_eq!(list["result"]["tools"], json!([]));
+
+        let call = handle_json_line_with_env(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pane_list","arguments":{}}}"#,
+            false,
+        )
+        .expect("tools/call reply");
+        assert_eq!(call["result"]["isError"], true);
     }
 
     #[test]
@@ -1195,7 +1256,7 @@ mod tests {
                 }
             }
         });
-        let pub_res = handle_json_line(&pub_req.to_string()).expect("publish reply");
+        let pub_res = handle_json_line_with_env(&pub_req.to_string(), true).expect("publish reply");
         assert_eq!(pub_res["result"]["isError"], false);
         let id = pub_res["result"]["structuredContent"]["id"]
             .as_str()
@@ -1214,7 +1275,7 @@ mod tests {
                 }
             }
         });
-        let list_res = handle_json_line(&list_req.to_string()).expect("list reply");
+        let list_res = handle_json_line_with_env(&list_req.to_string(), true).expect("list reply");
         assert_eq!(list_res["result"]["isError"], false);
         let items = list_res["result"]["structuredContent"]["artifacts"]
             .as_array()

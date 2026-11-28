@@ -29,6 +29,7 @@ pub fn run_cli() -> Option<i32> {
         "panes" => Some(panes_cli(&rest)),
         "pane" => Some(pane_cli(&rest)),
         "artifact" => Some(super::cli_artifact::artifact_cli(&rest)),
+        "integration" => Some(super::cli_integration::integration_cli(&rest)),
         "mcp" => Some(super::mcp::mcp_cli(&rest)),
         _ => None,
     }
@@ -44,6 +45,7 @@ usage:
   kumu pane wait <TARGET> [--timeout SECS] [--next] [--json]
   kumu pane close <TARGET> [--self] [--json]
   kumu artifact <publish|list|path|open|remove> ...   (see kumu artifact --help)
+  kumu integration <install|uninstall|status> ...     (see kumu integration --help)
   kumu mcp [serve|install|uninstall|status] ...       (see kumu mcp --help)
 
 TARGET is a pane id, left/right/up/down (relative to $KUMU_PANE), or focused

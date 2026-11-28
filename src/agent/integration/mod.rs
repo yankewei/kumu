@@ -3,6 +3,7 @@
 mod cli;
 mod hooks;
 mod mcp;
+mod skills;
 
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
@@ -16,6 +17,7 @@ pub use cli::{is_hook_notification_body, run_cli};
 pub use mcp::{
     install_mcp, mcp_agents, mcp_status, mcp_wrapper_path, supports_mcp, uninstall_mcp,
 };
+pub use skills::{install_skills, skills_status, uninstall_skills};
 use hooks::{
     agy_hooks_status, cursor_events, cursor_hook, hook_groups, hooks_status, temporary_path,
     update_hook_file,
@@ -43,6 +45,65 @@ pub enum Status {
     Missing,
     Registered,
     NeedsRepair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum McpState {
+    Supported(Result<Status, String>),
+    ExtensionPartial,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationDetail {
+    pub notify: Result<Status, String>,
+    pub mcp: McpState,
+    pub skills: Result<Status, String>,
+}
+
+impl IntegrationDetail {
+    /// Whether any component is present, broken, or needs cleanup.
+    pub fn has_any_registration(&self) -> bool {
+        let notify_present = !matches!(self.notify, Ok(Status::Missing));
+        let mcp_present = matches!(
+            &self.mcp,
+            McpState::Supported(Ok(Status::Registered | Status::NeedsRepair) | Err(_))
+        );
+        let skills_present = !matches!(self.skills, Ok(Status::Missing));
+        notify_present || mcp_present || skills_present
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ComponentOutcome {
+    pub notify: Result<(), String>,
+    pub mcp: Option<Result<(), String>>,
+    pub skills: Result<(), String>,
+}
+
+impl ComponentOutcome {
+    pub fn is_ok(&self) -> bool {
+        self.notify.is_ok()
+            && self.mcp.as_ref().is_none_or(Result::is_ok)
+            && self.skills.is_ok()
+    }
+
+    pub fn into_io_result(self) -> io::Result<()> {
+        let mut errors = Vec::new();
+        if let Err(err) = self.notify {
+            errors.push(format!("通知：{err}"));
+        }
+        if let Some(Err(err)) = self.mcp {
+            errors.push(format!("MCP：{err}"));
+        }
+        if let Err(err) = self.skills {
+            errors.push(format!("Skills：{err}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("；")))
+        }
+    }
 }
 
 struct Paths {
@@ -145,7 +206,7 @@ fn asset_files(agent: &str) -> Vec<(&'static str, String)> {
     files
 }
 
-pub fn status(agent: &str) -> io::Result<Status> {
+pub(super) fn notify_status(agent: &str) -> io::Result<Status> {
     let paths = paths(agent)?;
     if is_hook_agent(agent) {
         let text = match std::fs::read_to_string(&paths.registration) {
@@ -168,12 +229,6 @@ pub fn status(agent: &str) -> io::Result<Status> {
         } else {
             hooks_status(&value, &hook_groups(agent), true)
         };
-        if hook_state == Status::Registered
-            && supports_mcp(agent)
-            && !matches!(mcp_status(agent), Ok(Status::Registered))
-        {
-            return Ok(Status::NeedsRepair);
-        }
         return Ok(hook_state);
     }
     let target = paths.assets.join("extension");
@@ -197,8 +252,7 @@ pub fn status(agent: &str) -> io::Result<Status> {
                         .as_deref()
                         == Some(expected.as_str())
                 });
-            let mcp_ok = !supports_mcp(agent) || matches!(mcp_status(agent), Ok(Status::Registered));
-            Ok(if current && mcp_ok {
+            Ok(if current {
                 Status::Registered
             } else {
                 Status::NeedsRepair
@@ -215,25 +269,103 @@ pub fn status(agent: &str) -> io::Result<Status> {
     }
 }
 
-pub fn install(agent: &str) -> io::Result<()> {
+pub fn detailed_status(agent: &str) -> IntegrationDetail {
+    let notify = notify_status(agent).map_err(|e| e.to_string());
+    let mcp = if supports_mcp(agent) {
+        McpState::Supported(mcp_status(agent).map_err(|e| e.to_string()))
+    } else {
+        McpState::ExtensionPartial
+    };
+    let skills = skills_status(agent).map_err(|e| e.to_string());
+    IntegrationDetail {
+        notify,
+        mcp,
+        skills,
+    }
+}
+
+fn aggregate_status(detail: &IntegrationDetail) -> io::Result<Status> {
+    let notify = detail
+        .notify
+        .as_ref()
+        .copied()
+        .map_err(|err| io::Error::other(err.clone()))?;
+    let skills = detail
+        .skills
+        .as_ref()
+        .copied()
+        .map_err(|err| io::Error::other(err.clone()))?;
+    let mut states = vec![notify, skills];
+    if let McpState::Supported(ref mcp) = detail.mcp {
+        let mcp = mcp
+            .as_ref()
+            .copied()
+            .map_err(|err| io::Error::other(err.clone()))?;
+        states.push(mcp);
+    }
+    if states.iter().all(|s| *s == Status::Missing) {
+        Ok(Status::Missing)
+    } else if states.iter().all(|s| *s == Status::Registered) {
+        Ok(Status::Registered)
+    } else {
+        Ok(Status::NeedsRepair)
+    }
+}
+
+pub fn status(agent: &str) -> io::Result<Status> {
+    aggregate_status(&detailed_status(agent))
+}
+
+fn install_notify(agent: &str) -> io::Result<()> {
     let paths = paths(agent)?;
     if is_hook_agent(agent) {
-        update_hook_file(&paths.registration, agent, false)?;
-        if supports_mcp(agent) {
-            install_mcp(agent)?;
-        }
-        return Ok(());
+        return update_hook_file(&paths.registration, agent, false);
     }
     write_assets(&paths, agent)?;
     register_link(
         &paths.registration,
         &paths.assets.join("extension"),
         &paths.managed,
-    )?;
-    if supports_mcp(agent) {
-        install_mcp(agent)?;
+    )
+}
+
+fn uninstall_notify(agent: &str) -> io::Result<()> {
+    let paths = paths(agent)?;
+    if is_hook_agent(agent) {
+        update_hook_file(&paths.registration, agent, true)?;
+        // Grok's file is Kumu-owned (`~/.grok/hooks/kumu-notifications.json`):
+        // remove it once empty instead of leaving `{}` behind.
+        if agent == "grok"
+            && let Ok(text) = std::fs::read_to_string(&paths.registration)
+            && serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.as_object().map(|obj| obj.is_empty()))
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&paths.registration);
+        }
+        return Ok(());
     }
-    Ok(())
+    remove_link(
+        &paths.registration,
+        &paths.assets.join("extension"),
+        &paths.managed,
+    )
+}
+
+pub fn install_detailed(agent: &str) -> ComponentOutcome {
+    let notify = install_notify(agent).map_err(|e| e.to_string());
+    let mcp = supports_mcp(agent).then(|| install_mcp(agent).map_err(|e| e.to_string()));
+    let skills = install_skills(agent).map_err(|e| e.to_string());
+    ComponentOutcome {
+        notify,
+        mcp,
+        skills,
+    }
+}
+
+pub fn install(agent: &str) -> io::Result<()> {
+    install_detailed(agent).into_io_result()
 }
 
 /// Copy this build's extension files atomically into Kumu's managed directory.
@@ -273,17 +405,18 @@ fn write_assets(paths: &Paths, agent: &str) -> io::Result<()> {
 
 /// Bring Kumu's managed registrations up to date at startup.
 ///
-/// Native extensions (OpenCode, Pi, OMP) are refreshed whenever their link
-/// already points at Kumu. Claude Code and Antigravity hooks are upgraded in
-/// place when already enabled (both reload them without a separate trust
-/// step); Codex is left for the Settings UI because changing `hooks.json`
-/// requires re-trusting in `/hooks`.
+/// Only components that are already installed are refreshed: native extensions
+/// (OpenCode, Pi, OMP) whose link already points at Kumu, `~/.kumu/bin/kumu-mcp`
+/// when present, `~/.kumu/skills` when present, and Claude Code / Antigravity
+/// hooks when their hook entry is already registered and stale. Never installs
+/// missing components silently.
 pub fn refresh_installed() {
     mcp::refresh_mcp_wrapper();
+    skills::refresh_skills();
     refresh_native();
     for agent in ["claude", "agy"] {
-        if matches!(status(agent), Ok(Status::NeedsRepair))
-            && let Err(error) = install(agent)
+        if matches!(notify_status(agent), Ok(Status::NeedsRepair))
+            && let Err(error) = install_notify(agent)
         {
             eprintln!("[agent] 刷新 {agent} hooks 失败：{error}");
         }
@@ -326,31 +459,19 @@ fn refresh_registered(paths: &Paths, agent: &str) -> io::Result<()> {
     )
 }
 
+pub fn uninstall_detailed(agent: &str, force_shared: bool) -> ComponentOutcome {
+    let notify = uninstall_notify(agent).map_err(|e| e.to_string());
+    let mcp = supports_mcp(agent).then(|| uninstall_mcp(agent).map_err(|e| e.to_string()));
+    let skills = uninstall_skills(agent, force_shared).map_err(|e| e.to_string());
+    ComponentOutcome {
+        notify,
+        mcp,
+        skills,
+    }
+}
+
 pub fn uninstall(agent: &str) -> io::Result<()> {
-    let paths = paths(agent)?;
-    if supports_mcp(agent) {
-        let _ = uninstall_mcp(agent);
-    }
-    if is_hook_agent(agent) {
-        update_hook_file(&paths.registration, agent, true)?;
-        // Grok's file is Kumu-owned (`~/.grok/hooks/kumu-notifications.json`):
-        // remove it once empty instead of leaving `{}` behind.
-        if agent == "grok"
-            && let Ok(text) = std::fs::read_to_string(&paths.registration)
-            && serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v.as_object().map(|obj| obj.is_empty()))
-                .unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(&paths.registration);
-        }
-        return Ok(());
-    }
-    remove_link(
-        &paths.registration,
-        &paths.assets.join("extension"),
-        &paths.managed,
-    )
+    uninstall_detailed(agent, false).into_io_result()
 }
 
 fn register_link(entry: &Path, target: &Path, managed: &Path) -> io::Result<()> {
@@ -919,5 +1040,51 @@ mod tests {
         assert!(!registration_is_ours(&paths));
 
         std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn aggregate_status_combines_notify_mcp_and_skills_without_early_return() {
+        let all_missing = IntegrationDetail {
+            notify: Ok(Status::Missing),
+            mcp: McpState::Supported(Ok(Status::Missing)),
+            skills: Ok(Status::Missing),
+        };
+        assert_eq!(aggregate_status(&all_missing).unwrap(), Status::Missing);
+
+        let all_registered = IntegrationDetail {
+            notify: Ok(Status::Registered),
+            mcp: McpState::ExtensionPartial,
+            skills: Ok(Status::Registered),
+        };
+        assert_eq!(
+            aggregate_status(&all_registered).unwrap(),
+            Status::Registered
+        );
+
+        // Skills installed while notify/mcp missing must report NeedsRepair, not Missing.
+        let skills_only = IntegrationDetail {
+            notify: Ok(Status::Missing),
+            mcp: McpState::Supported(Ok(Status::Missing)),
+            skills: Ok(Status::Registered),
+        };
+        assert_eq!(aggregate_status(&skills_only).unwrap(), Status::NeedsRepair);
+
+        // Legacy user with notify+mcp but no skills reports NeedsRepair.
+        let missing_skills = IntegrationDetail {
+            notify: Ok(Status::Registered),
+            mcp: McpState::Supported(Ok(Status::Registered)),
+            skills: Ok(Status::Missing),
+        };
+        assert_eq!(
+            aggregate_status(&missing_skills).unwrap(),
+            Status::NeedsRepair
+        );
+
+        let errored = IntegrationDetail {
+            notify: Ok(Status::Registered),
+            mcp: McpState::Supported(Err("bad mcp".into())),
+            skills: Ok(Status::Registered),
+        };
+        assert!(aggregate_status(&errored).is_err());
     }
 }

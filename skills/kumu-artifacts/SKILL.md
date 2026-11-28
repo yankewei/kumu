@@ -5,73 +5,33 @@ description: 把方案、设计稿、报告、架构图或可交互 HTML 原型�
 
 # Kumu Artifacts
 
-Kumu 的每个项目都有一个 `.kumu/artifacts` 目录。把 Markdown、HTML 或纯文本发布进去，Kumu 会记录是哪个窗格、哪个 Agent、哪个会话发布的，并在右侧 **Artifacts** 抽屉里按会话分组展示。任何窗格都能打开项目里的全部 artifacts。
+Kumu 的每个项目都有一个本地 `.kumu/artifacts` 目录。将 Markdown、HTML 或纯文本发布进去后，Kumu 会自动记录发布窗格、Agent 与会话，并在右侧 **Artifacts** 抽屉中按会话分组展示。
 
-不要用 `cat` 把整份 HTML 或长文档打到终端；直接发布。
+**不要把整份 HTML 或大段长文档直接打印到终端；直接发布为 artifact。**
 
-## 先确认入口
+## 工具优先级
 
-在 Kumu 窗格里，`$KUMU_APP_BINARY` 指向 Kumu 本体：
+1. **优先调用 Kumu MCP 工具**（若当前会话已挂载）：`artifact_publish`、`artifact_list`、`artifact_open`、`artifact_remove`（参数以工具 schema 为准）。
+2. **Pi / Oh My Pi**：直接调用原生扩展工具 `kumu_artifact_publish` 和 `kumu_artifact_list`。
+3. **CLI 兜底**（未启用 MCP 时）：通过 `"$KUMU_APP_BINARY"`（或 PATH 上的 `kumu`）调用（完整参数见 `kumu artifact --help`）：
 
 ```sh
 "$KUMU_APP_BINARY" artifact publish ./plan.md --title "登录页重构方案"
+"$KUMU_APP_BINARY" artifact publish ./mockup.html --title "交互原型" --open
+"$KUMU_APP_BINARY" artifact publish ./mockup.html --replace <ARTIFACT_ID>
+"$KUMU_APP_BINARY" artifact list
 ```
-
-不在 Kumu 里（`KUMU_APP_BINARY` 为空）时用 PATH 上的 `kumu`；两者都没有就告诉用户需要在 Kumu 窗格内运行，或先安装 Kumu。
 
 ## 什么时候发布
 
-- 用户要一份方案、设计稿、评审意见、调研报告、架构说明、排期；
-- 你生成了一个 HTML 原型、演示页、可视化图表；
-- 内容超过一屏，终端里阅读体验明显变差；
-- 用户说“发到 artifacts”“在 Kumu 里给我看”。
+- **应该发布**：方案、设计稿、评审意见、调研报告、架构说明、HTML 原型/演示页/可视化图表、或超过一屏在终端阅读体验明显变差的长文档；用户明确说“发到 artifacts”“在 Kumu 里给我看”。
+- **不要发布**：普通的一两段回答、简短代码改动说明、命令输出总结。
 
-普通的一两段回答、代码修改说明、命令输出总结，不需要发布。
+## 规则与约束
 
-## 常用命令
-
-```sh
-# Markdown 方案
-"$KUMU_APP_BINARY" artifact publish ./docs/plan.md --title "登录页重构方案"
-
-# HTML 原型（单文件或目录）
-"$KUMU_APP_BINARY" artifact publish ./mockup.html --title "交互原型"
-"$KUMU_APP_BINARY" artifact publish ./site --entry index.html --title "营销页原型"
-
-# 从 stdin 发布（适合临时报告）
-cat <<'EOF' | "$KUMU_APP_BINARY" artifact publish - --title "排查报告"
-# 结论
-...
-EOF
-
-# 迭代同一份 artifact，不要产生新条目
-"$KUMU_APP_BINARY" artifact publish ./mockup.html --replace <ARTIFACT_ID>
-
-# 发布后立即打开阅读页（仅在用户明确想看时）
-"$KUMU_APP_BINARY" artifact publish ./plan.md --title "方案" --open
-
-# 查看与清理
-"$KUMU_APP_BINARY" artifact list
-"$KUMU_APP_BINARY" artifact path <ARTIFACT_ID>
-"$KUMU_APP_BINARY" artifact remove <ARTIFACT_ID> --force
-```
-
-## 规则
-
-- **标题**：始终传 `--title`，用用户能看懂的中文；缺省标题只会取首个 Markdown 标题或 HTML `<title>`。
-- **类型**：`.md` / `.html` / `.txt` 会自动识别；stdin 会嗅探 `<html`，其余按 Markdown。需要时用 `--kind`。
-- **迭代**：改同一份方案或原型时用 `--replace <id>`；`publish` 的 `--json` 输出里有 `id`。
-- **目录**：HTML 依赖本地 CSS/JS/图片时发布整个目录，并用 `--entry` 指定入口；目录默认拒绝 symlink，有总大小与文件数上限。
-- **打开**：默认只刷新抽屉，不抢用户焦点；只有用户说“打开看看”时才加 `--open`。
-- **会话**：在 Kumu 窗格里发布会自动记录 pane、Agent 和会话 id，不需要手动传 `--session`。
-- **隐私**：artifact 只写入项目本地的 `.kumu/artifacts`，不会上传；`.kumu/.gitignore` 默认忽略快照。
-
-## HTML 说明
-
-HTML artifact 会在阅读页内嵌 WebView 中直接渲染，支持本地 CSS/JS/图片、CDN 资源和根路径 `/assets/...`；每个页面使用非持久数据存储，关闭即丢弃。若 WebKit 不可用，阅读页会提供「在浏览器打开」兜底。外链点击会交给系统浏览器，不会把阅读页导航走。
-
-## 失败时
-
-- `cannot reach kumu`：Kumu 没运行或当前不在 Kumu 窗格内；文件仍会写入 `.kumu/artifacts`，等 Kumu 打开该项目就能看到。
-- `artifact ... does not exist`：检查 `kumu artifact list` 里的 id。
-- 发布被拒绝：检查单文件是否超过 32 MB、目录是否超过 64 MB / 500 个文件，或是否包含指向目录外的 symlink。
+- **标题**：始终提供清晰可读的中文 `title`。
+- **迭代更新**：修改同一份方案或原型时，使用 `replace`（CLI 为 `--replace <id>`）原地更新，不要反复产生重复条目。
+- **焦点礼仪**：默认只刷新抽屉、不抢用户焦点；仅当用户明确说“打开看看”时才传 `open: true`（CLI 为 `--open`）。
+- **目录与资源**：HTML 依赖本地 CSS/JS/图片时发布整个目录并指定入口（`entry` / `--entry`）；内嵌 WebView 直接渲染并隔离非持久存储，外链交给系统浏览器。
+- **体积与隐私**：仅写入项目本地 `.kumu/artifacts`（`.kumu/.gitignore` 默认忽略），不上传；单文件上限 32 MB，目录上限 64 MB / 500 文件，拒绝指向目录外的 symlink。
+- **失败处理**：若提示 `cannot reach kumu`，说明不在 Kumu 窗格内或 Kumu 未运行，文件仍会写入本地 `.kumu/artifacts`，等 Kumu 打开该项目即可查看。

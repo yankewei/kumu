@@ -570,14 +570,14 @@ impl SettingsWindow {
                     Ok(()) => ToastItem::success(
                         key,
                         if remove {
-                            "已关闭通知；请重新启动 Agent。"
+                            "已关闭接入；请重新启动 Agent。"
                         } else if agent == "codex" {
-                            "已开启通知；重新启动 Codex 后，请在 /hooks 中审查并信任。"
+                            "已开启接入（通知 / MCP / Skills）；重新启动 Codex 后，请在 /hooks 中审查并信任。"
                         } else {
-                            "已开启通知；请重新启动 Agent。"
+                            "已开启接入（通知 / MCP / Skills）；请重新启动 Agent。"
                         },
                     ),
-                    Err(error) => ToastItem::error(key, format!("通知设置失败：{error}")),
+                    Err(error) => ToastItem::error(key, format!("接入设置失败：{error}")),
                 };
                 this.push_toast(toast);
             });

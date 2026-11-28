@@ -113,16 +113,20 @@ Kumu 目前提供 **Apple Silicon Mac** 安装包，系统要求 **macOS 11** �
 
 安装包自带运行时，无需安装 Rust 或 Zig；编码 Agent CLI 需自行安装并完成登录。Kumu 会在启动时检查更新（也可在设置中手动检查），后台下载后经确认重启生效。
 
-### 安装配套 Agent Skills（推荐）
+### 一键接入编码 Agent（通知 + MCP + Skills，推荐）
 
-让你的编码 Agent 原生学会操作 Kumu 窗格和发布 artifacts：
+通过 Kumu 自带 CLI 为本机已安装的编码 Agent 一次性配置状态通知、MCP 工具与配套 Skills（无需 Node / `npx`，随 Kumu 版本自动刷新）：
 
 ```sh
-npx skills add yankewei/kumu
+kumu integration install          # 自动检测本机已安装的 Agent 并完成接入
+kumu integration install claude   # 也可以只接入指定 Agent（支持 claude-code / agy 等别名）
+kumu integration status           # 查看各 Agent 的通知、MCP、Skills 接入状态
+kumu integration uninstall        # 卸载全部已接入项
 ```
 
-包含以下 skill：
+内嵌包含以下 Skills（优先调用 Kumu MCP 工具，无 MCP 时自动回退 CLI）：
 - [`kumu-panes`](skills/kumu-panes/SKILL.md)：读取其它窗格内容、在旁边拆分新 Agent 窗格、向 Agent 窗格发消息。
+- [`kumu-artifacts`](skills/kumu-artifacts/SKILL.md)：将方案、设计稿、报告或可交互 HTML 原型发布到右侧 Artifacts 抽屉。
 
 ---
 
