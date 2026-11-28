@@ -138,6 +138,15 @@ impl KumuApp {
             return;
         }
 
+        // Onboarding wizard guard: Escape dismisses once without marking done.
+        if self.active_onboarding.is_some() {
+            if plain_escape {
+                self.dismiss_onboarding(false, window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         // Modal dialog or full-window sheet guard: block workspace shortcuts.
         if self.active_dialog.is_some() || self.active_sheet.is_some() {
             if plain_escape {
@@ -172,6 +181,7 @@ impl KumuApp {
         if self.active_palette.is_some()
             || self.active_dialog.is_some()
             || self.active_agent_picker.is_some()
+            || self.active_onboarding.is_some()
             || self.active_sheet.is_some()
         {
             return;
@@ -754,6 +764,18 @@ impl KumuApp {
 
         items.push(PaletteItem {
             section: PaletteSection::Actions,
+            title: "打开新手引导".into(),
+            subtitle: Some("分步接入 Agent、通知与 Artifacts".into()),
+            keywords: "onboarding guide wizard setup 引导 新手".into(),
+            icon: PaletteIcon::Svg("icons/settings.svg"),
+            agent_state: None,
+            badge: None,
+            shortcut: None,
+            target: PaletteTarget::OpenOnboarding,
+        });
+
+        items.push(PaletteItem {
+            section: PaletteSection::Actions,
             title: "打开设置".into(),
             subtitle: None,
             keywords: "settings preferences config".into(),
@@ -842,6 +864,9 @@ impl KumuApp {
             }
             PaletteTarget::OpenSettings => {
                 self.open_settings(false, cx);
+            }
+            PaletteTarget::OpenOnboarding => {
+                self.open_onboarding(window, cx);
             }
         }
     }

@@ -2193,6 +2193,7 @@ diff --git a/src/util.rs b/src/util.rs
                 tab_name: "主工作区".into(),
                 title: "优化 Git Diff 折叠视图".into(),
                 agent: Some("codex".into()),
+                agent_session_id: None,
                 state: None,
                 focused: true,
             }],

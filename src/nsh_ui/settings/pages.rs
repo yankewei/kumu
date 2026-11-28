@@ -69,7 +69,7 @@ pub(super) fn render_providers_card(state: ProvidersPageState) -> impl IntoEleme
                 .gap_1()
                 .child(section_title("编码 Agent"))
                 .child(meta_text(
-                    "开启通知会注册到 Agent 的配置或扩展目录；可为已安装的 Agent 配置默认启动参数（新建窗格生效）。",
+                    "开启接入会注册 Agent 通知与 Kumu MCP 工具（Artifact 渲染、窗格协作）；可为已安装的 Agent 配置默认启动参数（新建窗格生效）。",
                 )),
         )
         .child(dynamic(move || {
@@ -678,6 +678,11 @@ fn render_notifications_and_session_card(state: &GeneralPageState) -> impl IntoE
         })
         .into_element();
 
+    let tx_onboarding = state.actions_tx.clone();
+    let onboarding_btn = kumu_button("重新打开引导", ButtonVariant::Outline)
+        .on_press(move || send_action(&tx_onboarding, SettingsAction::OpenOnboarding))
+        .into_element();
+
     settings_section("通知与会话")
         .child(settings_row(
             "Agent 通知",
@@ -695,6 +700,12 @@ fn render_notifications_and_session_card(state: &GeneralPageState) -> impl IntoE
             "恢复 Agent 会话",
             "启动时让 Agent 窗格回到上次的对话；关闭后只恢复窗格，以新对话开始。",
             auto_resume_switch,
+            false,
+        ))
+        .child(settings_row(
+            "新手引导",
+            "分步接入编码 Agent、配置后台通知、启动窗格与体验 Artifacts。",
+            onboarding_btn,
             true,
         ))
 }

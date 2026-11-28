@@ -11,7 +11,10 @@
 //! home window starts.
 
 mod cli;
+mod cli_artifact;
+mod cli_integration;
 mod cli_pane;
+mod mcp;
 mod protocol;
 mod server;
 
@@ -20,8 +23,8 @@ use std::time::Duration;
 
 pub use cli::run_cli;
 pub use protocol::{
-    CloseResult, Command, ControlError, PaneContent, PaneSummary, PaneTarget, ScrollDirection,
-    ScrollResult, SendResult, SplitResult, WaitResult,
+    ArtifactNotifyResult, CloseResult, Command, ControlError, PaneContent, PaneSummary, PaneTarget,
+    ScrollDirection, ScrollResult, SendResult, SplitResult, WaitResult,
 };
 #[cfg(test)]
 use protocol::{Request, RequestLine};
@@ -101,6 +104,36 @@ mod tests {
     }
 
     #[test]
+    fn artifact_requests_carry_an_optional_pane_and_require_a_project_path() {
+        let published = serde_json::to_string(&Request::ArtifactPublished {
+            from: None,
+            project_path: "/repo".into(),
+            artifact: "20261128-153012-a1b2".into(),
+        })
+        .expect("published request");
+        assert_eq!(
+            published,
+            r#"{"op":"artifactPublished","projectPath":"/repo","artifact":"20261128-153012-a1b2"}"#
+        );
+
+        let opened = serde_json::to_string(&Request::ArtifactOpen {
+            from: Some(7),
+            project_path: "/repo".into(),
+            artifact: "20261128-153012-a1b2".into(),
+        })
+        .expect("open request");
+        assert_eq!(
+            opened,
+            r#"{"op":"artifactOpen","from":7,"projectPath":"/repo","artifact":"20261128-153012-a1b2"}"#
+        );
+        let decoded: Request = serde_json::from_str(&opened).expect("decode");
+        assert!(matches!(
+            decoded,
+            Request::ArtifactOpen { from: Some(7), .. }
+        ));
+    }
+
+    #[test]
     fn a_read_request_round_trips_as_one_json_line() {
         let request = Request::Read {
             pane: PaneTarget::Name("right".into()),
@@ -154,6 +187,9 @@ mod tests {
             agent: None,
             focused: id == 3,
             selected: true,
+            project_path: "/tmp".into(),
+            agent_session_id: None,
+            tab_name: "工作区 1".into(),
             cols: 120,
             rows: 38,
             exited: false,
@@ -276,6 +312,9 @@ mod tests {
                                     agent: Some("codex".into()),
                                     focused: false,
                                     selected: true,
+                                    project_path: "/tmp/kumu".into(),
+                                    agent_session_id: Some("session-1".into()),
+                                    tab_name: "工作区 1".into(),
                                     cols: 80,
                                     rows: 24,
                                     exited: false,
@@ -309,6 +348,7 @@ mod tests {
                             }))
                             .expect("scroll reply");
                     }
+                    Command::ArtifactPublished { .. } | Command::ArtifactOpen { .. } => {}
                 }
             }
         });

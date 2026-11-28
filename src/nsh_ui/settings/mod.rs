@@ -182,6 +182,7 @@ enum SettingsAction {
     UpdatePrimaryAction,
     ConfirmRestartUpdate,
     OpenReleasePage,
+    OpenOnboarding,
 }
 
 /// Per-window mount payload moved once into the NSH root component via a
@@ -204,6 +205,7 @@ pub struct SettingsWindow {
     integration_busy: Option<&'static str>,
     _theme_sub: Subscription,
     _terminal_theme_sub: Subscription,
+    _notif_sub: Subscription,
     _updater_sub: Subscription,
     _actions_task: Task<()>,
 }
@@ -303,6 +305,16 @@ impl SettingsWindow {
                 .unbounded_send(HostEvent::TerminalThemeChanged(theme::terminal_theme(cx)));
         });
 
+        let notif_sub = cx.observe_global::<NotificationSettings>(|this: &mut Self, cx| {
+            let cur = cx.global::<NotificationSettings>();
+            let _ = this
+                .events_tx
+                .unbounded_send(HostEvent::NotificationSettings {
+                    enabled: cur.enabled,
+                    sound: cur.sound,
+                });
+        });
+
         let updater_sub = cx.observe(&updater, |this, updater, cx| {
             let status = updater.read(cx).status();
             if let UpdateStatus::Errored(error) = status {
@@ -354,6 +366,7 @@ impl SettingsWindow {
             integration_busy: None,
             _theme_sub: theme_sub,
             _terminal_theme_sub: terminal_theme_sub,
+            _notif_sub: notif_sub,
             _updater_sub: updater_sub,
             _actions_task: actions_task,
         }
@@ -531,6 +544,13 @@ impl SettingsWindow {
             SettingsAction::OpenReleasePage => {
                 cx.open_url("https://github.com/yankewei/kumu/releases/latest");
             }
+            SettingsAction::OpenOnboarding => {
+                let next = cx
+                    .try_global::<crate::app::OnboardingRequested>()
+                    .map(|g| g.seq.wrapping_add(1))
+                    .unwrap_or(1);
+                cx.set_global(crate::app::OnboardingRequested { seq: next });
+            }
         }
     }
 
@@ -570,14 +590,14 @@ impl SettingsWindow {
                     Ok(()) => ToastItem::success(
                         key,
                         if remove {
-                            "已关闭通知；请重新启动 Agent。"
+                            "已关闭接入；请重新启动 Agent。"
                         } else if agent == "codex" {
-                            "已开启通知；重新启动 Codex 后，请在 /hooks 中审查并信任。"
+                            "已开启接入（通知 / MCP / Skills）；重新启动 Codex 后，请在 /hooks 中审查并信任。"
                         } else {
-                            "已开启通知；请重新启动 Agent。"
+                            "已开启接入（通知 / MCP / Skills）；请重新启动 Agent。"
                         },
                     ),
-                    Err(error) => ToastItem::error(key, format!("通知设置失败：{error}")),
+                    Err(error) => ToastItem::error(key, format!("接入设置失败：{error}")),
                 };
                 this.push_toast(toast);
             });

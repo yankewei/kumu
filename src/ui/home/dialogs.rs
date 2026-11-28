@@ -64,6 +64,7 @@ impl KumuApp {
             self.ensure_project_layout(id, cx);
             self.select_project(id, cx);
             self.refresh_project_branches(cx);
+            self.notify_onboarding_project_changed(cx);
         }
     }
 
@@ -510,5 +511,327 @@ impl KumuApp {
             handle.update(cx, activate).ok();
             self.settings_window = Some(handle);
         }
+    }
+
+    pub(super) fn open_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep modal layers mutually exclusive.
+        self.active_palette = None;
+        self.active_agent_picker = None;
+        self.active_dialog = None;
+
+        let notif = cx.global::<crate::app::NotificationSettings>();
+        let (project_name, project_path) = self.selected_project_info(cx);
+        let initial = crate::nsh_ui::onboarding::OnboardingState::new(
+            notif.enabled,
+            notif.sound,
+            project_name,
+            project_path,
+        );
+        self.onboarding_state = Some(initial.clone());
+
+        let theme = KumuTheme::global(cx).clone();
+        self.active_onboarding = Some(crate::nsh_ui::onboarding::ActiveOnboarding::open(
+            initial,
+            &theme,
+            window,
+            cx,
+            |app, action, window, cx| app.handle_onboarding_action(action, window, cx),
+        ));
+
+        // Probe installed agents and integration status off the UI thread.
+        let probe = cx.background_executor().spawn(async move {
+            crate::agent::AGENTS
+                .iter()
+                .map(|agent| {
+                    let is_installed = crate::agent::installed_with_shell_env(agent.id);
+                    let detail = crate::agent::integration::detailed_status(agent.id);
+                    (agent.id, is_installed, detail)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let probed = probe.await;
+            let _ = this.update(cx, |app, cx| {
+                if let Some(state) = app.onboarding_state.as_mut() {
+                    state.apply_probe(probed);
+                    app.push_onboarding_state();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn dismiss_onboarding(
+        &mut self,
+        mark_done: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mark_done {
+            let _ = crate::db::set_setting(crate::db::SETTING_ONBOARDING_DONE, "1");
+        }
+        self.active_onboarding = None;
+        self.onboarding_state = None;
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn selected_project_info(&self, cx: &Context<Self>) -> (Option<String>, Option<String>) {
+        let Some(id) = self.selected else {
+            return (None, None);
+        };
+        let workspace = self.workspace.read(cx);
+        match workspace.project(id) {
+            Some(project) => (Some(project.name.clone()), Some(project.path.clone())),
+            None => (None, None),
+        }
+    }
+
+    fn push_onboarding_state(&self) {
+        if let (Some(overlay), Some(state)) = (&self.active_onboarding, &self.onboarding_state) {
+            overlay.push_state(state.clone());
+        }
+    }
+
+    pub(super) fn notify_onboarding_project_changed(&mut self, cx: &mut Context<Self>) {
+        let (name, path) = self.selected_project_info(cx);
+        if let Some(state) = self.onboarding_state.as_mut() {
+            state.apply_project(name, path);
+            self.push_onboarding_state();
+            cx.notify();
+        }
+    }
+
+    fn handle_onboarding_action(
+        &mut self,
+        action: crate::nsh_ui::onboarding::OnboardingAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::nsh_ui::onboarding::{
+            ONBOARDING_SAMPLE_MARKDOWN, ONBOARDING_SAMPLE_TITLE, OnboardingAction,
+        };
+
+        match action {
+            OnboardingAction::NextStep => {
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.next_step();
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::PrevStep => {
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.prev_step();
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::GoToStep(step) => {
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.step = step;
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::InstallAllDetected => {
+                let targets: Vec<&'static str> = self
+                    .onboarding_state
+                    .as_ref()
+                    .filter(|s| !s.busy)
+                    .map(|s| s.installed_agents().into_iter().map(|a| a.id).collect())
+                    .unwrap_or_default();
+                if targets.is_empty() {
+                    return;
+                }
+                self.run_onboarding_install(targets, cx);
+            }
+            OnboardingAction::InstallOne(id) => {
+                if self.onboarding_state.as_ref().is_some_and(|s| s.busy) {
+                    return;
+                }
+                self.run_onboarding_install(vec![id], cx);
+            }
+            OnboardingAction::SetNotificationsEnabled(enabled) => {
+                let result = crate::db::set_setting(
+                    crate::db::SETTING_NOTIFICATIONS,
+                    if enabled { "1" } else { "0" },
+                );
+                if let Err(err) = result {
+                    if let Some(state) = self.onboarding_state.as_mut() {
+                        state.notification_feedback = Some(format!("保存通知设置失败：{err}"));
+                        self.push_onboarding_state();
+                    }
+                    return;
+                }
+                let sound = cx.global::<crate::app::NotificationSettings>().sound;
+                cx.set_global(crate::app::NotificationSettings { enabled, sound });
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.notifications_enabled = enabled;
+                    state.notification_feedback = None;
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::SetNotificationSound(sound) => {
+                let result = crate::db::set_setting(
+                    crate::db::SETTING_NOTIFICATION_SOUND,
+                    if sound { "1" } else { "0" },
+                );
+                if let Err(err) = result {
+                    if let Some(state) = self.onboarding_state.as_mut() {
+                        state.notification_feedback = Some(format!("保存提示音设置失败：{err}"));
+                        self.push_onboarding_state();
+                    }
+                    return;
+                }
+                let enabled = cx.global::<crate::app::NotificationSettings>().enabled;
+                cx.set_global(crate::app::NotificationSettings { enabled, sound });
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.notification_sound = sound;
+                    state.notification_feedback = None;
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::SendTestNotification => {
+                if cx.global::<crate::app::NotificationSettings>().sound {
+                    window.play_system_bell();
+                }
+                cx.show_system_notification(gpui::SystemNotification {
+                    tag: "kumu-onboarding-test".into(),
+                    title: "Kumu 通知测试".into(),
+                    body: "后台 Agent 完成任务或等待确认时，你会收到这样的提醒。".into(),
+                    actions: Vec::new(),
+                });
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.notification_feedback = Some(
+                        "已发送测试通知。如未看到系统横幅，请点击右侧打开系统通知设置检查权限。"
+                            .into(),
+                    );
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::OpenSystemNotificationSettings => {
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+                    .spawn();
+            }
+            OnboardingAction::PickProject => {
+                self.add_project(cx);
+            }
+            OnboardingAction::SelectAgent(id) => {
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.selected_agent = Some(id);
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::OpenAgentPane(id) => {
+                let outcome = self.open_onboarding_agent_pane(id, cx);
+                if let Some(state) = self.onboarding_state.as_mut() {
+                    state.pane_feedback = Some(outcome);
+                    self.push_onboarding_state();
+                }
+            }
+            OnboardingAction::PreviewSampleArtifact => {
+                // Close onboarding before opening the reading sheet to avoid stacked modals.
+                self.active_onboarding = None;
+                self.onboarding_state = None;
+                let home = cx.entity().downgrade();
+                let on_close: std::rc::Rc<crate::plugins::artifacts::CloseFn> =
+                    std::rc::Rc::new(move |window, cx| {
+                        let _ = home.update(cx, |app, cx| {
+                            app.active_sheet = None;
+                            app.focus_terminal(window, cx);
+                            cx.notify();
+                        });
+                    });
+                self.active_sheet = Some(crate::plugins::artifacts::inline_markdown_sheet(
+                    ONBOARDING_SAMPLE_TITLE.into(),
+                    ONBOARDING_SAMPLE_MARKDOWN.into(),
+                    on_close,
+                    window,
+                    cx,
+                ));
+                cx.notify();
+            }
+            OnboardingAction::Complete | OnboardingAction::SkipForever => {
+                self.dismiss_onboarding(true, window, cx);
+            }
+            OnboardingAction::DismissOnce => {
+                self.dismiss_onboarding(false, window, cx);
+            }
+        }
+    }
+
+    fn run_onboarding_install(&mut self, targets: Vec<&'static str>, cx: &mut Context<Self>) {
+        if let Some(state) = self.onboarding_state.as_mut() {
+            state.busy = true;
+            self.push_onboarding_state();
+        }
+        cx.spawn(async move |this, cx| {
+            for agent in targets {
+                let (outcome, detail) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let outcome = crate::agent::integration::install_detailed(agent);
+                        let detail = crate::agent::integration::detailed_status(agent);
+                        (outcome, detail)
+                    })
+                    .await;
+                let updated = this.update(cx, |app, cx| {
+                    if let Some(state) = app.onboarding_state.as_mut() {
+                        state.apply_agent_outcome(agent, &outcome, detail);
+                        app.push_onboarding_state();
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |app, cx| {
+                if let Some(state) = app.onboarding_state.as_mut() {
+                    state.busy = false;
+                    app.push_onboarding_state();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_onboarding_agent_pane(
+        &mut self,
+        agent: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if !crate::agent::installed_with_shell_env(agent) {
+            return Err(format!("未检测到 {agent} 可执行文件"));
+        }
+        let project = match self.selected {
+            Some(id) => id,
+            None => self
+                .workspace
+                .update(cx, |ws, cx| ws.ensure_project(cx))
+                .ok_or_else(|| "请先选择一个项目目录".to_string())?,
+        };
+        self.ensure_project_layout(project, cx);
+        self.select_project(project, cx);
+        let Some(anchor) = self.active_tab(project).map(|t| t.focused) else {
+            return Err("当前项目暂无可用窗格布局".into());
+        };
+        self.split_pane_with(
+            anchor,
+            crate::app::layout::SplitAxis::Horizontal,
+            crate::agent::launch::PaneLaunch::Agent {
+                agent: agent.to_string(),
+                session: None,
+            },
+            cx,
+        );
+        let display = crate::agent::AGENTS
+            .iter()
+            .find(|a| a.id == agent)
+            .map(|a| a.name)
+            .unwrap_or(agent);
+        Ok(format!("已在当前项目打开 {display} 窗格。"))
     }
 }

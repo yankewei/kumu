@@ -7,6 +7,7 @@ repository = "https://github.com/yankewei/kumu"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
 ghostty-sys = { path = "crates/ghostty-sys" }
 # Shared GPUI backend for nsh-platform-gpui and Kumu's Ghostty VT TerminalView.
@@ -15,7 +16,7 @@ gpui-platform = { package = "gpui-fast-platform", version = "0.1.17" }
 gpui-updater-core = "0.4.4"
 nsh-core = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", features = ["svg"] }
 nsh-base = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false, features = ["editor", "highlight"] }
-nsh-platform-gpui = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false, features = ["editor", "highlight", "svg", "runtime-shaders"] }
+nsh-platform-gpui = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", default-features = false, features = ["editor", "highlight", "svg", "runtime-shaders", "webview"] }
 portable-pty = "=0.9.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8"
@@ -36,7 +37,8 @@ nsh-testing = { git = "https://github.com/longbridge/nsh", rev = "ebfdfad", defa
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSError", "NSFileManager", "NSString", "NSURL"] }
+libc = "0.2"
 
 # Dependencies are optimized even in dev builds: unoptimized GPUI layout, text
 # shaping and markdown parsing make `cargo run` visibly stutter, while kumu's

@@ -97,6 +97,24 @@ pub enum Request {
         #[serde(default)]
         next: bool,
     },
+    /// Tell the app an artifact was published, so the drawer can refresh and
+    /// mark the project unread. `from` is absent when the CLI runs outside a
+    /// Kumu pane; `project_path` always identifies the project.
+    ArtifactPublished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(rename = "projectPath")]
+        project_path: String,
+        artifact: String,
+    },
+    /// Open one artifact's reading sheet in the app.
+    ArtifactOpen {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        #[serde(rename = "projectPath")]
+        project_path: String,
+        artifact: String,
+    },
 }
 
 fn submit_by_default() -> bool {
@@ -149,6 +167,15 @@ pub struct PaneSummary {
     pub focused: bool,
     /// In the project the window is showing.
     pub selected: bool,
+    /// The project root, where `.kumu/artifacts` lives.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_path: String,
+    /// The agent-side conversation id, when the agent reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// The tab that owns this pane, as the user named it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tab_name: String,
     pub cols: u16,
     pub rows: u16,
     pub exited: bool,
@@ -203,6 +230,13 @@ pub struct ScrollResult {
     /// or `None` when forwarded to a TUI (`mouse_tracking` / `alt_screen`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactNotifyResult {
+    /// Whether the reading sheet was opened (`artifactOpen` only).
+    pub opened: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -270,5 +304,17 @@ pub enum Command {
         next: bool,
         cancelled: Arc<AtomicBool>,
         reply: Sender<Result<WaitResult, ControlError>>,
+    },
+    ArtifactPublished {
+        from: Option<u64>,
+        project_path: String,
+        artifact: String,
+        reply: Sender<Result<ArtifactNotifyResult, ControlError>>,
+    },
+    ArtifactOpen {
+        from: Option<u64>,
+        project_path: String,
+        artifact: String,
+        reply: Sender<Result<ArtifactNotifyResult, ControlError>>,
     },
 }

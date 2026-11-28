@@ -165,6 +165,8 @@ pub struct WorkspaceCore {
     pub(crate) startup_error: Option<String>,
     /// The home window's last layout JSON, handed to the view once at startup.
     pub(crate) saved_workspace: Option<String>,
+    /// Whether this process bootstrapped a brand-new persistent workspace.
+    pub(crate) first_run: bool,
 }
 
 impl WorkspaceCore {
@@ -197,6 +199,7 @@ impl WorkspaceCore {
             next_term: 1,
             startup_error,
             saved_workspace,
+            first_run: false,
         };
         core.bootstrap();
         core
@@ -214,6 +217,7 @@ impl WorkspaceCore {
             next_term: 1,
             startup_error: None,
             saved_workspace: None,
+            first_run: false,
         }
     }
 
@@ -263,6 +267,7 @@ impl WorkspaceCore {
                 Err(_) => true,
             };
         if !seeded {
+            self.first_run = self.persistent;
             let seeded_ok = match self.store.projects() {
                 Ok(projects) if projects.is_empty() => {
                     insert_bootstrap_project(&self.store).is_some()
@@ -275,6 +280,10 @@ impl WorkspaceCore {
             }
         }
         self.refresh();
+    }
+
+    pub fn first_run(&self) -> bool {
+        self.first_run
     }
 
     fn refresh(&mut self) {

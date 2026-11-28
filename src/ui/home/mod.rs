@@ -20,7 +20,7 @@ mod tabs_nsh;
 mod terminal;
 mod workspace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent::launch::{PaneLaunch, session_launch};
 use crate::agent::status::clean_osc_title;
@@ -29,6 +29,7 @@ use crate::app::{NotificationSettings, Workspace, WorkspaceEvent};
 use crate::nsh_ui::agent_picker::ActiveAgentPicker;
 use crate::nsh_ui::command_palette::ActiveCommandPalette;
 use crate::nsh_ui::dialogs::ActiveDialog;
+use crate::nsh_ui::onboarding::{ActiveOnboarding, OnboardingState, should_auto_open_onboarding};
 use crate::nsh_ui::toast::{ToastItem, ToastOverlay};
 use crate::term::TermNotification;
 use crate::theme::KumuTheme;
@@ -80,6 +81,8 @@ pub struct KumuApp {
     /// Terminals that requested attention while unattended, mapped to their
     /// project for the sidebar marker.
     unread_notifications: HashMap<u64, i64>,
+    /// Projects whose Artifacts drawer has not seen the latest publish.
+    artifact_unread: HashSet<i64>,
     /// Whether the home window currently has keyboard focus. A status change
     /// while it does not still becomes an unseen marker until the pane is
     /// clicked.
@@ -155,8 +158,14 @@ pub struct KumuApp {
     active_agent_picker: Option<ActiveAgentPicker>,
     /// Full-window Pure Rust NSH right-edge sheet overlay (e.g. Git Diff Review).
     pub(super) active_sheet: Option<crate::plugins::ActiveSheet>,
+    /// Full-window Pure Rust NSH 4-step onboarding wizard (mounted only while open).
+    pub(super) active_onboarding: Option<ActiveOnboarding>,
+    /// Host-owned onboarding wizard state pushed to `active_onboarding`.
+    pub(super) onboarding_state: Option<OnboardingState>,
     /// Syncs KumuTheme updates into `shell_nsh` and the NSH overlays.
     _nsh_theme_sub: Subscription,
+    /// Listens for cross-window requests from Settings to reopen onboarding.
+    _onboarding_req_sub: Subscription,
     /// The local control socket a program inside a pane reads its neighbours
     /// through. Lives exactly as long as this window.
     control: Option<crate::control::ControlHandle>,
@@ -526,7 +535,17 @@ impl KumuApp {
             if let Some(picker) = &app.active_agent_picker {
                 picker.sync_theme(&theme, cx);
             }
+            if let Some(onboarding) = &app.active_onboarding {
+                onboarding.sync_theme(&theme, cx);
+            }
         });
+        let onboarding_req_sub = cx.observe_global_in::<crate::app::OnboardingRequested>(
+            window,
+            |app: &mut Self, window, cx| {
+                app.open_onboarding(window, cx);
+                window.activate_window();
+            },
+        );
         let window_focus = cx.focus_handle();
 
         let mut app = Self {
@@ -535,6 +554,7 @@ impl KumuApp {
             settings_window: None,
             selected: None,
             unread_notifications: HashMap::new(),
+            artifact_unread: HashSet::new(),
             window_active: window.is_window_active(),
             agent_status: HashMap::new(),
             project_branches: HashMap::new(),
@@ -568,16 +588,26 @@ impl KumuApp {
             active_dialog: None,
             active_agent_picker: None,
             active_sheet: None,
+            active_onboarding: None,
+            onboarding_state: None,
             _nsh_theme_sub: nsh_theme_sub,
+            _onboarding_req_sub: onboarding_req_sub,
             control: None,
         };
         if !app.restore_workspace(saved_workspace.as_deref(), cx) {
             app.start_default(cx);
         }
-        app.start_control(cx);
+        app.start_control(window, cx);
         app.start_shell_agent_watcher(cx);
         app.start_project_branch_watcher(cx);
-        app.focus_terminal(window, cx);
+        if should_auto_open_onboarding(
+            app.workspace.read(cx).first_run(),
+            crate::db::get_setting(crate::db::SETTING_ONBOARDING_DONE).as_deref(),
+        ) {
+            app.open_onboarding(window, cx);
+        } else {
+            app.focus_terminal(window, cx);
+        }
         app.sync_pane_chrome(cx);
         let shell_snap = app.build_shell_snapshot(cx);
         app.shell_nsh.sync(shell_snap);
@@ -861,6 +891,11 @@ impl KumuApp {
                     .child(picker.app_view.clone())
             }))
             .children(
+                self.active_onboarding
+                    .as_ref()
+                    .map(|onboarding| div().absolute().inset_0().child(onboarding.view().clone())),
+            )
+            .children(
                 self.active_palette
                     .as_ref()
                     .map(|palette| div().absolute().inset_0().child(palette.app_view.clone())),
@@ -873,6 +908,7 @@ impl Render for KumuApp {
         if self.active_palette.is_none()
             && self.active_dialog.is_none()
             && self.active_agent_picker.is_none()
+            && self.active_onboarding.is_none()
             && self.active_sheet.is_none()
             && let Some(pane) = self.pending_focus.take()
             && let Some(terminal) = self.panes.get(&pane).cloned()
