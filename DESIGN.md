@@ -1,6 +1,6 @@
 # Design System: Kumu
 
-Kumu is a compact native macOS workspace for running local AI coding agents in splitable terminal grids, paired with project tabs, a right-hand Git/TODO plugin drawer, and an integrated multi-file Git Diff review surface.
+Kumu is a compact native macOS workspace for running local AI coding agents in splitable terminal grids, paired with project tabs, a right-hand Git plugin drawer, and an integrated multi-file Git Diff review surface.
 
 Kumu's business UI is built with Pure Rust NSH (`nsh-core` + `nsh-base` + `src/nsh_ui/components.rs`). The macOS title-bar shell and Ghostty terminal surface remain native GPUI.
 
@@ -14,7 +14,7 @@ Restrained, high-legibility developer workbench inspired by Zed and native macOS
 - **Obsidian Canvas (`#22252b` dark / `#f9f9f8` light)**: Primary workspace, diff sheet, and panel background.
 - **Slate Surface (`#262931` dark / `#fdfdfc` light)**: Elevated popovers, floating sheets, and inline review comment cards.
 - **Muted Chrome (`#2f333d` dark / `#e9e9e6` light)**: Segmented controls, secondary buttons, collapsed separators, and neutral badges.
-- **Sidebar Base (`#22252b` dark / `#f0f0ee` light)**: Project list and right-hand Git/TODO plugin sidebar background.
+- **Sidebar Base (`#22252b` dark / `#f0f0ee` light)**: Project list and right-hand Git plugin sidebar background.
 - **Hairline Border (`#30343d` dark / `#e4e4e1` light)**: `1px` structural dividers between panes, toolbars, file headers, and drawers.
 - **Input Border (`#3f4450` dark / `#cfceca` light)**: Single-line and multiline text field outlines.
 

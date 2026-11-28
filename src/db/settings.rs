@@ -70,9 +70,6 @@ pub const SETTING_PLUGIN_WIDTH: &str = "plugin_width";
 /// Setting key holding whether the left sidebar is visible ("0" = collapsed).
 pub const SETTING_SIDEBAR_VISIBLE: &str = "sidebar_visible";
 
-/// Setting key holding the last agent id chosen for one-click TODO dispatch.
-pub const SETTING_TODO_DEFAULT_AGENT: &str = "todo_default_agent";
-
 /// Setting key prefix holding optional extra CLI flags per coding agent
 /// (keyed as `agent_args:<agent_id>`).
 pub const SETTING_AGENT_ARGS_PREFIX: &str = "agent_args:";

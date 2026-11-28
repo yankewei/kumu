@@ -27,7 +27,6 @@ use super::plugins_host::{PLUGIN_MAX_WIDTH, PLUGIN_MIN_WIDTH};
 use super::sidebar_nsh::{SidebarAction, SidebarSnapshot};
 use super::tabs_nsh::{TabBarAction, TabBarSnapshot};
 use super::terminal::PaneChromeSnapshot;
-use super::todo_board::{TodoBoardAction, TodoBoardSnapshot};
 use super::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use crate::app::layout::{PaneId, SplitAxis};
 use crate::nsh_ui::mount::MountRegistry;
@@ -87,7 +86,6 @@ pub(super) enum CenterModeSnapshot {
     EmptyProjects,
     EmptyTerminals,
     Panes(LayoutNodeSnapshot),
-    TodoBoard(TodoBoardSnapshot),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,11 +94,6 @@ pub(super) enum TerminalContextAction {
     Paste,
     SplitRight,
     SplitDown,
-    OpenTodo(i64),
-    CompleteTodo(i64),
-    DetachTodo(i64),
-    LinkTodo(i64),
-    CreateAndLinkTodo,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,8 +101,6 @@ pub(super) struct TerminalContextMenuRequest {
     pub(super) pane: PaneId,
     pub(super) x: f32,
     pub(super) y: f32,
-    pub(super) linked_todos: Vec<(i64, String)>,
-    pub(super) candidate_todos: Vec<(i64, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,10 +155,8 @@ pub(super) enum ShellHostEvent {
 pub(super) enum HomeShellAction {
     Sidebar(SidebarAction),
     TabBar(TabBarAction),
-    TodoBoard(TodoBoardAction),
     DismissStoreError,
     EmptyAddTerminal,
-    EmptyOpenTodoBoard,
     EmptyAddProject,
     ClosePlugin,
     /// Left or right drawer animation finished (or skipped under reduced motion):
@@ -191,10 +180,6 @@ pub(super) enum HomeShellAction {
     OpenAgentPicker {
         pane: PaneId,
         anchor: crate::nsh_ui::agent_picker::AgentPickerAnchor,
-    },
-    OpenTodoFromPane {
-        pane: PaneId,
-        todo_id: i64,
     },
     TerminalContextMenu {
         pane: PaneId,
@@ -252,7 +237,6 @@ mod view {
     use crate::nsh_ui::theme::{text_xs_size, warning_color};
     use crate::ui::home::sidebar_nsh::view::render_sidebar;
     use crate::ui::home::tabs_nsh::view::render_tab_bar;
-    use crate::ui::home::todo_board::board::render_todo_board;
 
     fn open_terminal_popup_menu(
         req: TerminalContextMenuRequest,
@@ -290,64 +274,6 @@ mod view {
                 emit(&tx_sd, TerminalContextAction::SplitDown);
             }));
         }
-
-        if !req.linked_todos.is_empty() {
-            items.push(MenuItem::separator());
-            for (tid, title) in &req.linked_todos {
-                let tid = *tid;
-                let tx_open = tx.clone();
-                let tx_done = tx.clone();
-                let tx_det = tx.clone();
-                let short: String = if title.chars().count() > 16 {
-                    let mut s: String = title.chars().take(16).collect();
-                    s.push('…');
-                    s
-                } else {
-                    title.clone()
-                };
-                items.push(MenuItem::submenu(
-                    format!("已关联 #{tid} {short}"),
-                    [
-                        MenuItem::new("在看板中查看详情").on_select(move || {
-                            emit(&tx_open, TerminalContextAction::OpenTodo(tid));
-                        }),
-                        MenuItem::new("移至已完成").on_select(move || {
-                            emit(&tx_done, TerminalContextAction::CompleteTodo(tid));
-                        }),
-                        MenuItem::new("解除与当前终端关联").on_select(move || {
-                            emit(&tx_det, TerminalContextAction::DetachTodo(tid));
-                        }),
-                    ],
-                ));
-            }
-        }
-
-        items.push(MenuItem::separator());
-        let mut link_sub = Vec::new();
-        for (tid, title) in &req.candidate_todos {
-            let tid = *tid;
-            let tx_l = tx.clone();
-            let short: String = if title.chars().count() > 20 {
-                let mut s: String = title.chars().take(20).collect();
-                s.push('…');
-                s
-            } else {
-                title.clone()
-            };
-            link_sub.push(MenuItem::new(format!("#{tid} {short}")).on_select(move || {
-                emit(&tx_l, TerminalContextAction::LinkTodo(tid));
-            }));
-        }
-        if !link_sub.is_empty() {
-            link_sub.push(MenuItem::separator());
-        }
-        {
-            let tx_new = tx.clone();
-            link_sub.push(MenuItem::new("新建卡片并关联当前终端").on_select(move || {
-                emit(&tx_new, TerminalContextAction::CreateAndLinkTodo);
-            }));
-        }
-        items.push(MenuItem::submenu("关联到 TODO 卡片", link_sub));
 
         drop(popup_menu_at(
             items,
@@ -394,10 +320,6 @@ mod view {
         );
         let sidebar_sig = signal(initial.sidebar);
         let tab_bar_sig = signal(initial.tab_bar);
-        let todo_board_sig = signal(match &initial.center {
-            CenterModeSnapshot::TodoBoard(snap) => Some(snap.clone()),
-            _ => None,
-        });
         let center_sig = signal(initial.center);
         let pane_signals: PaneSignalMap = Rc::new(RefCell::new(
             initial
@@ -415,7 +337,6 @@ mod view {
 
         let (sidebar_tx, mut sidebar_rx) = unbounded();
         let (tabs_tx, mut tabs_rx) = unbounded();
-        let (board_tx, mut board_rx) = unbounded();
 
         // Forward sub-view actions into unified HomeShellAction channel.
         let tx_sb = actions_tx.clone();
@@ -428,12 +349,6 @@ mod view {
         spawn(async move {
             while let Some(a) = tabs_rx.next().await {
                 send(&tx_tb, HomeShellAction::TabBar(a));
-            }
-        });
-        let tx_bd = actions_tx.clone();
-        spawn(async move {
-            while let Some(a) = board_rx.next().await {
-                send(&tx_bd, HomeShellAction::TodoBoard(a));
             }
         });
 
@@ -474,23 +389,7 @@ mod view {
                         }
                         ShellHostEvent::Sidebar(s) => sidebar_sig.set(s),
                         ShellHostEvent::TabBar(t) => tab_bar_sig.set(t),
-                        ShellHostEvent::Center(c) => match &c {
-                            CenterModeSnapshot::TodoBoard(snap) => {
-                                todo_board_sig.set(Some(snap.clone()));
-                                if !matches!(
-                                    center_sig.get_untracked(),
-                                    CenterModeSnapshot::TodoBoard(_)
-                                ) {
-                                    center_sig.set(c);
-                                }
-                            }
-                            _ => {
-                                if todo_board_sig.get_untracked().is_some() {
-                                    todo_board_sig.set(None);
-                                }
-                                center_sig.set(c);
-                            }
-                        },
+                        ShellHostEvent::Center(c) => center_sig.set(c),
                         ShellHostEvent::OpenTerminalContextMenu(req) => {
                             open_terminal_popup_menu(req, tx_ev.clone());
                         }
@@ -639,16 +538,11 @@ mod view {
 
         let tx_center = actions_tx.clone();
         let pane_signals_center = pane_signals.clone();
-        let board_tx_opt = Some(board_tx);
         let center_body = dynamic(move || {
             let tx_c = tx_center.clone();
-            let tx_b = tx_center.clone();
             match center_sig.get() {
                 CenterModeSnapshot::Panes(root_node) => {
                     render_pane_tree(&root_node, &pane_signals_center, tx_c)
-                }
-                CenterModeSnapshot::TodoBoard(_) => {
-                    render_todo_board(todo_board_sig, board_tx_opt.clone()).into_element()
                 }
                 CenterModeSnapshot::EmptyTerminals => view()
                     .flex_col()
@@ -661,23 +555,9 @@ mod view {
                     .child(
                         body_text("还没有终端").text_color(move || active_theme().muted_foreground),
                     )
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_2()
-                            .child(kumu_button("新建终端", ButtonVariant::Ghost).on_press(
-                                move || {
-                                    send(&tx_c, HomeShellAction::EmptyAddTerminal);
-                                },
-                            ))
-                            .child(
-                                kumu_button("打开 TODO 看板", ButtonVariant::Ghost).on_press(
-                                    move || {
-                                        send(&tx_b, HomeShellAction::EmptyOpenTodoBoard);
-                                    },
-                                ),
-                            ),
-                    )
+                    .child(kumu_button("新建终端", ButtonVariant::Ghost).on_press(move || {
+                        send(&tx_c, HomeShellAction::EmptyAddTerminal);
+                    }))
                     .into_element(),
                 CenterModeSnapshot::EmptyProjects => view()
                     .flex_col()
@@ -823,7 +703,7 @@ mod view {
             );
 
         // Right plugin drawer: slides in from the right edge (`justify_start` +
-        // fixed inner width) so Git / TODO content glides out intact instead of
+        // fixed inner width) so Git content glides out intact instead of
         // jumping or squishing.
         let pl_drag_start = stored(0.0_f32);
         let tx_pl_resize = actions_tx.clone();
@@ -1095,7 +975,6 @@ mod tests {
                     has_matches: true,
                     focus_nonce: 1,
                 }),
-                linked_todos: Vec::new(),
             },
         );
         let initial = HomeShellSnapshot {
@@ -1158,7 +1037,6 @@ mod tests {
                     has_matches: true,
                     focus_nonce: 2,
                 }),
-                linked_todos: Vec::new(),
             },
         );
         events_tx
@@ -1275,15 +1153,15 @@ mod tests {
             "expected PanelAnimationSettled after opening drawer, got {opened_actions:?}"
         );
 
-        // 2. Switching directly to TODO swaps content in place without closing.
+        // 2. Switching directly to another plugin swaps content in place without closing.
         events_tx
             .unbounded_send(ShellHostEvent::OpenPlugin(Some(PluginPanelSnapshot {
-                id: "todo",
-                title: "TODO",
-                icon: "icons/list-todo.svg",
+                id: "other_panel",
+                title: "Other",
+                icon: "icons/folder.svg",
             })))
-            .expect("switch to todo plugin");
-        app.wait_for("TODO").expect("todo header renders");
+            .expect("switch to other plugin");
+        app.wait_for("Other").expect("other plugin header renders");
         let switched_actions = drain_actions(&mut actions_rx);
         assert!(
             !switched_actions.contains(&HomeShellAction::PluginCloseFinished),

@@ -18,7 +18,7 @@
 //!   - `ui/`      GPUI window shell, macOS titlebar, GPU Ghostty VT `TerminalView`, and unified `NshHomeShell`;
 //!   - `theme.rs` standalone `themes/*.json` loader driving both NSH and Ghostty `TermColors`;
 //!   - `app/`     framework-agnostic `WorkspaceCore` + `layout` tree and thin GPUI adapter;
-//!   - `plugins/` Pure Rust NSH right-hand plugin panels (TODO board, Git Log & Diff Review sheet);
+//!   - `plugins/` Pure Rust NSH right-hand plugin panels (Git Log & Diff Review sheet);
 //!   - `git.rs`   worktree creation and commit history;
 //!   - `db.rs`    local SQLite persistence (projects and the workspace layout);
 //!   - `term/`    PTY + VT for shells and the agent TUIs they launch;

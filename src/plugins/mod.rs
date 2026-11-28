@@ -101,33 +101,6 @@ impl PaneTarget {
     }
 }
 
-/// One live agent pane across a repository and its worktrees, with real-time
-/// status from the home window.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentPaneInfo {
-    pub pane: u64,
-    pub project_id: i64,
-    pub project_name: String,
-    pub tab_name: String,
-    pub ordinal: usize,
-    pub agent: String,
-    pub title: String,
-    pub state: Option<AgentState>,
-    pub focused: bool,
-}
-
-/// How a TODO card starts a fresh Agent pane.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DispatchMode {
-    /// Split beside the active pane in the selected project's current tab.
-    SplitRight,
-    /// Open a new tab named after the task and start the agent inside it.
-    NewTab { tab_name: String },
-    /// Create a sibling git worktree for `branch`, attach it under the root
-    /// repository, and start the agent inside a fresh tab there.
-    NewWorktree { branch: String, tab_name: String },
-}
-
 /// The window's send function, erased so a panel holds no window type. `None`
 /// means the focused pane, which is what a panel without a target list uses.
 type SendFn = dyn Fn(i64, Option<u64>, &str, &mut App) -> Result<SendOutcome, String>;

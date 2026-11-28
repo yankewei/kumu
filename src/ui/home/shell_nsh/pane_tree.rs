@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use futures::channel::mpsc::UnboundedSender;
 use nsh_base::{h_resizable, resizable_panel, theme as active_theme, v_resizable};
-use nsh_core::element::desktop::{MenuItem, popup_menu};
 use nsh_core::element::native;
 use nsh_core::prelude::*;
 
@@ -178,86 +177,6 @@ fn render_pane_leaf(
         }
         if let Some(status) = snap.agent_status {
             extras = extras.child(render_agent_badge(status, snap.agent_unseen));
-        }
-        if !snap.linked_todos.is_empty() {
-            let (first_id, first_title) = snap.linked_todos[0].clone();
-            let short_title: String = if first_title.chars().count() > 14 {
-                let mut s: String = first_title.chars().take(14).collect();
-                s.push('…');
-                s
-            } else {
-                first_title
-            };
-            let tx_todo = tx_hdr.clone();
-            extras = extras.child(
-                nsh_base::button()
-                    .h(px(20.0))
-                    .px_1p5()
-                    .gap_1()
-                    .flex_row()
-                    .flex_shrink_0()
-                    .items_center()
-                    .rounded(px(999.0))
-                    .bg(move || link_color().opacity(0.14))
-                    .hover(|s| s.bg(move || link_color().opacity(0.22)))
-                    .on_press(move || {
-                        send(
-                            &tx_todo,
-                            HomeShellAction::OpenTodoFromPane {
-                                pane: pane_id,
-                                todo_id: first_id,
-                            },
-                        );
-                    })
-                    .child(icon_svg("icons/list-todo.svg", 11.0).text_color(link_color))
-                    .child(
-                        text(format!("#{first_id} {short_title}"))
-                            .text_size(text_xs_size)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(link_color),
-                    ),
-            );
-            if snap.linked_todos.len() > 1 {
-                let extra_count = snap.linked_todos.len() - 1;
-                let all_linked = snap.linked_todos.clone();
-                let tx_more = tx_hdr.clone();
-                extras = extras.child(
-                    nsh_base::button()
-                        .h(px(20.0))
-                        .px_1p5()
-                        .flex_shrink_0()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(999.0))
-                        .bg(move || active_theme().muted)
-                        .hover(|s| s.bg(move || active_theme().accent))
-                        .on_press(move || {
-                            let items: Vec<MenuItem> = all_linked
-                                .iter()
-                                .map(|(tid, title)| {
-                                    let tid = *tid;
-                                    let tx_item = tx_more.clone();
-                                    MenuItem::new(format!("#{tid} {title}")).on_select(move || {
-                                        send(
-                                            &tx_item,
-                                            HomeShellAction::OpenTodoFromPane {
-                                                pane: pane_id,
-                                                todo_id: tid,
-                                            },
-                                        );
-                                    })
-                                })
-                                .collect();
-                            drop(popup_menu(items));
-                        })
-                        .child(
-                            text(format!("+{extra_count}"))
-                                .text_size(text_xs_size)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(move || active_theme().muted_foreground),
-                        ),
-                );
-            }
         }
         if zoomed {
             extras = extras.child(pill("已最大化", PillTone::Neutral).flex_shrink_0());

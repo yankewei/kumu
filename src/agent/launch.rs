@@ -155,16 +155,6 @@ pub fn launch_args(agent: &str, session: Option<&str>, extra: &[String]) -> Vec<
     args
 }
 
-/// Whether `agent` has a verified CLI flag for resuming a saved session id.
-pub fn supports_resume(agent: &str) -> bool {
-    matches!(agent, "codex" | "opencode" | "claude" | "cursor" | "agy")
-}
-
-/// Whether `session` is a well-formed session id that can be passed to a resume CLI flag.
-pub fn session_is_valid(session: &str) -> bool {
-    well_formed(session)
-}
-
 /// The arguments that start `agent`, resuming `session` when this CLI has a
 /// checked resume syntax and the id is well formed.
 fn resume_args(agent: &str, session: Option<&str>) -> Vec<String> {

@@ -10,12 +10,10 @@
 mod projects;
 mod schema;
 mod settings;
-mod todos;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::{Connection, Result};
-use serde::{Deserialize, Serialize};
 
 use schema::prepare;
 
@@ -23,8 +21,8 @@ pub use settings::{
     SETTING_AUTO_RESUME, SETTING_FONT, SETTING_FONT_SIZE, SETTING_NOTIFICATION_SOUND,
     SETTING_NOTIFICATIONS, SETTING_PLUGIN_WIDTH, SETTING_SEEDED, SETTING_SIDEBAR_VISIBLE,
     SETTING_SIDEBAR_WIDTH, SETTING_TERM_FONT, SETTING_TERM_FONT_SIZE, SETTING_TERMINAL_THEME,
-    SETTING_THEME_MODE, SETTING_TODO_DEFAULT_AGENT, SETTING_WINDOW_BOUNDS, db_path, get_agent_args,
-    get_setting, set_agent_args, set_setting,
+    SETTING_THEME_MODE, SETTING_WINDOW_BOUNDS, db_path, get_agent_args, get_setting,
+    set_agent_args, set_setting,
 };
 
 /// Set when [`Store::open`] refuses a newer-schema database so standalone
@@ -39,110 +37,6 @@ pub struct Project {
     pub name: String,
     pub path: String,
     pub parent_id: Option<i64>,
-}
-
-/// The three columns of a project's TODO board.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
-    Todo,
-    InProgress,
-    Done,
-}
-
-impl TodoStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Todo => "todo",
-            Self::InProgress => "in_progress",
-            Self::Done => "done",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "todo" | "待办" => Some(Self::Todo),
-            "in_progress" | "in-progress" | "inprogress" | "进行中" => Some(Self::InProgress),
-            "done" | "completed" | "已完成" => Some(Self::Done),
-            _ => None,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Todo => "待办",
-            Self::InProgress => "进行中",
-            Self::Done => "已完成",
-        }
-    }
-}
-
-/// One Agent / Session binding attached to a [`TodoItem`] (1:N).
-///
-/// `pane_id` points at a live terminal pane while running; when that pane
-/// closes, `pane_id` is cleared to `None` while `agent_id`, `agent_session_id`,
-/// and `project_id` remain so the session can be resumed later.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TodoAgentLink {
-    pub id: i64,
-    pub todo_id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<i64>,
-    pub label: String,
-    pub awaiting_review: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// One task on a repository's TODO board.
-///
-/// `project_id` always points at the root repository so worktrees share the
-/// same board. `links` is the single source of truth for agent/session
-/// bindings; `pane_id`, `agent_id`, `agent_session_id`, and `awaiting_review`
-/// are derived from `links` for CLI/JSON compatibility.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TodoItem {
-    pub id: i64,
-    pub project_id: i64,
-    pub title: String,
-    pub description: String,
-    pub status: TodoStatus,
-    pub position: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_session_id: Option<String>,
-    pub awaiting_review: bool,
-    #[serde(default)]
-    pub links: Vec<TodoAgentLink>,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-/// Partial update for [`Store::update_todo`]. `None` leaves a field untouched.
-/// Agent/session bindings are managed exclusively via `todo_agent_links` APIs.
-#[derive(Clone, Debug, Default)]
-pub struct TodoPatch {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub status: Option<TodoStatus>,
-    pub awaiting_review: Option<bool>,
-    /// When set alongside `awaiting_review`, scopes the review flag update to
-    /// this specific caller pane's link so sibling agents on the same TODO are
-    /// not affected.
-    pub review_pane_id: Option<u64>,
 }
 
 pub struct Store {
@@ -640,76 +534,5 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION
         );
-    }
-
-    #[test]
-    fn todos_crud_review_transitions_and_project_cascade_work() {
-        let store = store();
-        let root = store.insert_project("kumu", "/tmp/kumu").unwrap();
-
-        let item = store
-            .insert_todo(
-                root,
-                "Implement TODO board",
-                "Wire up SQLite and panel UI",
-                TodoStatus::Todo,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(item.status, TodoStatus::Todo);
-        assert!(!item.awaiting_review);
-        assert_eq!(store.todos(root).unwrap().len(), 1);
-
-        // Bind to pane 7 and move to in_progress.
-        store
-            .add_todo_link(item.id, Some("claude"), None, Some(7), Some(root), "")
-            .unwrap()
-            .unwrap();
-        let active = store
-            .update_todo(
-                item.id,
-                &TodoPatch {
-                    status: Some(TodoStatus::InProgress),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(active.status, TodoStatus::InProgress);
-        assert_eq!(active.pane_id, Some(7));
-        assert_eq!(active.agent_id.as_deref(), Some("claude"));
-
-        // Agent completes -> awaiting review; agent resumes -> cleared.
-        assert_eq!(store.mark_pane_todos_review(7).unwrap(), vec![root]);
-        assert!(store.todo(item.id).unwrap().unwrap().awaiting_review);
-        assert_eq!(store.clear_pane_todos_review(7).unwrap(), vec![root]);
-        assert!(!store.todo(item.id).unwrap().unwrap().awaiting_review);
-
-        // Detaching a closed pane clears pane_id while preserving agent_id.
-        assert_eq!(store.detach_pane_links(7).unwrap(), vec![root]);
-        let detached = store.todo(item.id).unwrap().unwrap();
-        assert_eq!(detached.pane_id, None);
-        assert_eq!(detached.agent_id.as_deref(), Some("claude"));
-
-        // Completing sets completed_at and clears awaiting_review.
-        let done = store
-            .update_todo(
-                item.id,
-                &TodoPatch {
-                    status: Some(TodoStatus::Done),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(done.status, TodoStatus::Done);
-        assert!(done.completed_at.is_some());
-        assert!(!done.awaiting_review);
-
-        // Deleting the root project cascades to its todos.
-        store.delete_project(root).unwrap();
-        assert!(store.todos(root).unwrap().is_empty());
     }
 }

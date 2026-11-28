@@ -21,7 +21,6 @@ use crate::theme::{self, DEFAULT_FONT_SIZE, FONT_SIZES, KumuTheme, ThemeMode};
 pub(super) enum WindowShortcut {
     ToggleCommandPalette,
     ToggleSidebar,
-    ToggleTodoBoard,
     OpenSettings,
     NewTab,
     CloseTab,
@@ -79,7 +78,6 @@ pub(super) fn classify_window_shortcut(
         "b" if !mods.shift => Some(WindowShortcut::ToggleSidebar),
         "," if !mods.shift => Some(WindowShortcut::OpenSettings),
         "t" if !mods.shift => Some(WindowShortcut::NewTab),
-        "t" if mods.shift => Some(WindowShortcut::ToggleTodoBoard),
         "w" if !mods.shift => Some(WindowShortcut::CloseTab),
         "w" if mods.shift => Some(WindowShortcut::ClosePane),
         "{" | "[" if mods.shift => Some(WindowShortcut::PrevTab),
@@ -140,19 +138,10 @@ impl KumuApp {
             return;
         }
 
-        // Modal dialog, full-window sheet, or TODO modal guard: block workspace shortcuts.
-        if self.active_dialog.is_some()
-            || self.active_sheet.is_some()
-            || self.active_todo_modal.is_some()
-        {
+        // Modal dialog or full-window sheet guard: block workspace shortcuts.
+        if self.active_dialog.is_some() || self.active_sheet.is_some() {
             if plain_escape {
-                if let Some(modal) = &self.active_todo_modal {
-                    if !modal.request_close() {
-                        self.active_todo_modal = None;
-                        self.focus_terminal(window, cx);
-                        cx.notify();
-                    }
-                } else if self.active_dialog.is_some() {
+                if self.active_dialog.is_some() {
                     self.active_dialog = None;
                     self.focus_terminal(window, cx);
                     cx.notify();
@@ -167,27 +156,6 @@ impl KumuApp {
         let Some(shortcut) = classify_window_shortcut(&event.keystroke, event.is_held) else {
             return;
         };
-
-        // While the TODO Kanban board is active, block terminal-only shortcuts
-        // so they never act on the hidden terminals underneath.
-        if self.active_todo_board.is_some()
-            && matches!(
-                shortcut,
-                WindowShortcut::NewTab
-                    | WindowShortcut::CloseTab
-                    | WindowShortcut::ClosePane
-                    | WindowShortcut::PrevTab
-                    | WindowShortcut::NextTab
-                    | WindowShortcut::SelectTab(_)
-                    | WindowShortcut::SplitRight
-                    | WindowShortcut::SplitDown
-                    | WindowShortcut::ToggleZoomPane
-                    | WindowShortcut::FocusNeighbor(_)
-            )
-        {
-            cx.stop_propagation();
-            return;
-        }
 
         self.execute_window_shortcut(shortcut, window, cx);
         cx.stop_propagation();
@@ -205,21 +173,19 @@ impl KumuApp {
             || self.active_dialog.is_some()
             || self.active_agent_picker.is_some()
             || self.active_sheet.is_some()
-            || self.active_todo_modal.is_some()
         {
             return;
         }
         let mods = &event.keystroke.modifiers;
-        if mods.platform && !mods.shift && !mods.alt && !mods.control && event.keystroke.key == "f"
+        if mods.platform
+            && !mods.shift
+            && !mods.alt
+            && !mods.control
+            && event.keystroke.key == "f"
+            && let Some(terminal) = self.focused_visible_terminal()
         {
-            if self.active_todo_board.is_some() {
-                self.todo_search_focus_nonce = self.todo_search_focus_nonce.wrapping_add(1);
-                cx.notify();
-                cx.stop_propagation();
-            } else if let Some(terminal) = self.focused_visible_terminal() {
-                terminal.update(cx, |terminal, cx| terminal.open_find(window, cx));
-                cx.stop_propagation();
-            }
+            terminal.update(cx, |terminal, cx| terminal.open_find(window, cx));
+            cx.stop_propagation();
         }
     }
 
@@ -241,7 +207,6 @@ impl KumuApp {
         match shortcut {
             WindowShortcut::ToggleCommandPalette => self.open_command_palette(window, cx),
             WindowShortcut::ToggleSidebar => self.toggle_sidebar(cx),
-            WindowShortcut::ToggleTodoBoard => self.toggle_todo_board(window, cx),
             WindowShortcut::OpenSettings => self.open_settings(false, cx),
             WindowShortcut::NewTab => {
                 self.new_tab(cx);
@@ -813,57 +778,41 @@ impl KumuApp {
                 self.reveal_agent(pane, window, cx);
             }
             PaletteTarget::SelectProject(project_id) => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 self.select_project(project_id, cx);
                 self.focus_terminal(window, cx);
             }
             PaletteTarget::SelectTab(index) => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 self.select_tab(index, cx);
                 self.focus_terminal(window, cx);
             }
             PaletteTarget::NewTab => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 self.new_tab(cx);
                 self.focus_terminal(window, cx);
             }
             PaletteTarget::SplitRight => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 if self.focused_visible_terminal().is_some() {
                     self.split_pane(self.focused, SplitAxis::Horizontal, cx);
                     self.focus_terminal(window, cx);
                 }
             }
             PaletteTarget::SplitDown => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 if self.focused_visible_terminal().is_some() {
                     self.split_pane(self.focused, SplitAxis::Vertical, cx);
                     self.focus_terminal(window, cx);
                 }
             }
             PaletteTarget::ToggleZoomPane => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 if self.focused_visible_terminal().is_some() {
                     self.toggle_zoom_pane(self.focused, window, cx);
                 }
             }
             PaletteTarget::ClosePane => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 if self.focused_visible_terminal().is_some() {
                     self.close_pane(self.focused, cx);
                     self.focus_terminal(window, cx);
                 }
             }
             PaletteTarget::NewAgentPane(agent) => {
-                self.active_todo_board = None;
-                self.active_todo_modal = None;
                 if self.focused_visible_terminal().is_some() {
                     self.split_pane_with(
                         self.focused,
@@ -948,12 +897,7 @@ mod tests {
             classify_window_shortcut(&key("cmd-0"), false),
             Some(WindowShortcut::ZoomReset)
         );
-        assert_eq!(
-            classify_window_shortcut(&key("cmd-shift-t"), false),
-            Some(WindowShortcut::ToggleTodoBoard)
-        );
         // Held mutating/toggling shortcuts are ignored.
-        assert_eq!(classify_window_shortcut(&key("cmd-shift-t"), true), None);
         assert_eq!(classify_window_shortcut(&key("cmd-w"), true), None);
         assert_eq!(classify_window_shortcut(&key("cmd-k"), true), None);
         // Clipboard and find remain context-sensitive.

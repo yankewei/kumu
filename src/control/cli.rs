@@ -7,7 +7,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::cli_pane::{pane_cli, panes_cli};
-use super::cli_todo::todo_cli;
 use super::protocol::{MAX_WAIT_TIMEOUT_SECS, PaneTarget, Request, RequestLine};
 use super::{MAX_RESPONSE_BYTES, PID_ENV, REPLY_TIMEOUT, socket_path};
 
@@ -29,7 +28,6 @@ pub fn run_cli() -> Option<i32> {
     match first.as_str() {
         "panes" => Some(panes_cli(&rest)),
         "pane" => Some(pane_cli(&rest)),
-        "todo" => Some(todo_cli(&rest)),
         _ => None,
     }
 }
@@ -43,13 +41,6 @@ usage:
   kumu pane send <TARGET> <TEXT...> [--no-enter] [--json]
   kumu pane wait <TARGET> [--timeout SECS] [--next] [--json]
   kumu pane close <TARGET> [--self] [--json]
-  kumu todo list [--status todo|in_progress|done] [--mine] [--json]
-  kumu todo show <ID> [--json]
-  kumu todo add <TITLE...> [--desc TEXT] [--status todo|in_progress|done] [--bind] [--json]
-  kumu todo update <ID> [--title TEXT] [--desc TEXT] [--status todo|in_progress|done] [--review|--no-review] [--bind|--unbind] [--json]
-  kumu todo review <ID> [--json]
-  kumu todo done <ID> [--json]
-  kumu todo remove <ID> [--json]
 
 TARGET is a pane id, left/right/up/down (relative to $KUMU_PANE), or focused
 (the default). --history N reads N scrollback rows; --tail N keeps the last N

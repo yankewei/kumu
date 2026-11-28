@@ -65,16 +65,6 @@ Agent 需要确认、等待输入或完成任务时，前台弹应用内提醒�
 </tr>
 <tr>
 <td width="40%" valign="middle">
-<h3>项目级 TODO 看板与多 Agent 协同</h3>
-点击左侧项目名（或按 <code>⌘⇧T</code>）可在主内容区进入该项目专属的 Jira 风格三列 TODO 看板（Git Worktree 自动共享父仓库看板），支持跨列拖拽、搜索与「需关注」筛选，后台终端全程保活。每条任务支持 <strong>1:N 关联多个 Agent 与历史 Session</strong>：可从详情弹窗一键在新页签、新 Worktree 或右侧分屏派发 Agent、追问或一键恢复历史会话，也可在终端内右键菜单与窗格顶栏胶囊双向联动。<br><br>
-Agent 也能通过内置 CLI 自行认领待办并在完成后将自己的会话标记为「待确认」。
-</td>
-<td width="60%">
-<img src="docs/assets/todo-board.png" alt="项目级 TODO 看板与运行中的 Agent 窗格联动" width="100%">
-</td>
-</tr>
-<tr>
-<td width="40%" valign="middle">
 <h3>Agent 跨窗格协作</h3>
 Kumu 向每个窗格注入 <code>KUMU_APP_BINARY</code> 与 <code>KUMU_PANE</code>，让一个 Agent 可以读取其它窗格的输出与滚动历史、在旁边拆分出新 Agent 窗格并下发 prompt，或继续向已有 Agent 窗格发消息。<br><br>
 安装配套 Skills 后，只需用自然语言说「让右边开个 Codex review 改动」，Agent 就会自己调用。
@@ -86,11 +76,11 @@ Kumu 向每个窗格注入 <code>KUMU_APP_BINARY</code> 与 <code>KUMU_PANE</cod
 </table>
 
 - **Git 历史、分支总览与 Diff 行级审查** — 右上角打开 Git 面板查看当前分支、相对默认分支（`main`/`master`）的整条分支 Diff 总览、提交历史（支持搜索与悬停看完整信息）及工作区改动 diff；在 diff 任意行点 `+` 写审查意见，指定目标窗格后连同文件、行号与上下文一键发给 Agent（未发出的草稿自动保留，补丁变更时提示重新读取；焦点在普通 shell 时仅粘贴不执行）。
-- **原生 Git Worktree 全生命周期管理** — 在 Git 仓库右键按分支创建或导入同级 `<仓库>-<分支>` worktree，支持从 TODO 卡片一键新建 Worktree 并派发 Agent；任务完成后可选择「从列表移除（保留目录）」或「删除 worktree（带未提交改动检查并清理磁盘目录）」。
+- **原生 Git Worktree 全生命周期管理** — 在 Git 仓库右键按分支创建或导入同级 `<仓库>-<分支>` worktree；任务完成后可选择「从列表移除（保留目录）」或「删除 worktree（带未提交改动检查并清理磁盘目录）」。
 - **自动接管、会话恢复与自定义启动参数** — 无论是通过窗格按钮新建，还是在普通 shell 里手动输入 `claude`、`codex`、`opencode`、`agy` 等命令启动，Kumu 都会自动识别并在下次打开应用时按原 CLI 语法接回同一段对话；可在 **设置 → 服务商 → 编码 Agent** 为各已安装 Agent 配置默认启动参数。
 - **高性能原生架构** — 使用 Rust + Pure Rust NSH + GPUI 构建原生界面，内嵌 Ghostty (`libghostty`) 终端渲染引擎，轻快流畅、无 Electron 开销。
 - **亮暗主题、字体定制与源码跳转** — 支持亮色 / 深色外观切换与自定义字体字号；终端内支持 `⌘ + 点击` 直接打开网页链接及 `file:line:col` 本地源码路径（自动调用 Zed / Cursor / VS Code 等编辑器并定位到行列）。
-- **本地优先、隐私安全** — 所有项目、布局、TODO 与设置仅存放在本机 `~/.kumu/kumu.db`，不上传代码、不收集使用数据。
+- **本地优先、隐私安全** — 所有项目、布局与设置仅存放在本机 `~/.kumu/kumu.db`，不上传代码、不收集使用数据。
 
 ---
 
@@ -124,15 +114,14 @@ Kumu 目前提供 **Apple Silicon Mac** 安装包，系统要求 **macOS 11** �
 
 ### 安装配套 Agent Skills（推荐）
 
-让你的编码 Agent 原生学会操作 Kumu 窗格与 TODO 看板：
+让你的编码 Agent 原生学会操作 Kumu 窗格：
 
 ```sh
 npx skills add yankewei/kumu
 ```
 
-包含两个 skill：
+包含以下 skill：
 - [`kumu-panes`](skills/kumu-panes/SKILL.md)：读取其它窗格内容、在旁边拆分新 Agent 窗格、向 Agent 窗格发消息。
-- [`kumu-todos`](skills/kumu-todos/SKILL.md)：查看、新建、认领当前仓库的 TODO 卡片，并在完成后提交验收。
 
 ---
 
@@ -149,16 +138,11 @@ npx skills add yankewei/kumu
 "$KUMU_APP_BINARY" pane wait right --timeout 300                  # 阻塞等待右侧 Agent 完成或等待输入
 "$KUMU_APP_BINARY" pane send right "继续，把测试也补上"
 "$KUMU_APP_BINARY" pane close right                               # 关闭临时子窗格
-
-# 操作当前仓库的 TODO 看板（Worktree 自动关联父仓库）
-"$KUMU_APP_BINARY" todo list --json
-"$KUMU_APP_BINARY" todo update 12 --status in_progress --bind     # 认领任务并绑定当前窗格
-"$KUMU_APP_BINARY" todo review 12                                 # 标记为待确认，等待验收
 ```
 
 - 窗格目标支持 `left` / `right` / `up` / `down`（相对当前窗格）、`focused`、`current` 或 `panes` 中的数字 id。
 - `pane split` 支持向右（`right`）或向下（`down`），新建时保持原窗格键盘焦点不变，`--prompt` 会等待新 Agent 画出输入框后自动发送。
-- `pane send` 仅允许发送给 Agent 窗格，普通 shell 窗格会拒绝（防止误执行命令）；更多参数与边界说明见 [`kumu-panes`](skills/kumu-panes/SKILL.md) 与 [`kumu-todos`](skills/kumu-todos/SKILL.md)。
+- `pane send` 仅允许发送给 Agent 窗格，普通 shell 窗格会拒绝（防止误执行命令）；更多参数与边界说明见 [`kumu-panes`](skills/kumu-panes/SKILL.md)。
 
 ---
 
@@ -170,7 +154,6 @@ npx skills add yankewei/kumu
 | 折叠/展开左侧边栏 | `⌘B` |
 | 打开设置 | `⌘,` |
 | 新建页签 | `⌘T` |
-| 切换当前项目的 TODO 看板 | `⌘⇧T` |
 | 关闭页签（结束该布局内所有终端） | `⌘W` |
 | 关闭当前聚焦窗格 | `⌘⇧W` |
 | 切换页签 | `⌘⇧[` / `⌘⇧]` 或 `⌘1`…`⌘9` |
@@ -179,10 +162,10 @@ npx skills add yankewei/kumu
 | 最大化/还原当前分屏窗格 | `⌘⇧Enter` |
 | 在窗格间移动焦点 | `⌘⌥← / → / ↑ / ↓` |
 | 放大 / 缩小 / 重置字号 | `⌘+` / `⌘-` / `⌘0` |
-| 在当前窗格中查找（含滚动历史）/ 看板模式下聚焦搜索 | `⌘F` |
+| 在当前窗格中查找（含滚动历史） | `⌘F` |
 | 在查找结果间跳转 / 关闭查找条 | `Enter` / `⇧Enter` / `Esc` |
 | 打开终端中的链接 | `⌘ + 点击` |
-| 终端内打开 Kumu 上下文菜单（含关联 TODO） / 透传 TUI 右键 | `右键` / `⇧ + 右键` |
+| 终端内打开 Kumu 上下文菜单 / 透传 TUI 右键 | `右键` / `⇧ + 右键` |
 
 ---
 
@@ -229,7 +212,7 @@ sleep 3; printf '\033]9;任务完成\007'
 不会。控制通道 `~/.kumu/control.sock`（目录 `0700`、socket `0600`）仅由首个实例持有；第二个实例不会接管它，其窗格里的控制命令会直接报错，避免误操作第一个实例的窗格。
 
 ### 数据存在哪里？会联网吗？
-项目、布局、TODO 和设置全部保存在本机 SQLite 数据库 `~/.kumu/kumu.db`。除检查更新和下载安装包外，Kumu 不访问网络，也不收集任何使用数据。
+项目、布局和设置全部保存在本机 SQLite 数据库 `~/.kumu/kumu.db`。除检查更新和下载安装包外，Kumu 不访问网络，也不收集任何使用数据。
 
 ### 遇到问题需要日志怎么办？
 从 Finder 启动时 Kumu 没有可读的 stderr，因此会把诊断日志写到 `~/Library/Logs/Kumu/kumu.log`（超过 5 MB 轮转为 `kumu.log.1`）。在终端里直接运行 `cargo run` 时仍输出到 stderr；设置 `KUMU_LOG_TO_FILE=1` 可强制写文件。
@@ -240,7 +223,6 @@ sleep 3; printf '\033]9;任务完成\007'
 
 - [Agent 通知接入说明](docs/agent-notifications.md)
 - [窗格控制 Skill（`kumu-panes`）](skills/kumu-panes/SKILL.md)
-- [TODO 看板 Skill（`kumu-todos`）](skills/kumu-todos/SKILL.md)
 - [开发约定与技术栈（`AGENTS.md`）](AGENTS.md)
 
 ## License

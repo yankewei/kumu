@@ -4,8 +4,6 @@ use std::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::{TodoItem, TodoStatus};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScrollDirection {
@@ -99,57 +97,6 @@ pub enum Request {
         #[serde(default)]
         next: bool,
     },
-    /// List TODO items on the caller's repository board.
-    TodoList {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<TodoStatus>,
-        #[serde(default)]
-        mine: bool,
-    },
-    /// Show one TODO item in detail.
-    TodoShow {
-        id: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<u64>,
-    },
-    /// Create a TODO item on the caller's repository board.
-    TodoAdd {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<u64>,
-        title: String,
-        #[serde(default)]
-        description: String,
-        #[serde(default = "todo_status_default")]
-        status: TodoStatus,
-        #[serde(default)]
-        bind: bool,
-    },
-    /// Update one TODO item's fields, status, review mark, or pane link.
-    TodoUpdate {
-        id: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<TodoStatus>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        awaiting_review: Option<bool>,
-        #[serde(default)]
-        bind: bool,
-        #[serde(default)]
-        unbind: bool,
-    },
-    /// Remove one TODO item.
-    TodoRemove {
-        id: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<u64>,
-    },
 }
 
 fn submit_by_default() -> bool {
@@ -161,10 +108,6 @@ pub(super) const MAX_WAIT_TIMEOUT_SECS: u64 = 3600;
 
 fn default_wait_timeout() -> u64 {
     DEFAULT_WAIT_TIMEOUT_SECS
-}
-
-fn todo_status_default() -> TodoStatus {
-    TodoStatus::Todo
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -327,40 +270,5 @@ pub enum Command {
         next: bool,
         cancelled: Arc<AtomicBool>,
         reply: Sender<Result<WaitResult, ControlError>>,
-    },
-    TodoList {
-        from: Option<u64>,
-        status: Option<TodoStatus>,
-        mine: bool,
-        reply: Sender<Result<Vec<TodoItem>, ControlError>>,
-    },
-    TodoShow {
-        id: i64,
-        from: Option<u64>,
-        reply: Sender<Result<TodoItem, ControlError>>,
-    },
-    TodoAdd {
-        from: Option<u64>,
-        title: String,
-        description: String,
-        status: TodoStatus,
-        bind: bool,
-        reply: Sender<Result<TodoItem, ControlError>>,
-    },
-    TodoUpdate {
-        id: i64,
-        from: Option<u64>,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<TodoStatus>,
-        awaiting_review: Option<bool>,
-        bind: bool,
-        unbind: bool,
-        reply: Sender<Result<TodoItem, ControlError>>,
-    },
-    TodoRemove {
-        id: i64,
-        from: Option<u64>,
-        reply: Sender<Result<bool, ControlError>>,
     },
 }

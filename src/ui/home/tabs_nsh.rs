@@ -43,7 +43,6 @@ pub(super) enum TabBarAction {
     ConfirmClose { project_id: i64, tab_id: TabId },
     Add,
     PromptRename { project_id: i64, tab_id: TabId },
-    OpenProjectBoard(i64),
 }
 
 pub(super) mod view {
@@ -217,7 +216,6 @@ pub(super) mod view {
 
                 let tx_add = tx_root.clone();
                 let tx_menu = tx_root.clone();
-                let tx_board = tx_root.clone();
 
                 view()
                     .flex_row()
@@ -236,13 +234,6 @@ pub(super) mod view {
                             .unwrap_or_else(|| SharedString::from(crate::theme::SYSTEM_FONT_FAMILY))
                     })
                     .child(scroll().horizontal().flex_1().min_w_0().child(strip))
-                    .child(kumu_icon_button(
-                        "打开项目 TODO 看板 ⌘⇧T",
-                        icon_svg("icons/list-todo.svg", 14.0)
-                            .text_color(move || active_theme().muted_foreground),
-                        ControlTone::Default,
-                        move || send(&tx_board, TabBarAction::OpenProjectBoard(project_id)),
-                    ))
                     .child(kumu_icon_button(
                         "新建页签 ⌘T",
                         icon_svg("icons/plus.svg", 14.0)

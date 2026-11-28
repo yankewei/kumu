@@ -353,10 +353,8 @@ impl KumuApp {
             }
         }
         for pane in panes {
-            self.workspace.update(cx, |workspace, cx| {
-                workspace.drop_terminal(pane.0);
-                workspace.unbind_pane_todos(pane.0, cx);
-            });
+            self.workspace
+                .update(cx, |workspace, _cx| workspace.drop_terminal(pane.0));
             self.panes.remove(&pane);
             self.native_registry.unregister_pane(pane.0);
             self.launches.remove(&pane);
@@ -476,9 +474,6 @@ impl KumuApp {
             }
             TabBarAction::PromptRename { project_id, tab_id } => {
                 self.prompt_rename_tab(project_id, tab_id, window, cx);
-            }
-            TabBarAction::OpenProjectBoard(project_id) => {
-                self.open_todo_board(project_id, None, window, cx);
             }
         }
     }

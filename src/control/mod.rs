@@ -12,7 +12,6 @@
 
 mod cli;
 mod cli_pane;
-mod cli_todo;
 mod protocol;
 mod server;
 
@@ -69,8 +68,6 @@ mod tests {
     use std::path::Path;
 
     use serde_json::Value;
-
-    use crate::db::{TodoItem, TodoStatus};
 
     use super::cli::{call_at_instance, last_lines};
     use super::cli_pane::{ScrollCliArgs, ScrollParse, parse_pane_scroll};
@@ -242,34 +239,6 @@ mod tests {
                             }))
                             .expect("send reply");
                     }
-                    Command::TodoList {
-                        from,
-                        status,
-                        mine,
-                        reply,
-                    } => {
-                        assert_eq!(from, Some(3));
-                        assert_eq!(status, Some(TodoStatus::InProgress));
-                        assert!(mine);
-                        reply
-                            .send(Ok(vec![TodoItem {
-                                id: 9,
-                                project_id: 1,
-                                title: "Ship TODO board".into(),
-                                description: String::new(),
-                                status: TodoStatus::InProgress,
-                                position: 0,
-                                pane_id: Some(3),
-                                agent_id: Some("claude".into()),
-                                agent_session_id: None,
-                                awaiting_review: true,
-                                links: Vec::new(),
-                                created_at: "2026-11-21 00:00:00".into(),
-                                updated_at: "2026-11-21 00:00:00".into(),
-                                completed_at: None,
-                            }]))
-                            .expect("todo list reply");
-                    }
                     Command::Close {
                         target,
                         allow_self,
@@ -340,10 +309,6 @@ mod tests {
                             }))
                             .expect("scroll reply");
                     }
-                    Command::TodoShow { .. }
-                    | Command::TodoAdd { .. }
-                    | Command::TodoUpdate { .. }
-                    | Command::TodoRemove { .. } => {}
                 }
             }
         });
@@ -418,18 +383,6 @@ mod tests {
         )
         .expect("send");
         assert_eq!(send["submitted"], true);
-
-        let todos = call_here(
-            &path,
-            &Request::TodoList {
-                from: Some(3),
-                status: Some(TodoStatus::InProgress),
-                mine: true,
-            },
-        )
-        .expect("todo list");
-        assert_eq!(todos["todos"][0]["id"], 9);
-        assert_eq!(todos["todos"][0]["awaitingReview"], true);
 
         let waited = call_here(
             &path,

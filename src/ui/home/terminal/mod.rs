@@ -253,7 +253,6 @@ impl TerminalView {
                 .find
                 .as_ref()
                 .map(|bar| find_bar_snapshot(&self.snapshot, &bar.sent, bar.focus_nonce)),
-            linked_todos: Vec::new(),
         }
     }
 

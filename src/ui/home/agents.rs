@@ -385,10 +385,9 @@ impl KumuApp {
             if self.workspace.read(cx).pane_is_shell(pane.0) == Some(true)
                 && self.agent_status.remove(&pane).is_some()
             {
-                self.workspace.update(cx, |workspace, cx| {
-                    workspace.reset_terminal_program_status(pane.0);
-                    workspace.unbind_pane_todos(pane.0, cx);
-                });
+                self.workspace
+                    .read(cx)
+                    .reset_terminal_program_status(pane.0);
                 self.sync_pane_agent_status(pane, cx);
                 cx.notify();
             }
@@ -426,7 +425,6 @@ impl KumuApp {
             StatusSignal::Exited => unreachable!(),
         }
         entry.unseen = unseen_after_status(entry.unseen, previous, entry.state, attended);
-        self.apply_status_side_effects(pane, project, signal, cx);
         self.sync_pane_agent_status(pane, cx);
         cx.notify();
     }
@@ -480,10 +478,9 @@ impl KumuApp {
                 existing.process_tracked,
             ) {
                 self.agent_status.remove(&pane);
-                self.workspace.update(cx, |workspace, cx| {
-                    workspace.reset_terminal_program_status(pane.0);
-                    workspace.unbind_pane_todos(pane.0, cx);
-                });
+                self.workspace
+                    .read(cx)
+                    .reset_terminal_program_status(pane.0);
                 self.sync_pane_agent_status(pane, cx);
                 cx.notify();
                 return;
@@ -540,37 +537,11 @@ impl KumuApp {
             None
         };
 
-        self.apply_status_side_effects(pane, project, signal, cx);
         self.sync_pane_agent_status(pane, cx);
         if let Some(notification) = alert {
             self.raise_attention(terminal, project, &notification, window, cx);
         }
         cx.notify();
-    }
-
-    fn apply_status_side_effects(
-        &mut self,
-        pane: PaneId,
-        project: i64,
-        signal: StatusSignal,
-        cx: &mut Context<Self>,
-    ) {
-        match signal {
-            StatusSignal::Active(AgentState::Completed) => {
-                self.workspace.update(cx, |workspace, cx| {
-                    workspace.mark_pane_todos_review(pane.0, cx)
-                });
-            }
-            StatusSignal::Active(AgentState::Running) | StatusSignal::Resume => {
-                self.workspace.update(cx, |workspace, cx| {
-                    workspace.clear_pane_todos_review(pane.0, cx);
-                });
-            }
-            _ => {}
-        }
-        let board_id = self.workspace.read(cx).board_project_id(project);
-        self.refresh_todo_summary(board_id, cx);
-        self.sync_active_todo_modal(cx);
     }
 
     /// Record a session or first-prompt title reported on `kumu-title:`.
@@ -592,9 +563,6 @@ impl KumuApp {
         } else if entry.prompt_title.is_none() {
             entry.prompt_title = Some(title.to_string());
         }
-        let display = entry.display_title();
-        self.workspace
-            .update(cx, |ws, cx| ws.sync_pane_link_label(pane.0, &display, cx));
         cx.notify();
     }
 
@@ -625,8 +593,6 @@ impl KumuApp {
     /// hidden behind a zoomed sibling, and it holds keyboard focus.
     fn pane_is_attended(&self, pane: PaneId) -> bool {
         self.window_active
-            && self.active_todo_board.is_none()
-            && self.active_todo_modal.is_none()
             && self.active_sheet.is_none()
             && self.active_dialog.is_none()
             && self.active_palette.is_none()
@@ -758,12 +724,10 @@ impl KumuApp {
             }
         }
         if !removed_panes.is_empty() {
-            self.workspace.update(cx, |workspace, cx| {
-                for pane in &removed_panes {
-                    workspace.reset_terminal_program_status(pane.0);
-                    workspace.unbind_pane_todos(pane.0, cx);
-                }
-            });
+            let workspace = self.workspace.read(cx);
+            for pane in &removed_panes {
+                workspace.reset_terminal_program_status(pane.0);
+            }
             for pane in removed_panes {
                 self.sync_pane_agent_status(pane, cx);
             }
