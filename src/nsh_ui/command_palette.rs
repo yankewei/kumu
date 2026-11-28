@@ -58,6 +58,7 @@ pub enum PaletteTarget {
     ToggleSidebar,
     ToggleTheme,
     OpenSettings,
+    OpenOnboarding,
 }
 
 /// One selectable entry in the command palette.

@@ -421,6 +421,25 @@ pub fn reading_sheet(
     ActiveSheet::new(view.into(), dismiss)
 }
 
+/// Build an in-memory Markdown reading sheet without writing to disk.
+pub fn inline_markdown_sheet(
+    title: String,
+    body: String,
+    on_close: std::rc::Rc<CloseFn>,
+    window: &mut Window,
+    cx: &mut App,
+) -> ActiveSheet {
+    let view = cx.new(|cx| ArtifactSheet::new_inline_markdown(title, body, on_close, cx));
+    view.update(cx, |sheet, cx| sheet.ensure_nsh_mounted(window, cx));
+    let dismiss = {
+        let weak = view.downgrade();
+        move |cx: &mut App| {
+            let _ = weak.update(cx, |sheet, _| sheet.request_close());
+        }
+    };
+    ActiveSheet::new(view.into(), dismiss)
+}
+
 fn pane_key(pane: &PaneTarget) -> String {
     session_key(
         Some(pane.pane),

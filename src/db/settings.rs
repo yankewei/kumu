@@ -57,6 +57,10 @@ pub const SETTING_AUTO_RESUME: &str = "auto_resume";
 /// refilled on the next launch.
 pub const SETTING_SEEDED: &str = "seeded";
 
+/// Setting key marking that the user explicitly completed or skipped the
+/// onboarding wizard (`"1"` suppresses future automatic opens).
+pub const SETTING_ONBOARDING_DONE: &str = "onboarding_done";
+
 /// Setting key holding the main window's last geometry as JSON.
 pub const SETTING_WINDOW_BOUNDS: &str = "window_bounds";
 

@@ -76,6 +76,7 @@ pub(super) struct ArtifactSheet {
     mount_id: Option<u64>,
     artifact: Artifact,
     project_root: PathBuf,
+    inline: bool,
     body: Option<String>,
     error: Option<String>,
     notice: Option<String>,
@@ -121,10 +122,54 @@ impl ArtifactSheet {
             mount_id: None,
             artifact,
             project_root,
+            inline: false,
             body,
             error,
             notice: None,
             server,
+            reload_generation: 0,
+            app_view: None,
+            events_tx: Some(events_tx),
+            events_rx: Some(events_rx),
+            _theme_sub: None,
+            _actions_task: None,
+            on_close,
+        }
+    }
+
+    /// Construct a read-only in-memory Markdown reading sheet without writing
+    /// anything to disk (used by the onboarding wizard sample preview).
+    pub(super) fn new_inline_markdown(
+        title: String,
+        body: String,
+        on_close: Rc<CloseFn>,
+        _cx: &mut Context<Self>,
+    ) -> Self {
+        let artifact = Artifact {
+            dir: PathBuf::new(),
+            meta: crate::artifacts::ArtifactMeta {
+                version: 1,
+                id: "onboarding-sample".into(),
+                title,
+                kind: ArtifactKind::Markdown,
+                entry: "guide.md".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                session: crate::artifacts::SessionInfo::default(),
+                source: Some("Kumu 内置示例".into()),
+                tags: Vec::new(),
+            },
+        };
+        let (events_tx, events_rx) = unbounded::<SheetEvent>();
+        Self {
+            mount_id: None,
+            artifact,
+            project_root: PathBuf::new(),
+            inline: true,
+            body: Some(body),
+            error: None,
+            notice: None,
+            server: None,
             reload_generation: 0,
             app_view: None,
             events_tx: Some(events_tx),
@@ -187,14 +232,28 @@ impl ArtifactSheet {
             while let Some(action) = actions_rx.next().await {
                 let result = this.update_in(cx, |sheet, window, cx| match action {
                     SheetAction::Close => (sheet.on_close)(window, cx),
-                    SheetAction::Reload => sheet.reload(window, cx),
-                    SheetAction::OpenExternal => open_external(&sheet.artifact.entry_path()),
-                    SheetAction::CopyPath => {
-                        cx.write_to_clipboard(ClipboardItem::new_string(
-                            sheet.artifact.entry_path().to_string_lossy().into_owned(),
-                        ));
+                    SheetAction::Reload => {
+                        if !sheet.inline {
+                            sheet.reload(window, cx);
+                        }
                     }
-                    SheetAction::Reveal => cx.reveal_path(&sheet.artifact.dir),
+                    SheetAction::OpenExternal => {
+                        if !sheet.inline {
+                            open_external(&sheet.artifact.entry_path());
+                        }
+                    }
+                    SheetAction::CopyPath => {
+                        if !sheet.inline {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                sheet.artifact.entry_path().to_string_lossy().into_owned(),
+                            ));
+                        }
+                    }
+                    SheetAction::Reveal => {
+                        if !sheet.inline {
+                            cx.reveal_path(&sheet.artifact.dir);
+                        }
+                    }
                     SheetAction::Link(url) => sheet.open_link(&url, cx),
                 });
                 if result.is_err() {

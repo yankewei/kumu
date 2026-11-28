@@ -21,6 +21,15 @@ use crate::theme;
 
 impl Global for NotificationSettings {}
 
+/// Cross-window signal used by the Settings window to reopen the main window's
+/// onboarding wizard without holding a direct handle to `KumuApp`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OnboardingRequested {
+    pub seq: u64,
+}
+
+impl Global for OnboardingRequested {}
+
 /// GPUI entity adapter around [`WorkspaceCore`].
 ///
 /// Shares the underlying `Arc<Mutex<WorkspaceCore>>` so future NSH UI threads
@@ -67,6 +76,11 @@ impl Workspace {
     /// Take the layout JSON loaded before the home view existed.
     pub fn take_saved_workspace(&mut self) -> Option<String> {
         self.lock().take_saved_workspace()
+    }
+
+    /// Whether this launch initialized a brand-new persistent workspace.
+    pub fn first_run(&self) -> bool {
+        self.lock().first_run()
     }
 
     /// Replace the saved layout, reporting a write failure to the home window.

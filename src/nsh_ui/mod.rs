@@ -16,6 +16,7 @@ pub mod command_palette;
 pub mod components;
 pub mod dialogs;
 pub mod mount;
+pub mod onboarding;
 pub mod settings;
 pub mod theme;
 pub mod toast;

@@ -15,6 +15,9 @@ pub fn init(cx: &mut gpui::App) {
                 != Some("0"),
         });
     }
+    if !cx.has_global::<crate::app::OnboardingRequested>() {
+        cx.set_global(crate::app::OnboardingRequested::default());
+    }
     // Let the focused terminal receive completion keys through its normal encoder
     // instead of any outer focus-navigation binding.
     cx.bind_keys([
