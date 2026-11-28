@@ -223,11 +223,7 @@ impl OnboardingState {
             }
         }
         if self.selected_agent.is_none() {
-            self.selected_agent = self
-                .agents
-                .iter()
-                .find(|a| a.installed)
-                .map(|a| a.id);
+            self.selected_agent = self.agents.iter().find(|a| a.installed).map(|a| a.id);
         }
     }
 
@@ -309,9 +305,7 @@ mod view {
     use nsh_core::element::{AccessibilityRole, scroll};
     use nsh_core::prelude::*;
 
-    use super::{
-        MOUNTS, OnboardingAction, OnboardingHostEvent, OnboardingState, OnboardingStep,
-    };
+    use super::{MOUNTS, OnboardingAction, OnboardingHostEvent, OnboardingState, OnboardingStep};
     use crate::nsh_ui::components::{
         ButtonVariant, PillTone, body_text, kumu_button, kumu_switch_bare, meta_text, pill,
         row_title, section_title,
@@ -374,11 +368,9 @@ mod view {
                         )
                     })),
             )
-            .child(
-                kumu_button("关闭", ButtonVariant::Ghost).on_press(move || {
-                    send(&tx_close, OnboardingAction::DismissOnce);
-                }),
-            );
+            .child(kumu_button("关闭", ButtonVariant::Ghost).on_press(move || {
+                send(&tx_close, OnboardingAction::DismissOnce);
+            }));
 
         let stepper = view().flex_row().gap_1p5().children(
             OnboardingStep::ALL
@@ -491,7 +483,12 @@ mod view {
         state: OnboardingState,
         tx: Option<UnboundedSender<OnboardingAction>>,
     ) -> AnyElement {
-        let installed: Vec<_> = state.agents.iter().filter(|a| a.installed).cloned().collect();
+        let installed: Vec<_> = state
+            .agents
+            .iter()
+            .filter(|a| a.installed)
+            .cloned()
+            .collect();
         let not_installed_count = state.agents.len().saturating_sub(installed.len());
 
         let mut col = view()
@@ -505,7 +502,9 @@ mod view {
             ));
 
         if state.probing {
-            return col.child(meta_text("正在检测本机已安装的编码 Agent…")).into_element();
+            return col
+                .child(meta_text("正在检测本机已安装的编码 Agent…"))
+                .into_element();
         }
 
         if installed.is_empty() {
@@ -593,9 +592,12 @@ mod view {
                                 .child(meta_text(summary)),
                         )
                         .child(
-                            kumu_button(if done { "重新接入" } else { "接入" }, ButtonVariant::Outline)
-                                .disabled(state.busy)
-                                .on_press(move || send(&tx_one, OnboardingAction::InstallOne(id))),
+                            kumu_button(
+                                if done { "重新接入" } else { "接入" },
+                                ButtonVariant::Outline,
+                            )
+                            .disabled(state.busy)
+                            .on_press(move || send(&tx_one, OnboardingAction::InstallOne(id))),
                         ),
                 );
             if let Some(msg) = feedback {
@@ -697,7 +699,12 @@ mod view {
     ) -> AnyElement {
         let tx_pick = tx.clone();
         let tx_open = tx.clone();
-        let installed: Vec<_> = state.agents.iter().filter(|a| a.installed).cloned().collect();
+        let installed: Vec<_> = state
+            .agents
+            .iter()
+            .filter(|a| a.installed)
+            .cloned()
+            .collect();
         let selected = state.selected_agent;
 
         let project_title = state

@@ -376,9 +376,7 @@ fn handle_tools_call(params: &Value) -> Result<Value, (i64, String)> {
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    args.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
 fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
@@ -1171,11 +1169,9 @@ mod tests {
     #[test]
     fn dual_era_supports_stateless_calls_and_legacy_initialize() {
         // Modern 2026-07-28 client: calls tools/list directly without initialize.
-        let list = handle_json_line_with_env(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            true,
-        )
-        .expect("tools/list reply");
+        let list =
+            handle_json_line_with_env(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, true)
+                .expect("tools/list reply");
         let tools = list["result"]["tools"].as_array().expect("tools array");
         assert!(tools.len() >= 11);
         for tool in tools {
@@ -1201,8 +1197,9 @@ mod tests {
         );
 
         // Batching is rejected per MCP 2025-06-18+.
-        let batch = handle_json_line_with_env(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, true)
-            .expect("batch error");
+        let batch =
+            handle_json_line_with_env(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, true)
+                .expect("batch error");
         assert_eq!(batch["error"]["code"], -32600);
     }
 
@@ -1215,11 +1212,9 @@ mod tests {
         .expect("init reply");
         assert!(init["result"].get("instructions").is_none());
 
-        let list = handle_json_line_with_env(
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            false,
-        )
-        .expect("tools/list reply");
+        let list =
+            handle_json_line_with_env(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, false)
+                .expect("tools/list reply");
         assert_eq!(list["result"]["tools"], json!([]));
 
         let call = handle_json_line_with_env(

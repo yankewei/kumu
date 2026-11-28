@@ -14,14 +14,12 @@ use jsonc_parser::cst::CstRootNode;
 use serde_json::Value;
 
 pub use cli::{is_hook_notification_body, run_cli};
-pub use mcp::{
-    install_mcp, mcp_agents, mcp_status, mcp_wrapper_path, supports_mcp, uninstall_mcp,
-};
-pub use skills::{install_skills, skills_status, uninstall_skills};
 use hooks::{
     agy_hooks_status, cursor_events, cursor_hook, hook_groups, hooks_status, temporary_path,
     update_hook_file,
 };
+pub use mcp::{install_mcp, mcp_agents, mcp_status, mcp_wrapper_path, supports_mcp, uninstall_mcp};
+pub use skills::{install_skills, skills_status, uninstall_skills};
 
 pub(super) fn non_empty_env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
@@ -82,9 +80,7 @@ pub struct ComponentOutcome {
 
 impl ComponentOutcome {
     pub fn is_ok(&self) -> bool {
-        self.notify.is_ok()
-            && self.mcp.as_ref().is_none_or(Result::is_ok)
-            && self.skills.is_ok()
+        self.notify.is_ok() && self.mcp.as_ref().is_none_or(Result::is_ok) && self.skills.is_ok()
     }
 
     pub fn into_io_result(self) -> io::Result<()> {

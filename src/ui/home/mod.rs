@@ -890,12 +890,11 @@ impl KumuApp {
                     }))
                     .child(picker.app_view.clone())
             }))
-            .children(self.active_onboarding.as_ref().map(|onboarding| {
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(onboarding.view().clone())
-            }))
+            .children(
+                self.active_onboarding
+                    .as_ref()
+                    .map(|onboarding| div().absolute().inset_0().child(onboarding.view().clone())),
+            )
             .children(
                 self.active_palette
                     .as_ref()

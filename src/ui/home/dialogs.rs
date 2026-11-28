@@ -702,8 +702,10 @@ impl KumuApp {
                     actions: Vec::new(),
                 });
                 if let Some(state) = self.onboarding_state.as_mut() {
-                    state.notification_feedback =
-                        Some("已发送测试通知。如未看到系统横幅，请点击右侧打开系统通知设置检查权限。".into());
+                    state.notification_feedback = Some(
+                        "已发送测试通知。如未看到系统横幅，请点击右侧打开系统通知设置检查权限。"
+                            .into(),
+                    );
                     self.push_onboarding_state();
                 }
             }

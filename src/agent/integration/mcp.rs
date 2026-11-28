@@ -385,9 +385,7 @@ fn edit_codex_toml(text: &str, wrapper: &str, remove: bool) -> String {
     if !out.is_empty() {
         out.push_str("\n\n");
     }
-    out.push_str(&format!(
-        "[mcp_servers.kumu]\ncommand = \"{escaped}\"\n"
-    ));
+    out.push_str(&format!("[mcp_servers.kumu]\ncommand = \"{escaped}\"\n"));
     out
 }
 
@@ -414,7 +412,10 @@ mod tests {
             .expect("jsonc")
             .to_serde_value()
             .expect("value");
-        assert_eq!(json_mcp_status(&parsed, "claude", wrapper), Status::Registered);
+        assert_eq!(
+            json_mcp_status(&parsed, "claude", wrapper),
+            Status::Registered
+        );
 
         let removed = edit_json_mcp(&installed, "claude", wrapper, true).expect("remove");
         assert!(removed.contains("\"other\""));

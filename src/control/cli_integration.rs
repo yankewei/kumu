@@ -104,9 +104,7 @@ fn run_install(target: Option<&str>) -> i32 {
         let summary = format_outcome(&outcome);
         if outcome.is_ok() {
             if agent == "codex" {
-                println!(
-                    "{agent}: {summary} (restart Codex and review/trust hooks in /hooks)"
-                );
+                println!("{agent}: {summary} (restart Codex and review/trust hooks in /hooks)");
             } else {
                 println!("{agent}: {summary}");
             }
